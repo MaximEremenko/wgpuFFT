@@ -1,0 +1,1270 @@
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+use crate::config::FftDirection;
+
+pub const PIPELINE_CACHE_SNAPSHOT_SCHEMA: &str = "wgpu-fft.pipeline-cache";
+pub const PIPELINE_CACHE_SNAPSHOT_VERSION: u32 = 1;
+
+thread_local! {
+    static DEVICE_CACHES: RefCell<HashMap<u64, PipelineCache>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineCacheSnapshot {
+    schema: &'static str,
+    version: u32,
+    shader_codes: Vec<String>,
+    pipeline_keys: Vec<String>,
+    shader_entries: Vec<SnapshotShaderEntry>,
+    pipeline_entries: Vec<ComputePipelineCacheKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotShaderEntry {
+    key: ShaderCacheKey,
+    code: String,
+}
+
+impl PipelineCacheSnapshot {
+    pub fn empty() -> Self {
+        Self::from_entries(Vec::new(), Vec::new())
+    }
+
+    pub fn schema(&self) -> &str {
+        self.schema
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn shader_codes(&self) -> &[String] {
+        &self.shader_codes
+    }
+
+    pub fn pipeline_keys(&self) -> &[String] {
+        &self.pipeline_keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shader_codes.is_empty() && self.pipeline_keys.is_empty()
+    }
+
+    fn from_entries(
+        mut shader_entries: Vec<SnapshotShaderEntry>,
+        mut pipeline_entries: Vec<ComputePipelineCacheKey>,
+    ) -> Self {
+        shader_entries.sort_by_key(|entry| entry.key.stable_key());
+        pipeline_entries.sort_by_key(|key| key.stable_key());
+
+        let shader_codes = shader_entries
+            .iter()
+            .map(|entry| entry.code.clone())
+            .collect();
+        let pipeline_keys = pipeline_entries
+            .iter()
+            .map(ComputePipelineCacheKey::stable_key)
+            .collect();
+
+        Self {
+            schema: PIPELINE_CACHE_SNAPSHOT_SCHEMA,
+            version: PIPELINE_CACHE_SNAPSHOT_VERSION,
+            shader_codes,
+            pipeline_keys,
+            shader_entries,
+            pipeline_entries,
+        }
+    }
+}
+
+impl Default for PipelineCacheSnapshot {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PipelineCache {
+    bind_group_layouts: HashMap<PipelineLayoutCacheKey, wgpu::BindGroupLayout>,
+    pipeline_layouts: HashMap<PipelineLayoutCacheKey, wgpu::PipelineLayout>,
+    shader_modules: HashMap<ShaderCacheKey, wgpu::ShaderModule>,
+    shader_sources: HashMap<ShaderCacheKey, String>,
+    compute_pipelines: HashMap<ComputePipelineCacheKey, wgpu::ComputePipeline>,
+}
+
+pub(crate) fn with_device_pipeline_cache<R>(
+    device: &wgpu::Device,
+    f: impl FnOnce(&mut PipelineCache) -> R,
+) -> R {
+    let cache_id = device_cache_id(device);
+    DEVICE_CACHES.with(|caches| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.entry(cache_id).or_default();
+        f(cache)
+    })
+}
+
+pub fn export_pipeline_cache_snapshot(device: &wgpu::Device) -> PipelineCacheSnapshot {
+    with_device_pipeline_cache(device, |cache| cache.export_snapshot())
+}
+
+pub fn import_pipeline_cache_snapshot(
+    device: &wgpu::Device,
+    snapshot: &PipelineCacheSnapshot,
+) -> PipelineCacheSnapshot {
+    with_device_pipeline_cache(device, |cache| {
+        cache.import_snapshot(device, snapshot);
+        cache.export_snapshot()
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PipelineLayoutCacheKey {
+    AxisPlanInterleavedF32,
+    BridgeReadWriteReadF32,
+    BridgeReadWriteUniformF32,
+    BridgeTwoWriteUniformF32,
+    BridgeWriteReadUniformF32,
+    BluesteinBridgePostF32,
+    C2cSmoothBinaryF32,
+    C2cStridedBinaryF32,
+    DirectDftInterleavedF32,
+    RealBinaryF32,
+    RaderBridgePostF32,
+    RaderSumInterleavedF32,
+    RaderPackInterleavedF32,
+    RaderMulInterleavedF32,
+    RaderWriteY0InterleavedF32,
+    RaderPostInterleavedF32,
+}
+
+impl PipelineLayoutCacheKey {
+    fn stable_key(self) -> &'static str {
+        match self {
+            Self::AxisPlanInterleavedF32 => "axis-plan/interleaved-f32",
+            Self::BridgeReadWriteReadF32 => "bridge/read-write-read-f32",
+            Self::BridgeReadWriteUniformF32 => "bridge/read-write-uniform-f32",
+            Self::BridgeTwoWriteUniformF32 => "bridge/two-write-uniform-f32",
+            Self::BridgeWriteReadUniformF32 => "bridge/write-read-uniform-f32",
+            Self::BluesteinBridgePostF32 => "bridge/bluestein-post-f32",
+            Self::C2cSmoothBinaryF32 => "c2c-smooth/binary-f32",
+            Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
+            Self::DirectDftInterleavedF32 => "direct-dft/interleaved-f32",
+            Self::RealBinaryF32 => "real/binary-f32",
+            Self::RaderBridgePostF32 => "bridge/rader-post-f32",
+            Self::RaderSumInterleavedF32 => "rader/sum/interleaved-f32",
+            Self::RaderPackInterleavedF32 => "rader/pack/interleaved-f32",
+            Self::RaderMulInterleavedF32 => "rader/mul/interleaved-f32",
+            Self::RaderWriteY0InterleavedF32 => "rader/write-y0/interleaved-f32",
+            Self::RaderPostInterleavedF32 => "rader/post/interleaved-f32",
+        }
+    }
+}
+
+impl PipelineCache {
+    pub(crate) fn get_bind_group_layout(
+        &mut self,
+        device: &wgpu::Device,
+        key: PipelineLayoutCacheKey,
+    ) -> wgpu::BindGroupLayout {
+        if let Some(layout) = self.bind_group_layouts.get(&key) {
+            return layout.clone();
+        }
+
+        let label = format!(
+            "wgpu_fft.pipeline_cache.bind_group_layout.{}",
+            key.stable_key()
+        );
+        let entries = bind_group_layout_entries(key);
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&label),
+            entries: &entries,
+        });
+        self.bind_group_layouts.insert(key, layout.clone());
+        layout
+    }
+
+    pub(crate) fn get_pipeline_layout(
+        &mut self,
+        device: &wgpu::Device,
+        key: PipelineLayoutCacheKey,
+    ) -> wgpu::PipelineLayout {
+        if let Some(layout) = self.pipeline_layouts.get(&key) {
+            return layout.clone();
+        }
+
+        let bind_group_layout = self.get_bind_group_layout(device, key);
+        let label = format!(
+            "wgpu_fft.pipeline_cache.pipeline_layout.{}",
+            key.stable_key()
+        );
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&label),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        self.pipeline_layouts.insert(key, layout.clone());
+        layout
+    }
+
+    pub(crate) fn get_shader_module(
+        &mut self,
+        device: &wgpu::Device,
+        key: &ShaderCacheKey,
+        label: &str,
+        source: impl FnOnce() -> String,
+    ) -> wgpu::ShaderModule {
+        if let Some(module) = self.shader_modules.get(key) {
+            return module.clone();
+        }
+
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl({
+                let source = source();
+                self.shader_sources.insert(key.clone(), source.clone());
+                source.into()
+            }),
+        });
+        self.shader_modules.insert(key.clone(), module.clone());
+        module
+    }
+
+    pub(crate) fn get_compute_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        key: &ComputePipelineCacheKey,
+        label: &str,
+        shader_label: &str,
+        shader_source: impl FnOnce() -> String,
+    ) -> wgpu::ComputePipeline {
+        if let Some(pipeline) = self.compute_pipelines.get(key) {
+            return pipeline.clone();
+        }
+
+        let pipeline_layout = self.get_pipeline_layout(device, key.layout);
+        let shader = self.get_shader_module(device, &key.shader, shader_label, shader_source);
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some(&key.entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        self.compute_pipelines.insert(key.clone(), pipeline.clone());
+        pipeline
+    }
+
+    fn export_snapshot(&self) -> PipelineCacheSnapshot {
+        let shader_entries = self
+            .shader_sources
+            .iter()
+            .map(|(key, code)| SnapshotShaderEntry {
+                key: key.clone(),
+                code: code.clone(),
+            })
+            .collect();
+        let pipeline_entries = self.compute_pipelines.keys().cloned().collect();
+        PipelineCacheSnapshot::from_entries(shader_entries, pipeline_entries)
+    }
+
+    fn import_snapshot(&mut self, device: &wgpu::Device, snapshot: &PipelineCacheSnapshot) {
+        for entry in &snapshot.shader_entries {
+            let shader_label = format!(
+                "wgpu_fft.pipeline_cache.import.shader.{}",
+                entry.key.stable_key()
+            );
+            self.get_shader_module(device, &entry.key, &shader_label, || entry.code.clone());
+        }
+
+        let shader_sources = snapshot
+            .shader_entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.code.clone()))
+            .collect::<HashMap<_, _>>();
+        for key in &snapshot.pipeline_entries {
+            let pipeline_label = format!(
+                "wgpu_fft.pipeline_cache.import.pipeline.{}",
+                key.stable_key()
+            );
+            let shader_label = format!(
+                "wgpu_fft.pipeline_cache.import.shader.{}",
+                key.shader.stable_key()
+            );
+            let shader_source = shader_sources
+                .get(&key.shader)
+                .cloned()
+                .or_else(|| self.shader_sources.get(&key.shader).cloned())
+                .unwrap_or_else(|| key.shader.fallback_source());
+            self.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
+                shader_source
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShaderCacheKey {
+    StockhamStage(StockhamStageKey),
+    BridgeStage(BridgeStageKey),
+    RaderStage(RaderStageKey),
+    RealStage(RealStageKey),
+    C2cSmoothStage(C2cSmoothStageKey),
+    C2cStridedStage(C2cStridedStageKey),
+    DirectDftC2cF32,
+}
+
+impl ShaderCacheKey {
+    pub(crate) fn stable_key(&self) -> String {
+        match self {
+            Self::StockhamStage(key) => key.stable_key(),
+            Self::BridgeStage(key) => key.stable_key(),
+            Self::RaderStage(key) => key.stable_key(),
+            Self::RealStage(key) => key.stable_key(),
+            Self::C2cSmoothStage(key) => key.stable_key(),
+            Self::C2cStridedStage(key) => key.stable_key(),
+            Self::DirectDftC2cF32 => String::from("shader:v1:direct-dft/c2c-f32"),
+        }
+    }
+
+    fn fallback_source(&self) -> String {
+        match self {
+            Self::StockhamStage(_) => String::new(),
+            Self::BridgeStage(key) => crate::runtime::c2c::generate_bridge_wgsl_for_key(key),
+            Self::RaderStage(key) => crate::runtime::rader_axis::generate_rader_wgsl_for_key(key),
+            Self::RealStage(key) => crate::runtime::real::generate_real_wgsl_for_key(key),
+            Self::C2cSmoothStage(key) => crate::runtime::c2c::generate_c2c_smooth_wgsl_for_key(key),
+            Self::C2cStridedStage(key) => {
+                crate::runtime::c2c::generate_c2c_strided_wgsl_for_key(key)
+            }
+            Self::DirectDftC2cF32 => crate::kernels::C2C_DFT_WGSL.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ComputePipelineCacheKey {
+    pub(crate) layout: PipelineLayoutCacheKey,
+    pub(crate) entry_point: String,
+    pub(crate) shader: ShaderCacheKey,
+}
+
+impl ComputePipelineCacheKey {
+    pub(crate) fn stockham_stage(shader: StockhamStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::StockhamStage(shader),
+        }
+    }
+
+    pub(crate) fn direct_dft_c2c_f32() -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::DirectDftInterleavedF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::DirectDftC2cF32,
+        }
+    }
+
+    pub(crate) fn real_stage(shader: RealStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::RealBinaryF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::RealStage(shader),
+        }
+    }
+
+    pub(crate) fn c2c_strided_stage(shader: C2cStridedStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::C2cStridedBinaryF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::C2cStridedStage(shader),
+        }
+    }
+
+    pub(crate) fn c2c_smooth_stage(shader: C2cSmoothStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::C2cSmoothBinaryF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::C2cSmoothStage(shader),
+        }
+    }
+
+    pub(crate) fn bridge_stage(shader: BridgeStageKey) -> Self {
+        let layout = match shader.kind {
+            BridgeKernelKind::RaderSumInit => PipelineLayoutCacheKey::BridgeTwoWriteUniformF32,
+            BridgeKernelKind::RaderSumAccumulate => PipelineLayoutCacheKey::RaderSumInterleavedF32,
+            BridgeKernelKind::RaderPack | BridgeKernelKind::BluesteinPack => {
+                PipelineLayoutCacheKey::BridgeReadWriteReadF32
+            }
+            BridgeKernelKind::RaderMul | BridgeKernelKind::BluesteinMul => {
+                PipelineLayoutCacheKey::BridgeWriteReadUniformF32
+            }
+            BridgeKernelKind::RaderWriteY0 => PipelineLayoutCacheKey::BridgeReadWriteUniformF32,
+            BridgeKernelKind::RaderPost => PipelineLayoutCacheKey::RaderBridgePostF32,
+            BridgeKernelKind::BluesteinPost => PipelineLayoutCacheKey::BluesteinBridgePostF32,
+        };
+        Self {
+            layout,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::BridgeStage(shader),
+        }
+    }
+
+    pub(crate) fn rader_stage(shader: RaderStageKey) -> Self {
+        let layout = match shader.kind {
+            RaderKernelKind::Sum => PipelineLayoutCacheKey::RaderSumInterleavedF32,
+            RaderKernelKind::Pack => PipelineLayoutCacheKey::RaderPackInterleavedF32,
+            RaderKernelKind::Mul => PipelineLayoutCacheKey::RaderMulInterleavedF32,
+            RaderKernelKind::WriteY0 => PipelineLayoutCacheKey::RaderWriteY0InterleavedF32,
+            RaderKernelKind::Post => PipelineLayoutCacheKey::RaderPostInterleavedF32,
+        };
+        Self {
+            layout,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::RaderStage(shader),
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "pipeline:v1:layout={}:entry={}:{}",
+            self.layout.stable_key(),
+            self.entry_point,
+            self.shader.stable_key()
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RaderKernelKind {
+    Sum,
+    Pack,
+    Mul,
+    WriteY0,
+    Post,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BridgeKernelKind {
+    RaderSumInit,
+    RaderSumAccumulate,
+    RaderPack,
+    RaderMul,
+    RaderWriteY0,
+    RaderPost,
+    BluesteinPack,
+    BluesteinMul,
+    BluesteinPost,
+}
+
+impl BridgeKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RaderSumInit => "rader-sum-init",
+            Self::RaderSumAccumulate => "rader-sum-accumulate",
+            Self::RaderPack => "rader-pack-windowed",
+            Self::RaderMul => "rader-mul-windowed",
+            Self::RaderWriteY0 => "rader-write-y0-windowed",
+            Self::RaderPost => "rader-post-windowed",
+            Self::BluesteinPack => "bluestein-pack-windowed",
+            Self::BluesteinMul => "bluestein-mul-windowed",
+            Self::BluesteinPost => "bluestein-post-windowed",
+        }
+    }
+}
+
+impl RaderKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Pack => "pack",
+            Self::Mul => "mul",
+            Self::WriteY0 => "write-y0",
+            Self::Post => "post",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RealKernelKind {
+    RealToComplex,
+    RealToComplexWindowed,
+    PackR2c,
+    PackR2cWindowed,
+    UnpackC2r,
+    UnpackC2rWindowed,
+    ComplexToReal,
+    ComplexToRealWindowed,
+    PackRealStrided,
+    UnpackRealStrided,
+    PackComplexStrided,
+    UnpackComplexStrided,
+}
+
+impl RealKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RealToComplex => "real-to-complex",
+            Self::RealToComplexWindowed => "real-to-complex-windowed",
+            Self::PackR2c => "pack-r2c",
+            Self::PackR2cWindowed => "pack-r2c-windowed",
+            Self::UnpackC2r => "unpack-c2r",
+            Self::UnpackC2rWindowed => "unpack-c2r-windowed",
+            Self::ComplexToReal => "complex-to-real",
+            Self::ComplexToRealWindowed => "complex-to-real-windowed",
+            Self::PackRealStrided => "pack-real-strided",
+            Self::UnpackRealStrided => "unpack-real-strided",
+            Self::PackComplexStrided => "pack-complex-strided",
+            Self::UnpackComplexStrided => "unpack-complex-strided",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum C2cStridedKernelKind {
+    Pack,
+    Unpack,
+}
+
+impl C2cStridedKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pack => "pack-c2c-strided",
+            Self::Unpack => "unpack-c2c-strided",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum C2cSmoothKernelKind {
+    TwiddleTranspose,
+    GatherAxisLine,
+    ScatterAxisLine,
+    GatherSmoothPhase1,
+    ScatterSmoothPhase2,
+}
+
+impl C2cSmoothKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TwiddleTranspose => "twiddle-transpose",
+            Self::GatherAxisLine => "gather-axis-line",
+            Self::ScatterAxisLine => "scatter-axis-line",
+            Self::GatherSmoothPhase1 => "gather-smooth-phase1",
+            Self::ScatterSmoothPhase2 => "scatter-smooth-phase2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct C2cSmoothStageKey {
+    pub(crate) kind: C2cSmoothKernelKind,
+    pub(crate) workgroup_size: u32,
+}
+
+impl C2cSmoothStageKey {
+    pub(crate) const fn new(kind: C2cSmoothKernelKind, workgroup_size: u32) -> Self {
+        Self {
+            kind,
+            workgroup_size,
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:c2c-smooth:{}:workgroup={}",
+            self.kind.as_str(),
+            self.workgroup_size
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct C2cStridedStageKey {
+    pub(crate) kind: C2cStridedKernelKind,
+    pub(crate) workgroup_size: u32,
+}
+
+impl C2cStridedStageKey {
+    pub(crate) const fn new(kind: C2cStridedKernelKind, workgroup_size: u32) -> Self {
+        Self {
+            kind,
+            workgroup_size,
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:c2c-strided:{}:workgroup={}",
+            self.kind.as_str(),
+            self.workgroup_size
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RealStageKey {
+    pub(crate) kind: RealKernelKind,
+    pub(crate) rank: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) workgroup_size: u32,
+}
+
+impl RealStageKey {
+    pub(crate) fn new(kind: RealKernelKind, dims: &[usize], workgroup_size: u32) -> Self {
+        Self {
+            kind,
+            rank: dims.len(),
+            dims: dims.to_vec(),
+            workgroup_size,
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:real:{}:rank={}:dims={}:workgroup={}",
+            self.kind.as_str(),
+            self.rank,
+            dims_key(&self.dims),
+            self.workgroup_size
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BridgeStageKey {
+    pub(crate) kind: BridgeKernelKind,
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) convolution_length: usize,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl BridgeStageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        kind: BridgeKernelKind,
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        convolution_length: usize,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            kind,
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            convolution_length,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:bridge:{}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            self.kind.as_str(),
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            self.convolution_length,
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RaderStageKey {
+    pub(crate) kind: RaderKernelKind,
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) convolution_length: usize,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl RaderStageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        kind: RaderKernelKind,
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        convolution_length: usize,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            kind,
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            convolution_length,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:rader:{}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            self.kind.as_str(),
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            self.convolution_length,
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct StockhamStageKey {
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) radix: usize,
+    pub(crate) ns: usize,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl StockhamStageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        radix: usize,
+        ns: usize,
+        direction: FftDirection,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            radix,
+            ns,
+            direction,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:stockham:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            self.radix,
+            self.ns,
+            direction_key(self.direction),
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+}
+
+fn direction_key(direction: FftDirection) -> &'static str {
+    match direction {
+        FftDirection::Forward => "forward",
+        FftDirection::Inverse => "inverse",
+    }
+}
+
+fn dims_key(dims: &[usize]) -> String {
+    let mut out = String::new();
+    for (index, dim) in dims.iter().enumerate() {
+        if index > 0 {
+            out.push('x');
+        }
+        out.push_str(&dim.to_string());
+    }
+    out
+}
+
+fn device_cache_id(device: &wgpu::Device) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    device.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroupLayoutEntry> {
+    match key {
+        PipelineLayoutCacheKey::AxisPlanInterleavedF32
+        | PipelineLayoutCacheKey::C2cSmoothBinaryF32
+        | PipelineLayoutCacheKey::C2cStridedBinaryF32
+        | PipelineLayoutCacheKey::DirectDftInterleavedF32
+        | PipelineLayoutCacheKey::RealBinaryF32
+        | PipelineLayoutCacheKey::RaderWriteY0InterleavedF32 => {
+            vec![
+                storage_entry(0, true),
+                storage_entry(1, false),
+                uniform_entry(2),
+            ]
+        }
+        PipelineLayoutCacheKey::BridgeTwoWriteUniformF32 => vec![
+            storage_entry(0, false),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ],
+        PipelineLayoutCacheKey::BridgeReadWriteUniformF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+        ],
+        PipelineLayoutCacheKey::BridgeWriteReadUniformF32 => vec![
+            storage_entry(0, false),
+            storage_entry(1, true),
+            uniform_entry(2),
+        ],
+        PipelineLayoutCacheKey::BridgeReadWriteReadF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, true),
+            uniform_entry(3),
+        ],
+        PipelineLayoutCacheKey::BluesteinBridgePostF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ],
+        PipelineLayoutCacheKey::RaderSumInterleavedF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, false),
+            uniform_entry(3),
+        ],
+        PipelineLayoutCacheKey::RaderPackInterleavedF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, true),
+            uniform_entry(3),
+        ],
+        PipelineLayoutCacheKey::RaderMulInterleavedF32 => {
+            vec![
+                storage_entry(0, false),
+                storage_entry(1, true),
+                uniform_entry(2),
+            ]
+        }
+        PipelineLayoutCacheKey::RaderPostInterleavedF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, false),
+            uniform_entry(4),
+        ],
+        PipelineLayoutCacheKey::RaderBridgePostF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, false),
+            uniform_entry(5),
+        ],
+    }
+}
+
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stockham_shader_key_is_stable_and_includes_stage_constants() {
+        let key = StockhamStageKey::new(
+            2,
+            1,
+            &[4, 3],
+            3,
+            4,
+            3,
+            3,
+            FftDirection::Forward,
+            64,
+            true,
+            1.0 / 12.0,
+        );
+
+        assert_eq!(key.scale_factor(), 1.0 / 12.0);
+        assert_eq!(
+            key.stable_key(),
+            "shader:v1:stockham:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab"
+        );
+    }
+
+    #[test]
+    fn stockham_shader_key_ignores_scale_value_when_scale_is_not_applied() {
+        let a = StockhamStageKey::new(
+            1,
+            0,
+            &[8],
+            8,
+            1,
+            8,
+            8,
+            FftDirection::Forward,
+            64,
+            false,
+            1.0,
+        );
+        let b = StockhamStageKey::new(
+            1,
+            0,
+            &[8],
+            8,
+            1,
+            8,
+            8,
+            FftDirection::Forward,
+            64,
+            false,
+            0.125,
+        );
+
+        assert_eq!(a, b);
+        assert_eq!(a.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn compute_pipeline_key_wraps_layout_entry_point_and_shader_key() {
+        let shader = StockhamStageKey::new(
+            1,
+            0,
+            &[8],
+            8,
+            1,
+            8,
+            8,
+            FftDirection::Inverse,
+            64,
+            false,
+            1.0,
+        );
+        let pipeline = ComputePipelineCacheKey::stockham_stage(shader);
+
+        assert!(pipeline
+            .stable_key()
+            .starts_with("pipeline:v1:layout=axis-plan/interleaved-f32:entry=main:"));
+        assert!(pipeline.stable_key().contains("direction=inverse"));
+
+        assert_eq!(
+            ComputePipelineCacheKey::direct_dft_c2c_f32().stable_key(),
+            "pipeline:v1:layout=direct-dft/interleaved-f32:entry=main:shader:v1:direct-dft/c2c-f32"
+        );
+    }
+
+    #[test]
+    fn snapshot_exposes_stable_schema_codes_and_pipeline_keys() {
+        let shader = ShaderCacheKey::StockhamStage(StockhamStageKey::new(
+            1,
+            0,
+            &[8],
+            8,
+            1,
+            8,
+            8,
+            FftDirection::Forward,
+            64,
+            false,
+            1.0,
+        ));
+        let pipeline = ComputePipelineCacheKey::stockham_stage(match &shader {
+            ShaderCacheKey::StockhamStage(key) => key.clone(),
+            ShaderCacheKey::BridgeStage(_) => unreachable!(),
+            ShaderCacheKey::RaderStage(_) => unreachable!(),
+            ShaderCacheKey::RealStage(_) => unreachable!(),
+            ShaderCacheKey::C2cSmoothStage(_) => unreachable!(),
+            ShaderCacheKey::C2cStridedStage(_) => unreachable!(),
+            ShaderCacheKey::DirectDftC2cF32 => unreachable!(),
+        });
+        let snapshot = PipelineCacheSnapshot::from_entries(
+            vec![SnapshotShaderEntry {
+                key: shader,
+                code: String::from("wgsl-a"),
+            }],
+            vec![pipeline],
+        );
+
+        assert_eq!(snapshot.schema(), PIPELINE_CACHE_SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot.version(), PIPELINE_CACHE_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.shader_codes(), &[String::from("wgsl-a")]);
+        assert_eq!(snapshot.pipeline_keys().len(), 1);
+        assert!(!snapshot.is_empty());
+    }
+
+    #[test]
+    fn rader_pipeline_key_uses_typed_helper_layout_and_shader_key() {
+        let shader = RaderStageKey::new(
+            RaderKernelKind::Pack,
+            2,
+            1,
+            &[4, 17],
+            17,
+            4,
+            32,
+            64,
+            false,
+            1.0,
+        );
+        let pipeline = ComputePipelineCacheKey::rader_stage(shader.clone());
+
+        assert_eq!(
+            pipeline.layout,
+            PipelineLayoutCacheKey::RaderPackInterleavedF32
+        );
+        assert!(pipeline.stable_key().contains("shader:v1:rader:pack"));
+        assert!(pipeline.stable_key().contains("dims=4x17"));
+        assert_eq!(shader.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn real_pipeline_key_uses_typed_helper_layout_and_shader_key() {
+        let shader = RealStageKey::new(RealKernelKind::PackR2c, &[17, 4], 64);
+        let pipeline = ComputePipelineCacheKey::real_stage(shader);
+
+        assert_eq!(pipeline.layout, PipelineLayoutCacheKey::RealBinaryF32);
+        assert_eq!(
+            pipeline.stable_key(),
+            "pipeline:v1:layout=real/binary-f32:entry=main:shader:v1:real:pack-r2c:rank=2:dims=17x4:workgroup=64"
+        );
+    }
+
+    #[test]
+    fn real_windowed_pipeline_keys_are_stable_and_snapshot_visible() {
+        for (kind, expected) in [
+            (
+                RealKernelKind::RealToComplexWindowed,
+                "real-to-complex-windowed",
+            ),
+            (RealKernelKind::PackR2cWindowed, "pack-r2c-windowed"),
+            (RealKernelKind::UnpackC2rWindowed, "unpack-c2r-windowed"),
+            (
+                RealKernelKind::ComplexToRealWindowed,
+                "complex-to-real-windowed",
+            ),
+        ] {
+            let shader = RealStageKey::new(kind, &[64], 64);
+            let pipeline = ComputePipelineCacheKey::real_stage(shader.clone());
+            assert_eq!(pipeline.layout, PipelineLayoutCacheKey::RealBinaryF32);
+            assert!(pipeline.stable_key().contains(expected));
+            let snapshot = PipelineCacheSnapshot::from_entries(
+                vec![SnapshotShaderEntry {
+                    key: ShaderCacheKey::RealStage(shader),
+                    code: String::from("wgsl"),
+                }],
+                vec![pipeline],
+            );
+            assert!(snapshot
+                .pipeline_keys()
+                .iter()
+                .any(|key| key.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn c2c_strided_pipeline_key_uses_typed_helper_layout_and_shader_key() {
+        let shader = C2cStridedStageKey::new(C2cStridedKernelKind::Pack, 64);
+        let pipeline = ComputePipelineCacheKey::c2c_strided_stage(shader);
+
+        assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cStridedBinaryF32);
+        assert_eq!(
+            pipeline.stable_key(),
+            "pipeline:v1:layout=c2c-strided/binary-f32:entry=main:shader:v1:c2c-strided:pack-c2c-strided:workgroup=64"
+        );
+    }
+
+    #[test]
+    fn c2c_smooth_pipeline_key_uses_typed_helper_layout_and_shader_key() {
+        let shader = C2cSmoothStageKey::new(C2cSmoothKernelKind::TwiddleTranspose, 64);
+        let pipeline = ComputePipelineCacheKey::c2c_smooth_stage(shader);
+
+        assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cSmoothBinaryF32);
+        assert_eq!(
+            pipeline.stable_key(),
+            "pipeline:v1:layout=c2c-smooth/binary-f32:entry=main:shader:v1:c2c-smooth:twiddle-transpose:workgroup=64"
+        );
+
+        for (kind, expected) in [
+            (C2cSmoothKernelKind::GatherAxisLine, "gather-axis-line"),
+            (C2cSmoothKernelKind::ScatterAxisLine, "scatter-axis-line"),
+            (
+                C2cSmoothKernelKind::GatherSmoothPhase1,
+                "gather-smooth-phase1",
+            ),
+            (
+                C2cSmoothKernelKind::ScatterSmoothPhase2,
+                "scatter-smooth-phase2",
+            ),
+        ] {
+            let shader = C2cSmoothStageKey::new(kind, 64);
+            let pipeline = ComputePipelineCacheKey::c2c_smooth_stage(shader);
+            assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cSmoothBinaryF32);
+            assert!(pipeline.stable_key().contains(expected));
+        }
+    }
+
+    #[test]
+    fn bridge_pipeline_keys_are_stable_and_snapshot_visible() {
+        for (kind, expected) in [
+            (BridgeKernelKind::RaderSumInit, "rader-sum-init"),
+            (BridgeKernelKind::RaderSumAccumulate, "rader-sum-accumulate"),
+            (BridgeKernelKind::RaderPack, "rader-pack-windowed"),
+            (BridgeKernelKind::RaderMul, "rader-mul-windowed"),
+            (BridgeKernelKind::RaderWriteY0, "rader-write-y0-windowed"),
+            (BridgeKernelKind::RaderPost, "rader-post-windowed"),
+            (BridgeKernelKind::BluesteinPack, "bluestein-pack-windowed"),
+            (BridgeKernelKind::BluesteinMul, "bluestein-mul-windowed"),
+            (BridgeKernelKind::BluesteinPost, "bluestein-post-windowed"),
+        ] {
+            let shader = BridgeStageKey::new(kind, 1, 0, &[17], 17, 1, 32, 64, false, 1.0);
+            let pipeline = ComputePipelineCacheKey::bridge_stage(shader.clone());
+            assert!(pipeline.stable_key().contains(expected));
+            let snapshot = PipelineCacheSnapshot::from_entries(
+                vec![SnapshotShaderEntry {
+                    key: ShaderCacheKey::BridgeStage(shader),
+                    code: String::from("wgsl"),
+                }],
+                vec![pipeline],
+            );
+            assert!(snapshot
+                .pipeline_keys()
+                .iter()
+                .any(|key| key.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn empty_snapshot_has_no_codes_or_pipeline_keys() {
+        let snapshot = PipelineCacheSnapshot::empty();
+        assert_eq!(snapshot.schema(), PIPELINE_CACHE_SNAPSHOT_SCHEMA);
+        assert_eq!(snapshot.version(), PIPELINE_CACHE_SNAPSHOT_VERSION);
+        assert!(snapshot.shader_codes().is_empty());
+        assert!(snapshot.pipeline_keys().is_empty());
+        assert!(snapshot.is_empty());
+    }
+}

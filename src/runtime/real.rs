@@ -5,6 +5,7 @@ use crate::error::{FftError, Result};
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::c2c::{C2cPlan, C2cRoute};
+use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_chunk::LargeChunkPlan;
 use crate::runtime::large_graph::{
     ElementFormat, LargeExecutionGraph, LargeStage, LogicalBufferId, LogicalRange,
@@ -2118,7 +2119,8 @@ impl RealKernel {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_x, 1, 1);
+        let (x, y, z) = split_workgroups(self.workgroups_x, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 }
@@ -2500,7 +2502,11 @@ fn dispatch_real_windowed_kernel(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(params.total.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        params.total.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -2585,7 +2591,11 @@ fn dispatch_real_strided_copy(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(params.total_elements.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        params.total_elements.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -3060,8 +3070,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total_elements / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total_elements) {{ return; }}
   let batch: u32 = i / params.logical_per_batch;
   let element: u32 = i - batch * params.logical_per_batch;
@@ -3087,8 +3099,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   output[i] = vec2<f32>(input[i], 0.0);
 }}
@@ -3111,8 +3125,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   output[i] = input[i].x;
 }}
@@ -3139,8 +3155,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   output[params.output_base + i] = vec2<f32>(input[params.input_base + i], 0.0);
 }}
@@ -3167,8 +3185,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   output[params.output_base + i] = input[params.input_base + i].x;
 }}
@@ -3211,9 +3231,11 @@ struct Params {{
 const OUT_TOTAL_PER_BATCH: u32 = {out_total}u;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
   let totalOut: u32 = OUT_TOTAL_PER_BATCH * params.batch;
+  if (wgFlat > totalOut / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= totalOut) {{ return; }}
   let b: u32 = i / OUT_TOTAL_PER_BATCH;
   let rem: u32 = i - b * OUT_TOTAL_PER_BATCH;
@@ -3299,9 +3321,11 @@ const OUT_TOTAL_PER_BATCH: u32 = {full_total}u;
 fn conj(v: vec2<f32>) -> vec2<f32> {{ return vec2<f32>(v.x, -v.y); }}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
   let totalOut: u32 = OUT_TOTAL_PER_BATCH * params.batch;
+  if (wgFlat > totalOut / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= totalOut) {{ return; }}
   let b: u32 = i / OUT_TOTAL_PER_BATCH;
   let rem: u32 = i - b * OUT_TOTAL_PER_BATCH;
@@ -3365,8 +3389,10 @@ struct Params {{
 const OUT_TOTAL_PER_BATCH: u32 = {out_total}u;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   let globalOut: u32 = params.output_logical_start + i;
   let b: u32 = globalOut / OUT_TOTAL_PER_BATCH;
@@ -3457,8 +3483,10 @@ const OUT_TOTAL_PER_BATCH: u32 = {full_total}u;
 fn conj(v: vec2<f32>) -> vec2<f32> {{ return vec2<f32>(v.x, -v.y); }}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total) {{ return; }}
   let globalOut: u32 = params.output_logical_start + i;
   let b: u32 = globalOut / OUT_TOTAL_PER_BATCH;

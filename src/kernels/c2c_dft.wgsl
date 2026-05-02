@@ -17,8 +17,16 @@ var<storage, read_write> output: array<vec2<f32>>;
 var<uniform> params: Params;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let k = global_id.x;
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let wgFlat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wgFlat > params.len / 64u) {
+        return;
+    }
+    let k = wgFlat * 64u + lid.x;
     if (k >= params.len) {
         return;
     }

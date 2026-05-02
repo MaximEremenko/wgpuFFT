@@ -8,6 +8,7 @@ use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
 };
 use crate::runtime::buffer_view::BufferView;
+use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
     format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
@@ -408,7 +409,9 @@ impl RaderAxis {
         });
         pass.set_pipeline(&self.sum_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_sum, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_sum, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -435,7 +438,9 @@ impl RaderAxis {
         });
         pass.set_pipeline(&self.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_work, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -460,7 +465,9 @@ impl RaderAxis {
         });
         pass.set_pipeline(&self.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_work, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -486,7 +493,9 @@ impl RaderAxis {
         });
         pass.set_pipeline(&self.write_y0_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_lines, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_lines, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -514,7 +523,9 @@ impl RaderAxis {
         });
         pass.set_pipeline(&self.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_tail, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_tail, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 }
@@ -733,8 +744,8 @@ const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 var<workgroup> scratch: array<vec2<f32>, {workgroup_size}>;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
-  let lineLocal: u32 = wid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let lineLocal: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
   if (lineLocal >= params.lines) {{
     return;
   }}
@@ -800,11 +811,8 @@ const STRIDE: u32 = {stride}u;
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.lines * M) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
 
   let lineLocal: u32 = i / M;
   let t: u32 = i - lineLocal * M;
@@ -824,6 +832,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         m = key.convolution_length,
         stride = key.stride_complex,
         workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.lines * M",
+            key.workgroup_size,
+        ),
         line_base_fn = line_base_fn,
     )
 }
@@ -851,17 +865,20 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
 }}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.total) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
   let t: u32 = i - (i / M) * M;
   work[i] = c_mul(work[i], bfft[t]);
 }}
 "#,
         m = key.convolution_length,
         workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.total",
+            key.workgroup_size
+        ),
     )
 }
 
@@ -885,11 +902,8 @@ const SCALE: f32 = {scale};
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let lineLocal: u32 = gid.x;
-  if (lineLocal >= params.lines) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
 
   let base: u32 = line_base(params.lineOffset + lineLocal);
   output[base] = sumAll[lineLocal] * vec2<f32>(SCALE, SCALE);
@@ -898,6 +912,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         scale = scale,
         line_base_fn = line_base_fn,
         workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "lineLocal",
+            "params.lines",
+            key.workgroup_size,
+        ),
     )
 }
 
@@ -926,11 +946,8 @@ const SCALE: f32 = {scale};
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.lines * L) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
 
   let lineLocal: u32 = i / L;
   let t: u32 = i - lineLocal * L;
@@ -952,6 +969,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         stride = key.stride_complex,
         scale = scale,
         workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.lines * L",
+            key.workgroup_size,
+        ),
         line_base_fn = line_base_fn,
     )
 }

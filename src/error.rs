@@ -13,6 +13,10 @@ pub enum FftError {
     LengthTooLarge {
         len: usize,
     },
+    DispatchWorkgroupsUnsupported {
+        workgroups: u32,
+        max_per_dimension: u32,
+    },
     UnsupportedLength {
         len: usize,
     },
@@ -203,6 +207,16 @@ impl fmt::Display for FftError {
                 write!(
                     f,
                     "FFT length {len} exceeds the current u32 GPU dispatch limit"
+                )
+            }
+            Self::DispatchWorkgroupsUnsupported {
+                workgroups,
+                max_per_dimension,
+            } => {
+                write!(
+                    f,
+                    "dispatch of {workgroups} workgroups cannot fit a safely linearizable 3D grid with \
+                     max_compute_workgroups_per_dimension {max_per_dimension}"
                 )
             }
             Self::UnsupportedLength { len } => write!(
@@ -441,6 +455,12 @@ impl FftError {
                     .with_layout("workgroup grid")
                     .with_required_bytes(*len as u64)
                     .with_limit_bytes(u32::MAX as u64)
+            }
+            Self::DispatchWorkgroupsUnsupported { .. } => {
+                FftBlocker::new(FftBlockerKind::DeviceLimit, self.to_string())
+                    .with_route("dispatch-split")
+                    .with_stage("dispatch-dimensions")
+                    .with_layout("workgroup grid")
             }
             Self::EmptyAxes => FftBlocker::new(FftBlockerKind::Validation, self.to_string())
                 .with_route("axis-policy")

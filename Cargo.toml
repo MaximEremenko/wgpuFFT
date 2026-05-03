@@ -16,3 +16,7 @@ wgpu = "29.0.1"
 
 [dev-dependencies]
 pollster = "0.4"
+
+[[bench]]
+name = "fft_bench"
+harness = false

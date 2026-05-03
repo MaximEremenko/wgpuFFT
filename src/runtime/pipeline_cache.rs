@@ -107,6 +107,19 @@ pub(crate) fn with_device_pipeline_cache<R>(
     })
 }
 
+/// Drops cached shader modules, layouts, and compute pipelines for `device`
+/// from the calling thread's cache.
+///
+/// Existing plans keep their own `wgpu` handles and remain usable. This is
+/// primarily useful for long-running tools that create many shape-specialized
+/// plans and no longer need earlier cache entries. The return value is `true`
+/// only when an entry existed and was removed; it does not guarantee immediate
+/// driver-level memory reclamation or affect entries on other threads.
+pub fn clear_thread_local_pipeline_cache(device: &wgpu::Device) -> bool {
+    let cache_id = device_cache_id(device);
+    DEVICE_CACHES.with(|caches| caches.borrow_mut().remove(&cache_id).is_some())
+}
+
 pub fn export_pipeline_cache_snapshot(device: &wgpu::Device) -> PipelineCacheSnapshot {
     with_device_pipeline_cache(device, |cache| cache.export_snapshot())
 }

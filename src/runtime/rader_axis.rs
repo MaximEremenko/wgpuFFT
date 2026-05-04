@@ -3,7 +3,9 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd, to_interleaved_f32, Complex32};
-use crate::runtime::axis_plan::{AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision};
+use crate::runtime::axis_plan::{
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+};
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
 };
@@ -306,16 +308,16 @@ impl RaderAxis {
         0
     }
 
-    pub(crate) fn graph_forward_fft_stage_count(&self) -> usize {
-        self.work_fft_forward.graph_stage_count()
+    pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
+        self.work_fft_forward.graph_stage_kinds()
     }
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
         self.work_fft_forward.workspace_size_bytes()
     }
 
-    pub(crate) fn graph_inverse_fft_stage_count(&self) -> usize {
-        self.work_fft_inverse.graph_stage_count()
+    pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
+        self.work_fft_inverse.graph_stage_kinds()
     }
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {

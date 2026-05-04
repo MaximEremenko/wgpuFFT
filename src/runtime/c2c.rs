@@ -3,7 +3,9 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::to_interleaved_f32;
-use crate::runtime::axis_plan::{AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision};
+use crate::runtime::axis_plan::{
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+};
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::bluestein_axis::{
     bluestein_bfft, bluestein_chirp, BluesteinAxis, BluesteinAxisConfig,
@@ -284,7 +286,7 @@ enum SmoothPhaseExecution {
 enum SmoothGraphStep {
     Mixed {
         step: SmoothMixedGraphStep,
-        stage_count: usize,
+        stage_kinds: Vec<AxisStageKind>,
         workspace_bytes: u64,
     },
     Smooth {
@@ -364,7 +366,7 @@ impl SmoothAxisGraphStep {
 
 enum SmoothPhaseGraph {
     Axis {
-        stage_count: usize,
+        stage_kinds: Vec<AxisStageKind>,
         workspace_bytes: u64,
     },
     C2c(LargeExecutionGraph),
@@ -2682,7 +2684,7 @@ impl SmoothPhaseExecution {
     fn graph(&self) -> Result<SmoothPhaseGraph> {
         Ok(match self {
             Self::Axis(plan) => SmoothPhaseGraph::Axis {
-                stage_count: plan.graph_stage_count(),
+                stage_kinds: plan.graph_stage_kinds(),
                 workspace_bytes: plan.workspace_size_bytes(),
             },
             Self::C2c(plan) => SmoothPhaseGraph::C2c(plan.execution_graph()?),
@@ -3229,11 +3231,12 @@ fn build_normal_c2c_graph_for_impl(
 ) -> Result<LargeExecutionGraph> {
     match route_impl {
         C2cRouteImpl::DirectDft(_) => build_direct_dft_c2c_graph(required_bytes, limits),
-        C2cRouteImpl::MixedRadix(plan) => build_axis_plan_c2c_graph(
+        C2cRouteImpl::MixedRadix(plan) => build_axis_plan_c2c_graph_with_kinds(
             "c2c-mixed-radix-normal",
             "mixed-radix-stockham-stage",
+            "fused-pow2-workgroup-stage",
             "mixed-radix-workspace",
-            plan.graph_stage_count(),
+            &plan.graph_stage_kinds(),
             required_bytes,
             workspace_bytes,
             limits,
@@ -3360,38 +3363,38 @@ fn work_items_for_bytes(bytes: u64, format: ElementFormat) -> u64 {
     (bytes / format.bytes_per_element()).max(1)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ConvolutionGraphFfts {
-    forward_stage_count: usize,
+    forward_stage_kinds: Vec<AxisStageKind>,
     forward_workspace_bytes: u64,
-    inverse_stage_count: usize,
+    inverse_stage_kinds: Vec<AxisStageKind>,
     inverse_workspace_bytes: u64,
 }
 
 impl ConvolutionGraphFfts {
     fn rader(plan: &RaderAxis) -> Self {
         Self {
-            forward_stage_count: plan.graph_forward_fft_stage_count(),
+            forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
-            inverse_stage_count: plan.graph_inverse_fft_stage_count(),
+            inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
             inverse_workspace_bytes: plan.graph_inverse_fft_workspace_bytes(),
         }
     }
 
     fn bluestein(plan: &BluesteinAxis) -> Self {
         Self {
-            forward_stage_count: plan.graph_forward_fft_stage_count(),
+            forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
-            inverse_stage_count: plan.graph_inverse_fft_stage_count(),
+            inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
             inverse_workspace_bytes: plan.graph_inverse_fft_workspace_bytes(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum AxisSequenceGraphStep {
     Mixed {
-        stage_count: usize,
+        stage_kinds: Vec<AxisStageKind>,
         workspace_bytes: u64,
     },
     Rader {
@@ -3435,11 +3438,59 @@ fn build_direct_dft_c2c_graph(
     Ok(graph)
 }
 
+#[cfg(test)]
 fn build_axis_plan_c2c_graph(
     graph_label: &'static str,
     kernel_label: &'static str,
     workspace_label: &'static str,
     stage_count: usize,
+    required_bytes: u64,
+    workspace_bytes: u64,
+    limits: LargePolicyLimits,
+) -> Result<LargeExecutionGraph> {
+    let stage_labels = vec![kernel_label; stage_count];
+    build_axis_plan_c2c_graph_with_labels(
+        graph_label,
+        &stage_labels,
+        workspace_label,
+        required_bytes,
+        workspace_bytes,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_axis_plan_c2c_graph_with_kinds(
+    graph_label: &'static str,
+    stockham_label: &'static str,
+    fused_pow2_label: &'static str,
+    workspace_label: &'static str,
+    stage_kinds: &[AxisStageKind],
+    required_bytes: u64,
+    workspace_bytes: u64,
+    limits: LargePolicyLimits,
+) -> Result<LargeExecutionGraph> {
+    let stage_labels = stage_kinds
+        .iter()
+        .map(|kind| match kind {
+            AxisStageKind::Stockham { .. } => stockham_label,
+            AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
+        })
+        .collect::<Vec<_>>();
+    build_axis_plan_c2c_graph_with_labels(
+        graph_label,
+        &stage_labels,
+        workspace_label,
+        required_bytes,
+        workspace_bytes,
+        limits,
+    )
+}
+
+fn build_axis_plan_c2c_graph_with_labels(
+    graph_label: &'static str,
+    stage_labels: &[&'static str],
+    workspace_label: &'static str,
     required_bytes: u64,
     workspace_bytes: u64,
     limits: LargePolicyLimits,
@@ -3452,11 +3503,10 @@ fn build_axis_plan_c2c_graph(
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_labels(
         &mut graph,
-        kernel_label,
+        stage_labels,
         workspace_label,
-        stage_count,
         c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
         c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
         0,
@@ -3475,11 +3525,42 @@ fn build_axis_plan_c2c_graph(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_axis_plan_kernel_stages(
+fn add_axis_plan_kernel_stages_with_kinds(
     graph: &mut LargeExecutionGraph,
-    kernel_label: &'static str,
+    stockham_label: &'static str,
+    fused_pow2_label: &'static str,
     workspace_label: &'static str,
-    stage_count: usize,
+    stage_kinds: &[AxisStageKind],
+    input: LogicalRange,
+    output: LogicalRange,
+    temp_index: u32,
+    workspace_bytes: u64,
+    limits: LargePolicyLimits,
+) -> Result<()> {
+    let stage_labels = stage_kinds
+        .iter()
+        .map(|kind| match kind {
+            AxisStageKind::Stockham { .. } => stockham_label,
+            AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
+        })
+        .collect::<Vec<_>>();
+    add_axis_plan_kernel_stages_with_labels(
+        graph,
+        &stage_labels,
+        workspace_label,
+        input,
+        output,
+        temp_index,
+        workspace_bytes,
+        limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_axis_plan_kernel_stages_with_labels(
+    graph: &mut LargeExecutionGraph,
+    stage_labels: &[&'static str],
+    workspace_label: &'static str,
     input: LogicalRange,
     output: LogicalRange,
     temp_index: u32,
@@ -3497,16 +3578,17 @@ fn add_axis_plan_kernel_stages(
         )?;
     }
 
+    let stage_count = stage_labels.len();
     let mut src_slot = SequenceBufferSlot::Input;
     let mut dst_slot = if stage_count % 2 == 1 {
         SequenceBufferSlot::Output
     } else {
         SequenceBufferSlot::Temp
     };
-    for stage_index in 0..stage_count {
+    for (stage_index, &stage_label) in stage_labels.iter().enumerate() {
         graph.push_stage(
             LargeStage::Kernel {
-                label: kernel_label,
+                label: stage_label,
                 input: stage_range_with_temp(src_slot, input, output, temp),
                 output: stage_range_with_temp(dst_slot, input, output, temp),
                 work_items: work_items_for_bytes(input.size_bytes, ElementFormat::ComplexF32),
@@ -3575,11 +3657,12 @@ fn build_normal_rader_c2c_graph(
             work.size_bytes.max(perm.size_bytes),
         )?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         &mut graph,
         "rader-forward-stockham-stage",
+        "rader-forward-fused-pow2-stage",
         "rader-forward-workspace",
-        convolution.forward_stage_count,
+        &convolution.forward_stage_kinds,
         work_range,
         fft_range,
         8,
@@ -3595,11 +3678,12 @@ fn build_normal_rader_c2c_graph(
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         &mut graph,
         "rader-inverse-stockham-stage",
+        "rader-inverse-fused-pow2-stage",
         "rader-inverse-workspace",
-        convolution.inverse_stage_count,
+        &convolution.inverse_stage_kinds,
         fft_range,
         work_range,
         9,
@@ -3680,11 +3764,12 @@ fn build_normal_bluestein_c2c_graph(
             work.size_bytes.max(chirp.size_bytes),
         )?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         &mut graph,
         "bluestein-forward-stockham-stage",
+        "bluestein-forward-fused-pow2-stage",
         "bluestein-forward-workspace",
-        convolution.forward_stage_count,
+        &convolution.forward_stage_kinds,
         work_range,
         fft_range,
         8,
@@ -3700,11 +3785,12 @@ fn build_normal_bluestein_c2c_graph(
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         &mut graph,
         "bluestein-inverse-stockham-stage",
+        "bluestein-inverse-fused-pow2-stage",
         "bluestein-inverse-workspace",
-        convolution.inverse_stage_count,
+        &convolution.inverse_stage_kinds,
         fft_range,
         work_range,
         9,
@@ -3779,19 +3865,20 @@ fn build_axis_sequence_c2c_graph_from_steps(
     } else {
         SequenceBufferSlot::Temp
     };
-    for (step_index, step) in steps.iter().copied().enumerate() {
+    for (step_index, step) in steps.iter().cloned().enumerate() {
         let input = stage_range(src_slot, required_bytes)?;
         let output = stage_range(dst_slot, required_bytes)?;
         let helper_base = 16 + step_index as u32 * 16;
         match step {
             AxisSequenceGraphStep::Mixed {
-                stage_count,
+                stage_kinds,
                 workspace_bytes,
-            } => add_axis_plan_kernel_stages(
+            } => add_axis_plan_kernel_stages_with_kinds(
                 &mut graph,
                 "axis-sequence-mixed-stockham-stage",
+                "axis-sequence-mixed-fused-pow2-stage",
                 "axis-sequence-mixed-workspace",
-                stage_count,
+                &stage_kinds,
                 input,
                 output,
                 helper_base,
@@ -3890,11 +3977,12 @@ fn add_rader_c2c_stages(
             work.size_bytes.max(perm.size_bytes),
         )?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         graph,
         "rader-forward-stockham-stage",
+        "rader-forward-fused-pow2-stage",
         "rader-forward-workspace",
-        convolution.forward_stage_count,
+        &convolution.forward_stage_kinds,
         work_range,
         fft_range,
         helper_index_base + 8,
@@ -3910,11 +3998,12 @@ fn add_rader_c2c_stages(
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         graph,
         "rader-inverse-stockham-stage",
+        "rader-inverse-fused-pow2-stage",
         "rader-inverse-workspace",
-        convolution.inverse_stage_count,
+        &convolution.inverse_stage_kinds,
         fft_range,
         work_range,
         helper_index_base + 9,
@@ -3982,11 +4071,12 @@ fn add_bluestein_c2c_stages(
             work.size_bytes.max(chirp.size_bytes),
         )?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         graph,
         "bluestein-forward-stockham-stage",
+        "bluestein-forward-fused-pow2-stage",
         "bluestein-forward-workspace",
-        convolution.forward_stage_count,
+        &convolution.forward_stage_kinds,
         work_range,
         fft_range,
         helper_index_base + 8,
@@ -4002,11 +4092,12 @@ fn add_bluestein_c2c_stages(
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
-    add_axis_plan_kernel_stages(
+    add_axis_plan_kernel_stages_with_kinds(
         graph,
         "bluestein-inverse-stockham-stage",
+        "bluestein-inverse-fused-pow2-stage",
         "bluestein-inverse-workspace",
-        convolution.inverse_stage_count,
+        &convolution.inverse_stage_kinds,
         fft_range,
         work_range,
         helper_index_base + 9,
@@ -4421,7 +4512,7 @@ fn smooth_graph_steps(steps: &[SmoothExecutionStep]) -> Result<Vec<SmoothGraphSt
         .map(|step| match step {
             SmoothExecutionStep::Mixed(step) => Ok(SmoothGraphStep::Mixed {
                 step: step.step.into(),
-                stage_count: step.plan.graph_stage_count(),
+                stage_kinds: step.plan.graph_stage_kinds(),
                 workspace_bytes: step.plan.workspace_size_bytes(),
             }),
             SmoothExecutionStep::Smooth(step) => Ok(SmoothGraphStep::Smooth {
@@ -4453,7 +4544,7 @@ fn build_smooth_c2c_graph(
         match step {
             SmoothGraphStep::Mixed {
                 step,
-                stage_count,
+                stage_kinds,
                 workspace_bytes,
             } => {
                 let step = *step;
@@ -4470,11 +4561,12 @@ fn build_smooth_c2c_graph(
                 )?;
 
                 let line_output = c2c_range(LogicalBufferId::Stage(1), 0, step.line_bytes())?;
-                add_axis_plan_kernel_stages(
+                add_axis_plan_kernel_stages_with_kinds(
                     &mut graph,
                     "mixed-axis-stockham-stage",
+                    "mixed-axis-fused-pow2-stage",
                     "mixed-axis-workspace",
-                    *stage_count,
+                    stage_kinds,
                     line_input,
                     line_output,
                     smooth_graph_temp_base(index, 0)?,
@@ -4583,13 +4675,14 @@ fn append_smooth_phase_graph(
 ) -> Result<()> {
     match phase {
         SmoothPhaseGraph::Axis {
-            stage_count,
+            stage_kinds,
             workspace_bytes,
-        } => add_axis_plan_kernel_stages(
+        } => add_axis_plan_kernel_stages_with_kinds(
             graph,
             kernel_label,
+            "smooth-axis-fused-pow2-stage",
             workspace_label,
-            *stage_count,
+            stage_kinds,
             input,
             output,
             temp_index_base,
@@ -6274,7 +6367,7 @@ impl AxisSequencePlan {
             .iter()
             .map(|step| match step {
                 AxisStep::Mixed(plan) => AxisSequenceGraphStep::Mixed {
-                    stage_count: plan.graph_stage_count(),
+                    stage_kinds: plan.graph_stage_kinds(),
                     workspace_bytes: plan.workspace_size_bytes(),
                 },
                 AxisStep::Rader(plan) => AxisSequenceGraphStep::Rader {
@@ -6774,7 +6867,10 @@ mod tests {
         let graph = build_axis_sequence_c2c_graph_from_steps(
             &[
                 AxisSequenceGraphStep::Mixed {
-                    stage_count: 2,
+                    stage_kinds: vec![
+                        AxisStageKind::Stockham { radix: 8, ns: 8 },
+                        AxisStageKind::Stockham { radix: 2, ns: 16 },
+                    ],
                     workspace_bytes: 128,
                 },
                 AxisSequenceGraphStep::Rader {
@@ -6975,9 +7071,15 @@ mod tests {
 
     fn test_convolution_ffts() -> ConvolutionGraphFfts {
         ConvolutionGraphFfts {
-            forward_stage_count: 2,
+            forward_stage_kinds: vec![
+                AxisStageKind::Stockham { radix: 8, ns: 8 },
+                AxisStageKind::Stockham { radix: 2, ns: 16 },
+            ],
             forward_workspace_bytes: 128,
-            inverse_stage_count: 2,
+            inverse_stage_kinds: vec![
+                AxisStageKind::Stockham { radix: 8, ns: 8 },
+                AxisStageKind::Stockham { radix: 2, ns: 16 },
+            ],
             inverse_workspace_bytes: 128,
         }
     }
@@ -7017,13 +7119,19 @@ mod tests {
             &[
                 SmoothGraphStep::Mixed {
                     step: mixed,
-                    stage_count: 2,
+                    stage_kinds: vec![
+                        AxisStageKind::Stockham { radix: 8, ns: 8 },
+                        AxisStageKind::Stockham { radix: 2, ns: 16 },
+                    ],
                     workspace_bytes: 128,
                 },
                 SmoothGraphStep::Smooth {
                     step: smooth,
                     phase1: SmoothPhaseGraph::Axis {
-                        stage_count: 2,
+                        stage_kinds: vec![
+                            AxisStageKind::Stockham { radix: 8, ns: 8 },
+                            AxisStageKind::Stockham { radix: 2, ns: 16 },
+                        ],
                         workspace_bytes: 128,
                     },
                     phase2: SmoothPhaseGraph::C2c(child),

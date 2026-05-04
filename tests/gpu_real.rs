@@ -1050,10 +1050,12 @@ fn assert_real_segmented_strided_usage_diagnostics(
         .stages()
         .iter()
         .any(|stage| stage.label.starts_with(transform) && stage.route == transform));
-    assert!(diagnostics
-        .stages()
-        .iter()
-        .any(|stage| stage.label == "mixed-radix-stockham-stage" && stage.route == "mixed-radix"));
+    assert!(diagnostics.stages().iter().any(|stage| {
+        matches!(
+            stage.label.as_str(),
+            "mixed-radix-stockham-stage" | "fused-pow2-workgroup-stage"
+        ) && stage.route == "mixed-radix"
+    }));
     assert!(diagnostics.blockers().iter().any(|blocker| {
         blocker.kind == FftBlockerKind::BufferUsage
             && blocker.route.as_deref() == Some("mixed-radix")

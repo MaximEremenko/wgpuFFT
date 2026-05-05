@@ -3235,6 +3235,7 @@ fn build_normal_c2c_graph_for_impl(
             "c2c-mixed-radix-normal",
             "mixed-radix-stockham-stage",
             "fused-pow2-workgroup-stage",
+            "fused-smooth-workgroup-stage",
             "mixed-radix-workspace",
             &plan.graph_stage_kinds(),
             required_bytes,
@@ -3464,6 +3465,7 @@ fn build_axis_plan_c2c_graph_with_kinds(
     graph_label: &'static str,
     stockham_label: &'static str,
     fused_pow2_label: &'static str,
+    fused_smooth_label: &'static str,
     workspace_label: &'static str,
     stage_kinds: &[AxisStageKind],
     required_bytes: u64,
@@ -3475,6 +3477,7 @@ fn build_axis_plan_c2c_graph_with_kinds(
         .map(|kind| match kind {
             AxisStageKind::Stockham { .. } => stockham_label,
             AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
+            AxisStageKind::FusedSmooth { .. } => fused_smooth_label,
         })
         .collect::<Vec<_>>();
     build_axis_plan_c2c_graph_with_labels(
@@ -3529,6 +3532,7 @@ fn add_axis_plan_kernel_stages_with_kinds(
     graph: &mut LargeExecutionGraph,
     stockham_label: &'static str,
     fused_pow2_label: &'static str,
+    fused_smooth_label: &'static str,
     workspace_label: &'static str,
     stage_kinds: &[AxisStageKind],
     input: LogicalRange,
@@ -3542,6 +3546,7 @@ fn add_axis_plan_kernel_stages_with_kinds(
         .map(|kind| match kind {
             AxisStageKind::Stockham { .. } => stockham_label,
             AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
+            AxisStageKind::FusedSmooth { .. } => fused_smooth_label,
         })
         .collect::<Vec<_>>();
     add_axis_plan_kernel_stages_with_labels(
@@ -3661,6 +3666,7 @@ fn build_normal_rader_c2c_graph(
         &mut graph,
         "rader-forward-stockham-stage",
         "rader-forward-fused-pow2-stage",
+        "rader-forward-fused-smooth-stage",
         "rader-forward-workspace",
         &convolution.forward_stage_kinds,
         work_range,
@@ -3682,6 +3688,7 @@ fn build_normal_rader_c2c_graph(
         &mut graph,
         "rader-inverse-stockham-stage",
         "rader-inverse-fused-pow2-stage",
+        "rader-inverse-fused-smooth-stage",
         "rader-inverse-workspace",
         &convolution.inverse_stage_kinds,
         fft_range,
@@ -3768,6 +3775,7 @@ fn build_normal_bluestein_c2c_graph(
         &mut graph,
         "bluestein-forward-stockham-stage",
         "bluestein-forward-fused-pow2-stage",
+        "bluestein-forward-fused-smooth-stage",
         "bluestein-forward-workspace",
         &convolution.forward_stage_kinds,
         work_range,
@@ -3789,6 +3797,7 @@ fn build_normal_bluestein_c2c_graph(
         &mut graph,
         "bluestein-inverse-stockham-stage",
         "bluestein-inverse-fused-pow2-stage",
+        "bluestein-inverse-fused-smooth-stage",
         "bluestein-inverse-workspace",
         &convolution.inverse_stage_kinds,
         fft_range,
@@ -3877,6 +3886,7 @@ fn build_axis_sequence_c2c_graph_from_steps(
                 &mut graph,
                 "axis-sequence-mixed-stockham-stage",
                 "axis-sequence-mixed-fused-pow2-stage",
+                "axis-sequence-mixed-fused-smooth-stage",
                 "axis-sequence-mixed-workspace",
                 &stage_kinds,
                 input,
@@ -3981,6 +3991,7 @@ fn add_rader_c2c_stages(
         graph,
         "rader-forward-stockham-stage",
         "rader-forward-fused-pow2-stage",
+        "rader-forward-fused-smooth-stage",
         "rader-forward-workspace",
         &convolution.forward_stage_kinds,
         work_range,
@@ -4002,6 +4013,7 @@ fn add_rader_c2c_stages(
         graph,
         "rader-inverse-stockham-stage",
         "rader-inverse-fused-pow2-stage",
+        "rader-inverse-fused-smooth-stage",
         "rader-inverse-workspace",
         &convolution.inverse_stage_kinds,
         fft_range,
@@ -4075,6 +4087,7 @@ fn add_bluestein_c2c_stages(
         graph,
         "bluestein-forward-stockham-stage",
         "bluestein-forward-fused-pow2-stage",
+        "bluestein-forward-fused-smooth-stage",
         "bluestein-forward-workspace",
         &convolution.forward_stage_kinds,
         work_range,
@@ -4096,6 +4109,7 @@ fn add_bluestein_c2c_stages(
         graph,
         "bluestein-inverse-stockham-stage",
         "bluestein-inverse-fused-pow2-stage",
+        "bluestein-inverse-fused-smooth-stage",
         "bluestein-inverse-workspace",
         &convolution.inverse_stage_kinds,
         fft_range,
@@ -4565,6 +4579,7 @@ fn build_smooth_c2c_graph(
                     &mut graph,
                     "mixed-axis-stockham-stage",
                     "mixed-axis-fused-pow2-stage",
+                    "mixed-axis-fused-smooth-stage",
                     "mixed-axis-workspace",
                     stage_kinds,
                     line_input,
@@ -4609,6 +4624,8 @@ fn build_smooth_c2c_graph(
                     &mut graph,
                     phase1,
                     "smooth-axis-phase1-stockham-stage",
+                    "smooth-axis-phase1-fused-pow2-stage",
+                    "smooth-axis-phase1-fused-smooth-stage",
                     "smooth-axis-phase1-workspace",
                     phase1_input,
                     phase1_output,
@@ -4636,6 +4653,8 @@ fn build_smooth_c2c_graph(
                     &mut graph,
                     phase2,
                     "smooth-axis-phase2-stockham-stage",
+                    "smooth-axis-phase2-fused-pow2-stage",
+                    "smooth-axis-phase2-fused-smooth-stage",
                     "smooth-axis-phase2-workspace",
                     phase2_input,
                     phase2_output,
@@ -4665,6 +4684,8 @@ fn append_smooth_phase_graph(
     graph: &mut LargeExecutionGraph,
     phase: &SmoothPhaseGraph,
     kernel_label: &'static str,
+    fused_pow2_label: &'static str,
+    fused_smooth_label: &'static str,
     workspace_label: &'static str,
     input: LogicalRange,
     output: LogicalRange,
@@ -4680,7 +4701,8 @@ fn append_smooth_phase_graph(
         } => add_axis_plan_kernel_stages_with_kinds(
             graph,
             kernel_label,
-            "smooth-axis-fused-pow2-stage",
+            fused_pow2_label,
+            fused_smooth_label,
             workspace_label,
             stage_kinds,
             input,
@@ -7136,6 +7158,17 @@ mod tests {
                     },
                     phase2: SmoothPhaseGraph::C2c(child),
                 },
+                SmoothGraphStep::Smooth {
+                    step: smooth,
+                    phase1: SmoothPhaseGraph::Axis {
+                        stage_kinds: vec![AxisStageKind::FusedSmooth { axis_length: 15 }],
+                        workspace_bytes: 0,
+                    },
+                    phase2: SmoothPhaseGraph::Axis {
+                        stage_kinds: vec![AxisStageKind::FusedPow2 { axis_length: 16 }],
+                        workspace_bytes: 0,
+                    },
+                },
             ],
             limits,
             1,
@@ -7159,6 +7192,14 @@ mod tests {
                 .count(),
             2
         );
+        assert!(graph
+            .stages()
+            .iter()
+            .any(|stage| { stage.label() == "smooth-axis-phase1-fused-smooth-stage" }));
+        assert!(graph
+            .stages()
+            .iter()
+            .any(|stage| { stage.label() == "smooth-axis-phase2-fused-pow2-stage" }));
         assert_eq!(
             graph
                 .stages()

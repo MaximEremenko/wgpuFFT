@@ -1,4 +1,4 @@
-//! Focused correctness and routing coverage for the single-workgroup power-of-two kernel.
+//! Focused correctness and routing coverage for single-workgroup FFT kernels.
 
 use std::f64::consts::PI;
 use std::sync::mpsc;
@@ -9,11 +9,32 @@ use wgpu_fft::{
     Normalization,
 };
 
-const FUSED_LABEL: &str = "fused-pow2-workgroup-stage";
+const FUSED_POW2_LABEL: &str = "fused-pow2-workgroup-stage";
+const FUSED_SMOOTH_LABEL: &str = "fused-smooth-workgroup-stage";
 const STOCKHAM_LABEL: &str = "mixed-radix-stockham-stage";
 
 #[test]
-fn fused_pow2_gpu_matches_cpu_and_multipass() {
+fn smooth_cpu_oracle_matches_direct_reference() {
+    for length in [3, 5, 7, 11, 13, 24, 125] {
+        let input = test_signal(length);
+        for inverse in [false, true] {
+            let config = if inverse {
+                FftConfig::inverse(length)
+            } else {
+                FftConfig::new(length).with_normalization(Normalization::None)
+            };
+            let expected = reference_c2c_nd(&from_interleaved_f32(&input), &config).unwrap();
+            assert_close(
+                &cpu_fft_smooth(&input, inverse, inverse),
+                &to_interleaved_f32(&expected),
+                &format!("smooth CPU oracle N={length} inverse={inverse}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn fused_workgroup_gpu_matches_cpu_and_multipass() {
     if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
         eprintln!("skipping GPU test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
         return;
@@ -48,34 +69,65 @@ async fn run_fused_cases() {
             let input = test_signal(length);
             let expected = cpu_fft_pow2(&input, inverse, inverse);
             let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
-            assert_fused_plan(&plan, 1, 0);
+            assert_fused_pow2_plan(&plan, 1, 0);
             assert_close(&actual, &expected, &format!("N={length} inverse={inverse}"));
         }
     }
 
-    for (config, expected_fused, expected_stockham) in [
+    for length in [9, 25, 49, 121, 169, 1001, 2187, 3000] {
+        if length * 8 > storage_limit {
+            eprintln!(
+                "skipping fused smooth N={length}: {}-byte line exceeds {}-byte workgroup storage limit",
+                length * 8,
+                storage_limit
+            );
+            continue;
+        }
+        for inverse in [false, true] {
+            let config = if inverse {
+                FftConfig::inverse(length)
+            } else {
+                FftConfig::new(length).with_normalization(Normalization::None)
+            };
+            let input = test_signal(length);
+            let expected = cpu_fft_smooth(&input, inverse, inverse);
+            let (actual, plan) =
+                execute_c2c(&context.device, &context.queue, config.clone(), &input);
+            assert_fused_smooth_plan(&plan, 1, 0);
+            assert_close(
+                &actual,
+                &expected,
+                &format!("smooth N={length} inverse={inverse}"),
+            );
+        }
+    }
+
+    for (config, expected_pow2, expected_smooth, expected_stockham) in [
         (
             FftConfig::new(256)
                 .with_batch(3)
                 .with_normalization(Normalization::None),
             1,
             0,
+            0,
         ),
-        (FftConfig::inverse(256).with_batch(3), 1, 0),
+        (FftConfig::inverse(256).with_batch(3), 1, 0, 0),
         (
             FftConfig::new_nd([8, 16])
                 .with_batch(2)
                 .with_normalization(Normalization::None),
             2,
             0,
+            0,
         ),
-        (FftConfig::inverse_nd([8, 16]).with_batch(2), 2, 0),
+        (FftConfig::inverse_nd([8, 16]).with_batch(2), 2, 0, 0),
         (
             FftConfig::new_nd([3, 256, 5])
                 .with_axes([1])
                 .with_batch(2)
                 .with_normalization(Normalization::None),
             1,
+            0,
             0,
         ),
         (
@@ -84,19 +136,45 @@ async fn run_fused_cases() {
                 .with_batch(2),
             1,
             0,
+            0,
         ),
         (
             FftConfig::new_nd([256, 12]).with_normalization(Normalization::None),
             1,
-            2,
+            1,
+            0,
         ),
-        (FftConfig::inverse_nd([256, 12]), 1, 2),
+        (FftConfig::inverse_nd([256, 12]), 1, 1, 0),
+        (
+            FftConfig::new(315)
+                .with_batch(3)
+                .with_normalization(Normalization::None),
+            0,
+            1,
+            0,
+        ),
+        (FftConfig::inverse(315).with_batch(3), 0, 1, 0),
+        (
+            FftConfig::new(13).with_normalization(Normalization::None),
+            0,
+            0,
+            1,
+        ),
+        (
+            FftConfig::new_nd([9, 25])
+                .with_batch(2)
+                .with_normalization(Normalization::None),
+            0,
+            2,
+            0,
+        ),
+        (FftConfig::inverse_nd([9, 25]).with_batch(2), 0, 2, 0),
     ] {
         let input = test_signal(config.logical_complex_len().unwrap() * config.batch());
         let expected = reference_c2c_nd(&from_interleaved_f32(&input), &config).unwrap();
         let expected = to_interleaved_f32(&expected);
         let (actual, plan) = execute_c2c(&context.device, &context.queue, config.clone(), &input);
-        assert_stage_labels(&plan, expected_fused, expected_stockham);
+        assert_stage_labels(&plan, expected_pow2, expected_smooth, expected_stockham);
         assert_close(&actual, &expected, &format!("batched/ND {config:?}"));
     }
 
@@ -137,11 +215,50 @@ async fn compare_fused_and_multipass_4096(context: &wgpu_fft::device::GpuContext
         .pipeline_keys()
         .iter()
         .any(|key| key.contains("fused-pow2") && key.contains("n=4096")));
+    assert!(full_snapshot
+        .pipeline_keys()
+        .iter()
+        .any(|key| key.contains("fused-smooth") && key.contains("n=2187")));
     let low_snapshot = import_pipeline_cache_snapshot(&low_device, &full_snapshot);
     assert!(!low_snapshot
         .pipeline_keys()
         .iter()
         .any(|key| key.contains("fused-pow2") && key.contains("n=4096")));
+    assert!(!low_snapshot
+        .pipeline_keys()
+        .iter()
+        .any(|key| key.contains("fused-smooth") && key.contains("n=2187")));
+    assert!(low_snapshot
+        .pipeline_keys()
+        .iter()
+        .any(|key| key.contains("fused-pow2") && key.contains("n=2048")));
+    assert!(low_snapshot
+        .pipeline_keys()
+        .iter()
+        .any(|key| key.contains("fused-smooth") && key.contains("n=1001")));
+
+    let boundary_plan = FftPlan::c2c(
+        &low_device,
+        &low_queue,
+        FftConfig::new(2048).with_normalization(Normalization::None),
+    )
+    .unwrap();
+    assert_fused_pow2_plan(&boundary_plan, 1, 0);
+
+    let boundary_smooth_input = test_signal(1001);
+    let boundary_smooth_config = FftConfig::new(1001).with_normalization(Normalization::None);
+    let (boundary_smooth, boundary_smooth_plan) = execute_c2c(
+        &low_device,
+        &low_queue,
+        boundary_smooth_config,
+        &boundary_smooth_input,
+    );
+    assert_fused_smooth_plan(&boundary_smooth_plan, 1, 0);
+    assert_close(
+        &boundary_smooth,
+        &cpu_fft_smooth(&boundary_smooth_input, false, false),
+        "N=1001 fused smooth on 16 KiB device",
+    );
 
     let input = test_signal(4096);
     for inverse in [false, true] {
@@ -155,8 +272,8 @@ async fn compare_fused_and_multipass_4096(context: &wgpu_fft::device::GpuContext
             execute_c2c(&context.device, &context.queue, config.clone(), &input);
         let (multipass, multipass_plan) = execute_c2c(&low_device, &low_queue, config, &input);
 
-        assert_fused_plan(&fused_plan, 1, 0);
-        assert_stage_labels(&multipass_plan, 0, 4);
+        assert_fused_pow2_plan(&fused_plan, 1, 0);
+        assert_stage_labels(&multipass_plan, 0, 0, 4);
         assert_eq!(multipass_plan.workspace_size_bytes(), 4096 * 8);
         assert_close(
             &fused,
@@ -167,6 +284,38 @@ async fn compare_fused_and_multipass_4096(context: &wgpu_fft::device::GpuContext
             &fused,
             &expected,
             &format!("N=4096 fused versus CPU inverse={inverse}"),
+        );
+    }
+
+    let smooth_input = test_signal(2187);
+    for inverse in [false, true] {
+        let config = if inverse {
+            FftConfig::inverse(2187)
+        } else {
+            FftConfig::new(2187).with_normalization(Normalization::None)
+        };
+        let expected = cpu_fft_smooth(&smooth_input, inverse, inverse);
+        let (fused, fused_plan) = execute_c2c(
+            &context.device,
+            &context.queue,
+            config.clone(),
+            &smooth_input,
+        );
+        let (multipass, multipass_plan) =
+            execute_c2c(&low_device, &low_queue, config, &smooth_input);
+
+        assert_fused_smooth_plan(&fused_plan, 1, 0);
+        assert_stage_labels(&multipass_plan, 0, 0, 7);
+        assert_eq!(multipass_plan.workspace_size_bytes(), 2187 * 8);
+        assert_close(
+            &fused,
+            &multipass,
+            &format!("N=2187 fused smooth versus multipass inverse={inverse}"),
+        );
+        assert_close(
+            &fused,
+            &expected,
+            &format!("N=2187 fused smooth versus CPU inverse={inverse}"),
         );
     }
 
@@ -220,12 +369,22 @@ fn execute_c2c(
     (actual, plan)
 }
 
-fn assert_fused_plan(plan: &FftPlan, fused_stages: usize, workspace_bytes: u64) {
-    assert_stage_labels(plan, fused_stages, 0);
+fn assert_fused_pow2_plan(plan: &FftPlan, fused_stages: usize, workspace_bytes: u64) {
+    assert_stage_labels(plan, fused_stages, 0, 0);
     assert_eq!(plan.workspace_size_bytes(), workspace_bytes);
 }
 
-fn assert_stage_labels(plan: &FftPlan, fused_stages: usize, stockham_stages: usize) {
+fn assert_fused_smooth_plan(plan: &FftPlan, fused_stages: usize, workspace_bytes: u64) {
+    assert_stage_labels(plan, 0, fused_stages, 0);
+    assert_eq!(plan.workspace_size_bytes(), workspace_bytes);
+}
+
+fn assert_stage_labels(
+    plan: &FftPlan,
+    fused_pow2_stages: usize,
+    fused_smooth_stages: usize,
+    stockham_stages: usize,
+) {
     let diagnostics = plan.diagnostics();
     assert!(diagnostics.blockers().is_empty());
     let kernels = diagnostics
@@ -236,10 +395,18 @@ fn assert_stage_labels(plan: &FftPlan, fused_stages: usize, stockham_stages: usi
     assert_eq!(
         kernels
             .iter()
-            .filter(|stage| stage.label == FUSED_LABEL)
+            .filter(|stage| stage.label == FUSED_POW2_LABEL)
             .count(),
-        fused_stages,
-        "unexpected fused-stage diagnostics: {kernels:?}"
+        fused_pow2_stages,
+        "unexpected fused-pow2 diagnostics: {kernels:?}"
+    );
+    assert_eq!(
+        kernels
+            .iter()
+            .filter(|stage| stage.label == FUSED_SMOOTH_LABEL)
+            .count(),
+        fused_smooth_stages,
+        "unexpected fused-smooth diagnostics: {kernels:?}"
     );
     assert_eq!(
         kernels
@@ -251,7 +418,7 @@ fn assert_stage_labels(plan: &FftPlan, fused_stages: usize, stockham_stages: usi
     );
     assert_eq!(
         kernels.len(),
-        fused_stages + stockham_stages,
+        fused_pow2_stages + fused_smooth_stages + stockham_stages,
         "unexpected extra kernel diagnostics: {kernels:?}"
     );
 }
@@ -313,6 +480,57 @@ fn cpu_fft_pow2(input: &[f32], inverse: bool, normalize: bool) -> Vec<f32> {
         .into_iter()
         .flat_map(|value| [(value.0 * scale) as f32, (value.1 * scale) as f32])
         .collect()
+}
+
+fn cpu_fft_smooth(input: &[f32], inverse: bool, normalize: bool) -> Vec<f32> {
+    let n = input.len() / 2;
+    let factors = wgpu_fft::runtime::factor_supported_length(n).unwrap();
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let scale = if normalize { 1.0 / n as f64 } else { 1.0 };
+    let values = input
+        .chunks_exact(2)
+        .map(|value| (f64::from(value[0]), f64::from(value[1])))
+        .collect::<Vec<_>>();
+    cpu_fft_smooth_recursive(&values, &factors, sign)
+        .into_iter()
+        .flat_map(|value| [(value.0 * scale) as f32, (value.1 * scale) as f32])
+        .collect()
+}
+
+fn cpu_fft_smooth_recursive(input: &[(f64, f64)], factors: &[usize], sign: f64) -> Vec<(f64, f64)> {
+    if input.len() == 1 {
+        return input.to_vec();
+    }
+
+    let radix = factors[0];
+    let sub_len = input.len() / radix;
+    let sub_ffts = (0..radix)
+        .map(|residue| {
+            let subsequence = (0..sub_len)
+                .map(|index| input[residue + radix * index])
+                .collect::<Vec<_>>();
+            cpu_fft_smooth_recursive(&subsequence, &factors[1..], sign)
+        })
+        .collect::<Vec<_>>();
+    let mut output = vec![(0.0, 0.0); input.len()];
+
+    for inner_frequency in 0..sub_len {
+        for outer_frequency in 0..radix {
+            let frequency = inner_frequency + sub_len * outer_frequency;
+            let mut sum = (0.0, 0.0);
+            for (residue, sub_fft) in sub_ffts.iter().enumerate() {
+                let angle =
+                    sign * 2.0 * PI * residue as f64 * frequency as f64 / input.len() as f64;
+                let twiddle = (angle.cos(), angle.sin());
+                let product = complex_mul(twiddle, sub_fft[inner_frequency]);
+                sum.0 += product.0;
+                sum.1 += product.1;
+            }
+            output[frequency] = sum;
+        }
+    }
+
+    output
 }
 
 fn complex_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {

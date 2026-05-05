@@ -14,14 +14,14 @@ R2C/C2R use the WebGPU-FFT packed-spectrum convention. For a logical real
 shape `[N0, ...]`, the packed complex shape is `[floor(N0 / 2) + 1, ...]`, also
 stored as interleaved complex values.
 
-Power-of-two axes use a single-workgroup fused kernel when the complete line
-fits device workgroup storage (8 bytes per complex element) and 256
-invocations are supported. Other factorable axes use generated mixed-radix
-Stockham stages with radices `2, 3, 4, 5, 7, 8, 11, 13`. Prime axes route
-through Rader, unsupported composite axes route through Bluestein convolution
-over a smooth internal length, and mixed-algorithm ND plans execute typed
-axis-sequence stage graphs. The direct DFT compute kernel remains as a
-length-one fallback.
+Power-of-two axes and multi-stage smooth axes use a single-workgroup fused
+kernel when the complete line fits device workgroup storage (8 bytes per
+complex element) and 256 invocations are supported. This covers mixed-radix
+lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`; single-stage smooth axes and
+larger lines use generated Stockham stages. Other prime axes route through
+Rader, unsupported composite axes route through Bluestein convolution over a
+smooth internal length, and mixed-algorithm ND plans execute typed axis-sequence
+stage graphs. The direct DFT compute kernel remains as a length-one fallback.
 
 Public `FftLogicalView` and `BufferView` execution APIs normalize whole-buffer,
 offset, segmented, strided, and segmented+strided logical input/output views for
@@ -50,10 +50,10 @@ original `FftError` plus route, stage, layout, helper-buffer, and device-limit
 diagnostics.
 
 A thread-local per-device internal cache reuses bind group layouts, pipeline
-layouts, shader modules, and compute pipelines for generated fused power-of-two
-and Stockham kernels, Rader/Bluestein helpers, real helpers, C2C/real layout
-helpers, smooth/strided helpers, and direct DFT pipelines. Typed in-memory
-cache snapshots can be exported and imported through
+layouts, shader modules, and compute pipelines for generated fused
+power-of-two, fused smooth-radix, and Stockham kernels, Rader/Bluestein helpers,
+real helpers, C2C/real layout helpers, smooth/strided helpers, and direct DFT
+pipelines. Typed in-memory cache snapshots can be exported and imported through
 `export_pipeline_cache_snapshot` and `import_pipeline_cache_snapshot`;
 entries that exceed the target device's fused-kernel compute limits are skipped.
 
@@ -96,9 +96,9 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   graphs when the required full-temp/helper buffers fit active limits.
 - True host/disk out-of-core execution is not implemented; routes that require
   it return structured diagnostics with attempted out-of-core metadata.
-- Internal shader/module/pipeline cache keyed by generated fused power-of-two
-  and Stockham stages, Rader helper, real helper, C2C strided/smooth helper,
-  and direct DFT pipeline parameters.
+- Internal shader/module/pipeline cache keyed by generated fused power-of-two,
+  fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
+  strided/smooth helper, and direct DFT pipeline parameters.
 - Typed in-memory pipeline cache snapshots expose WGSL shader code and stable
   pipeline key strings.
 - Route policy executes mixed-radix, Rader, Bluestein, and mixed algorithm

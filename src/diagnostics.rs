@@ -461,7 +461,10 @@ pub(crate) fn stage_route_for_label(label: &str, default_route: &str) -> String 
         "rader"
     } else if label.starts_with("bluestein-") {
         "bluestein"
-    } else if label.starts_with("mixed-radix-") || label.starts_with("fused-pow2-") {
+    } else if label.starts_with("mixed-radix-")
+        || label.starts_with("fused-pow2-")
+        || label.starts_with("fused-smooth-")
+    {
         "mixed-radix"
     } else if label.starts_with("direct-dft") {
         "direct-dft"
@@ -640,9 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn generic_fused_pow2_stage_is_attributed_to_mixed_radix() {
+    fn generic_fused_stages_are_attributed_to_mixed_radix() {
         assert_eq!(
             stage_route_for_label("fused-pow2-workgroup-stage", "r2c"),
+            "mixed-radix"
+        );
+        assert_eq!(
+            stage_route_for_label("fused-smooth-workgroup-stage", "r2c"),
             "mixed-radix"
         );
     }

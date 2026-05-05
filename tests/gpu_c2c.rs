@@ -225,11 +225,11 @@ fn assert_pipeline_cache_snapshot_behavior(context: &wgpu_fft::device::GpuContex
     assert!(snapshot
         .pipeline_keys()
         .iter()
-        .any(|key| key.contains("stockham")));
+        .any(|key| key.contains("fused-pow2")));
     assert!(snapshot
         .pipeline_keys()
         .iter()
-        .any(|key| key.contains("fused-pow2")));
+        .any(|key| key.contains("fused-smooth")));
     assert!(snapshot
         .pipeline_keys()
         .iter()
@@ -415,7 +415,8 @@ fn assert_workspace_behavior(context: &wgpu_fft::device::GpuContext) {
         )
         .unwrap();
 
-    let multi_stage = FftPlan::c2c(&context.device, &context.queue, FftConfig::new(12)).unwrap();
+    let multi_stage =
+        FftPlan::c2c(&context.device, &context.queue, FftConfig::new_nd([4, 3])).unwrap();
     assert_eq!(multi_stage.route(), C2cRoute::MixedRadix);
     assert_eq!(multi_stage.workspace_size_bytes(), 12 * 2 * 4);
 
@@ -3085,7 +3086,8 @@ fn assert_view_validation_behavior(context: &wgpu_fft::device::GpuContext) {
         )
         .unwrap();
 
-    let workspace_plan = FftPlan::c2c(&context.device, &context.queue, FftConfig::new(12)).unwrap();
+    let workspace_plan =
+        FftPlan::c2c(&context.device, &context.queue, FftConfig::new_nd([4, 3])).unwrap();
     let workspace_required = workspace_plan.workspace_size_bytes();
     let valid_input = context.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_fft.test.workspace_view_valid_input"),

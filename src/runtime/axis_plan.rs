@@ -6,13 +6,14 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::ElementFormat;
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, PipelineLayoutCacheKey,
-    StockhamStageKey,
+    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, FusedSmoothStageKey,
+    PipelineLayoutCacheKey, StockhamStageKey,
 };
 use crate::runtime::window_scheduler::WindowScheduler;
 
 const WORKGROUP_SIZE: u32 = 64;
 const FUSED_POW2_WORKGROUP_SIZE: u32 = 256;
+const FUSED_SMOOTH_WORKGROUP_SIZE: u32 = 256;
 const COMPLEX_F32_BYTES: u64 = 8;
 
 #[repr(C)]
@@ -50,6 +51,7 @@ pub(crate) struct AxisPlanConfig {
 pub(crate) enum AxisStageKind {
     Stockham { radix: usize, ns: usize },
     FusedPow2 { axis_length: usize },
+    FusedSmooth { axis_length: usize },
 }
 
 impl AxisStageKind {
@@ -57,6 +59,7 @@ impl AxisStageKind {
         match self {
             Self::Stockham { radix, ns } => format!("stockham.radix{radix}.ns{ns}"),
             Self::FusedPow2 { axis_length } => format!("fused_pow2.n{axis_length}"),
+            Self::FusedSmooth { axis_length } => format!("fused_smooth.n{axis_length}"),
         }
     }
 }
@@ -104,6 +107,20 @@ pub(crate) struct FusedPow2StageWgslConfig<'a> {
     pub(crate) dims: &'a [usize],
     pub(crate) axis_length: usize,
     pub(crate) stride_complex: usize,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    pub(crate) scale_factor: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FusedSmoothStageWgslConfig<'a> {
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: &'a [usize],
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) factors: &'a [usize],
     pub(crate) direction: FftDirection,
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
@@ -229,9 +246,9 @@ impl AxisPlanConfig {
     }
 
     #[cfg(test)]
-    pub(crate) fn planned_workspace_size_bytes(&self) -> Result<u64> {
+    pub(crate) fn stockham_workspace_size_bytes(&self) -> Result<u64> {
         self.validate()?;
-        let stage_count = self.stage_count()?;
+        let stage_count = self.stockham_stage_count()?;
         Ok(workspace_size_bytes_for_stage_count(
             stage_count,
             self.total_complex()?,
@@ -239,7 +256,7 @@ impl AxisPlanConfig {
     }
 
     #[cfg(test)]
-    fn stage_count(&self) -> Result<usize> {
+    fn stockham_stage_count(&self) -> Result<usize> {
         let mut count = 0usize;
         for &axis in &self.axes {
             count += crate::runtime::factor_supported_length(self.shape[axis])?.len();
@@ -306,6 +323,47 @@ impl AxisPlan {
                 stages.push(AxisStage {
                     axis,
                     kind: AxisStageKind::FusedPow2 {
+                        axis_length: axis_len,
+                    },
+                    stride_complex,
+                    apply_scale,
+                    pipeline_key,
+                    workgroups_x: total_complex_u32 / axis_len as u32,
+                    pipeline,
+                });
+            } else if fused_smooth_supported(axis_len, &axis_factors, &device.limits()) {
+                let apply_scale = apply_any_scale && final_axis;
+                let shader_key = FusedSmoothStageKey::new(
+                    config.shape.len(),
+                    axis,
+                    &config.shape,
+                    axis_len,
+                    stride_complex,
+                    &axis_factors,
+                    config.direction,
+                    FUSED_SMOOTH_WORKGROUP_SIZE,
+                    apply_scale,
+                    scale,
+                );
+                let pipeline_key = ComputePipelineCacheKey::fused_smooth_stage(shader_key.clone());
+
+                let shader_label =
+                    format!("wgpu_fft.axis_plan.fused_smooth.axis{axis}.n{axis_len}.shader");
+                let pipeline_label =
+                    format!("wgpu_fft.axis_plan.fused_smooth.axis{axis}.n{axis_len}.pipeline");
+                let pipeline = with_device_pipeline_cache(device, |cache| {
+                    cache.get_compute_pipeline(
+                        device,
+                        &pipeline_key,
+                        &pipeline_label,
+                        &shader_label,
+                        || generate_fused_smooth_stage_wgsl_for_key(&shader_key),
+                    )
+                });
+
+                stages.push(AxisStage {
+                    axis,
+                    kind: AxisStageKind::FusedSmooth {
                         axis_length: axis_len,
                     },
                     stride_complex,
@@ -645,6 +703,38 @@ fn fused_pow2_supported_by_limits(
         && FUSED_POW2_WORKGROUP_SIZE <= max_workgroup_size_x
 }
 
+fn fused_smooth_supported(axis_length: usize, factors: &[usize], limits: &wgpu::Limits) -> bool {
+    fused_smooth_supported_by_limits(
+        axis_length,
+        factors,
+        u64::from(limits.max_compute_workgroup_storage_size),
+        limits.max_compute_invocations_per_workgroup,
+        limits.max_compute_workgroup_size_x,
+    )
+}
+
+fn fused_smooth_supported_by_limits(
+    axis_length: usize,
+    factors: &[usize],
+    max_workgroup_storage_bytes: u64,
+    max_invocations_per_workgroup: u32,
+    max_workgroup_size_x: u32,
+) -> bool {
+    if axis_length < 2
+        || axis_length.is_power_of_two()
+        || factors.len() < 2
+        || factors.iter().product::<usize>() != axis_length
+    {
+        return false;
+    }
+    let Some(scratch_bytes) = axis_length.checked_mul(COMPLEX_F32_BYTES as usize) else {
+        return false;
+    };
+    scratch_bytes as u64 <= max_workgroup_storage_bytes
+        && FUSED_SMOOTH_WORKGROUP_SIZE <= max_invocations_per_workgroup
+        && FUSED_SMOOTH_WORKGROUP_SIZE <= max_workgroup_size_x
+}
+
 pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'_>) -> String {
     debug_assert_eq!(config.rank, config.dims.len());
     debug_assert_eq!(config.axis_length, config.dims[config.axis]);
@@ -867,6 +957,228 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         dims: &key.dims,
         axis_length: key.axis_length,
         stride_complex: key.stride_complex,
+        direction: key.direction,
+        workgroup_size: key.workgroup_size,
+        apply_scale: key.apply_scale,
+        scale_factor: key.scale_factor(),
+    })
+}
+
+pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConfig<'_>) -> String {
+    debug_assert_eq!(config.rank, config.dims.len());
+    debug_assert_eq!(config.axis_length, config.dims[config.axis]);
+    debug_assert!(!config.axis_length.is_power_of_two());
+    debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
+    debug_assert_eq!(config.workgroup_size, FUSED_SMOOTH_WORKGROUP_SIZE);
+
+    let sign = match config.direction {
+        FftDirection::Forward => "-1.0",
+        FftDirection::Inverse => "1.0",
+    };
+    let maybe_scale = if config.apply_scale {
+        let scale = format_wgsl_f32(config.scale_factor);
+        format!("      out = out * vec2<f32>({scale}, {scale});\n")
+    } else {
+        String::new()
+    };
+    let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
+    let slot_count = config.axis_length.div_ceil(config.workgroup_size as usize);
+
+    let mut ns = 1usize;
+    let mut radix_stages = String::new();
+    let final_stage_index = config.factors.len() - 1;
+    for (stage_index, &radix) in config.factors.iter().enumerate() {
+        ns *= radix;
+        if stage_index == final_stage_index {
+            radix_stages.push_str(&generate_fused_smooth_final_stage_wgsl(
+                config.axis_length,
+                config.stride_complex,
+                radix,
+                ns,
+                &maybe_scale,
+            ));
+        } else {
+            radix_stages.push_str(&generate_fused_smooth_intermediate_stage_wgsl(
+                config.axis_length,
+                radix,
+                ns,
+                slot_count,
+            ));
+        }
+    }
+    debug_assert_eq!(ns, config.axis_length);
+
+    format!(
+        r#"struct Params {{
+  total: u32,
+  baseIndex: u32,
+  lineOffset: u32,
+  elementBase: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+{complex_wgsl}
+
+const N: u32 = {n}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const SLOT_COUNT: u32 = {slot_count}u;
+const SIGN: f32 = {sign};
+
+var<workgroup> scratch: array<vec2<f32>, {n}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let firstLine: u32 = params.baseIndex / N;
+  let totalLines: u32 = params.total / N;
+  if (firstLine >= totalLines) {{
+    return;
+  }}
+  let activeLines: u32 = totalLines - firstLine;
+  if (wgFlat >= activeLines) {{
+    return;
+  }}
+
+  let lineLocal: u32 = firstLine + wgFlat;
+  let line: u32 = params.lineOffset + lineLocal;
+  let baseLineGlobal: u32 = line_base(line);
+
+  for (var slot: u32 = 0u; slot < SLOT_COUNT; slot = slot + 1u) {{
+    let p: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (p < N) {{
+      let srcIdxGlobal: u32 = baseLineGlobal + p * STRIDE;
+      let srcIdx: u32 = srcIdxGlobal - params.elementBase;
+      scratch[p] = src[srcIdx];
+    }}
+  }}
+  workgroupBarrier();
+
+{radix_stages}}}
+"#,
+        complex_wgsl = complex_wgsl(),
+        n = config.axis_length,
+        stride = config.stride_complex,
+        workgroup_size = config.workgroup_size,
+        slot_count = slot_count,
+        sign = sign,
+        line_base_fn = line_base_fn,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+        radix_stages = radix_stages,
+    )
+}
+
+fn generate_fused_smooth_intermediate_stage_wgsl(
+    axis_length: usize,
+    radix: usize,
+    ns: usize,
+    slot_count: usize,
+) -> String {
+    debug_assert_eq!(ns % radix, 0);
+    debug_assert_eq!(axis_length % radix, 0);
+    let ns_div_r = ns / radix;
+    let n_div_r = axis_length / radix;
+    let mut computes = String::new();
+    let mut writes = String::new();
+
+    for slot in 0..slot_count {
+        computes.push_str(&format!(
+            r#"    let p_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+    var stageOut_{slot}: vec2<f32> = vec2<f32>(0.0, 0.0);
+    if (p_{slot} < N) {{
+      let block_{slot}: u32 = p_{slot} / {ns}u;
+      let pInBlock_{slot}: u32 = p_{slot} - block_{slot} * {ns}u;
+      let offset_{slot}: u32 = p_{slot} - (p_{slot} / {ns_div_r}u) * {ns_div_r}u;
+      let base_{slot}: u32 = block_{slot} * {ns_div_r}u + offset_{slot};
+      let angle_{slot}: f32 = SIGN * (2.0 * PI) * (f32(pInBlock_{slot}) / f32({ns}u));
+      let w1_{slot}: vec2<f32> = cis(angle_{slot});
+      var w_{slot}: vec2<f32> = vec2<f32>(1.0, 0.0);
+      var out_{slot}: vec2<f32> = vec2<f32>(0.0, 0.0);
+      for (var q_{slot}: u32 = 0u; q_{slot} < {radix}u; q_{slot} = q_{slot} + 1u) {{
+        let value_{slot}: vec2<f32> = scratch[base_{slot} + q_{slot} * {n_div_r}u];
+        out_{slot} = c_add(out_{slot}, c_mul(w_{slot}, value_{slot}));
+        w_{slot} = c_mul(w_{slot}, w1_{slot});
+      }}
+      stageOut_{slot} = out_{slot};
+    }}
+"#
+        ));
+        writes.push_str(&format!(
+            "    if (p_{slot} < N) {{\n      scratch[p_{slot}] = stageOut_{slot};\n    }}\n"
+        ));
+    }
+
+    format!(
+        r#"  {{
+{computes}    workgroupBarrier();
+{writes}    workgroupBarrier();
+  }}
+"#,
+        computes = computes,
+        writes = writes,
+    )
+}
+
+fn generate_fused_smooth_final_stage_wgsl(
+    axis_length: usize,
+    stride_complex: usize,
+    radix: usize,
+    ns: usize,
+    maybe_scale: &str,
+) -> String {
+    debug_assert_eq!(ns, axis_length);
+    debug_assert_eq!(ns % radix, 0);
+    let ns_div_r = ns / radix;
+    let n_div_r = axis_length / radix;
+
+    format!(
+        r#"  {{
+    for (var slot: u32 = 0u; slot < SLOT_COUNT; slot = slot + 1u) {{
+      let p: u32 = lid.x + slot * WORKGROUP_SIZE;
+      if (p < N) {{
+        let block: u32 = p / {ns}u;
+        let pInBlock: u32 = p - block * {ns}u;
+        let offset: u32 = p - (p / {ns_div_r}u) * {ns_div_r}u;
+        let base: u32 = block * {ns_div_r}u + offset;
+        let angle: f32 = SIGN * (2.0 * PI) * (f32(pInBlock) / f32({ns}u));
+        let w1: vec2<f32> = cis(angle);
+        var w: vec2<f32> = vec2<f32>(1.0, 0.0);
+        var out: vec2<f32> = vec2<f32>(0.0, 0.0);
+        for (var q: u32 = 0u; q < {radix}u; q = q + 1u) {{
+          let value: vec2<f32> = scratch[base + q * {n_div_r}u];
+          out = c_add(out, c_mul(w, value));
+          w = c_mul(w, w1);
+        }}
+{maybe_scale}        let dstIdxGlobal: u32 = baseLineGlobal + p * {stride}u;
+        let dstIdx: u32 = dstIdxGlobal - params.elementBase;
+        dst[dstIdx] = out;
+      }}
+    }}
+  }}
+"#,
+        ns = ns,
+        ns_div_r = ns_div_r,
+        radix = radix,
+        n_div_r = n_div_r,
+        maybe_scale = maybe_scale,
+        stride = stride_complex,
+    )
+}
+
+pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey) -> String {
+    generate_fused_smooth_stage_wgsl(&FusedSmoothStageWgslConfig {
+        rank: key.rank,
+        axis: key.axis,
+        dims: &key.dims,
+        axis_length: key.axis_length,
+        stride_complex: key.stride_complex,
+        factors: &key.factors,
         direction: key.direction,
         workgroup_size: key.workgroup_size,
         apply_scale: key.apply_scale,
@@ -1103,6 +1415,7 @@ fn format_wgsl_f32(value: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::{reference_c2c_nd, Complex32};
 
     fn wgsl_for(radix: usize, axis_length: usize, ns: usize) -> String {
         let dims = [axis_length];
@@ -1134,6 +1447,59 @@ mod tests {
             apply_scale: false,
             scale_factor: 1.0,
         })
+    }
+
+    fn fused_smooth_wgsl_for(axis_length: usize, direction: FftDirection) -> String {
+        let dims = [axis_length];
+        let factors = crate::runtime::factor_supported_length(axis_length).unwrap();
+        generate_fused_smooth_stage_wgsl(&FusedSmoothStageWgslConfig {
+            rank: 1,
+            axis: 0,
+            dims: &dims,
+            axis_length,
+            stride_complex: 1,
+            factors: &factors,
+            direction,
+            workgroup_size: FUSED_SMOOTH_WORKGROUP_SIZE,
+            apply_scale: false,
+            scale_factor: 1.0,
+        })
+    }
+
+    fn simulate_fused_smooth_1d(
+        input: &[Complex32],
+        factors: &[usize],
+        sign: f32,
+    ) -> Vec<Complex32> {
+        let n = input.len();
+        let mut scratch = input.to_vec();
+        let mut ns = 1usize;
+        for &radix in factors {
+            ns *= radix;
+            let ns_div_r = ns / radix;
+            let n_div_r = n / radix;
+            let mut stage = vec![Complex32::default(); n];
+            for p in 0..n {
+                let block = p / ns;
+                let p_in_block = p - block * ns;
+                let offset = p - (p / ns_div_r) * ns_div_r;
+                let base = block * ns_div_r + offset;
+                let angle = sign * std::f32::consts::TAU * p_in_block as f32 / ns as f32;
+                let (sin, cos) = angle.sin_cos();
+                let w1 = Complex32::new(cos, sin);
+                let mut w = Complex32::new(1.0, 0.0);
+                let mut out = Complex32::default();
+                for q in 0..radix {
+                    let value = scratch[base + q * n_div_r];
+                    out.re += w.re * value.re - w.im * value.im;
+                    out.im += w.re * value.im + w.im * value.re;
+                    w = Complex32::new(w.re * w1.re - w.im * w1.im, w.re * w1.im + w.im * w1.re);
+                }
+                stage[p] = out;
+            }
+            scratch = stage;
+        }
+        scratch
     }
 
     #[test]
@@ -1237,6 +1603,71 @@ mod tests {
     }
 
     #[test]
+    fn fused_smooth_gate_matches_factorization_and_compute_boundaries() {
+        let factors_2048 = crate::runtime::factor_supported_length(2048).unwrap();
+        let factors_13 = crate::runtime::factor_supported_length(13).unwrap();
+        let factors_2187 = crate::runtime::factor_supported_length(2187).unwrap();
+        let factors_3000 = crate::runtime::factor_supported_length(3000).unwrap();
+
+        assert!(!fused_smooth_supported_by_limits(
+            2048,
+            &factors_2048,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            13,
+            &factors_13,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            2187,
+            &factors_2187,
+            16 * 1024,
+            256,
+            256
+        ));
+        assert!(fused_smooth_supported_by_limits(
+            2187,
+            &factors_2187,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(fused_smooth_supported_by_limits(
+            3000,
+            &factors_3000,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            3000,
+            &factors_3000,
+            48 * 1024,
+            255,
+            256
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            3000,
+            &factors_3000,
+            48 * 1024,
+            256,
+            255
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            3000,
+            &[8, 5, 5, 3],
+            48 * 1024,
+            256,
+            256
+        ));
+    }
+
+    #[test]
     fn fused_pow2_generator_uses_one_shared_line_and_radix_schedule() {
         let wgsl = fused_wgsl_for(4096, FftDirection::Forward);
         assert!(wgsl.contains("@compute @workgroup_size(256, 1, 1)"));
@@ -1294,14 +1725,106 @@ mod tests {
     }
 
     #[test]
-    fn planned_workspace_is_zero_for_one_stage_and_full_buffer_for_multi_stage() {
+    fn fused_smooth_generator_uses_guarded_named_slots_and_uniform_barriers() {
+        let wgsl = fused_smooth_wgsl_for(3000, FftDirection::Forward);
+        assert!(wgsl.contains("@compute @workgroup_size(256, 1, 1)"));
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 3000>;"));
+        assert!(wgsl.contains("const SLOT_COUNT: u32 = 12u;"));
+        assert!(wgsl.contains("scratch[p] = src[srcIdx];"));
+        assert!(wgsl.contains("var stageOut_11: vec2<f32>"));
+        assert!(wgsl.contains("if (p_11 < N)"));
+        assert!(wgsl.contains("scratch[p_11] = stageOut_11;"));
+        assert!(wgsl.contains("dst[dstIdx] = out;"));
+        assert!(!wgsl.contains("bit_reverse"));
+        assert_eq!(wgsl.matches("workgroupBarrier();").count(), 9);
+    }
+
+    #[test]
+    fn fused_smooth_generator_covers_large_odd_radices() {
+        let wgsl = fused_smooth_wgsl_for(1001, FftDirection::Inverse);
+        assert!(wgsl.contains("q_0 < 13u"));
+        assert!(wgsl.contains("q_0 < 11u"));
+        assert!(wgsl.contains("q < 7u"));
+        assert!(wgsl.contains("const SIGN: f32 = 1.0;"));
+        assert_eq!(wgsl.matches("workgroupBarrier();").count(), 5);
+    }
+
+    #[test]
+    fn fused_smooth_stockham_math_matches_cpu_reference_in_both_directions() {
+        for length in [3, 5, 7, 11, 13, 24, 143, 315] {
+            let factors = crate::runtime::factor_supported_length(length).unwrap();
+            let input = (0..length)
+                .map(|index| {
+                    let x = index as f32 + 1.0;
+                    Complex32::new((x * 0.17).sin(), (x * 0.11).cos())
+                })
+                .collect::<Vec<_>>();
+            for direction in [FftDirection::Forward, FftDirection::Inverse] {
+                let config = match direction {
+                    FftDirection::Forward => FftConfig::new(length),
+                    FftDirection::Inverse => FftConfig::inverse(length),
+                }
+                .with_normalization(Normalization::None);
+                let expected = reference_c2c_nd(&input, &config).unwrap();
+                let sign = match direction {
+                    FftDirection::Forward => -1.0,
+                    FftDirection::Inverse => 1.0,
+                };
+                let actual = simulate_fused_smooth_1d(&input, &factors, sign);
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    let tolerance = 2.0e-2 + 2.0e-5 * expected.re.abs().max(expected.im.abs());
+                    assert!(
+                        actual.abs_diff(*expected) <= tolerance,
+                        "N={length} direction={direction:?} index={index}: actual={actual:?} expected={expected:?} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_wgsl_can_be_recreated_from_fused_smooth_cache_key() {
+        let dims = [4, 1001, 3];
+        let factors = crate::runtime::factor_supported_length(1001).unwrap();
+        let config = FusedSmoothStageWgslConfig {
+            rank: 3,
+            axis: 1,
+            dims: &dims,
+            axis_length: 1001,
+            stride_complex: 4,
+            factors: &factors,
+            direction: FftDirection::Inverse,
+            workgroup_size: FUSED_SMOOTH_WORKGROUP_SIZE,
+            apply_scale: true,
+            scale_factor: 1.0 / 12012.0,
+        };
+        let key = FusedSmoothStageKey::new(
+            config.rank,
+            config.axis,
+            config.dims,
+            config.axis_length,
+            config.stride_complex,
+            config.factors,
+            config.direction,
+            config.workgroup_size,
+            config.apply_scale,
+            config.scale_factor,
+        );
+        assert_eq!(
+            generate_fused_smooth_stage_wgsl_for_key(&key),
+            generate_fused_smooth_stage_wgsl(&config)
+        );
+    }
+
+    #[test]
+    fn stockham_workspace_is_zero_for_one_stage_and_full_buffer_for_multi_stage() {
         let one_stage = AxisPlanConfig::from_c2c_config(&FftConfig::new(8));
-        assert_eq!(one_stage.planned_workspace_size_bytes().unwrap(), 0);
+        assert_eq!(one_stage.stockham_workspace_size_bytes().unwrap(), 0);
 
         let multi_stage = AxisPlanConfig::from_c2c_config(&FftConfig::new(16));
-        assert_eq!(multi_stage.planned_workspace_size_bytes().unwrap(), 16 * 8);
+        assert_eq!(multi_stage.stockham_workspace_size_bytes().unwrap(), 16 * 8);
 
         let nd_batched = AxisPlanConfig::from_c2c_config(&FftConfig::new_nd([4, 3]).with_batch(2));
-        assert_eq!(nd_batched.planned_workspace_size_bytes().unwrap(), 24 * 8);
+        assert_eq!(nd_batched.stockham_workspace_size_bytes().unwrap(), 24 * 8);
     }
 }

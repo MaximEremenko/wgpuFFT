@@ -4,7 +4,7 @@ use crate::config::{FftConfig, FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::to_interleaved_f32;
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::bluestein_axis::{
@@ -34,6 +34,11 @@ use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
 };
 use crate::runtime::stage_executor::StageExecutor;
+#[cfg(test)]
+use crate::runtime::twiddle::twiddle_lut_f32;
+use crate::runtime::twiddle::{
+    create_twiddle_lut_buffer, create_twiddle_lut_buffer_for_len, two_level_twiddle_lut_f32,
+};
 use crate::runtime::window_scheduler::{strided_span_elements, WindowScheduler};
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -74,8 +79,8 @@ struct SmoothTwiddleParams {
     inverse: u32,
     scale: f32,
     inner: u32,
-    _pad0: u32,
-    _pad1: u32,
+    lut_shift: u32,
+    lut_mask: u32,
 }
 
 #[repr(C)]
@@ -252,6 +257,7 @@ struct SmoothDecompositionC2cPlan {
     graph_plan: LargeExecutionPlan,
     steps: Vec<SmoothExecutionStep>,
     temp_buffer: Option<wgpu::Buffer>,
+    axis_twiddle_lut_storage_bytes: u64,
 }
 
 enum SmoothExecutionStep {
@@ -274,6 +280,10 @@ struct SmoothAxisExecution {
     phase1_output: wgpu::Buffer,
     phase2_input: wgpu::Buffer,
     phase2_output: wgpu::Buffer,
+    twiddle_coarse: wgpu::Buffer,
+    twiddle_fine: wgpu::Buffer,
+    twiddle_shift: u32,
+    twiddle_mask: u32,
     scale: f32,
     inverse: bool,
 }
@@ -388,7 +398,64 @@ struct DirectDftPlan {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
+    twiddle_buffer: wgpu::Buffer,
     workgroups_x: u32,
+}
+
+fn route_impl_twiddle_lut_storage_bytes(route_impl: &C2cRouteImpl) -> u64 {
+    match route_impl {
+        C2cRouteImpl::DirectDft(plan) => plan.twiddle_buffer.size(),
+        C2cRouteImpl::MixedRadix(plan) => plan.twiddle_lut_storage_bytes(),
+        C2cRouteImpl::Rader(plan) => plan.twiddle_lut_storage_bytes(),
+        C2cRouteImpl::Bluestein(plan) => plan.twiddle_lut_storage_bytes(),
+        C2cRouteImpl::AxisSequence(plan) => {
+            plan.steps
+                .iter()
+                .fold(plan.axis_twiddle_lut_storage_bytes, |bytes, step| {
+                    bytes.saturating_add(match step {
+                        AxisStep::Mixed(_) => 0,
+                        AxisStep::Rader(plan) => plan.twiddle_lut_storage_bytes(),
+                        AxisStep::Bluestein(plan) => plan.twiddle_lut_storage_bytes(),
+                    })
+                })
+        }
+    }
+}
+
+fn smooth_phase_twiddle_lut_storage_bytes(phase: &SmoothPhaseExecution) -> u64 {
+    match phase {
+        SmoothPhaseExecution::Axis(_) => 0,
+        SmoothPhaseExecution::C2c(plan) => plan.twiddle_lut_storage_bytes(),
+    }
+}
+
+fn smooth_decomposition_twiddle_lut_storage_bytes(plan: &SmoothDecompositionC2cPlan) -> u64 {
+    plan.steps
+        .iter()
+        .fold(plan.axis_twiddle_lut_storage_bytes, |bytes, step| {
+            bytes.saturating_add(match step {
+                SmoothExecutionStep::Mixed(_) => 0,
+                SmoothExecutionStep::Smooth(step) => {
+                    smooth_phase_twiddle_lut_storage_bytes(&step.phase1)
+                        .saturating_add(smooth_phase_twiddle_lut_storage_bytes(&step.phase2))
+                        .saturating_add(step.twiddle_coarse.size())
+                        .saturating_add(step.twiddle_fine.size())
+                }
+            })
+        })
+}
+
+fn large_bridge_twiddle_lut_storage_bytes(plan: &LargeBridgeC2cPlan) -> u64 {
+    match plan {
+        LargeBridgeC2cPlan::Rader(plan) => plan
+            .child_forward
+            .twiddle_lut_storage_bytes()
+            .saturating_add(plan.child_inverse.twiddle_lut_storage_bytes()),
+        LargeBridgeC2cPlan::Bluestein(plan) => plan
+            .child_forward
+            .twiddle_lut_storage_bytes()
+            .saturating_add(plan.child_inverse.twiddle_lut_storage_bytes()),
+    }
 }
 
 struct C2cIoLayout<'a> {
@@ -674,6 +741,22 @@ impl C2cPlan {
             C2cExecution::SmoothDecomposition(_) => 0,
             C2cExecution::LargeBridge(_) => 0,
             C2cExecution::LargeAxisSequence(_) => 0,
+        }
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        match &self.execution {
+            C2cExecution::Normal(route_impl) => route_impl_twiddle_lut_storage_bytes(route_impl),
+            C2cExecution::LargeChunk(plan) => plan.child.twiddle_lut_storage_bytes(),
+            C2cExecution::SmoothDecomposition(plan) => {
+                smooth_decomposition_twiddle_lut_storage_bytes(plan)
+            }
+            C2cExecution::LargeBridge(plan) => large_bridge_twiddle_lut_storage_bytes(plan),
+            C2cExecution::LargeAxisSequence(plan) => {
+                plan.children.iter().fold(0u64, |bytes, child| {
+                    bytes.saturating_add(child.twiddle_lut_storage_bytes())
+                })
+            }
         }
     }
 
@@ -2698,11 +2781,12 @@ fn build_smooth_phase_execution(
     config: AxisPlanConfig,
     required_bytes: u64,
     limits: LargePolicyLimits,
+    twiddle_lut_pool: &mut AxisTwiddleLutPool,
 ) -> Result<SmoothPhaseExecution> {
     if required_bytes <= limits.max_storage_buffer_binding_size {
-        return Ok(SmoothPhaseExecution::Axis(AxisPlan::new(
-            device, queue, config,
-        )?));
+        return Ok(SmoothPhaseExecution::Axis(
+            AxisPlan::new_with_twiddle_lut_pool(device, queue, config, twiddle_lut_pool)?,
+        ));
     }
     let c2c_config = FftConfig::new_nd(config.shape.clone())
         .with_axes(config.axes.clone())
@@ -2723,11 +2807,12 @@ impl SmoothDecompositionC2cPlan {
         limits: LargePolicyLimits,
     ) -> Result<Self> {
         let mut steps = Vec::with_capacity(plan.steps().len());
+        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
         for (step_index, step) in plan.steps().iter().copied().enumerate() {
             let final_axis = step_index + 1 == plan.steps().len();
             match step {
                 SmoothDecompositionStep::MixedAxis(step) => {
-                    let axis_plan = AxisPlan::new(
+                    let axis_plan = AxisPlan::new_with_twiddle_lut_pool(
                         device,
                         queue,
                         AxisPlanConfig {
@@ -2748,6 +2833,7 @@ impl SmoothDecompositionC2cPlan {
                             layout: AxisLayout::Interleaved,
                             precision: AxisPrecision::F32,
                         },
+                        &mut twiddle_lut_pool,
                     )?;
                     let line_input = create_view_staging_buffer(
                         device,
@@ -2785,6 +2871,7 @@ impl SmoothDecompositionC2cPlan {
                         phase1_config,
                         step.phase1_chunk_bytes(),
                         limits,
+                        &mut twiddle_lut_pool,
                     )?;
                     let phase2_config = AxisPlanConfig {
                         shape: vec![step.chunk_outer() as usize, step.inner() as usize],
@@ -2802,6 +2889,7 @@ impl SmoothDecompositionC2cPlan {
                         phase2_config,
                         step.phase2_chunk_bytes(),
                         limits,
+                        &mut twiddle_lut_pool,
                     )?;
                     let phase1_input = create_view_staging_buffer(
                         device,
@@ -2827,6 +2915,19 @@ impl SmoothDecompositionC2cPlan {
                         step.phase2_chunk_bytes(),
                         wgpu::BufferUsages::COPY_SRC,
                     )?;
+                    let twiddle_lut = two_level_twiddle_lut_f32(step.len() as usize);
+                    let twiddle_coarse = create_twiddle_lut_buffer(
+                        device,
+                        queue,
+                        "wgpu_fft.c2c.smooth.twiddle_coarse",
+                        &twiddle_lut.coarse,
+                    )?;
+                    let twiddle_fine = create_twiddle_lut_buffer(
+                        device,
+                        queue,
+                        "wgpu_fft.c2c.smooth.twiddle_fine",
+                        &twiddle_lut.fine,
+                    )?;
                     steps.push(SmoothExecutionStep::Smooth(SmoothAxisExecution {
                         step,
                         phase1,
@@ -2835,6 +2936,10 @@ impl SmoothDecompositionC2cPlan {
                         phase1_output,
                         phase2_input,
                         phase2_output,
+                        twiddle_coarse,
+                        twiddle_fine,
+                        twiddle_shift: twiddle_lut.shift,
+                        twiddle_mask: twiddle_lut.mask,
                         scale: if final_axis { config.scale()? } else { 1.0 },
                         inverse: config.direction() == FftDirection::Inverse,
                     }));
@@ -2857,11 +2962,13 @@ impl SmoothDecompositionC2cPlan {
             limits,
             device.limits().min_storage_buffer_offset_alignment,
         )?;
+        let axis_twiddle_lut_storage_bytes = twiddle_lut_pool.storage_bytes();
         Ok(Self {
             plan,
             graph_plan,
             steps,
             temp_buffer,
+            axis_twiddle_lut_storage_bytes,
         })
     }
 
@@ -3073,6 +3180,8 @@ impl SmoothAxisExecution {
                             .prefix(self.step.phase1_chunk_bytes())?,
                         &BufferView::whole(&self.phase2_input)
                             .prefix(self.step.phase2_chunk_bytes())?,
+                        &self.twiddle_coarse,
+                        &self.twiddle_fine,
                         SmoothTwiddleParams {
                             total_complex: (chunk_inner * chunk_outer) as u32,
                             chunk_inner: chunk_inner as u32,
@@ -3084,8 +3193,8 @@ impl SmoothAxisExecution {
                             inverse: u32::from(self.inverse),
                             scale: self.scale,
                             inner: inner as u32,
-                            _pad0: 0,
-                            _pad1: 0,
+                            lut_shift: self.twiddle_shift,
+                            lut_mask: self.twiddle_mask,
                         },
                     )?;
                 }
@@ -5612,16 +5721,24 @@ fn dispatch_c2c_smooth_twiddle_transpose(
     encoder: &mut wgpu::CommandEncoder,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
+    twiddle_coarse: &wgpu::Buffer,
+    twiddle_fine: &wgpu::Buffer,
     params: SmoothTwiddleParams,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let input_resource = scheduler.storage_binding_resource(input, ElementFormat::ComplexF32)?;
     let output_resource = scheduler.storage_binding_resource(output, ElementFormat::ComplexF32)?;
+    let coarse_view = BufferView::whole(twiddle_coarse);
+    let fine_view = BufferView::whole(twiddle_fine);
+    let coarse_resource =
+        scheduler.storage_binding_resource(&coarse_view, ElementFormat::ComplexF32)?;
+    let fine_resource =
+        scheduler.storage_binding_resource(&fine_view, ElementFormat::ComplexF32)?;
 
     let shader_key = C2cSmoothStageKey::new(C2cSmoothKernelKind::TwiddleTranspose, WORKGROUP_SIZE);
     let pipeline_key = ComputePipelineCacheKey::c2c_smooth_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
-        cache.get_bind_group_layout(device, PipelineLayoutCacheKey::C2cSmoothBinaryF32)
+        cache.get_bind_group_layout(device, pipeline_key.layout)
     });
     let pipeline = with_device_pipeline_cache(device, |cache| {
         cache.get_compute_pipeline(
@@ -5652,6 +5769,14 @@ fn dispatch_c2c_smooth_twiddle_transpose(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: coarse_resource,
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: fine_resource,
             },
         ],
     });
@@ -6056,15 +6181,15 @@ struct Params {{
   inverse: u32,
   scale: f32,
   inner: u32,
-  _pad0: u32,
-  _pad1: u32,
+  lut_shift: u32,
+  lut_mask: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
-
-const PI: f32 = 3.1415926535897932384626433832795;
+@group(0) @binding(3) var<storage, read> twiddle_coarse: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> twiddle_fine: array<vec2<f32>>;
 
 fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
   return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
@@ -6080,9 +6205,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
   let local_n1: u32 = i / params.chunk_outer;
   let k1: u32 = params.k1_start + local_k1;
   let n1: u32 = params.n1_start + local_n1;
-  let sign: f32 = select(-1.0, 1.0, params.inverse != 0u);
-  let angle: f32 = sign * (2.0 * PI) * ((f32(n1) * f32(k1)) / f32(params.total_len));
-  let twiddle: vec2<f32> = vec2<f32>(cos(angle), sin(angle));
+  // The decomposition keeps n1 and k1 inside complementary factors of
+  // total_len, so this product is reduced, less than total_len, and u32-safe.
+  let exponent: u32 = n1 * k1;
+  let coarse: vec2<f32> = twiddle_coarse[exponent >> params.lut_shift];
+  let fine: vec2<f32> = twiddle_fine[exponent & params.lut_mask];
+  let forward_twiddle: vec2<f32> = c_mul(coarse, fine);
+  let twiddle: vec2<f32> = select(
+    forward_twiddle,
+    vec2<f32>(forward_twiddle.x, -forward_twiddle.y),
+    params.inverse != 0u,
+  );
   let input_index: u32 = local_n1 + params.chunk_inner * k1;
   let value: vec2<f32> = c_mul(input[input_index], twiddle) * vec2<f32>(params.scale, params.scale);
   let out_index: u32 = local_k1 + params.chunk_outer * n1;
@@ -6307,6 +6440,7 @@ struct AxisSequencePlan {
     temp_buffer: Option<wgpu::Buffer>,
     workspace_size_bytes: u64,
     required_buffer_size_bytes: u64,
+    axis_twiddle_lut_storage_bytes: u64,
 }
 
 impl AxisSequencePlan {
@@ -6319,15 +6453,17 @@ impl AxisSequencePlan {
         let required_buffer_size_bytes = config.required_buffer_size_bytes()?;
         let mut steps = Vec::with_capacity(config.axes().len());
         let mut axis_factors = Vec::with_capacity(config.axes().len());
+        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
 
         for (axis_index, (&axis, &kind)) in config.axes().iter().zip(axis_kinds).enumerate() {
             let final_axis = axis_index + 1 == config.axes().len();
             match kind {
                 AxisKind::Mixed => {
-                    let plan = AxisPlan::new(
+                    let plan = AxisPlan::new_with_twiddle_lut_pool(
                         device,
                         queue,
                         axis_plan_config_for_axis(config, axis, final_axis),
+                        &mut twiddle_lut_pool,
                     )?;
                     axis_factors.push(plan.factors().first().cloned().unwrap_or_default());
                     steps.push(AxisStep::Mixed(plan));
@@ -6367,12 +6503,14 @@ impl AxisSequencePlan {
             None
         };
 
+        let axis_twiddle_lut_storage_bytes = twiddle_lut_pool.storage_bytes();
         Ok(Self {
             steps,
             axis_factors,
             temp_buffer,
             workspace_size_bytes,
             required_buffer_size_bytes,
+            axis_twiddle_lut_storage_bytes,
         })
     }
 
@@ -6564,7 +6702,7 @@ impl DirectDftPlan {
         };
 
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
-            cache.get_bind_group_layout(device, PipelineLayoutCacheKey::DirectDftInterleavedF32)
+            cache.get_bind_group_layout(device, pipeline_key.layout)
         });
         let pipeline = with_device_pipeline_cache(device, |cache| {
             cache.get_compute_pipeline(
@@ -6583,6 +6721,12 @@ impl DirectDftPlan {
             mapped_at_creation: false,
         });
         queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+        let twiddle_buffer = create_twiddle_lut_buffer_for_len(
+            device,
+            queue,
+            "wgpu_fft.c2c_dft.twiddle_lut",
+            len as usize,
+        )?;
 
         let workgroups_x = len.div_ceil(WORKGROUP_SIZE);
 
@@ -6591,6 +6735,7 @@ impl DirectDftPlan {
             pipeline,
             bind_group_layout,
             params_buffer,
+            twiddle_buffer,
             workgroups_x,
         })
     }
@@ -6611,6 +6756,9 @@ impl DirectDftPlan {
             scheduler.storage_binding_resource(&input, ElementFormat::ComplexF32)?;
         let output_resource =
             scheduler.storage_binding_resource(&output, ElementFormat::ComplexF32)?;
+        let twiddle_view = BufferView::whole(&self.twiddle_buffer);
+        let twiddle_resource =
+            scheduler.storage_binding_resource(&twiddle_view, ElementFormat::ComplexF32)?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.c2c_dft.bind_group"),
             layout: &self.bind_group_layout,
@@ -6626,6 +6774,10 @@ impl DirectDftPlan {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: twiddle_resource,
                 },
             ],
         });
@@ -6649,6 +6801,98 @@ impl DirectDftPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_twiddle_kernels_use_host_luts_without_shader_trig() {
+        let direct = crate::kernels::C2C_DFT_WGSL;
+        assert!(direct.contains("@group(0) @binding(3)"));
+        assert!(direct.contains("twiddle_lut[twiddle_index]"));
+        assert!(!direct.contains("sin("));
+        assert!(!direct.contains("cos("));
+
+        let smooth = generate_c2c_smooth_wgsl_for_key(&C2cSmoothStageKey::new(
+            C2cSmoothKernelKind::TwiddleTranspose,
+            WORKGROUP_SIZE,
+        ));
+        assert!(smooth.contains("@group(0) @binding(3)"));
+        assert!(smooth.contains("@group(0) @binding(4)"));
+        assert!(smooth.contains("exponent >> params.lut_shift"));
+        assert!(!smooth.contains("sin("));
+        assert!(!smooth.contains("cos("));
+    }
+
+    #[test]
+    fn direct_dft_lut_recurrence_matches_exact_modular_products() {
+        for len in [1u32, 2, 17, 4096, u32::MAX] {
+            for k in [0, len / 3, len / 2, len - 1] {
+                let mut index = 0u32;
+                for n in 0..len.min(64) {
+                    let expected = ((u128::from(k) * u128::from(n)) % u128::from(len)) as u32;
+                    assert_eq!(index, expected, "len={len} k={k} n={n}");
+                    if index >= len - k {
+                        index -= len - k;
+                    } else {
+                        index += k;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_dft_lut_loop_matches_reference_in_both_directions() {
+        for len in [2usize, 3, 5, 17] {
+            let input = (0..len)
+                .map(|index| {
+                    let x = index as f32 + 1.0;
+                    crate::math::Complex32::new(x * 0.25 - 0.5, x * -0.125 + 0.75)
+                })
+                .collect::<Vec<_>>();
+            let lut = twiddle_lut_f32(len);
+            for direction in [FftDirection::Forward, FftDirection::Inverse] {
+                let mut actual = Vec::with_capacity(len);
+                for k in 0..len {
+                    let mut sum = crate::math::Complex32::default();
+                    let mut twiddle_index = 0usize;
+                    for &value in &input {
+                        let mut twiddle = lut[twiddle_index];
+                        if direction == FftDirection::Inverse {
+                            twiddle.im = -twiddle.im;
+                        }
+                        sum.re += value.re * twiddle.re - value.im * twiddle.im;
+                        sum.im += value.re * twiddle.im + value.im * twiddle.re;
+                        if twiddle_index >= len - k {
+                            twiddle_index -= len - k;
+                        } else {
+                            twiddle_index += k;
+                        }
+                    }
+                    actual.push(sum);
+                }
+                let config = match direction {
+                    FftDirection::Forward => FftConfig::new(len),
+                    FftDirection::Inverse => FftConfig::inverse(len),
+                }
+                .with_normalization(Normalization::None);
+                let input_f64 = input
+                    .iter()
+                    .map(|value| {
+                        crate::math::Complex64::new(f64::from(value.re), f64::from(value.im))
+                    })
+                    .collect::<Vec<_>>();
+                let expected = crate::math::reference_c2c_nd_f64(&input_f64, &config).unwrap();
+                for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    let error = (f64::from(actual.re) - expected.re)
+                        .abs()
+                        .max((f64::from(actual.im) - expected.im).abs());
+                    assert!(
+                        error < 2.0e-6 * len as f64,
+                        "N={len} direction={direction:?} index={index}: actual={actual:?} expected={expected:?} error={error}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn invalid_smooth_copy_kernel_kinds_return_stage_errors() {

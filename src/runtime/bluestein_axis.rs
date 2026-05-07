@@ -2,9 +2,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd, to_interleaved_f32, Complex32};
+use crate::math::{reference_c2c_nd_f64, to_interleaved_f32, Complex32, Complex64};
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
 use crate::runtime::axis_policy::next_smooth_at_least;
 use crate::runtime::buffer_view::BufferView;
@@ -186,7 +186,8 @@ impl BluesteinAxis {
             wgpu::BufferUsages::empty(),
         )?;
 
-        let work_fft_forward = AxisPlan::new(
+        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
+        let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
             device,
             queue,
             AxisPlanConfig {
@@ -199,8 +200,9 @@ impl BluesteinAxis {
                 layout: AxisLayout::Interleaved,
                 precision: AxisPrecision::F32,
             },
+            &mut twiddle_lut_pool,
         )?;
-        let work_fft_inverse = AxisPlan::new(
+        let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
             device,
             queue,
             AxisPlanConfig {
@@ -213,6 +215,7 @@ impl BluesteinAxis {
                 layout: AxisLayout::Interleaved,
                 precision: AxisPrecision::F32,
             },
+            &mut twiddle_lut_pool,
         )?;
 
         let pack_bind_group_layout = bind_group_layout(
@@ -305,6 +308,12 @@ impl BluesteinAxis {
 
     pub(crate) fn workspace_size_bytes(&self) -> u64 {
         0
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        let bytes = self.work_fft_forward.twiddle_lut_storage_bytes();
+        debug_assert_eq!(bytes, self.work_fft_inverse.twiddle_lut_storage_bytes());
+        bytes
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
@@ -462,11 +471,7 @@ impl BluesteinAxis {
 pub(crate) fn bluestein_chirp(n: usize, direction: FftDirection) -> Vec<Complex32> {
     let sign = transform_sign(direction);
     (0..n)
-        .map(|i| {
-            let angle = sign * std::f32::consts::PI * (i * i) as f32 / n as f32;
-            let (sin, cos) = angle.sin_cos();
-            Complex32::new(cos, sin)
-        })
+        .map(|i| round_complex64(bluestein_phase(n, i, sign)))
         .collect()
 }
 
@@ -476,21 +481,37 @@ pub(crate) fn bluestein_bfft(
     direction: FftDirection,
 ) -> Result<Vec<Complex32>> {
     let sign = transform_sign(direction);
-    let mut values = vec![Complex32::default(); m];
-    values[0] = Complex32::new(1.0, 0.0);
+    let mut values = vec![Complex64::default(); m];
+    values[0] = Complex64::new(1.0, 0.0);
     for i in 1..n {
-        let angle = -sign * std::f32::consts::PI * (i * i) as f32 / n as f32;
-        let (sin, cos) = angle.sin_cos();
-        let value = Complex32::new(cos, sin);
+        let value = bluestein_phase(n, i, -sign);
         values[i] = value;
         values[m - i] = value;
     }
 
     let config = crate::config::FftConfig::new(m).with_normalization(Normalization::None);
-    reference_c2c_nd(&values, &config)
+    Ok(reference_c2c_nd_f64(&values, &config)?
+        .into_iter()
+        .map(round_complex64)
+        .collect())
 }
 
-fn transform_sign(direction: FftDirection) -> f32 {
+fn bluestein_phase(n: usize, i: usize, sign: f64) -> Complex64 {
+    debug_assert!(n > 0);
+    debug_assert!(i < n);
+    let modulus = 2 * n as u128;
+    let i = i as u128;
+    let square_mod = (i * i) % modulus;
+    let angle = sign * std::f64::consts::PI * square_mod as f64 / n as f64;
+    let (sin, cos) = angle.sin_cos();
+    Complex64::new(cos, sin)
+}
+
+fn round_complex64(value: Complex64) -> Complex32 {
+    Complex32::new(value.re as f32, value.im as f32)
+}
+
+fn transform_sign(direction: FftDirection) -> f64 {
     match direction {
         FftDirection::Forward => -1.0,
         FftDirection::Inverse => 1.0,
@@ -817,14 +838,66 @@ mod tests {
         assert!((chirp[0].re - 1.0).abs() < 1.0e-6);
         assert!(chirp[0].im.abs() < 1.0e-6);
 
-        let bfft_input = {
-            let sign = transform_sign(FftDirection::Forward);
-            let angle = -sign * std::f32::consts::PI / 14.0;
-            let (sin, cos) = angle.sin_cos();
-            Complex32::new(cos, sin)
-        };
+        let bfft_input = round_complex64(bluestein_phase(
+            14,
+            1,
+            -transform_sign(FftDirection::Forward),
+        ));
         assert!((bfft_input.re - chirp[1].re).abs() < 1.0e-6);
         assert!((bfft_input.im + chirp[1].im).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn bluestein_chirp_reduces_large_square_before_f64_phase() {
+        const N: usize = 1_000_003;
+        const I: usize = 999_999;
+        const SQUARE_MOD_2N: u128 = 1_000_019;
+
+        let actual = bluestein_phase(N, I, transform_sign(FftDirection::Forward));
+        let expected_angle = -std::f64::consts::PI * SQUARE_MOD_2N as f64 / N as f64;
+        let (expected_sin, expected_cos) = expected_angle.sin_cos();
+        assert_eq!(actual.re.to_bits(), expected_cos.to_bits());
+        assert_eq!(actual.im.to_bits(), expected_sin.to_bits());
+        let inverse = bluestein_phase(N, I, transform_sign(FftDirection::Inverse));
+        assert_eq!(inverse.re.to_bits(), actual.re.to_bits());
+        assert_eq!(inverse.im.to_bits(), (-actual.im).to_bits());
+
+        let old_square = I as u64 * I as u64;
+        let old_angle = -std::f32::consts::PI * old_square as f32 / N as f32;
+        let (old_sin, old_cos) = old_angle.sin_cos();
+        let old_error =
+            ((old_cos as f64 - actual.re).powi(2) + (old_sin as f64 - actual.im).powi(2)).sqrt();
+        assert!(
+            old_error > 0.25,
+            "legacy unreduced f32 phase unexpectedly close: error={old_error}"
+        );
+    }
+
+    #[test]
+    fn bluestein_bfft_is_f64_generated_then_rounded_once() {
+        let n = 14;
+        let m = 27;
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            let actual = bluestein_bfft(n, m, direction).unwrap();
+
+            let mut kernel = vec![Complex64::default(); m];
+            kernel[0] = Complex64::new(1.0, 0.0);
+            for i in 1..n {
+                let value = bluestein_phase(n, i, -transform_sign(direction));
+                kernel[i] = value;
+                kernel[m - i] = value;
+            }
+            let expected = reference_c2c_nd_f64(
+                &kernel,
+                &crate::config::FftConfig::new(m).with_normalization(Normalization::None),
+            )
+            .unwrap();
+
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.re.to_bits(), (expected.re as f32).to_bits());
+                assert_eq!(actual.im.to_bits(), (expected.im as f32).to_bits());
+            }
+        }
     }
 
     #[test]

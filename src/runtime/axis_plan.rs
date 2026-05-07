@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftConfig, FftDirection, Normalization};
@@ -9,6 +12,9 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, FusedSmoothStageKey,
     PipelineLayoutCacheKey, StockhamStageKey,
 };
+use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len;
+#[cfg(test)]
+use crate::runtime::twiddle::twiddle_lut_f32;
 use crate::runtime::window_scheduler::WindowScheduler;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -70,8 +76,27 @@ pub(crate) struct AxisStage {
     pub(crate) stride_complex: usize,
     pub(crate) apply_scale: bool,
     pub(crate) pipeline_key: ComputePipelineCacheKey,
+    twiddle_lut_index: usize,
     workgroups_x: u32,
     pipeline: wgpu::ComputePipeline,
+}
+
+struct AxisTwiddleLut {
+    axis_length: usize,
+    buffer: Arc<wgpu::Buffer>,
+}
+
+#[derive(Default)]
+pub(crate) struct AxisTwiddleLutPool {
+    buffers: HashMap<usize, Arc<wgpu::Buffer>>,
+}
+
+impl AxisTwiddleLutPool {
+    pub(crate) fn storage_bytes(&self) -> u64 {
+        self.buffers
+            .values()
+            .fold(0u64, |bytes, buffer| bytes.saturating_add(buffer.size()))
+    }
 }
 
 pub(crate) struct AxisPlan {
@@ -81,6 +106,7 @@ pub(crate) struct AxisPlan {
     bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     temp_buffer: Option<wgpu::Buffer>,
+    twiddle_luts: Vec<AxisTwiddleLut>,
     required_buffer_size_bytes: u64,
     workspace_size_bytes: u64,
 }
@@ -271,6 +297,16 @@ impl AxisPlan {
         queue: &wgpu::Queue,
         config: AxisPlanConfig,
     ) -> Result<Self> {
+        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
+        Self::new_with_twiddle_lut_pool(device, queue, config, &mut twiddle_lut_pool)
+    }
+
+    pub(crate) fn new_with_twiddle_lut_pool(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: AxisPlanConfig,
+        twiddle_lut_pool: &mut AxisTwiddleLutPool,
+    ) -> Result<Self> {
         config.validate()?;
 
         let total_complex = config.total_complex()?;
@@ -279,17 +315,45 @@ impl AxisPlan {
         let apply_any_scale = (scale - 1.0).abs() > f32::EPSILON;
 
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
-            cache.get_bind_group_layout(device, PipelineLayoutCacheKey::AxisPlanInterleavedF32)
+            cache.get_bind_group_layout(device, PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut)
         });
 
         let mut factors = Vec::with_capacity(config.axes.len());
         let mut stages = Vec::new();
+        let mut twiddle_luts = Vec::<AxisTwiddleLut>::new();
 
         for (axis_index, &axis) in config.axes.iter().enumerate() {
             let axis_len = config.shape[axis];
             let axis_factors = crate::runtime::factor_supported_length(axis_len)?;
             let stride_complex = stride_for_axis(&config.shape, axis);
             let final_axis = axis_index + 1 == config.axes.len();
+            let twiddle_lut_index = if let Some(index) = twiddle_luts
+                .iter()
+                .position(|lut| lut.axis_length == axis_len)
+            {
+                index
+            } else {
+                let buffer = if let Some(buffer) = twiddle_lut_pool.buffers.get(&axis_len) {
+                    Arc::clone(buffer)
+                } else {
+                    let buffer = Arc::new(create_twiddle_lut_buffer_for_len(
+                        device,
+                        queue,
+                        "wgpu_fft.axis_plan.twiddle_lut",
+                        axis_len,
+                    )?);
+                    twiddle_lut_pool
+                        .buffers
+                        .insert(axis_len, Arc::clone(&buffer));
+                    buffer
+                };
+                let index = twiddle_luts.len();
+                twiddle_luts.push(AxisTwiddleLut {
+                    axis_length: axis_len,
+                    buffer,
+                });
+                index
+            };
 
             if fused_pow2_supported(axis_len, &device.limits()) {
                 let apply_scale = apply_any_scale && final_axis;
@@ -328,6 +392,7 @@ impl AxisPlan {
                     stride_complex,
                     apply_scale,
                     pipeline_key,
+                    twiddle_lut_index,
                     workgroups_x: total_complex_u32 / axis_len as u32,
                     pipeline,
                 });
@@ -369,6 +434,7 @@ impl AxisPlan {
                     stride_complex,
                     apply_scale,
                     pipeline_key,
+                    twiddle_lut_index,
                     workgroups_x: total_complex_u32 / axis_len as u32,
                     pipeline,
                 });
@@ -415,7 +481,8 @@ impl AxisPlan {
                         stride_complex,
                         apply_scale,
                         pipeline_key,
-                        workgroups_x: total_complex_u32.div_ceil(WORKGROUP_SIZE),
+                        twiddle_lut_index,
+                        workgroups_x: (total_complex_u32 / radix as u32).div_ceil(WORKGROUP_SIZE),
                         pipeline,
                     });
                 }
@@ -458,6 +525,7 @@ impl AxisPlan {
             bind_group_layout,
             params_buffer,
             temp_buffer,
+            twiddle_luts,
             required_buffer_size_bytes,
             workspace_size_bytes,
         })
@@ -469,6 +537,12 @@ impl AxisPlan {
 
     pub(crate) fn workspace_size_bytes(&self) -> u64 {
         self.workspace_size_bytes
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        self.twiddle_luts
+            .iter()
+            .fold(0u64, |bytes, lut| bytes.saturating_add(lut.buffer.size()))
     }
 
     pub(crate) fn graph_stage_kinds(&self) -> Vec<AxisStageKind> {
@@ -556,6 +630,10 @@ impl AxisPlan {
                 scheduler.storage_binding_resource(&src, ElementFormat::ComplexF32)?;
             let dst_resource =
                 scheduler.storage_binding_resource(&dst, ElementFormat::ComplexF32)?;
+            let twiddle_lut = &self.twiddle_luts[stage.twiddle_lut_index];
+            let twiddle_view = BufferView::whole(twiddle_lut.buffer.as_ref());
+            let twiddle_resource =
+                scheduler.storage_binding_resource(&twiddle_view, ElementFormat::ComplexF32)?;
 
             let bind_group_label = format!(
                 "wgpu_fft.axis_plan.bind_group.axis{}.{}.stride{}.scale{}.cache{}",
@@ -580,6 +658,10 @@ impl AxisPlan {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: twiddle_resource,
                     },
                 ],
             });
@@ -741,10 +823,6 @@ pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'
     debug_assert!(config.axis_length.is_power_of_two());
     debug_assert_eq!(config.workgroup_size, FUSED_POW2_WORKGROUP_SIZE);
 
-    let sign = match config.direction {
-        FftDirection::Forward => "-1.0",
-        FftDirection::Inverse => "1.0",
-    };
     let maybe_scale = if config.apply_scale {
         let scale = format_wgsl_f32(config.scale_factor);
         format!("    value = value * vec2<f32>({scale}, {scale});\n")
@@ -762,6 +840,7 @@ pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'
             config.axis_length,
             radix,
             previous,
+            config.direction,
         ));
         previous *= radix;
     }
@@ -778,15 +857,15 @@ pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'
 @group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
 
 {complex_wgsl}
+{twiddle_lookup_wgsl}
 
 const N: u32 = {n}u;
 const LOG_N: u32 = {log_n}u;
 const STRIDE: u32 = {stride}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
-const SIGN: f32 = {sign};
-const SQRT_HALF: f32 = 0.7071067811865475244;
 
 var<workgroup> scratch: array<vec2<f32>, {n}>;
 
@@ -840,7 +919,7 @@ fn main({entry_params}) {{
         log_n = config.axis_length.ilog2(),
         stride = config.stride_complex,
         workgroup_size = config.workgroup_size,
-        sign = sign,
+        twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
         line_base_fn = line_base_fn,
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -849,7 +928,12 @@ fn main({entry_params}) {{
     )
 }
 
-fn generate_fused_radix_stage_wgsl(axis_length: usize, radix: usize, previous: usize) -> String {
+fn generate_fused_radix_stage_wgsl(
+    axis_length: usize,
+    radix: usize,
+    previous: usize,
+    direction: FftDirection,
+) -> String {
     debug_assert!(matches!(radix, 2 | 4 | 8));
     debug_assert_eq!(axis_length % radix, 0);
     let mut values = String::new();
@@ -861,30 +945,43 @@ fn generate_fused_radix_stage_wgsl(axis_length: usize, radix: usize, previous: u
         writes.push_str(&format!("      scratch[base + {q}u * PREVIOUS] = v{q};\n"));
     }
 
+    let step = axis_length / (radix * previous);
+    let root4 = radix_root_wgsl(4, 1, direction);
+    let root8_1 = radix_root_wgsl(8, 1, direction);
+    let root8_3 = radix_root_wgsl(8, 3, direction);
     let twiddles = match radix {
         8 => {
-            r#"      let z8: vec2<f32> = cis(SIGN * (2.0 * PI) * (f32(j) / f32(RADIX * PREVIOUS)));
-      let z4: vec2<f32> = c_mul(z8, z8);
-      let z2: vec2<f32> = c_mul(z4, z4);
-      let root4: vec2<f32> = vec2<f32>(0.0, SIGN);
-      let root8_1: vec2<f32> = vec2<f32>(SQRT_HALF, SIGN * SQRT_HALF);
-      let root8_3: vec2<f32> = vec2<f32>(-SQRT_HALF, SIGN * SQRT_HALF);
+            format!(
+                r#"      let z8: vec2<f32> = twiddle(j * {step}u);
+      let z4: vec2<f32> = twiddle(j * {step2}u);
+      let z2: vec2<f32> = twiddle(j * {step4}u);
+      let root4: vec2<f32> = {root4};
+      let root8_1: vec2<f32> = {root8_1};
+      let root8_3: vec2<f32> = {root8_3};
       let z4_1: vec2<f32> = c_mul(z4, root4);
       let z8_1: vec2<f32> = c_mul(z8, root8_1);
       let z8_2: vec2<f32> = c_mul(z8, root4);
       let z8_3: vec2<f32> = c_mul(z8, root8_3);
-"#
+"#,
+                step2 = step * 2,
+                step4 = step * 4,
+            )
         }
         4 => {
-            r#"      let z4: vec2<f32> = cis(SIGN * (2.0 * PI) * (f32(j) / f32(RADIX * PREVIOUS)));
-      let z2: vec2<f32> = c_mul(z4, z4);
-      let root4: vec2<f32> = vec2<f32>(0.0, SIGN);
+            format!(
+                r#"      let z4: vec2<f32> = twiddle(j * {step}u);
+      let z2: vec2<f32> = twiddle(j * {step2}u);
+      let root4: vec2<f32> = {root4};
       let z4_1: vec2<f32> = c_mul(z4, root4);
-"#
+"#,
+                step2 = step * 2,
+            )
         }
         2 => {
-            r#"      let z2: vec2<f32> = cis(SIGN * (2.0 * PI) * (f32(j) / f32(RADIX * PREVIOUS)));
+            format!(
+                r#"      let z2: vec2<f32> = twiddle(j * {step}u);
 "#
+            )
         }
         _ => unreachable!(),
     };
@@ -971,18 +1068,14 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
     debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
     debug_assert_eq!(config.workgroup_size, FUSED_SMOOTH_WORKGROUP_SIZE);
 
-    let sign = match config.direction {
-        FftDirection::Forward => "-1.0",
-        FftDirection::Inverse => "1.0",
-    };
     let maybe_scale = if config.apply_scale {
         let scale = format_wgsl_f32(config.scale_factor);
-        format!("      out = out * vec2<f32>({scale}, {scale});\n")
+        format!(" * vec2<f32>({scale}, {scale})")
     } else {
         String::new()
     };
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
-    let slot_count = config.axis_length.div_ceil(config.workgroup_size as usize);
+    let line_slot_count = config.axis_length.div_ceil(config.workgroup_size as usize);
 
     let mut ns = 1usize;
     let mut radix_stages = String::new();
@@ -996,13 +1089,16 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
                 radix,
                 ns,
                 &maybe_scale,
+                config.direction,
+                config.workgroup_size,
             ));
         } else {
             radix_stages.push_str(&generate_fused_smooth_intermediate_stage_wgsl(
                 config.axis_length,
                 radix,
                 ns,
-                slot_count,
+                config.direction,
+                config.workgroup_size,
             ));
         }
     }
@@ -1019,14 +1115,15 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
 @group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
 
 {complex_wgsl}
+{twiddle_lookup_wgsl}
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
-const SLOT_COUNT: u32 = {slot_count}u;
-const SIGN: f32 = {sign};
+const LINE_SLOT_COUNT: u32 = {line_slot_count}u;
 
 var<workgroup> scratch: array<vec2<f32>, {n}>;
 
@@ -1049,7 +1146,7 @@ fn main({entry_params}) {{
   let line: u32 = params.lineOffset + lineLocal;
   let baseLineGlobal: u32 = line_base(line);
 
-  for (var slot: u32 = 0u; slot < SLOT_COUNT; slot = slot + 1u) {{
+  for (var slot: u32 = 0u; slot < LINE_SLOT_COUNT; slot = slot + 1u) {{
     let p: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (p < N) {{
       let srcIdxGlobal: u32 = baseLineGlobal + p * STRIDE;
@@ -1065,8 +1162,8 @@ fn main({entry_params}) {{
         n = config.axis_length,
         stride = config.stride_complex,
         workgroup_size = config.workgroup_size,
-        slot_count = slot_count,
-        sign = sign,
+        line_slot_count = line_slot_count,
+        twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
         line_base_fn = line_base_fn,
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -1078,48 +1175,56 @@ fn generate_fused_smooth_intermediate_stage_wgsl(
     axis_length: usize,
     radix: usize,
     ns: usize,
-    slot_count: usize,
+    direction: FftDirection,
+    workgroup_size: u32,
 ) -> String {
     debug_assert_eq!(ns % radix, 0);
     debug_assert_eq!(axis_length % radix, 0);
     let ns_div_r = ns / radix;
     let n_div_r = axis_length / radix;
+    let n_div_ns = axis_length / ns;
+    let unit_count = axis_length / radix;
+    let unit_slot_count = unit_count.div_ceil(workgroup_size as usize);
     let mut computes = String::new();
     let mut writes = String::new();
 
-    for slot in 0..slot_count {
+    for slot in 0..unit_slot_count {
+        let mut stage_outputs = String::new();
+        for output in 0..radix {
+            stage_outputs.push_str(&format!(
+                "    var stageOut_{slot}_{output}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
+            ));
+        }
+        let butterfly = generate_fused_smooth_butterfly_math_wgsl(
+            radix, ns_div_r, n_div_r, n_div_ns, direction, slot,
+        );
         computes.push_str(&format!(
-            r#"    let p_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
-    var stageOut_{slot}: vec2<f32> = vec2<f32>(0.0, 0.0);
-    if (p_{slot} < N) {{
-      let block_{slot}: u32 = p_{slot} / {ns}u;
-      let pInBlock_{slot}: u32 = p_{slot} - block_{slot} * {ns}u;
-      let offset_{slot}: u32 = p_{slot} - (p_{slot} / {ns_div_r}u) * {ns_div_r}u;
-      let base_{slot}: u32 = block_{slot} * {ns_div_r}u + offset_{slot};
-      let angle_{slot}: f32 = SIGN * (2.0 * PI) * (f32(pInBlock_{slot}) / f32({ns}u));
-      let w1_{slot}: vec2<f32> = cis(angle_{slot});
-      var w_{slot}: vec2<f32> = vec2<f32>(1.0, 0.0);
-      var out_{slot}: vec2<f32> = vec2<f32>(0.0, 0.0);
-      for (var q_{slot}: u32 = 0u; q_{slot} < {radix}u; q_{slot} = q_{slot} + 1u) {{
-        let value_{slot}: vec2<f32> = scratch[base_{slot} + q_{slot} * {n_div_r}u];
-        out_{slot} = c_add(out_{slot}, c_mul(w_{slot}, value_{slot}));
-        w_{slot} = c_mul(w_{slot}, w1_{slot});
-      }}
-      stageOut_{slot} = out_{slot};
-    }}
+            r#"    let unit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+    let block_{slot}: u32 = unit_{slot} / {ns_div_r}u;
+    let j_{slot}: u32 = unit_{slot} - block_{slot} * {ns_div_r}u;
+{stage_outputs}    if (unit_{slot} < {unit_count}u) {{
+      let base_{slot}: u32 = block_{slot} * {ns_div_r}u + j_{slot};
+{butterfly}    }}
 "#
         ));
+        let mut slot_writes = String::new();
+        for output in 0..radix {
+            slot_writes.push_str(&format!(
+                "      scratch[block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot}] = stageOut_{slot}_{output};\n"
+            ));
+        }
         writes.push_str(&format!(
-            "    if (p_{slot} < N) {{\n      scratch[p_{slot}] = stageOut_{slot};\n    }}\n"
+            "    if (unit_{slot} < {unit_count}u) {{\n{slot_writes}    }}\n"
         ));
     }
 
     format!(
-        r#"  {{
+        r#"  {{ // fused smooth radix-{radix} butterflies
 {computes}    workgroupBarrier();
 {writes}    workgroupBarrier();
   }}
 "#,
+        radix = radix,
         computes = computes,
         writes = writes,
     )
@@ -1131,44 +1236,103 @@ fn generate_fused_smooth_final_stage_wgsl(
     radix: usize,
     ns: usize,
     maybe_scale: &str,
+    direction: FftDirection,
+    workgroup_size: u32,
 ) -> String {
     debug_assert_eq!(ns, axis_length);
     debug_assert_eq!(ns % radix, 0);
     let ns_div_r = ns / radix;
     let n_div_r = axis_length / radix;
+    let n_div_ns = axis_length / ns;
+    let unit_count = axis_length / radix;
+    let unit_slot_count = unit_count.div_ceil(workgroup_size as usize);
+    let mut slots = String::new();
 
-    format!(
-        r#"  {{
-    for (var slot: u32 = 0u; slot < SLOT_COUNT; slot = slot + 1u) {{
-      let p: u32 = lid.x + slot * WORKGROUP_SIZE;
-      if (p < N) {{
-        let block: u32 = p / {ns}u;
-        let pInBlock: u32 = p - block * {ns}u;
-        let offset: u32 = p - (p / {ns_div_r}u) * {ns_div_r}u;
-        let base: u32 = block * {ns_div_r}u + offset;
-        let angle: f32 = SIGN * (2.0 * PI) * (f32(pInBlock) / f32({ns}u));
-        let w1: vec2<f32> = cis(angle);
-        var w: vec2<f32> = vec2<f32>(1.0, 0.0);
-        var out: vec2<f32> = vec2<f32>(0.0, 0.0);
-        for (var q: u32 = 0u; q < {radix}u; q = q + 1u) {{
-          let value: vec2<f32> = scratch[base + q * {n_div_r}u];
-          out = c_add(out, c_mul(w, value));
-          w = c_mul(w, w1);
-        }}
-{maybe_scale}        let dstIdxGlobal: u32 = baseLineGlobal + p * {stride}u;
-        let dstIdx: u32 = dstIdxGlobal - params.elementBase;
-        dst[dstIdx] = out;
-      }}
-    }}
-  }}
+    for slot in 0..unit_slot_count {
+        let mut stage_outputs = String::new();
+        for output in 0..radix {
+            stage_outputs.push_str(&format!(
+                "      var stageOut_{slot}_{output}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
+            ));
+        }
+        let butterfly = generate_fused_smooth_butterfly_math_wgsl(
+            radix, ns_div_r, n_div_r, n_div_ns, direction, slot,
+        );
+        let mut stores = String::new();
+        for output in 0..radix {
+            stores.push_str(&format!(
+                r#"      let value_{slot}_{output}: vec2<f32> = stageOut_{slot}_{output}{maybe_scale};
+      let p_{slot}_{output}: u32 = block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot};
+      let dstIdxGlobal_{slot}_{output}: u32 = baseLineGlobal + p_{slot}_{output} * {stride}u;
+      let dstIdx_{slot}_{output}: u32 = dstIdxGlobal_{slot}_{output} - params.elementBase;
+      dst[dstIdx_{slot}_{output}] = value_{slot}_{output};
 "#,
-        ns = ns,
-        ns_div_r = ns_div_r,
-        radix = radix,
-        n_div_r = n_div_r,
-        maybe_scale = maybe_scale,
-        stride = stride_complex,
-    )
+                stride = stride_complex,
+            ));
+        }
+        slots.push_str(&format!(
+            r#"    let unit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+    if (unit_{slot} < {unit_count}u) {{
+      let block_{slot}: u32 = unit_{slot} / {ns_div_r}u;
+      let j_{slot}: u32 = unit_{slot} - block_{slot} * {ns_div_r}u;
+      let base_{slot}: u32 = block_{slot} * {ns_div_r}u + j_{slot};
+{stage_outputs}{butterfly}{stores}    }}
+"#
+        ));
+    }
+
+    format!("  {{ // fused smooth radix-{radix} butterflies\n{slots}\n  }}\n")
+}
+
+fn generate_fused_smooth_butterfly_math_wgsl(
+    radix: usize,
+    ns_div_r: usize,
+    n_div_r: usize,
+    n_div_ns: usize,
+    direction: FftDirection,
+    slot: usize,
+) -> String {
+    // Workgroup-scratch form of the same unit-centric Stockham factorization
+    // used by the multi-pass generator.
+    let mut shader = String::new();
+    shader.push_str(&format!(
+        "      let x_{slot}_0: vec2<f32> = scratch[base_{slot}];\n"
+    ));
+    for q in 1..radix {
+        if ns_div_r == 1 {
+            shader.push_str(&format!(
+                "      let x_{slot}_{q}: vec2<f32> = scratch[base_{slot} + {q}u * {n_div_r}u];\n"
+            ));
+        } else {
+            shader.push_str(&format!(
+                "      let x_{slot}_{q}: vec2<f32> = c_mul(twiddle(j_{slot} * {}u), scratch[base_{slot} + {q}u * {n_div_r}u]);\n",
+                q * n_div_ns,
+            ));
+        }
+    }
+
+    for output in 0..radix {
+        shader.push_str(&format!(
+            "      var out_{slot}_{output}: vec2<f32> = x_{slot}_0;\n"
+        ));
+        for q in 1..radix {
+            let power = (output * q) % radix;
+            if power == 0 {
+                shader.push_str(&format!(
+                    "      out_{slot}_{output} = c_add(out_{slot}_{output}, x_{slot}_{q});\n"
+                ));
+            } else {
+                let root = radix_root_wgsl(radix, power, direction);
+                shader.push_str(&format!(
+                    "      out_{slot}_{output} = c_add(out_{slot}_{output}, c_mul({root}, x_{slot}_{q}));\n"
+                ));
+            }
+        }
+        shader.push_str(&format!(
+            "      stageOut_{slot}_{output} = out_{slot}_{output};\n"
+        ));
+    }
+    shader
 }
 
 pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey) -> String {
@@ -1192,18 +1356,55 @@ pub(crate) fn generate_stockham_radix_stage_wgsl(config: &StockhamStageWgslConfi
     debug_assert_eq!(config.ns % config.radix, 0);
     debug_assert_eq!(config.axis_length % config.radix, 0);
 
-    let sign = match config.direction {
-        FftDirection::Forward => "-1.0",
-        FftDirection::Inverse => "1.0",
-    };
-    let maybe_scale = if config.apply_scale {
+    let scale_suffix = if config.apply_scale {
         let scale = format_wgsl_f32(config.scale_factor);
-        format!("  out = out * vec2<f32>({scale}, {scale});\n")
+        format!(" * vec2<f32>({scale}, {scale})")
     } else {
         String::new()
     };
     let complex_wgsl = complex_wgsl();
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
+    let ns_div_r = config.ns / config.radix;
+    let n_div_r = config.axis_length / config.radix;
+    let n_div_ns = config.axis_length / config.ns;
+
+    // One unit owns all radix outputs for a (block, j) butterfly. Splitting
+    // W_NS^((t*NS/R+j)*q) into W_N^(j*q*N/NS) * W_R^(t*q) lets us load each
+    // input and exact external LUT power once. Since j < NS/R and q < R,
+    // j*q < NS, so the generated u32 LUT index is both reduced and < N.
+    let mut inputs = String::new();
+    for q in 0..config.radix {
+        inputs.push_str(&format!(
+            "  let srcIdxGlobal_{q}: u32 = baseLineGlobal + (base + {q}u * N_DIV_R) * STRIDE;\n  let srcIdx_{q}: u32 = srcIdxGlobal_{q} - params.elementBase;\n"
+        ));
+        if q == 0 || ns_div_r == 1 {
+            inputs.push_str(&format!("  let x_{q}: vec2<f32> = src[srcIdx_{q}];\n"));
+        } else {
+            inputs.push_str(&format!(
+                "  let x_{q}: vec2<f32> = c_mul(twiddle(j * {}u), src[srcIdx_{q}]);\n",
+                q * n_div_ns,
+            ));
+        }
+    }
+
+    let mut outputs = String::new();
+    for output in 0..config.radix {
+        outputs.push_str(&format!("  var out_{output}: vec2<f32> = x_0;\n"));
+        for q in 1..config.radix {
+            let power = (output * q) % config.radix;
+            if power == 0 {
+                outputs.push_str(&format!("  out_{output} = c_add(out_{output}, x_{q});\n"));
+            } else {
+                let root = radix_root_wgsl(config.radix, power, config.direction);
+                outputs.push_str(&format!(
+                    "  out_{output} = c_add(out_{output}, c_mul({root}, x_{q}));\n"
+                ));
+            }
+        }
+        outputs.push_str(&format!(
+            "  let value_{output}: vec2<f32> = out_{output}{scale_suffix};\n  let p_{output}: u32 = block * NS + {output}u * NS_DIV_R + j;\n  let dstIdxGlobal_{output}: u32 = baseLineGlobal + p_{output} * STRIDE;\n  let dstIdx_{output}: u32 = dstIdxGlobal_{output} - params.elementBase;\n  dst[dstIdx_{output}] = value_{output};\n"
+        ));
+    }
 
     format!(
         r#"struct Params {{
@@ -1216,72 +1417,62 @@ pub(crate) fn generate_stockham_radix_stage_wgsl(config: &StockhamStageWgslConfi
 @group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
 
 {complex_wgsl}
+{twiddle_lookup_wgsl}
 
 const N: u32 = {n}u;
 const RADIX: u32 = {radix}u;
 const NS: u32 = {ns}u;
 const NS_DIV_R: u32 = {ns_div_r}u;
 const N_DIV_R: u32 = {n_div_r}u;
+const N_DIV_NS: u32 = {n_div_ns}u;
+const UNITS_PER_LINE: u32 = N_DIV_R;
 const STRIDE: u32 = {stride}u;
-const SIGN: f32 = {sign};
 
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main({entry_params}) {{
   {flat_workgroup_index}
-  if (wgFlat > params.total / {workgroup_size}u) {{
+  let firstUnit: u32 = params.baseIndex / RADIX;
+  let totalUnits: u32 = params.total / RADIX;
+  if (wgFlat > totalUnits / {workgroup_size}u) {{
     return;
   }}
-  let idx: u32 = params.baseIndex + wgFlat * {workgroup_size}u + lid.x;
-  if (idx >= params.total) {{
+  let unit: u32 = firstUnit + wgFlat * {workgroup_size}u + lid.x;
+  if (unit >= totalUnits) {{
     return;
   }}
 
-  let lineLocal: u32 = idx / N;
+  let lineLocal: u32 = unit / UNITS_PER_LINE;
   let line: u32 = params.lineOffset + lineLocal;
-  let p: u32 = idx - lineLocal * N;
+  let unitInLine: u32 = unit - lineLocal * UNITS_PER_LINE;
   let baseLineGlobal: u32 = line_base(line);
 
-  let block: u32 = p / NS;
-  let p_in_block: u32 = p - block * NS;
-  let offset: u32 = p - (p / NS_DIV_R) * NS_DIV_R;
-  let base: u32 = block * NS_DIV_R + offset;
+  let block: u32 = unitInLine / NS_DIV_R;
+  let j: u32 = unitInLine - block * NS_DIV_R;
+  let base: u32 = block * NS_DIV_R + j;
 
-  let r: u32 = p_in_block;
-  let angle: f32 = SIGN * (2.0 * PI) * (f32(r) / f32(NS));
-  let w1: vec2<f32> = cis(angle);
-
-  var w: vec2<f32> = vec2<f32>(1.0, 0.0);
-  var out: vec2<f32> = vec2<f32>(0.0, 0.0);
-
-  for (var q: u32 = 0u; q < RADIX; q = q + 1u) {{
-    let srcIdxGlobal: u32 = baseLineGlobal + (base + q * N_DIV_R) * STRIDE;
-    let srcIdx: u32 = srcIdxGlobal - params.elementBase;
-    let x: vec2<f32> = src[srcIdx];
-    out = c_add(out, c_mul(w, x));
-    w = c_mul(w, w1);
-  }}
-{maybe_scale}  let dstIdxGlobal: u32 = baseLineGlobal + p * STRIDE;
-  let dstIdx: u32 = dstIdxGlobal - params.elementBase;
-  dst[dstIdx] = out;
+{inputs}{outputs}
 }}
 "#,
         complex_wgsl = complex_wgsl,
         n = config.axis_length,
         radix = config.radix,
         ns = config.ns,
-        ns_div_r = config.ns / config.radix,
-        n_div_r = config.axis_length / config.radix,
+        ns_div_r = ns_div_r,
+        n_div_r = n_div_r,
+        n_div_ns = n_div_ns,
         stride = config.stride_complex,
-        sign = sign,
+        twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
         line_base_fn = line_base_fn,
         workgroup_size = config.workgroup_size,
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
-        maybe_scale = maybe_scale,
+        inputs = inputs,
+        outputs = outputs,
     )
 }
 
@@ -1302,9 +1493,7 @@ pub(crate) fn generate_stockham_radix_stage_wgsl_for_key(key: &StockhamStageKey)
 }
 
 fn complex_wgsl() -> &'static str {
-    r#"const PI: f32 = 3.1415926535897932384626433832795;
-
-fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    r#"fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
   return a + b;
 }
 
@@ -1317,11 +1506,39 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
     a.x * b.x - a.y * b.y,
     a.x * b.y + a.y * b.x
   );
+}"#
 }
 
-fn cis(angle: f32) -> vec2<f32> {
-  return vec2<f32>(cos(angle), sin(angle));
+fn twiddle_lookup_wgsl(direction: FftDirection) -> &'static str {
+    match direction {
+        FftDirection::Forward => {
+            r#"fn twiddle(index: u32) -> vec2<f32> {
+  return axisTwiddles[index];
 }"#
+        }
+        FftDirection::Inverse => {
+            r#"fn twiddle(index: u32) -> vec2<f32> {
+  let value: vec2<f32> = axisTwiddles[index];
+  return vec2<f32>(value.x, -value.y);
+}"#
+        }
+    }
+}
+
+fn radix_root_wgsl(radix: usize, power: usize, direction: FftDirection) -> String {
+    debug_assert!(radix > 0);
+    debug_assert!(power < radix);
+    let sign = match direction {
+        FftDirection::Forward => -1.0f64,
+        FftDirection::Inverse => 1.0f64,
+    };
+    let angle = sign * std::f64::consts::TAU * power as f64 / radix as f64;
+    let (sin, cos) = angle.sin_cos();
+    format!(
+        "vec2<f32>({}, {})",
+        format_wgsl_f32(cos as f32),
+        format_wgsl_f32(sin as f32)
+    )
 }
 
 fn wgsl_line_base_fn(rank: usize, axis: usize, dims: &[usize]) -> String {
@@ -1399,14 +1616,8 @@ fn product(values: &[usize]) -> usize {
 fn format_wgsl_f32(value: f32) -> String {
     assert!(value.is_finite(), "WGSL f32 constants must be finite");
 
-    let mut formatted = format!("{value:.9}");
-    while formatted.contains('.') && formatted.ends_with('0') {
-        formatted.pop();
-    }
-    if formatted.ends_with('.') {
-        formatted.push('0');
-    }
-    if !formatted.contains('.') {
+    let mut formatted = value.to_string();
+    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
         formatted.push_str(".0");
     }
     formatted
@@ -1469,33 +1680,58 @@ mod tests {
     fn simulate_fused_smooth_1d(
         input: &[Complex32],
         factors: &[usize],
-        sign: f32,
+        direction: FftDirection,
     ) -> Vec<Complex32> {
         let n = input.len();
+        let twiddles = twiddle_lut_f32(n);
         let mut scratch = input.to_vec();
         let mut ns = 1usize;
         for &radix in factors {
             ns *= radix;
             let ns_div_r = ns / radix;
             let n_div_r = n / radix;
-            let mut stage = vec![Complex32::default(); n];
-            for p in 0..n {
-                let block = p / ns;
-                let p_in_block = p - block * ns;
-                let offset = p - (p / ns_div_r) * ns_div_r;
-                let base = block * ns_div_r + offset;
-                let angle = sign * std::f32::consts::TAU * p_in_block as f32 / ns as f32;
-                let (sin, cos) = angle.sin_cos();
-                let w1 = Complex32::new(cos, sin);
-                let mut w = Complex32::new(1.0, 0.0);
-                let mut out = Complex32::default();
-                for q in 0..radix {
-                    let value = scratch[base + q * n_div_r];
-                    out.re += w.re * value.re - w.im * value.im;
-                    out.im += w.re * value.im + w.im * value.re;
-                    w = Complex32::new(w.re * w1.re - w.im * w1.im, w.re * w1.im + w.im * w1.re);
+            let n_div_ns = n / ns;
+            let mut roots = twiddle_lut_f32(radix);
+            if direction == FftDirection::Inverse {
+                for root in &mut roots {
+                    root.im = -root.im;
                 }
-                stage[p] = out;
+            }
+            let mut stage = vec![Complex32::default(); n];
+            for unit in 0..n_div_r {
+                let block = unit / ns_div_r;
+                let j = unit - block * ns_div_r;
+                let base = block * ns_div_r + j;
+                let mut inputs = Vec::with_capacity(radix);
+                for q in 0..radix {
+                    let mut value = scratch[base + q * n_div_r];
+                    if q != 0 && ns_div_r != 1 {
+                        let mut w = twiddles[j * q * n_div_ns];
+                        if direction == FftDirection::Inverse {
+                            w.im = -w.im;
+                        }
+                        value = Complex32::new(
+                            w.re * value.re - w.im * value.im,
+                            w.re * value.im + w.im * value.re,
+                        );
+                    }
+                    inputs.push(value);
+                }
+                for output in 0..radix {
+                    let mut out = inputs[0];
+                    for (q, &value) in inputs.iter().enumerate().skip(1) {
+                        let power = (output * q) % radix;
+                        if power == 0 {
+                            out.re += value.re;
+                            out.im += value.im;
+                        } else {
+                            let root = roots[power];
+                            out.re += root.re * value.re - root.im * value.im;
+                            out.im += root.re * value.im + root.im * value.re;
+                        }
+                    }
+                    stage[block * ns + output * ns_div_r + j] = out;
+                }
             }
             scratch = stage;
         }
@@ -1511,7 +1747,8 @@ mod tests {
         assert!(wgsl.contains("const NS_DIV_R: u32 = 1u;"));
         assert!(wgsl.contains("const N_DIV_R: u32 = 5u;"));
         assert!(wgsl.contains("const STRIDE: u32 = 1u;"));
-        assert!(wgsl.contains("const SIGN: f32 = -1.0;"));
+        assert!(wgsl.contains("const N_DIV_NS: u32 = 5u;"));
+        assert!(wgsl.contains("@binding(3) var<storage, read> axisTwiddles"));
     }
 
     #[test]
@@ -1550,6 +1787,59 @@ mod tests {
         assert!(wgsl.contains("const NS: u32 = 8u;"));
         assert!(wgsl.contains("const NS_DIV_R: u32 = 1u;"));
         assert!(wgsl.contains("const N_DIV_R: u32 = 1u;"));
+    }
+
+    #[test]
+    fn radix_root_literals_are_f64_generated_then_rounded_once() {
+        for radix in [2, 3, 4, 5, 7, 8, 11, 13] {
+            for power in 0..radix {
+                for direction in [FftDirection::Forward, FftDirection::Inverse] {
+                    let sign = if direction == FftDirection::Forward {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    let angle = sign * std::f64::consts::TAU * power as f64 / radix as f64;
+                    let (sin, cos) = angle.sin_cos();
+                    assert_eq!(
+                        radix_root_wgsl(radix, power, direction),
+                        format!(
+                            "vec2<f32>({}, {})",
+                            format_wgsl_f32(cos as f32),
+                            format_wgsl_f32(sin as f32)
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn axis_generators_use_host_luts_without_shader_trigonometry() {
+        let sources = [
+            wgsl_for(13, 143, 13),
+            fused_wgsl_for(4096, FftDirection::Forward),
+            fused_smooth_wgsl_for(3000, FftDirection::Inverse),
+        ];
+        for wgsl in sources {
+            assert!(wgsl.contains("@binding(3) var<storage, read> axisTwiddles"));
+            assert!(wgsl.contains("fn twiddle(index: u32)"));
+            assert!(!wgsl.contains("cos("));
+            assert!(!wgsl.contains("sin("));
+            assert!(!wgsl.contains("cis("));
+        }
+    }
+
+    #[test]
+    fn generated_stockham_loads_each_exact_external_power_without_a_chain() {
+        let wgsl = wgsl_for(11, 143, 143);
+        for q in 1..11 {
+            assert!(wgsl.contains(&format!("twiddle(j * {q}u)")));
+        }
+        assert!(wgsl.contains("let x_10: vec2<f32>"));
+        assert!(wgsl.contains("let value_10: vec2<f32>"));
+        assert!(!wgsl.contains("w = c_mul(w"));
+        assert!(!wgsl.contains("p_in_block"));
     }
 
     #[test]
@@ -1674,7 +1964,11 @@ mod tests {
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 4096>;"));
         assert!(wgsl.contains("scratch[bit_reverse(p)] = src[srcIdx];"));
         assert!(wgsl.contains("dst[dstIdx] = value;"));
-        assert!(wgsl.contains("const SIGN: f32 = -1.0;"));
+        assert!(wgsl.contains("@binding(3) var<storage, read> axisTwiddles"));
+        assert!(wgsl.contains("let z8: vec2<f32> = twiddle(j *"));
+        assert!(!wgsl.contains("cos("));
+        assert!(!wgsl.contains("sin("));
+        assert!(!wgsl.contains("cis("));
         assert_eq!(wgsl.matches("const RADIX: u32 = 8u;").count(), 4);
         assert_eq!(wgsl.matches("workgroupBarrier();").count(), 5);
         assert!(wgsl.contains("let wgFlat: u32 ="));
@@ -1686,7 +1980,7 @@ mod tests {
         let n1024 = fused_wgsl_for(1024, FftDirection::Inverse);
         assert_eq!(n1024.matches("const RADIX: u32 = 8u;").count(), 3);
         assert_eq!(n1024.matches("const RADIX: u32 = 2u;").count(), 1);
-        assert!(n1024.contains("const SIGN: f32 = 1.0;"));
+        assert!(n1024.contains("return vec2<f32>(value.x, -value.y);"));
 
         let n2048 = fused_wgsl_for(2048, FftDirection::Forward);
         assert_eq!(n2048.matches("const RADIX: u32 = 8u;").count(), 3);
@@ -1729,12 +2023,12 @@ mod tests {
         let wgsl = fused_smooth_wgsl_for(3000, FftDirection::Forward);
         assert!(wgsl.contains("@compute @workgroup_size(256, 1, 1)"));
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 3000>;"));
-        assert!(wgsl.contains("const SLOT_COUNT: u32 = 12u;"));
+        assert!(wgsl.contains("const LINE_SLOT_COUNT: u32 = 12u;"));
         assert!(wgsl.contains("scratch[p] = src[srcIdx];"));
-        assert!(wgsl.contains("var stageOut_11: vec2<f32>"));
-        assert!(wgsl.contains("if (p_11 < N)"));
-        assert!(wgsl.contains("scratch[p_11] = stageOut_11;"));
-        assert!(wgsl.contains("dst[dstIdx] = out;"));
+        assert!(wgsl.contains("var stageOut_1_7: vec2<f32>"));
+        assert!(wgsl.contains("if (unit_1 < 375u)"));
+        assert!(wgsl.contains("scratch[block_1 * 8u + 7u * 1u + j_1] = stageOut_1_7;"));
+        assert!(wgsl.contains("dst[dstIdx_3_2] = value_3_2;"));
         assert!(!wgsl.contains("bit_reverse"));
         assert_eq!(wgsl.matches("workgroupBarrier();").count(), 9);
     }
@@ -1742,10 +2036,13 @@ mod tests {
     #[test]
     fn fused_smooth_generator_covers_large_odd_radices() {
         let wgsl = fused_smooth_wgsl_for(1001, FftDirection::Inverse);
-        assert!(wgsl.contains("q_0 < 13u"));
-        assert!(wgsl.contains("q_0 < 11u"));
-        assert!(wgsl.contains("q < 7u"));
-        assert!(wgsl.contains("const SIGN: f32 = 1.0;"));
+        assert!(wgsl.contains("fused smooth radix-13 butterflies"));
+        assert!(wgsl.contains("fused smooth radix-11 butterflies"));
+        assert!(wgsl.contains("fused smooth radix-7 butterflies"));
+        assert!(wgsl.contains("return vec2<f32>(value.x, -value.y);"));
+        assert!(!wgsl.contains("cos("));
+        assert!(!wgsl.contains("sin("));
+        assert!(!wgsl.contains("cis("));
         assert_eq!(wgsl.matches("workgroupBarrier();").count(), 5);
     }
 
@@ -1766,11 +2063,7 @@ mod tests {
                 }
                 .with_normalization(Normalization::None);
                 let expected = reference_c2c_nd(&input, &config).unwrap();
-                let sign = match direction {
-                    FftDirection::Forward => -1.0,
-                    FftDirection::Inverse => 1.0,
-                };
-                let actual = simulate_fused_smooth_1d(&input, &factors, sign);
+                let actual = simulate_fused_smooth_1d(&input, &factors, direction);
                 for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
                     let tolerance = 2.0e-2 + 2.0e-5 * expected.re.abs().max(expected.im.abs());
                     assert!(

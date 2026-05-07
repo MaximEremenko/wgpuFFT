@@ -17,6 +17,7 @@ pub(crate) mod rader_axis;
 pub mod real;
 pub(crate) mod smooth_decompose;
 pub(crate) mod stage_executor;
+pub(crate) mod twiddle;
 pub(crate) mod window_scheduler;
 
 pub const SUPPORTED_RADICES: &[usize] = &[2, 3, 4, 5, 7, 8, 11, 13];

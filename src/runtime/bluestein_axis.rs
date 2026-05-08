@@ -4,18 +4,29 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd_f64, to_interleaved_f32, Complex32, Complex64};
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
+    generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
+    AxisStageKind, AxisTwiddleLutPool,
 };
 use crate::runtime::axis_policy::next_smooth_at_least;
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
-    format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
+    format_wgsl_f32, format_wgsl_f32_roundtrip, lines_per_batch, product, stride_for_axis,
+    wgsl_line_base_fn,
 };
+use crate::runtime::pipeline_cache::{
+    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
+    PipelineLayoutCacheKey,
+};
+use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len;
 use crate::runtime::window_scheduler::WindowScheduler;
 
 const WORKGROUP_SIZE: u32 = 64;
+const FUSED_WORKGROUP_SIZE: u32 = 256;
+// Avoid a 256-lane whole-pipeline shader when the convolution is too small to
+// keep even half of the workgroup useful; the staged path is already cheap.
+const FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
 const COMPLEX_F32_BYTES: u64 = 8;
 
 #[repr(C)]
@@ -49,6 +60,25 @@ pub(crate) struct BluesteinAxis {
     n: usize,
     m: usize,
     lines: u32,
+    lines_params_buffer: wgpu::Buffer,
+    chirp_buffer: wgpu::Buffer,
+    bfft_buffer: wgpu::Buffer,
+    execution: BluesteinExecution,
+}
+
+enum BluesteinExecution {
+    Fused(FusedBluesteinExecution),
+    MultiPass(Box<MultiPassBluesteinExecution>),
+}
+
+struct FusedBluesteinExecution {
+    workgroups: u32,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    twiddle_buffer: wgpu::Buffer,
+}
+
+struct MultiPassBluesteinExecution {
     workgroups_work: u32,
     workgroups_output: u32,
     pack_pipeline: wgpu::ComputePipeline,
@@ -57,10 +87,7 @@ pub(crate) struct BluesteinAxis {
     mul_bind_group_layout: wgpu::BindGroupLayout,
     post_pipeline: wgpu::ComputePipeline,
     post_bind_group_layout: wgpu::BindGroupLayout,
-    lines_params_buffer: wgpu::Buffer,
     total_params_buffer: wgpu::Buffer,
-    chirp_buffer: wgpu::Buffer,
-    bfft_buffer: wgpu::Buffer,
     work_buffer: wgpu::Buffer,
     fft_buffer: wgpu::Buffer,
     work_fft_forward: AxisPlan,
@@ -113,17 +140,13 @@ impl BluesteinAxis {
 
         let n = config.shape[config.axis];
         let m = next_smooth_at_least(2 * n - 1);
-        crate::runtime::factor_supported_length(m)?;
+        let factors = crate::runtime::factor_supported_length(m)?;
 
         let lines = checked_mul(config.batch, lines_per_batch(&config.shape, config.axis))?;
-        let work_complex = checked_mul(lines, m)?;
-        if work_complex > u32::MAX as usize {
-            return Err(FftError::LengthTooLarge { len: work_complex });
-        }
-        let total_work_u32 = work_complex as u32;
         let lines_u32 = lines as u32;
         let stride_complex = stride_for_axis(&config.shape, config.axis);
         let scale = config.scale()?;
+        let apply_scale = (scale - 1.0).abs() > f32::EPSILON;
 
         let chirp = bluestein_chirp(n, config.direction);
         let bfft = bluestein_bfft(n, m, config.direction)?;
@@ -138,19 +161,6 @@ impl BluesteinAxis {
                 line_offset: 0,
                 _pad0: 0,
                 _pad1: 0,
-            }),
-        );
-
-        let total_params_buffer =
-            uniform_buffer::<BluesteinTotalParams>(device, "wgpu_fft.bluestein.total_params");
-        queue.write_buffer(
-            &total_params_buffer,
-            0,
-            bytemuck::bytes_of(&BluesteinTotalParams {
-                total: total_work_u32,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
             }),
         );
 
@@ -172,137 +182,191 @@ impl BluesteinAxis {
         )?;
         queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft_values));
 
-        let work_bytes = work_complex as u64 * COMPLEX_F32_BYTES;
-        let work_buffer = storage_buffer(
-            device,
-            "wgpu_fft.bluestein.work",
-            work_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
-        let fft_buffer = storage_buffer(
-            device,
-            "wgpu_fft.bluestein.fft",
-            work_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
-
-        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
-        let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
-            device,
-            queue,
-            AxisPlanConfig {
-                shape: vec![m],
-                axes: vec![0],
-                batch: lines,
-                direction: FftDirection::Forward,
-                normalization: Normalization::None,
-                scale_override_bits: None,
-                layout: AxisLayout::Interleaved,
-                precision: AxisPrecision::F32,
-            },
-            &mut twiddle_lut_pool,
-        )?;
-        let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
-            device,
-            queue,
-            AxisPlanConfig {
-                shape: vec![m],
-                axes: vec![0],
-                batch: lines,
-                direction: FftDirection::Inverse,
-                normalization: Normalization::Inverse,
-                scale_override_bits: None,
-                layout: AxisLayout::Interleaved,
-                precision: AxisPrecision::F32,
-            },
-            &mut twiddle_lut_pool,
-        )?;
-
-        let pack_bind_group_layout = bind_group_layout(
-            device,
-            "wgpu_fft.bluestein.pack.bind_group_layout",
-            &[
-                storage_entry(0, true),
-                storage_entry(1, false),
-                storage_entry(2, true),
-                uniform_entry(3),
-            ],
-        );
-        let pack_pipeline = compute_pipeline(
-            device,
-            "wgpu_fft.bluestein.pack.pipeline",
-            &pack_bind_group_layout,
-            &generate_bluestein_pack_wgsl(
+        let execution = if fused_bluestein_supported(m, &device.limits()) {
+            let twiddle_buffer = create_twiddle_lut_buffer_for_len(
+                device,
+                queue,
+                "wgpu_fft.bluestein.fused.twiddle_lut",
+                m,
+            )?;
+            let shader_key = FusedPrimeStageKey::new(
+                FusedPrimeKind::Bluestein,
                 config.shape.len(),
                 config.axis,
                 &config.shape,
                 n,
-                m,
                 stride_complex,
-            ),
-        );
-
-        let mul_bind_group_layout = bind_group_layout(
-            device,
-            "wgpu_fft.bluestein.mul.bind_group_layout",
-            &[
-                storage_entry(0, false),
-                storage_entry(1, true),
-                uniform_entry(2),
-            ],
-        );
-        let mul_pipeline = compute_pipeline(
-            device,
-            "wgpu_fft.bluestein.mul.pipeline",
-            &mul_bind_group_layout,
-            &generate_bluestein_mul_wgsl(m),
-        );
-
-        let post_bind_group_layout = bind_group_layout(
-            device,
-            "wgpu_fft.bluestein.post.bind_group_layout",
-            &[
-                storage_entry(0, true),
-                storage_entry(1, true),
-                storage_entry(2, false),
-                uniform_entry(3),
-            ],
-        );
-        let post_pipeline = compute_pipeline(
-            device,
-            "wgpu_fft.bluestein.post.pipeline",
-            &post_bind_group_layout,
-            &generate_bluestein_post_wgsl(
-                config.shape.len(),
-                config.axis,
-                &config.shape,
-                n,
                 m,
-                stride_complex,
+                &factors,
+                config.direction,
+                FUSED_WORKGROUP_SIZE,
+                apply_scale,
                 scale,
-            ),
-        );
+            );
+            let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
+            let bind_group_layout = with_device_pipeline_cache(device, |cache| {
+                cache
+                    .get_bind_group_layout(device, PipelineLayoutCacheKey::FusedPrimeInterleavedF32)
+            });
+            let pipeline = cached_fused_bluestein_pipeline(device, &pipeline_key, &shader_key);
+            BluesteinExecution::Fused(FusedBluesteinExecution {
+                workgroups: lines_u32,
+                pipeline,
+                bind_group_layout,
+                twiddle_buffer,
+            })
+        } else {
+            let work_complex = checked_mul(lines, m)?;
+            if work_complex > u32::MAX as usize {
+                return Err(FftError::LengthTooLarge { len: work_complex });
+            }
+            let total_work_u32 = work_complex as u32;
+            let total_params_buffer =
+                uniform_buffer::<BluesteinTotalParams>(device, "wgpu_fft.bluestein.total_params");
+            queue.write_buffer(
+                &total_params_buffer,
+                0,
+                bytemuck::bytes_of(&BluesteinTotalParams {
+                    total: total_work_u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+            );
+            let work_bytes = work_complex as u64 * COMPLEX_F32_BYTES;
+            let work_buffer = storage_buffer(
+                device,
+                "wgpu_fft.bluestein.work",
+                work_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
+            let fft_buffer = storage_buffer(
+                device,
+                "wgpu_fft.bluestein.fft",
+                work_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
+
+            let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
+            let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
+                device,
+                queue,
+                AxisPlanConfig {
+                    shape: vec![m],
+                    axes: vec![0],
+                    batch: lines,
+                    direction: FftDirection::Forward,
+                    normalization: Normalization::None,
+                    scale_override_bits: None,
+                    layout: AxisLayout::Interleaved,
+                    precision: AxisPrecision::F32,
+                },
+                &mut twiddle_lut_pool,
+            )?;
+            let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
+                device,
+                queue,
+                AxisPlanConfig {
+                    shape: vec![m],
+                    axes: vec![0],
+                    batch: lines,
+                    direction: FftDirection::Inverse,
+                    normalization: Normalization::Inverse,
+                    scale_override_bits: None,
+                    layout: AxisLayout::Interleaved,
+                    precision: AxisPrecision::F32,
+                },
+                &mut twiddle_lut_pool,
+            )?;
+
+            let pack_bind_group_layout = bind_group_layout(
+                device,
+                "wgpu_fft.bluestein.pack.bind_group_layout",
+                &[
+                    storage_entry(0, true),
+                    storage_entry(1, false),
+                    storage_entry(2, true),
+                    uniform_entry(3),
+                ],
+            );
+            let pack_pipeline = compute_pipeline(
+                device,
+                "wgpu_fft.bluestein.pack.pipeline",
+                &pack_bind_group_layout,
+                &generate_bluestein_pack_wgsl(
+                    config.shape.len(),
+                    config.axis,
+                    &config.shape,
+                    n,
+                    m,
+                    stride_complex,
+                ),
+            );
+            let mul_bind_group_layout = bind_group_layout(
+                device,
+                "wgpu_fft.bluestein.mul.bind_group_layout",
+                &[
+                    storage_entry(0, false),
+                    storage_entry(1, true),
+                    uniform_entry(2),
+                ],
+            );
+            let mul_pipeline = compute_pipeline(
+                device,
+                "wgpu_fft.bluestein.mul.pipeline",
+                &mul_bind_group_layout,
+                &generate_bluestein_mul_wgsl(m),
+            );
+            let post_bind_group_layout = bind_group_layout(
+                device,
+                "wgpu_fft.bluestein.post.bind_group_layout",
+                &[
+                    storage_entry(0, true),
+                    storage_entry(1, true),
+                    storage_entry(2, false),
+                    uniform_entry(3),
+                ],
+            );
+            let post_pipeline = compute_pipeline(
+                device,
+                "wgpu_fft.bluestein.post.pipeline",
+                &post_bind_group_layout,
+                &generate_bluestein_post_wgsl(
+                    config.shape.len(),
+                    config.axis,
+                    &config.shape,
+                    n,
+                    m,
+                    stride_complex,
+                    scale,
+                ),
+            );
+
+            BluesteinExecution::MultiPass(Box::new(MultiPassBluesteinExecution {
+                workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
+                workgroups_output: (lines_u32 * n as u32).div_ceil(WORKGROUP_SIZE),
+                pack_pipeline,
+                pack_bind_group_layout,
+                mul_pipeline,
+                mul_bind_group_layout,
+                post_pipeline,
+                post_bind_group_layout,
+                total_params_buffer,
+                work_buffer,
+                fft_buffer,
+                work_fft_forward,
+                work_fft_inverse,
+            }))
+        };
 
         Ok(Self {
             n,
             m,
             lines: lines_u32,
-            workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
-            workgroups_output: (lines_u32 * n as u32).div_ceil(WORKGROUP_SIZE),
-            pack_pipeline,
-            pack_bind_group_layout,
-            mul_pipeline,
-            mul_bind_group_layout,
-            post_pipeline,
-            post_bind_group_layout,
             lines_params_buffer,
-            total_params_buffer,
             chirp_buffer,
             bfft_buffer,
-            work_buffer,
-            fft_buffer,
-            work_fft_forward,
-            work_fft_inverse,
+            execution,
         })
     }
 
@@ -311,29 +375,61 @@ impl BluesteinAxis {
     }
 
     pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
-        let bytes = self.work_fft_forward.twiddle_lut_storage_bytes();
-        debug_assert_eq!(bytes, self.work_fft_inverse.twiddle_lut_storage_bytes());
-        bytes
+        match &self.execution {
+            BluesteinExecution::Fused(execution) => execution.twiddle_buffer.size(),
+            BluesteinExecution::MultiPass(execution) => {
+                let bytes = execution.work_fft_forward.twiddle_lut_storage_bytes();
+                debug_assert_eq!(
+                    bytes,
+                    execution.work_fft_inverse.twiddle_lut_storage_bytes()
+                );
+                bytes
+            }
+        }
+    }
+
+    pub(crate) fn graph_is_fused(&self) -> bool {
+        matches!(self.execution, BluesteinExecution::Fused(_))
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
-        self.work_fft_forward.graph_stage_kinds()
+        match &self.execution {
+            BluesteinExecution::Fused(_) => Vec::new(),
+            BluesteinExecution::MultiPass(execution) => {
+                execution.work_fft_forward.graph_stage_kinds()
+            }
+        }
     }
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
-        self.work_fft_forward.workspace_size_bytes()
+        match &self.execution {
+            BluesteinExecution::Fused(_) => 0,
+            BluesteinExecution::MultiPass(execution) => {
+                execution.work_fft_forward.workspace_size_bytes()
+            }
+        }
     }
 
     pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
-        self.work_fft_inverse.graph_stage_kinds()
+        match &self.execution {
+            BluesteinExecution::Fused(_) => Vec::new(),
+            BluesteinExecution::MultiPass(execution) => {
+                execution.work_fft_inverse.graph_stage_kinds()
+            }
+        }
     }
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {
-        self.work_fft_inverse.workspace_size_bytes()
+        match &self.execution {
+            BluesteinExecution::Fused(_) => 0,
+            BluesteinExecution::MultiPass(execution) => {
+                execution.work_fft_inverse.workspace_size_bytes()
+            }
+        }
     }
 
-    pub(crate) fn graph_helper_buffers(&self) -> [HelperBufferRange; 4] {
-        [
+    pub(crate) fn graph_helper_buffers(&self) -> Vec<HelperBufferRange> {
+        let mut helpers = vec![
             HelperBufferRange {
                 label: "bluestein-chirp-helper",
                 index: 0,
@@ -346,19 +442,24 @@ impl BluesteinAxis {
                 size_bytes: self.bfft_buffer.size(),
                 format: ElementFormat::ComplexF32,
             },
-            HelperBufferRange {
-                label: "bluestein-work-helper",
-                index: 2,
-                size_bytes: self.work_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-            HelperBufferRange {
-                label: "bluestein-fft-helper",
-                index: 3,
-                size_bytes: self.fft_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-        ]
+        ];
+        if let BluesteinExecution::MultiPass(execution) = &self.execution {
+            helpers.extend([
+                HelperBufferRange {
+                    label: "bluestein-work-helper",
+                    index: 2,
+                    size_bytes: execution.work_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+                HelperBufferRange {
+                    label: "bluestein-fft-helper",
+                    index: 3,
+                    size_bytes: execution.fft_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+            ]);
+        }
+        helpers
     }
 
     pub(crate) fn execute_views(
@@ -372,13 +473,66 @@ impl BluesteinAxis {
         debug_assert!(self.m >= 2 * self.n - 1);
         debug_assert!(self.lines > 0);
 
-        self.dispatch_pack(device, encoder, input)?;
-        self.work_fft_forward
-            .execute(device, encoder, &self.work_buffer, &self.fft_buffer)?;
-        self.dispatch_mul(device, encoder)?;
-        self.work_fft_inverse
-            .execute(device, encoder, &self.fft_buffer, &self.work_buffer)?;
-        self.dispatch_post(device, encoder, output)?;
+        match &self.execution {
+            BluesteinExecution::Fused(execution) => {
+                self.dispatch_fused(device, encoder, input, output, execution)?;
+            }
+            BluesteinExecution::MultiPass(execution) => {
+                self.dispatch_pack(device, encoder, input, execution)?;
+                execution.work_fft_forward.execute(
+                    device,
+                    encoder,
+                    &execution.work_buffer,
+                    &execution.fft_buffer,
+                )?;
+                self.dispatch_mul(device, encoder, execution)?;
+                execution.work_fft_inverse.execute(
+                    device,
+                    encoder,
+                    &execution.fft_buffer,
+                    &execution.work_buffer,
+                )?;
+                self.dispatch_post(device, encoder, output, execution)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_fused(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+        execution: &FusedBluesteinExecution,
+    ) -> Result<()> {
+        let scheduler = WindowScheduler::for_device(device);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_fft.bluestein.fused.bind_group"),
+            layout: &execution.bind_group_layout,
+            entries: &[
+                bind_view_entry(&scheduler, 0, input)?,
+                bind_view_entry(&scheduler, 1, output)?,
+                bind_storage_entry(&scheduler, 2, &self.chirp_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    4,
+                    &execution.twiddle_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
+                bind_uniform_entry(5, &self.lines_params_buffer),
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("wgpu_fft.bluestein.fused.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&execution.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let (x, y, z) =
+            split_workgroups(execution.workgroups, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -387,14 +541,20 @@ impl BluesteinAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input: BufferView<'_>,
+        execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.bluestein.pack.bind_group"),
-            layout: &self.pack_bind_group_layout,
+            layout: &execution.pack_bind_group_layout,
             entries: &[
                 bind_view_entry(&scheduler, 0, input)?,
-                bind_storage_entry(&scheduler, 1, &self.work_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    1,
+                    &execution.work_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 2, &self.chirp_buffer, ElementFormat::ComplexF32)?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
@@ -403,10 +563,12 @@ impl BluesteinAxis {
             label: Some("wgpu_fft.bluestein.pack.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.pack_pipeline);
+        pass.set_pipeline(&execution.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_work,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -415,25 +577,33 @@ impl BluesteinAxis {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.bluestein.mul.bind_group"),
-            layout: &self.mul_bind_group_layout,
+            layout: &execution.mul_bind_group_layout,
             entries: &[
-                bind_storage_entry(&scheduler, 0, &self.fft_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    0,
+                    &execution.fft_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 1, &self.bfft_buffer, ElementFormat::ComplexF32)?,
-                bind_uniform_entry(2, &self.total_params_buffer),
+                bind_uniform_entry(2, &execution.total_params_buffer),
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("wgpu_fft.bluestein.mul.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.mul_pipeline);
+        pass.set_pipeline(&execution.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_work,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -443,13 +613,19 @@ impl BluesteinAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         output: BufferView<'_>,
+        execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.bluestein.post.bind_group"),
-            layout: &self.post_bind_group_layout,
+            layout: &execution.post_bind_group_layout,
             entries: &[
-                bind_storage_entry(&scheduler, 0, &self.work_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    0,
+                    &execution.work_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 1, &self.chirp_buffer, ElementFormat::ComplexF32)?,
                 bind_view_entry(&scheduler, 2, output)?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
@@ -459,10 +635,12 @@ impl BluesteinAxis {
             label: Some("wgpu_fft.bluestein.post.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.post_pipeline);
+        pass.set_pipeline(&execution.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_output, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_output,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -516,6 +694,32 @@ fn transform_sign(direction: FftDirection) -> f64 {
         FftDirection::Forward => -1.0,
         FftDirection::Inverse => 1.0,
     }
+}
+
+fn fused_bluestein_supported(m: usize, limits: &wgpu::Limits) -> bool {
+    fused_bluestein_supported_by_limits(
+        m,
+        u64::from(limits.max_compute_workgroup_storage_size),
+        limits.max_compute_invocations_per_workgroup,
+        limits.max_compute_workgroup_size_x,
+    )
+}
+
+fn fused_bluestein_supported_by_limits(
+    m: usize,
+    max_workgroup_storage_bytes: u64,
+    max_invocations_per_workgroup: u32,
+    max_workgroup_size_x: u32,
+) -> bool {
+    if m < FUSED_MIN_CONVOLUTION_LENGTH {
+        return false;
+    }
+    let Some(scratch_bytes) = m.checked_mul(COMPLEX_F32_BYTES as usize) else {
+        return false;
+    };
+    scratch_bytes as u64 <= max_workgroup_storage_bytes
+        && FUSED_WORKGROUP_SIZE <= max_invocations_per_workgroup
+        && FUSED_WORKGROUP_SIZE <= max_workgroup_size_x
 }
 
 fn checked_mul(left: usize, right: usize) -> Result<usize> {
@@ -601,6 +805,21 @@ fn compute_pipeline(
     })
 }
 
+fn cached_fused_bluestein_pipeline(
+    device: &wgpu::Device,
+    key: &ComputePipelineCacheKey,
+    shader_key: &FusedPrimeStageKey,
+) -> wgpu::ComputePipeline {
+    let stable_key = key.stable_key();
+    let pipeline_label = format!("wgpu_fft.bluestein.fused.pipeline.{stable_key}");
+    let shader_label = format!("wgpu_fft.bluestein.fused.shader.{stable_key}");
+    with_device_pipeline_cache(device, |cache| {
+        cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
+            generate_fused_bluestein_wgsl_for_key(shader_key)
+        })
+    })
+}
+
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -668,6 +887,132 @@ fn complex_mul_wgsl() -> &'static str {
     a.x * b.y + a.y * b.x
   );
 }"#
+}
+
+pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
+    debug_assert_eq!(key.kind, FusedPrimeKind::Bluestein);
+    let n = key.axis_length;
+    let m = key.convolution_length;
+    let m_slot_count = m.div_ceil(key.workgroup_size as usize);
+    let n_slot_count = n.div_ceil(key.workgroup_size as usize);
+    let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
+    let scale = format_wgsl_f32_roundtrip(key.scale_factor());
+    let inverse_m = format_wgsl_f32_roundtrip(1.0 / m as f32);
+    let forward_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Forward,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_forward",
+    );
+    let inverse_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Inverse,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_inverse",
+    );
+
+    format!(
+        r#"struct Params {{
+  lines: u32,
+  lineOffset: u32,
+  pad0: u32,
+  pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> chirp: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a + b;
+}}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a - b;
+}}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}}
+
+fn twiddle_forward(index: u32) -> vec2<f32> {{
+  return axisTwiddles[index];
+}}
+
+fn twiddle_inverse(index: u32) -> vec2<f32> {{
+  let value: vec2<f32> = axisTwiddles[index];
+  return vec2<f32>(value.x, -value.y);
+}}
+
+const N: u32 = {n}u;
+const M: u32 = {m}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const M_SLOT_COUNT: u32 = {m_slot_count}u;
+const N_SLOT_COUNT: u32 = {n_slot_count}u;
+const INVERSE_M: f32 = {inverse_m};
+const SCALE: f32 = {scale};
+
+var<workgroup> scratch: array<vec2<f32>, {m}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let lineLocal: u32 = wgFlat;
+  if (lineLocal >= params.lines) {{
+    return;
+  }}
+
+  let base: u32 = line_base(params.lineOffset + lineLocal);
+  for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t < M) {{
+      if (t < N) {{
+        scratch[t] = c_mul(input[base + t * STRIDE], chirp[t]);
+      }} else {{
+        scratch[t] = vec2<f32>(0.0, 0.0);
+      }}
+    }}
+  }}
+  workgroupBarrier();
+
+{forward_stages}
+  for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t < M) {{
+      scratch[t] = c_mul(scratch[t], bfft[t]);
+    }}
+  }}
+  workgroupBarrier();
+
+{inverse_stages}
+  for (var slot: u32 = 0u; slot < N_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t < N) {{
+      let convolution: vec2<f32> = scratch[t] * vec2<f32>(INVERSE_M, INVERSE_M);
+      let value: vec2<f32> = c_mul(convolution, chirp[t]);
+      output[base + t * STRIDE] = value * vec2<f32>(SCALE, SCALE);
+    }}
+  }}
+}}
+"#,
+        stride = key.stride_complex,
+        workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+    )
 }
 
 fn generate_bluestein_pack_wgsl(
@@ -831,6 +1176,76 @@ fn main({entry_params}) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_bluestein_gate_respects_storage_lane_limits_and_tiny_floor() {
+        assert!(fused_bluestein_supported_by_limits(
+            4056,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_bluestein_supported_by_limits(
+            4056,
+            16 * 1024,
+            256,
+            256
+        ));
+        assert!(fused_bluestein_supported_by_limits(
+            2016,
+            16 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_bluestein_supported_by_limits(
+            6561,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_bluestein_supported_by_limits(
+            70,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_bluestein_supported_by_limits(
+            4056,
+            48 * 1024,
+            256,
+            255
+        ));
+    }
+
+    #[test]
+    fn fused_bluestein_wgsl_inlines_both_ffts_and_chirp_steps() {
+        let factors = crate::runtime::factor_supported_length(441).unwrap();
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Bluestein,
+            2,
+            0,
+            &[221, 3],
+            221,
+            1,
+            441,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 663.0,
+        );
+        let wgsl = generate_fused_bluestein_wgsl_for_key(&key);
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 441>"));
+        assert!(wgsl.contains("c_mul(input[base + t * STRIDE], chirp[t])"));
+        assert!(wgsl.contains("scratch[t] = c_mul(scratch[t], bfft[t])"));
+        assert!(wgsl.contains("c_mul(convolution, chirp[t])"));
+        assert!(wgsl.contains("fn twiddle_forward"));
+        assert!(wgsl.contains("fn twiddle_inverse"));
+        assert!(wgsl.contains("const INVERSE_M: f32"));
+        assert!(wgsl.contains("let wgFlat: u32"));
+        assert!(!wgsl.contains("sin("));
+        assert!(!wgsl.contains("cos("));
+    }
 
     #[test]
     fn bluestein_chirp_has_unit_first_value_and_conjugate_kernel() {

@@ -90,6 +90,15 @@ pub(crate) fn format_wgsl_f32(value: f32) -> String {
     formatted
 }
 
+pub(crate) fn format_wgsl_f32_roundtrip(value: f32) -> String {
+    assert!(value.is_finite(), "WGSL f32 constants must be finite");
+    let mut formatted = value.to_string();
+    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+        formatted.push_str(".0");
+    }
+    formatted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +119,15 @@ mod tests {
         assert_eq!(stride_for_axis(&[4, 17, 2], 2), 68);
         assert_eq!(lines_per_batch(&[4, 17, 2], 1), 8);
         assert_eq!(strides_for_shape(&[4, 17, 2]), [1, 4, 68]);
+    }
+
+    #[test]
+    fn roundtrip_formatter_preserves_small_f32_scale_bits() {
+        for value in [1.0f32, -0.0, 1.0 / 6000.0, 1.0 / 2999.0, f32::MIN_POSITIVE] {
+            let formatted = format_wgsl_f32_roundtrip(value);
+            let parsed = formatted.parse::<f32>().unwrap();
+            assert_eq!(parsed.to_bits(), value.to_bits(), "{value} -> {formatted}");
+            assert!(formatted.contains('.') || formatted.contains('e') || formatted.contains('E'));
+        }
     }
 }

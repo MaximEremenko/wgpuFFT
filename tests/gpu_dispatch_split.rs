@@ -2,7 +2,8 @@
 //! `max_compute_workgroups_per_dimension` (65535 on most devices). Before the
 //! 3D dispatch-grid split these cases issued invalid `dispatch_workgroups`
 //! calls once a pass covered more than `limit * WORKGROUP_SIZE` work items,
-//! and the Rader sum kernel overflowed at just `limit + 1` lines.
+//! and fused one-workgroup-per-line kernels overflowed at just `limit + 1`
+//! lines.
 
 use std::sync::mpsc;
 
@@ -29,13 +30,40 @@ async fn run_cases() {
 
     // The fused N=2 kernel dispatches one workgroup per line. 65_537 lines
     // produce one padded workgroup in the balanced 32_769 x 2 grid.
-    roundtrip_c2c(&context, &[2], 65_537, C2cRoute::MixedRadix, 65_537);
-    // Rader sum dispatches one workgroup per line and exercises the same
-    // padded-grid guard independently of the element-index kernels.
-    roundtrip_c2c(&context, &[17], 65_537, C2cRoute::Rader, 65_537);
-    // Any valid Bluestein convolution for N=34 has at least 67 elements, so
-    // 62_601 lines require at least ceil(62_601 * 67 / 64) = 65_536 groups.
-    roundtrip_c2c(&context, &[34], 62_601, C2cRoute::Bluestein, 65_536);
+    roundtrip_c2c(
+        &context,
+        &[2],
+        65_537,
+        C2cRoute::MixedRadix,
+        65_537,
+        Some("fused-pow2-workgroup-stage"),
+    );
+    // N=67 uses a small fitting Rader convolution (M=132). The fused prime
+    // kernel dispatches exactly one workgroup per line.
+    roundtrip_c2c(
+        &context,
+        &[67],
+        65_537,
+        C2cRoute::Rader,
+        65_537,
+        Some("rader-fused-workgroup-stage"),
+    );
+    // N=68 routes through a small fitting Bluestein convolution (M=135) and
+    // likewise dispatches exactly one fused workgroup per line.
+    roundtrip_c2c(
+        &context,
+        &[68],
+        65_537,
+        C2cRoute::Bluestein,
+        65_537,
+        Some("bluestein-fused-workgroup-stage"),
+    );
+    // Retain coverage for the legacy multipass kernels as well. N=17 stays
+    // below the fused-prime floor, and its sum pass has one workgroup per line.
+    roundtrip_c2c(&context, &[17], 65_537, C2cRoute::Rader, 65_537, None);
+    // N=34 likewise remains a tiny Bluestein fallback; its flattened M=70
+    // pack/multiply dispatch exceeds the one-dimensional limit.
+    roundtrip_c2c(&context, &[34], 62_601, C2cRoute::Bluestein, 65_536, None);
     // Real conversion kernels share the same flat dispatch path. N=256 keeps
     // their element dispatch oversized without creating millions of mostly
     // idle fused child-FFT workgroups.
@@ -63,6 +91,7 @@ fn roundtrip_c2c(
     batch: usize,
     expected_route: C2cRoute,
     oversized_dispatch_workgroups: u64,
+    expected_fused_stage: Option<&str>,
 ) {
     let label = format!("c2c shape={shape:?} batch={batch}");
     let total: usize = shape.iter().product::<usize>() * batch;
@@ -99,6 +128,10 @@ fn roundtrip_c2c(
     .unwrap();
     assert_eq!(forward.route(), expected_route, "{label}");
     assert_eq!(inverse.route(), expected_route, "{label}");
+    if let Some(expected_fused_stage) = expected_fused_stage {
+        assert_single_fused_stage(&forward, expected_fused_stage, &label);
+        assert_single_fused_stage(&inverse, expected_fused_stage, &label);
+    }
 
     let mut encoder = context
         .device
@@ -117,6 +150,24 @@ fn roundtrip_c2c(
     let actual = read_f32(context, &readback_buffer);
     assert_roundtrip(&actual, &input, &label);
     eprintln!("passed {label}");
+}
+
+fn assert_single_fused_stage(plan: &FftPlan, expected_label: &str, case_label: &str) {
+    let diagnostics = plan.diagnostics();
+    let kernels = diagnostics
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind == "kernel")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kernels.len(),
+        1,
+        "{case_label}: expected one fused kernel stage, got {kernels:?}"
+    );
+    assert_eq!(
+        kernels[0].label, expected_label,
+        "{case_label}: expected fused stage"
+    );
 }
 
 fn roundtrip_real(context: &wgpu_fft::device::GpuContext, len: usize, batch: usize) {

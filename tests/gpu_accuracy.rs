@@ -21,46 +21,65 @@ async fn run_accuracy_cases() {
         return;
     };
     eprintln!("adapter: {:?}", context.adapter.get_info());
+    let storage_limit = context.device.limits().max_compute_workgroup_storage_size as u64;
 
-    for (label, config) in [
+    for (label, config, fused_stage) in [
         (
             "pow2-4096",
             FftConfig::new(4096).with_normalization(Normalization::None),
+            None,
         ),
         (
             "smooth-3000",
             FftConfig::new(3000).with_normalization(Normalization::None),
+            None,
         ),
         (
             "rader-2999",
             FftConfig::new(2999).with_normalization(Normalization::None),
+            Some(("rader-fused-workgroup-stage", 48_008u64)),
         ),
         (
             "bluestein-3256",
             FftConfig::new(3256).with_normalization(Normalization::None),
+            Some(("bluestein-fused-workgroup-stage", 52_272u64)),
         ),
         (
             "batched-nd-12x25x2",
             FftConfig::new_nd([12, 25])
                 .with_batch(2)
                 .with_normalization(Normalization::None),
+            None,
         ),
         (
             "smooth-3000-inverse",
             FftConfig::inverse(3000).with_normalization(Normalization::None),
+            None,
         ),
         (
             "rader-2999-inverse",
             FftConfig::inverse(2999).with_normalization(Normalization::None),
+            Some(("rader-fused-workgroup-stage", 48_008u64)),
         ),
         (
             "bluestein-3256-inverse",
             FftConfig::inverse(3256).with_normalization(Normalization::None),
+            Some(("bluestein-fused-workgroup-stage", 52_272u64)),
         ),
     ] {
         let input = test_signal(config.total_complex_len().unwrap());
         let reference = reference_c2c_f64(&input, &config);
-        let actual = execute_c2c(&context.device, &context.queue, config, &input);
+        let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
+        let fused_selected = fused_stage.is_some_and(|(_, bytes)| storage_limit >= bytes);
+        if let Some((stage_label, _)) = fused_stage.filter(|(_, bytes)| storage_limit >= *bytes) {
+            assert_single_fused_stage(&plan, stage_label, label);
+        }
+        if label.starts_with("bluestein-3256") && !fused_selected {
+            assert_multipass_prime_stage(&plan, "bluestein-fused-workgroup-stage", label);
+        }
+        if label.starts_with("rader-2999") && !fused_selected {
+            assert_no_fused_stage(&plan, "rader-fused-workgroup-stage", label);
+        }
         let metrics = accuracy_metrics(&actual, &reference);
         eprintln!(
             "ACCURACY label={label} max_relative={:.9e} rms_relative={:.9e} max_abs={:.9e} rms_abs={:.9e} reference_max={:.9e}",
@@ -75,8 +94,9 @@ async fn run_accuracy_cases() {
             "{label}: max relative error is unexpectedly large: {}",
             metrics.max_relative
         );
+        let rms_limit = if fused_selected { 3.0e-7 } else { 5.0e-7 };
         assert!(
-            metrics.rms_relative.is_finite() && metrics.rms_relative < 5.0e-7,
+            metrics.rms_relative.is_finite() && metrics.rms_relative < rms_limit,
             "{label}: RMS relative error is unexpectedly large: {}",
             metrics.rms_relative
         );
@@ -84,6 +104,16 @@ async fn run_accuracy_cases() {
 
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+fn assert_no_fused_stage(plan: &FftPlan, fused_label: &str, case_label: &str) {
+    assert!(
+        plan.diagnostics()
+            .stages()
+            .iter()
+            .all(|stage| stage.label != fused_label),
+        "{case_label}: unexpectedly selected {fused_label}"
+    );
 }
 
 fn test_signal(complex_len: usize) -> Vec<f32> {
@@ -144,12 +174,52 @@ fn accuracy_metrics(actual: &[f32], reference: &[Complex64]) -> AccuracyMetrics 
     }
 }
 
+fn assert_single_fused_stage(plan: &FftPlan, expected_label: &str, case_label: &str) {
+    let diagnostics = plan.diagnostics();
+    let kernels = diagnostics
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind == "kernel")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kernels.len(),
+        1,
+        "{case_label}: expected one fused kernel stage, got {kernels:?}"
+    );
+    assert_eq!(
+        kernels[0].label, expected_label,
+        "{case_label}: expected fused-prime stage"
+    );
+}
+
+fn assert_multipass_prime_stage(plan: &FftPlan, fused_label: &str, case_label: &str) {
+    let diagnostics = plan.diagnostics();
+    let kernels = diagnostics
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind == "kernel")
+        .collect::<Vec<_>>();
+    assert!(
+        kernels.len() > 1,
+        "{case_label}: expected multipass fallback"
+    );
+    assert_eq!(
+        kernels.len(),
+        15,
+        "{case_label}: expected unchanged 15-pass Bluestein fallback"
+    );
+    assert!(
+        kernels.iter().all(|stage| stage.label != fused_label),
+        "{case_label}: unexpectedly selected {fused_label}: {kernels:?}"
+    );
+}
+
 fn execute_c2c(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: FftConfig,
     input: &[f32],
-) -> Vec<f32> {
+) -> (Vec<f32>, FftPlan) {
     let plan = FftPlan::c2c(device, queue, config).unwrap();
     let byte_len = std::mem::size_of_val(input) as u64;
     let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -191,5 +261,5 @@ fn execute_c2c(
     let values = bytemuck::cast_slice(&mapped).to_vec();
     drop(mapped);
     readback.unmap();
-    values
+    (values, plan)
 }

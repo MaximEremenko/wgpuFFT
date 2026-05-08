@@ -146,6 +146,7 @@ pub(crate) enum PipelineLayoutCacheKey {
     C2cSmoothTwiddleLutF32,
     C2cStridedBinaryF32,
     DirectDftInterleavedF32Lut,
+    FusedPrimeInterleavedF32,
     RealBinaryF32,
     RaderBridgePostF32,
     RaderSumInterleavedF32,
@@ -168,6 +169,7 @@ impl PipelineLayoutCacheKey {
             Self::C2cSmoothTwiddleLutF32 => "c2c-smooth/twiddle-lut-f32",
             Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
             Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
+            Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
             Self::RealBinaryF32 => "real/binary-f32",
             Self::RaderBridgePostF32 => "bridge/rader-post-f32",
             Self::RaderSumInterleavedF32 => "rader/sum/interleaved-f32",
@@ -333,6 +335,7 @@ pub(crate) enum ShaderCacheKey {
     StockhamStage(StockhamStageKey),
     FusedPow2Stage(FusedPow2StageKey),
     FusedSmoothStage(FusedSmoothStageKey),
+    FusedPrimeStage(FusedPrimeStageKey),
     BridgeStage(BridgeStageKey),
     RaderStage(RaderStageKey),
     RealStage(RealStageKey),
@@ -347,6 +350,7 @@ impl ShaderCacheKey {
             Self::StockhamStage(key) => key.stable_key(),
             Self::FusedPow2Stage(key) => key.stable_key(),
             Self::FusedSmoothStage(key) => key.stable_key(),
+            Self::FusedPrimeStage(key) => key.stable_key(),
             Self::BridgeStage(key) => key.stable_key(),
             Self::RaderStage(key) => key.stable_key(),
             Self::RealStage(key) => key.stable_key(),
@@ -367,6 +371,14 @@ impl ShaderCacheKey {
             Self::FusedSmoothStage(key) => {
                 crate::runtime::axis_plan::generate_fused_smooth_stage_wgsl_for_key(key)
             }
+            Self::FusedPrimeStage(key) => match key.kind {
+                FusedPrimeKind::Rader => {
+                    crate::runtime::rader_axis::generate_fused_rader_wgsl_for_key(key)
+                }
+                FusedPrimeKind::Bluestein => {
+                    crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
+                }
+            },
             Self::BridgeStage(key) => crate::runtime::c2c::generate_bridge_wgsl_for_key(key),
             Self::RaderStage(key) => crate::runtime::rader_axis::generate_rader_wgsl_for_key(key),
             Self::RealStage(key) => crate::runtime::real::generate_real_wgsl_for_key(key),
@@ -389,6 +401,14 @@ impl ShaderCacheKey {
                 )
             }
             Self::FusedSmoothStage(key) => {
+                let limits = device.limits();
+                key.is_supported_by_limits(
+                    u64::from(limits.max_compute_workgroup_storage_size),
+                    limits.max_compute_invocations_per_workgroup,
+                    limits.max_compute_workgroup_size_x,
+                )
+            }
+            Self::FusedPrimeStage(key) => {
                 let limits = device.limits();
                 key.is_supported_by_limits(
                     u64::from(limits.max_compute_workgroup_storage_size),
@@ -430,6 +450,14 @@ impl ComputePipelineCacheKey {
             layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedSmoothStage(shader),
+        }
+    }
+
+    pub(crate) fn fused_prime_stage(shader: FusedPrimeStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::FusedPrimeStage(shader),
         }
     }
 
@@ -527,6 +555,21 @@ pub(crate) enum RaderKernelKind {
     Mul,
     WriteY0,
     Post,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FusedPrimeKind {
+    Rader,
+    Bluestein,
+}
+
+impl FusedPrimeKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rader => "rader",
+            Self::Bluestein => "bluestein",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -913,6 +956,110 @@ pub(crate) struct FusedSmoothStageKey {
     scale_bits: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FusedPrimeStageKey {
+    pub(crate) kind: FusedPrimeKind,
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) convolution_length: usize,
+    pub(crate) factors: Vec<usize>,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl FusedPrimeStageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        kind: FusedPrimeKind,
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        convolution_length: usize,
+        factors: &[usize],
+        direction: FftDirection,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert_eq!(factors.iter().product::<usize>(), convolution_length);
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            kind,
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            convolution_length,
+            factors: factors.to_vec(),
+            direction,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:fused-prime:{}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
+            self.kind.as_str(),
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            self.convolution_length,
+            dims_key(&self.factors),
+            direction_key(self.direction),
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+
+    pub(crate) fn is_supported_by_limits(
+        &self,
+        max_workgroup_storage_bytes: u64,
+        max_invocations_per_workgroup: u32,
+        max_workgroup_size_x: u32,
+    ) -> bool {
+        let Some(scratch_bytes) = self.convolution_length.checked_mul(8) else {
+            return false;
+        };
+        let extra_bytes = match self.kind {
+            FusedPrimeKind::Rader => 8usize,
+            FusedPrimeKind::Bluestein => 0usize,
+        };
+        let Some(workgroup_storage_bytes) = scratch_bytes.checked_add(extra_bytes) else {
+            return false;
+        };
+        workgroup_storage_bytes as u64 <= max_workgroup_storage_bytes
+            && self.workgroup_size <= max_invocations_per_workgroup
+            && self.workgroup_size <= max_workgroup_size_x
+    }
+}
+
 impl FusedSmoothStageKey {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1173,6 +1320,14 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
             uniform_entry(2),
             storage_entry(3, true),
             storage_entry(4, true),
+        ],
+        PipelineLayoutCacheKey::FusedPrimeInterleavedF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            uniform_entry(5),
         ],
         PipelineLayoutCacheKey::BridgeTwoWriteUniformF32 => vec![
             storage_entry(0, false),
@@ -1456,6 +1611,73 @@ mod tests {
     }
 
     #[test]
+    fn fused_prime_shader_key_is_stable_and_uses_typed_layout() {
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            2,
+            1,
+            &[4, 2999],
+            2999,
+            4,
+            6000,
+            &[8, 5, 5, 5, 3, 2],
+            FftDirection::Inverse,
+            256,
+            true,
+            0.5,
+        );
+
+        assert_eq!(key.scale_factor(), 0.5);
+        assert_eq!(
+            key.stable_key(),
+            "shader:v1:fused-prime:rader:rank=2:axis=1:dims=4x2999:n=2999:stride=4:m=6000:factors=8x5x5x5x3x2:direction=inverse:workgroup=256:scale=true:scale_bits=0x3f000000:twiddle=host-f64-f32-v1"
+        );
+        let pipeline = ComputePipelineCacheKey::fused_prime_stage(key);
+        assert_eq!(
+            pipeline.layout,
+            PipelineLayoutCacheKey::FusedPrimeInterleavedF32
+        );
+        assert!(pipeline.stable_key().starts_with(
+            "pipeline:v1:layout=fused-prime/interleaved-f32:entry=main:shader:v1:fused-prime:rader:"
+        ));
+    }
+
+    #[test]
+    fn fused_prime_shader_key_canonicalizes_scale_and_checks_kind_storage() {
+        let key = |kind, apply_scale, scale_factor| {
+            FusedPrimeStageKey::new(
+                kind,
+                1,
+                0,
+                &[2999],
+                2999,
+                1,
+                6000,
+                &[8, 5, 5, 5, 3, 2],
+                FftDirection::Forward,
+                256,
+                apply_scale,
+                scale_factor,
+            )
+        };
+
+        let rader = key(FusedPrimeKind::Rader, false, 1.0);
+        let rader_unused_scale = key(FusedPrimeKind::Rader, false, 1.0 / 2999.0);
+        assert_eq!(rader, rader_unused_scale);
+        assert_eq!(rader.scale_factor(), 1.0);
+        assert!(rader.is_supported_by_limits(48_008, 256, 256));
+        assert!(!rader.is_supported_by_limits(48_007, 256, 256));
+        assert!(!rader.is_supported_by_limits(48_008, 255, 256));
+        assert!(!rader.is_supported_by_limits(48_008, 256, 255));
+
+        let bluestein = key(FusedPrimeKind::Bluestein, false, 1.0);
+        assert!(bluestein.is_supported_by_limits(48_000, 256, 256));
+        assert!(!bluestein.is_supported_by_limits(47_999, 256, 256));
+        assert_ne!(rader, bluestein);
+        assert!(bluestein.stable_key().contains("fused-prime:bluestein"));
+    }
+
+    #[test]
     fn compute_pipeline_key_wraps_layout_entry_point_and_shader_key() {
         let shader = StockhamStageKey::new(
             1,
@@ -1502,6 +1724,7 @@ mod tests {
             ShaderCacheKey::StockhamStage(key) => key.clone(),
             ShaderCacheKey::FusedPow2Stage(_) => unreachable!(),
             ShaderCacheKey::FusedSmoothStage(_) => unreachable!(),
+            ShaderCacheKey::FusedPrimeStage(_) => unreachable!(),
             ShaderCacheKey::BridgeStage(_) => unreachable!(),
             ShaderCacheKey::RaderStage(_) => unreachable!(),
             ShaderCacheKey::RealStage(_) => unreachable!(),

@@ -3475,6 +3475,7 @@ fn work_items_for_bytes(bytes: u64, format: ElementFormat) -> u64 {
 
 #[derive(Debug, Clone)]
 struct ConvolutionGraphFfts {
+    fused: bool,
     forward_stage_kinds: Vec<AxisStageKind>,
     forward_workspace_bytes: u64,
     inverse_stage_kinds: Vec<AxisStageKind>,
@@ -3484,6 +3485,7 @@ struct ConvolutionGraphFfts {
 impl ConvolutionGraphFfts {
     fn rader(plan: &RaderAxis) -> Self {
         Self {
+            fused: plan.graph_is_fused(),
             forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
             inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
@@ -3493,6 +3495,7 @@ impl ConvolutionGraphFfts {
 
     fn bluestein(plan: &BluesteinAxis) -> Self {
         Self {
+            fused: plan.graph_is_fused(),
             forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
             inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
@@ -3508,11 +3511,11 @@ enum AxisSequenceGraphStep {
         workspace_bytes: u64,
     },
     Rader {
-        helpers: [HelperBufferRange; 6],
+        helpers: Vec<HelperBufferRange>,
         convolution: ConvolutionGraphFfts,
     },
     Bluestein {
-        helpers: [HelperBufferRange; 4],
+        helpers: Vec<HelperBufferRange>,
         convolution: ConvolutionGraphFfts,
     },
 }
@@ -3722,7 +3725,7 @@ fn add_axis_plan_kernel_stages_with_labels(
 }
 
 fn build_normal_rader_c2c_graph(
-    helpers: [HelperBufferRange; 6],
+    helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     required_bytes: u64,
     limits: LargePolicyLimits,
@@ -3735,11 +3738,37 @@ fn build_normal_rader_c2c_graph(
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
-    push_helper_windows(&mut graph, helpers, limits)?;
+    push_helper_windows(&mut graph, helpers.iter().copied(), limits)?;
 
-    let [perm, _bfft, sum, x0, work, fft] = helpers;
     let input = c2c_range(LogicalBufferId::Input, 0, required_bytes)?;
     let output = c2c_range(LogicalBufferId::Output, 0, required_bytes)?;
+    if convolution.fused {
+        graph.push_stage(
+            LargeStage::Kernel {
+                label: "rader-fused-workgroup-stage",
+                input,
+                output,
+                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        graph.push_stage(
+            LargeStage::HostWindow {
+                label: "logical-output",
+                range: output,
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        return Ok(graph);
+    }
+
+    let [perm, _bfft, sum, x0, work, fft] = helpers.as_slice() else {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "rader-normal-helpers",
+            reason: "non-fused Rader graph requires six helper buffers",
+        });
+    };
+    let (perm, sum, x0, work, fft) = (*perm, *sum, *x0, *work, *fft);
     let work_range = helper_range_from_info(work)?;
     let fft_range = helper_range_from_info(fft)?;
 
@@ -3845,7 +3874,7 @@ fn build_normal_rader_c2c_graph(
 }
 
 fn build_normal_bluestein_c2c_graph(
-    helpers: [HelperBufferRange; 4],
+    helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     required_bytes: u64,
     limits: LargePolicyLimits,
@@ -3858,11 +3887,37 @@ fn build_normal_bluestein_c2c_graph(
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
-    push_helper_windows(&mut graph, helpers, limits)?;
+    push_helper_windows(&mut graph, helpers.iter().copied(), limits)?;
 
-    let [chirp, _bfft, work, fft] = helpers;
     let input = c2c_range(LogicalBufferId::Input, 0, required_bytes)?;
     let output = c2c_range(LogicalBufferId::Output, 0, required_bytes)?;
+    if convolution.fused {
+        graph.push_stage(
+            LargeStage::Kernel {
+                label: "bluestein-fused-workgroup-stage",
+                input,
+                output,
+                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        graph.push_stage(
+            LargeStage::HostWindow {
+                label: "logical-output",
+                range: output,
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        return Ok(graph);
+    }
+
+    let [chirp, _bfft, work, fft] = helpers.as_slice() else {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "bluestein-normal-helpers",
+            reason: "non-fused Bluestein graph requires four helper buffers",
+        });
+    };
+    let (chirp, work, fft) = (*chirp, *work, *fft);
     let work_range = helper_range_from_info(work)?;
     let fft_range = helper_range_from_info(fft)?;
 
@@ -4056,15 +4111,34 @@ fn add_rader_c2c_stages(
     graph: &mut LargeExecutionGraph,
     input: LogicalRange,
     output: LogicalRange,
-    helpers: [HelperBufferRange; 6],
+    helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     helper_index_base: u32,
     required_bytes: u64,
     limits: LargePolicyLimits,
 ) -> Result<()> {
-    push_helper_windows_with_base(graph, helpers, helper_index_base, limits)?;
+    push_helper_windows_with_base(graph, helpers.iter().copied(), helper_index_base, limits)?;
 
-    let [perm, _bfft, sum, x0, work, fft] = helpers;
+    if convolution.fused {
+        graph.push_stage(
+            LargeStage::Kernel {
+                label: "rader-fused-workgroup-stage",
+                input,
+                output,
+                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        return Ok(());
+    }
+
+    let [perm, _bfft, sum, x0, work, fft] = helpers.as_slice() else {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "rader-axis-sequence-helpers",
+            reason: "non-fused Rader graph requires six helper buffers",
+        });
+    };
+    let (perm, sum, x0, work, fft) = (*perm, *sum, *x0, *work, *fft);
     let work_range = helper_range_from_info_with_base(work, helper_index_base)?;
     let fft_range = helper_range_from_info_with_base(fft, helper_index_base)?;
 
@@ -4166,15 +4240,34 @@ fn add_bluestein_c2c_stages(
     graph: &mut LargeExecutionGraph,
     input: LogicalRange,
     output: LogicalRange,
-    helpers: [HelperBufferRange; 4],
+    helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     helper_index_base: u32,
     required_bytes: u64,
     limits: LargePolicyLimits,
 ) -> Result<()> {
-    push_helper_windows_with_base(graph, helpers, helper_index_base, limits)?;
+    push_helper_windows_with_base(graph, helpers.iter().copied(), helper_index_base, limits)?;
 
-    let [chirp, _bfft, work, fft] = helpers;
+    if convolution.fused {
+        graph.push_stage(
+            LargeStage::Kernel {
+                label: "bluestein-fused-workgroup-stage",
+                input,
+                output,
+                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            },
+            graph_requirements_covering(limits, 1, required_bytes, 0)?,
+        )?;
+        return Ok(());
+    }
+
+    let [chirp, _bfft, work, fft] = helpers.as_slice() else {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "bluestein-axis-sequence-helpers",
+            reason: "non-fused Bluestein graph requires four helper buffers",
+        });
+    };
+    let (chirp, work, fft) = (*chirp, *work, *fft);
     let work_range = helper_range_from_info_with_base(work, helper_index_base)?;
     let fft_range = helper_range_from_info_with_base(fft, helper_index_base)?;
 
@@ -7140,11 +7233,11 @@ mod tests {
                     workspace_bytes: 128,
                 },
                 AxisSequenceGraphStep::Rader {
-                    helpers: rader_helpers,
+                    helpers: rader_helpers.to_vec(),
                     convolution: test_convolution_ffts(),
                 },
                 AxisSequenceGraphStep::Bluestein {
-                    helpers: bluestein_helpers,
+                    helpers: bluestein_helpers.to_vec(),
                     convolution: test_convolution_ffts(),
                 },
             ],
@@ -7337,6 +7430,7 @@ mod tests {
 
     fn test_convolution_ffts() -> ConvolutionGraphFfts {
         ConvolutionGraphFfts {
+            fused: false,
             forward_stage_kinds: vec![
                 AxisStageKind::Stockham { radix: 8, ns: 8 },
                 AxisStageKind::Stockham { radix: 2, ns: 16 },
@@ -7347,6 +7441,16 @@ mod tests {
                 AxisStageKind::Stockham { radix: 2, ns: 16 },
             ],
             inverse_workspace_bytes: 128,
+        }
+    }
+
+    fn test_fused_convolution() -> ConvolutionGraphFfts {
+        ConvolutionGraphFfts {
+            fused: true,
+            forward_stage_kinds: Vec::new(),
+            forward_workspace_bytes: 0,
+            inverse_stage_kinds: Vec::new(),
+            inverse_workspace_bytes: 0,
         }
     }
 
@@ -7643,7 +7747,8 @@ mod tests {
             helper("rader-fft-helper", 5, 128, ElementFormat::ComplexF32),
         ];
         let graph =
-            build_normal_rader_c2c_graph(helpers, test_convolution_ffts(), 128, limits).unwrap();
+            build_normal_rader_c2c_graph(helpers.to_vec(), test_convolution_ffts(), 128, limits)
+                .unwrap();
 
         assert_eq!(graph.stages().len(), 19);
         for label in [
@@ -7686,6 +7791,58 @@ mod tests {
     }
 
     #[test]
+    fn fused_prime_graphs_expose_one_kernel_and_only_common_helpers() {
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 4096,
+            max_buffer_size: 4096,
+        };
+        let rader = build_normal_rader_c2c_graph(
+            vec![
+                helper("rader-permutation-helper", 0, 64, ElementFormat::U32),
+                helper("rader-bfft-helper", 1, 128, ElementFormat::ComplexF32),
+            ],
+            test_fused_convolution(),
+            128,
+            limits,
+        )
+        .unwrap();
+        let bluestein = build_normal_bluestein_c2c_graph(
+            vec![
+                helper("bluestein-chirp-helper", 0, 128, ElementFormat::ComplexF32),
+                helper("bluestein-bfft-helper", 1, 128, ElementFormat::ComplexF32),
+            ],
+            test_fused_convolution(),
+            128,
+            limits,
+        )
+        .unwrap();
+
+        for (graph, label) in [
+            (&rader, "rader-fused-workgroup-stage"),
+            (&bluestein, "bluestein-fused-workgroup-stage"),
+        ] {
+            let kernels = graph
+                .stages()
+                .iter()
+                .filter(|stage| matches!(stage, LargeStage::Kernel { .. }))
+                .collect::<Vec<_>>();
+            assert_eq!(kernels.len(), 1);
+            assert_eq!(kernels[0].label(), label);
+            assert_eq!(graph.stages().first().unwrap().label(), "logical-input");
+            assert_eq!(graph.stages().last().unwrap().label(), "logical-output");
+            assert!(!graph.stages().iter().any(|stage| {
+                matches!(
+                    stage.label(),
+                    "rader-work-helper"
+                        | "rader-fft-helper"
+                        | "bluestein-work-helper"
+                        | "bluestein-fft-helper"
+                )
+            }));
+        }
+    }
+
+    #[test]
     fn normal_bluestein_graph_exposes_helper_and_kernel_stages() {
         let limits = LargePolicyLimits {
             max_storage_buffer_binding_size: 4096,
@@ -7697,8 +7854,13 @@ mod tests {
             helper("bluestein-work-helper", 2, 128, ElementFormat::ComplexF32),
             helper("bluestein-fft-helper", 3, 128, ElementFormat::ComplexF32),
         ];
-        let graph = build_normal_bluestein_c2c_graph(helpers, test_convolution_ffts(), 128, limits)
-            .unwrap();
+        let graph = build_normal_bluestein_c2c_graph(
+            helpers.to_vec(),
+            test_convolution_ffts(),
+            128,
+            limits,
+        )
+        .unwrap();
 
         assert_eq!(graph.stages().len(), 15);
         for label in [

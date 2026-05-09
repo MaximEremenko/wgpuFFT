@@ -12,6 +12,7 @@ use crate::runtime::bluestein_axis::{
 };
 use crate::runtime::buffer_view::{BufferLayout, BufferView, FftIoView};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
+use crate::runtime::four_step::FourStepC2cPlan;
 use crate::runtime::large_bridge::{plan_large_bridge, LargeBridgePlan, LargeBridgeRoute};
 use crate::runtime::large_chunk::LargeChunkPlan;
 use crate::runtime::large_graph::{
@@ -173,6 +174,7 @@ enum C2cExecution {
     SmoothDecomposition(SmoothDecompositionC2cPlan),
     LargeBridge(LargeBridgeC2cPlan),
     LargeAxisSequence(LargeAxisSequenceC2cPlan),
+    FourStep(FourStepC2cPlan),
 }
 
 enum C2cRouteImpl {
@@ -498,12 +500,6 @@ impl C2cPlan {
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
         let mut large_routing_policy =
             resolve_c2c_large_routing_policy(device, &config, &axis_kinds, policy_limits)?;
-        if large_routing_policy.route_mode() == LargeRouteMode::LargeOutOfCore {
-            return Err(FftError::LargeRouteUnsupported {
-                route_mode: large_routing_policy.route_mode().as_str(),
-                reason_codes: large_routing_policy.reason_codes().to_vec(),
-            });
-        }
         let route = select_route(&config);
 
         let execution = match large_routing_policy.route_mode() {
@@ -679,12 +675,30 @@ impl C2cPlan {
                     output_stage,
                 })
             }
-            LargeRouteMode::LargeOutOfCore => unreachable!("out-of-core was rejected above"),
+            LargeRouteMode::LargeOutOfCore => {
+                let limits =
+                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                if config.required_buffer_size_bytes()? > limits.max_buffer_size {
+                    return Err(FftError::OutOfCoreExecutionUnsupported {
+                        reason: "four-step full volume exceeds maxBufferSize; segmented full-volume execution is not implemented",
+                    });
+                }
+                let plan = FourStepC2cPlan::new(device, queue, &config, limits)?;
+                large_routing_policy = large_routing_policy
+                    .with_execution_kind(LargeExecutionKind::OutOfCoreFourStep)
+                    .with_diagnostics(None, plan.factor_splits(), plan.staging_bytes(), None);
+                C2cExecution::FourStep(plan)
+            }
         };
         let axis_factors = match &execution {
             C2cExecution::Normal(route_impl) => axis_factors_for_route_impl(&config, route_impl)?,
             C2cExecution::LargeChunk(plan) => plan.child.axis_factors().to_vec(),
             C2cExecution::LargeAxisSequence(plan) => plan.axis_factors(),
+            C2cExecution::FourStep(_) => config
+                .axes()
+                .iter()
+                .map(|&axis| crate::runtime::factor_supported_length(config.shape()[axis]))
+                .collect::<Result<Vec<_>>>()?,
             C2cExecution::SmoothDecomposition(_) | C2cExecution::LargeBridge(_) => config
                 .axes()
                 .iter()
@@ -741,6 +755,7 @@ impl C2cPlan {
             C2cExecution::SmoothDecomposition(_) => 0,
             C2cExecution::LargeBridge(_) => 0,
             C2cExecution::LargeAxisSequence(_) => 0,
+            C2cExecution::FourStep(_) => 0,
         }
     }
 
@@ -757,6 +772,7 @@ impl C2cPlan {
                     bytes.saturating_add(child.twiddle_lut_storage_bytes())
                 })
             }
+            C2cExecution::FourStep(plan) => plan.twiddle_lut_storage_bytes(),
         }
     }
 
@@ -780,6 +796,7 @@ impl C2cPlan {
                 plan.execution_graph(self.required_buffer_size_bytes())
             }
             C2cExecution::LargeAxisSequence(plan) => Ok(plan.graph_plan.graph().clone()),
+            C2cExecution::FourStep(plan) => Ok(plan.graph_plan().graph().clone()),
         }
     }
 
@@ -838,7 +855,7 @@ impl C2cPlan {
     ) -> Result<()> {
         if self.is_large_route() {
             return Err(FftError::LargeRouteWorkspaceUnsupported {
-                route_mode: LargeRouteMode::LargeChunk.as_str(),
+                route_mode: self.large_routing_policy.route_mode().as_str(),
             });
         }
         let input = self.validate_io_view(device, input)?;
@@ -872,7 +889,7 @@ impl C2cPlan {
     ) -> Result<()> {
         if self.is_large_route() {
             return Err(FftError::LargeRouteWorkspaceUnsupported {
-                route_mode: LargeRouteMode::LargeChunk.as_str(),
+                route_mode: self.large_routing_policy.route_mode().as_str(),
             });
         }
         let input = self.validate_io_layout(device, input)?;
@@ -954,8 +971,11 @@ impl C2cPlan {
         self.validate_execution_graph(device)?;
         if workspace.is_some() && self.is_large_route() {
             return Err(FftError::LargeRouteWorkspaceUnsupported {
-                route_mode: LargeRouteMode::LargeChunk.as_str(),
+                route_mode: self.large_routing_policy.route_mode().as_str(),
             });
+        }
+        if let C2cExecution::FourStep(plan) = &self.execution {
+            return plan.execute_views(device, encoder, input, output);
         }
         if let C2cExecution::LargeChunk(plan) = &self.execution {
             return plan.execute_views(device, encoder, input, output);
@@ -1030,6 +1050,12 @@ impl C2cPlan {
         output: C2cIoLayout<'_>,
         workspace: Option<BufferView<'_>>,
     ) -> Result<()> {
+        if matches!(&self.execution, C2cExecution::FourStep(_)) {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "four-step-logical-io",
+                reason: "phase-A four-step execution does not yet support strided logical I/O",
+            });
+        }
         let required = self.required_buffer_size_bytes();
         let input_stage = if input.contiguous {
             if input.view.is_single_segment() {
@@ -1200,14 +1226,14 @@ impl C2cPlan {
             },
             C2cExecution::LargeChunk(_) | C2cExecution::SmoothDecomposition(_) => {
                 Err(FftError::LargeRouteWorkspaceUnsupported {
-                    route_mode: LargeRouteMode::LargeChunk.as_str(),
+                    route_mode: self.large_routing_policy.route_mode().as_str(),
                 })
             }
-            C2cExecution::LargeBridge(_) | C2cExecution::LargeAxisSequence(_) => {
-                Err(FftError::LargeRouteWorkspaceUnsupported {
-                    route_mode: LargeRouteMode::LargeChunk.as_str(),
-                })
-            }
+            C2cExecution::LargeBridge(_)
+            | C2cExecution::LargeAxisSequence(_)
+            | C2cExecution::FourStep(_) => Err(FftError::LargeRouteWorkspaceUnsupported {
+                route_mode: self.large_routing_policy.route_mode().as_str(),
+            }),
         }
     }
 
@@ -1268,6 +1294,7 @@ impl C2cPlan {
                 | C2cExecution::SmoothDecomposition(_)
                 | C2cExecution::LargeBridge(_)
                 | C2cExecution::LargeAxisSequence(_)
+                | C2cExecution::FourStep(_)
         )
     }
 
@@ -4582,6 +4609,16 @@ fn remap_child_c2c_stage(
                 stage_index_base,
             )?,
         },
+        LargeStage::WindowedHelper { label, range } => LargeStage::WindowedHelper {
+            label,
+            range: remap_child_c2c_range(
+                range,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+        },
         LargeStage::Kernel {
             label,
             input,
@@ -4651,6 +4688,44 @@ fn remap_child_c2c_stage(
             )?,
             work_items,
         },
+        LargeStage::StripeTranspose {
+            label,
+            input,
+            output,
+            work_items,
+        } => LargeStage::StripeTranspose {
+            label,
+            input: remap_child_c2c_range(
+                input,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+            output: remap_child_c2c_range(
+                output,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+            work_items,
+        },
+        LargeStage::Scale {
+            label,
+            range,
+            work_items,
+        } => LargeStage::Scale {
+            label,
+            range: remap_child_c2c_range(
+                range,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+            work_items,
+        },
         LargeStage::HostWindow { label, range } => LargeStage::HostWindow {
             label,
             range: remap_child_c2c_range(
@@ -4708,12 +4783,14 @@ fn max_stage_range_bytes(stage: &LargeStage) -> u64 {
 
 fn stage_scratch_bytes(stage: &LargeStage) -> u64 {
     match stage {
-        LargeStage::HelperWindow { range, .. } | LargeStage::HostWindow { range, .. } => {
-            range.size_bytes
-        }
+        LargeStage::HelperWindow { range, .. }
+        | LargeStage::WindowedHelper { range, .. }
+        | LargeStage::Scale { range, .. }
+        | LargeStage::HostWindow { range, .. } => range.size_bytes,
         LargeStage::Kernel { input, output, .. }
         | LargeStage::WindowedKernel { input, output, .. }
-        | LargeStage::TwiddleTranspose { input, output, .. } => {
+        | LargeStage::TwiddleTranspose { input, output, .. }
+        | LargeStage::StripeTranspose { input, output, .. } => {
             input.size_bytes.max(output.size_bytes)
         }
         LargeStage::Copy { src, dst, .. } | LargeStage::GatherScatter { src, dst, .. } => {
@@ -5018,6 +5095,12 @@ fn resolve_c2c_large_routing_policy(
         .collect::<Result<Vec<_>>>()?;
     let bytes_per_batch = bytes_per_batch(config)?;
     let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+    let four_step_phase_a_supported = config.shape().len() == 2
+        && config.axes() == [0, 1]
+        && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
+        && line_bytes
+            .iter()
+            .all(|&bytes| bytes <= limits.max_storage_buffer_binding_size);
 
     resolve_large_routing_policy(LargeRoutingPolicyInput {
         limits,
@@ -5025,7 +5108,7 @@ fn resolve_c2c_large_routing_policy(
         line_bytes: &line_bytes,
         axis_kinds: Some(axis_kinds),
         axis_lengths: Some(&axis_lengths),
-        allow_out_of_core: false,
+        allow_out_of_core: four_step_phase_a_supported,
         rank: config.shape().len(),
         bytes_per_batch: Some(bytes_per_batch),
         ..LargeRoutingPolicyInput::new(limits, &[])

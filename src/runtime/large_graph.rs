@@ -93,9 +93,12 @@ pub(crate) enum LargeStageKind {
     Copy,
     GatherScatter,
     HelperWindow,
+    WindowedHelper,
     Kernel,
     WindowedKernel,
     TwiddleTranspose,
+    StripeTranspose,
+    Scale,
     HostWindow,
 }
 
@@ -113,6 +116,10 @@ pub(crate) enum LargeStage {
         stride_elements: u64,
     },
     HelperWindow {
+        label: &'static str,
+        range: LogicalRange,
+    },
+    WindowedHelper {
         label: &'static str,
         range: LogicalRange,
     },
@@ -134,6 +141,17 @@ pub(crate) enum LargeStage {
         output: LogicalRange,
         work_items: u64,
     },
+    StripeTranspose {
+        label: &'static str,
+        input: LogicalRange,
+        output: LogicalRange,
+        work_items: u64,
+    },
+    Scale {
+        label: &'static str,
+        range: LogicalRange,
+        work_items: u64,
+    },
     HostWindow {
         label: &'static str,
         range: LogicalRange,
@@ -146,9 +164,12 @@ impl LargeStage {
             Self::Copy { .. } => LargeStageKind::Copy,
             Self::GatherScatter { .. } => LargeStageKind::GatherScatter,
             Self::HelperWindow { .. } => LargeStageKind::HelperWindow,
+            Self::WindowedHelper { .. } => LargeStageKind::WindowedHelper,
             Self::Kernel { .. } => LargeStageKind::Kernel,
             Self::WindowedKernel { .. } => LargeStageKind::WindowedKernel,
             Self::TwiddleTranspose { .. } => LargeStageKind::TwiddleTranspose,
+            Self::StripeTranspose { .. } => LargeStageKind::StripeTranspose,
+            Self::Scale { .. } => LargeStageKind::Scale,
             Self::HostWindow { .. } => LargeStageKind::HostWindow,
         }
     }
@@ -158,9 +179,12 @@ impl LargeStage {
             Self::Copy { label, .. }
             | Self::GatherScatter { label, .. }
             | Self::HelperWindow { label, .. }
+            | Self::WindowedHelper { label, .. }
             | Self::Kernel { label, .. }
             | Self::WindowedKernel { label, .. }
             | Self::TwiddleTranspose { label, .. }
+            | Self::StripeTranspose { label, .. }
+            | Self::Scale { label, .. }
             | Self::HostWindow { label, .. } => label,
         }
     }
@@ -170,10 +194,13 @@ impl LargeStage {
             Self::Copy { src, dst, .. } | Self::GatherScatter { src, dst, .. } => {
                 vec![*src, *dst]
             }
-            Self::HelperWindow { range, .. } => vec![*range],
+            Self::HelperWindow { range, .. }
+            | Self::WindowedHelper { range, .. }
+            | Self::Scale { range, .. } => vec![*range],
             Self::Kernel { input, output, .. }
             | Self::WindowedKernel { input, output, .. }
-            | Self::TwiddleTranspose { input, output, .. } => vec![*input, *output],
+            | Self::TwiddleTranspose { input, output, .. }
+            | Self::StripeTranspose { input, output, .. } => vec![*input, *output],
             Self::HostWindow { range, .. } => vec![*range],
         }
     }
@@ -182,7 +209,10 @@ impl LargeStage {
         match self {
             Self::Copy { .. }
             | Self::GatherScatter { .. }
+            | Self::WindowedHelper { .. }
             | Self::WindowedKernel { .. }
+            | Self::StripeTranspose { .. }
+            | Self::Scale { .. }
             | Self::HostWindow { .. } => Vec::new(),
             Self::HelperWindow { range, .. } => vec![*range],
             Self::Kernel { input, output, .. } | Self::TwiddleTranspose { input, output, .. } => {
@@ -204,10 +234,16 @@ impl LargeStage {
                 Some(*work_items)
             }
             Self::WindowedKernel { work_items, .. } => Some(*work_items),
+            Self::StripeTranspose { work_items, .. } | Self::Scale { work_items, .. } => {
+                Some(*work_items)
+            }
             Self::GatherScatter {
                 stride_elements, ..
             } => Some(*stride_elements),
-            Self::Copy { .. } | Self::HelperWindow { .. } | Self::HostWindow { .. } => None,
+            Self::Copy { .. }
+            | Self::HelperWindow { .. }
+            | Self::WindowedHelper { .. }
+            | Self::HostWindow { .. } => None,
         }
     }
 }

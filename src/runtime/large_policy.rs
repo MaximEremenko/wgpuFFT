@@ -43,6 +43,7 @@ pub enum LargeExecutionKind {
     AxisDecomposition,
     RaderBridge,
     BluesteinBridge,
+    OutOfCoreFourStep,
     OutOfCoreUnsupported,
 }
 
@@ -55,6 +56,7 @@ impl LargeExecutionKind {
             Self::AxisDecomposition => "axis-decomposition",
             Self::RaderBridge => "rader-bridge",
             Self::BluesteinBridge => "bluestein-bridge",
+            Self::OutOfCoreFourStep => "out-of-core-four-step",
             Self::OutOfCoreUnsupported => "out-of-core-unsupported",
         }
     }

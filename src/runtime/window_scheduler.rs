@@ -359,7 +359,7 @@ mod tests {
         }
     }
 
-    fn route_source_files() -> [(&'static str, &'static str); 11] {
+    fn route_source_files() -> [(&'static str, &'static str); 12] {
         [
             ("runtime/axis_plan.rs", include_str!("axis_plan.rs")),
             (
@@ -367,6 +367,7 @@ mod tests {
                 include_str!("bluestein_axis.rs"),
             ),
             ("runtime/c2c.rs", include_str!("c2c.rs")),
+            ("runtime/four_step.rs", include_str!("four_step.rs")),
             ("runtime/large_bridge.rs", include_str!("large_bridge.rs")),
             ("runtime/large_chunk.rs", include_str!("large_chunk.rs")),
             ("runtime/large_graph.rs", include_str!("large_graph.rs")),

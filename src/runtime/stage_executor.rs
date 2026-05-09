@@ -246,10 +246,11 @@ fn stage_blockers(stage: &LargeStage, route: &str, limits: SchedulerLimits) -> V
 }
 
 fn with_stage_helper_context(blocker: FftBlocker, stage: &LargeStage) -> FftBlocker {
-    if let LargeStage::HelperWindow { label, .. } = stage {
-        blocker.with_helper_buffer(*label)
-    } else {
-        blocker
+    match stage {
+        LargeStage::HelperWindow { label, .. } | LargeStage::WindowedHelper { label, .. } => {
+            blocker.with_helper_buffer(*label)
+        }
+        _ => blocker,
     }
 }
 
@@ -257,11 +258,13 @@ fn stage_range_layout(stage: &LargeStage) -> &'static str {
     match stage {
         LargeStage::Copy { .. } => "copy range",
         LargeStage::GatherScatter { .. } => "gather/scatter range",
-        LargeStage::HelperWindow { .. } => "helper buffer",
+        LargeStage::HelperWindow { .. } | LargeStage::WindowedHelper { .. } => "helper buffer",
         LargeStage::HostWindow { .. } => "host window",
         LargeStage::Kernel { .. }
         | LargeStage::WindowedKernel { .. }
-        | LargeStage::TwiddleTranspose { .. } => "logical range",
+        | LargeStage::TwiddleTranspose { .. }
+        | LargeStage::StripeTranspose { .. }
+        | LargeStage::Scale { .. } => "logical range",
     }
 }
 

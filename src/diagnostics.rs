@@ -398,6 +398,20 @@ pub(crate) fn stage_summaries_for_route(
                 Some(required_bytes),
             ));
         }
+        LargeExecutionKind::OutOfCoreFourStep => {
+            stages.push(FftStageSummary::new(
+                "four-step-window-schedule",
+                "window-schedule",
+                route.clone(),
+                Some(required_bytes),
+            ));
+            stages.push(FftStageSummary::new(
+                "four-step-stage-graph",
+                "stage-graph",
+                route,
+                Some(required_bytes),
+            ));
+        }
         LargeExecutionKind::OutOfCoreUnsupported => {
             stages.push(FftStageSummary::new(
                 "out-of-core-required",
@@ -435,8 +449,10 @@ pub(crate) fn helper_buffer_requirements_from_graph(
 ) -> Vec<FftBufferRequirement> {
     let mut requirements: Vec<FftBufferRequirement> = Vec::new();
     for stage in graph.stages() {
-        let LargeStage::HelperWindow { label, range } = stage else {
-            continue;
+        let (label, range) = match stage {
+            LargeStage::HelperWindow { label, range }
+            | LargeStage::WindowedHelper { label, range } => (label, range),
+            _ => continue,
         };
         let role = format!("helper:{label}");
         let format = element_format_label(range.format);
@@ -470,6 +486,8 @@ pub(crate) fn stage_route_for_label(label: &str, default_route: &str) -> String 
         "direct-dft"
     } else if label.starts_with("large-chunk-") {
         "large-chunk"
+    } else if label.starts_with("four-step-") {
+        "large-out-of-core"
     } else if label.starts_with("large-axis-sequence-") || label.starts_with("axis-sequence-") {
         "axis-sequence"
     } else if label.starts_with("mixed-axis-") || label.starts_with("smooth-axis-") {
@@ -498,9 +516,12 @@ fn stage_kind_label(kind: LargeStageKind) -> &'static str {
         LargeStageKind::Copy => "copy",
         LargeStageKind::GatherScatter => "gather-scatter",
         LargeStageKind::HelperWindow => "helper-buffer-window",
+        LargeStageKind::WindowedHelper => "windowed-helper-buffer",
         LargeStageKind::Kernel => "kernel",
         LargeStageKind::WindowedKernel => "windowed-kernel",
         LargeStageKind::TwiddleTranspose => "twiddle-transpose",
+        LargeStageKind::StripeTranspose => "stripe-transpose",
+        LargeStageKind::Scale => "scale",
         LargeStageKind::HostWindow => "host-window",
     }
 }
@@ -510,7 +531,9 @@ fn stage_required_bytes(stage: &LargeStage) -> Option<u64> {
         LargeStage::Copy { src, dst, .. } | LargeStage::GatherScatter { src, dst, .. } => {
             src.size_bytes.max(dst.size_bytes)
         }
-        LargeStage::HelperWindow { range, .. } => range.size_bytes,
+        LargeStage::HelperWindow { range, .. }
+        | LargeStage::WindowedHelper { range, .. }
+        | LargeStage::Scale { range, .. } => range.size_bytes,
         LargeStage::Kernel {
             input,
             output,
@@ -524,6 +547,12 @@ fn stage_required_bytes(stage: &LargeStage) -> Option<u64> {
             ..
         }
         | LargeStage::TwiddleTranspose {
+            input,
+            output,
+            work_items,
+            ..
+        }
+        | LargeStage::StripeTranspose {
             input,
             output,
             work_items,

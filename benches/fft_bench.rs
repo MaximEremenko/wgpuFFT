@@ -81,7 +81,8 @@ struct BenchCase {
 struct CaseResult {
     route: String,
     axis_kinds: String,
-    pass_count: u64,
+    graph_stage_count: u64,
+    traffic_equivalent_pass_count: u64,
     pass_count_method: String,
     buffer_size: u64,
     external_io_bytes: u64,
@@ -428,7 +429,8 @@ async fn run_case(
 
     let mut route = None;
     let mut axis_kinds = None;
-    let mut pass_count = None;
+    let mut graph_stage_count = None;
+    let mut traffic_equivalent_pass_count = None;
     let mut pass_count_method = None;
     let mut plan_workspace_requirement_bytes = None;
     let mut diagnostic_helper_requirement_total = None;
@@ -479,8 +481,15 @@ async fn run_case(
             diagnostic_helper_requirement_bytes(&forward_diagnostics)?
                 .checked_add(diagnostic_helper_requirement_bytes(&inverse_diagnostics)?)
                 .ok_or_else(|| input_error("combined plan helper requirement overflow"))?;
-        let (forward_passes, forward_pass_method) = compute_pass_count(&forward_diagnostics)?;
-        let (inverse_passes, inverse_pass_method) = compute_pass_count(&inverse_diagnostics)?;
+        let (forward_graph_stages, forward_passes, forward_pass_method) =
+            compute_pass_count(&forward_diagnostics)?;
+        let (inverse_graph_stages, inverse_passes, inverse_pass_method) =
+            compute_pass_count(&inverse_diagnostics)?;
+        if forward_graph_stages != inverse_graph_stages {
+            return Err(input_error(format!(
+                "forward/inverse graph-stage mismatch: {forward_graph_stages} versus {inverse_graph_stages}"
+            )));
+        }
         if forward_passes != inverse_passes {
             return Err(input_error(format!(
                 "forward/inverse compute-pass mismatch: {forward_passes} versus {inverse_passes}"
@@ -509,7 +518,16 @@ async fn run_case(
 
         ensure_consistent(&mut route, this_route, "route")?;
         ensure_consistent(&mut axis_kinds, this_axis_kinds, "axis kinds")?;
-        ensure_consistent(&mut pass_count, forward_passes, "compute pass count")?;
+        ensure_consistent(
+            &mut graph_stage_count,
+            forward_graph_stages,
+            "graph stage count",
+        )?;
+        ensure_consistent(
+            &mut traffic_equivalent_pass_count,
+            forward_passes,
+            "traffic-equivalent pass count",
+        )?;
         ensure_consistent(
             &mut pass_count_method,
             forward_pass_method,
@@ -615,7 +633,10 @@ async fn run_case(
     Ok(CaseResult {
         route: route.ok_or_else(|| input_error("benchmark produced no route"))?,
         axis_kinds: axis_kinds.ok_or_else(|| input_error("benchmark produced no axis kinds"))?,
-        pass_count: pass_count.ok_or_else(|| input_error("benchmark produced no pass count"))?,
+        graph_stage_count: graph_stage_count
+            .ok_or_else(|| input_error("benchmark produced no graph stage count"))?,
+        traffic_equivalent_pass_count: traffic_equivalent_pass_count
+            .ok_or_else(|| input_error("benchmark produced no traffic-equivalent pass count"))?,
         pass_count_method: pass_count_method
             .ok_or_else(|| input_error("benchmark produced no pass-count method"))?,
         buffer_size: expected_buffer_size,
@@ -766,7 +787,7 @@ fn wait_for_submission(
         })
 }
 
-fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, String)> {
+fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, String)> {
     if !diagnostics.blockers().is_empty() {
         return Err(input_error(format!(
             "plan diagnostics contain {} blocker(s)",
@@ -774,17 +795,36 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, String)
         )));
     }
 
-    let mut count = diagnostics
+    let mut graph_count = diagnostics
         .stages()
         .iter()
         .filter(|stage| {
             matches!(
                 stage.kind.as_str(),
-                "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose"
+                "kernel"
+                    | "windowed-kernel"
+                    | "gather-scatter"
+                    | "twiddle-transpose"
+                    | "permutation"
+                    | "stripe-transpose"
+                    | "scale"
             )
         })
         .count();
-    if count == 0 {
+    let mut traffic_count: usize = diagnostics
+        .stages()
+        .iter()
+        .map(|stage| match stage.kind.as_str() {
+            // The rank-2 stripe route gathers into compact storage, runs the
+            // transpose kernel, then scatters back: three full-volume
+            // read/write traffic passes per logical transpose.
+            "stripe-transpose" => 3usize,
+            "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose"
+            | "permutation" | "scale" => 1,
+            _ => 0,
+        })
+        .sum();
+    if graph_count == 0 || traffic_count == 0 {
         return Err(input_error(
             "diagnostics reported no FFT axis-pass graph stages",
         ));
@@ -801,21 +841,26 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, String)
             .iter()
             .filter(|stage| stage.label == "large-chunk-copy-input")
             .count();
-        if chunk_count == 0 || count % chunk_count != 0 {
+        if chunk_count == 0 || graph_count % chunk_count != 0 || traffic_count % chunk_count != 0 {
             return Err(input_error(format!(
-                "cannot collapse batch-chunk graph: {count} pass-like stages across {chunk_count} chunks"
+                "cannot collapse batch-chunk graph: {graph_count} graph stages and {traffic_count} traffic-equivalent passes across {chunk_count} chunks"
             )));
         }
-        count /= chunk_count;
+        graph_count /= chunk_count;
+        traffic_count /= chunk_count;
         "estimated-batch-chunk-collapsed"
     } else if execution_kind == "normal" {
         "exact-normal-graph"
+    } else if execution_kind == "out-of-core-four-step" {
+        "exact-four-step-traffic-equivalent"
     } else {
         "estimated-graph"
     };
-    let count =
-        u64::try_from(count).map_err(|_| input_error("compute pass count does not fit u64"))?;
-    Ok((count, method.to_owned()))
+    let graph_count = u64::try_from(graph_count)
+        .map_err(|_| input_error("graph stage count does not fit u64"))?;
+    let traffic_count = u64::try_from(traffic_count)
+        .map_err(|_| input_error("traffic-equivalent pass count does not fit u64"))?;
+    Ok((graph_count, traffic_count, method.to_owned()))
 }
 
 fn ensure_consistent<T>(slot: &mut Option<T>, value: T, name: &str) -> BenchResult<()>
@@ -837,7 +882,7 @@ where
 fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -> BenchResult<f64> {
     let statistics = statistics(&result.run_pair_ms)?;
     let traffic_multiplier = result
-        .pass_count
+        .traffic_equivalent_pass_count
         .checked_mul(4)
         .ok_or_else(|| input_error("traffic multiplier overflow"))?;
     let traffic_bytes_per_pair = result.buffer_size as f64 * traffic_multiplier as f64;
@@ -851,7 +896,7 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
     let bandwidth_gb_s = traffic_bytes_per_pair / seconds_per_pair / 1_000_000_000.0;
 
     println!(
-        "RESULT suite={} label={} shape={:?} batch={} logical_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-axis-pass-stages estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
+        "RESULT suite={} label={} shape={:?} batch={} logical_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
         case.suite,
         case.label,
         case.shape,
@@ -872,7 +917,8 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
         statistics.stderr_ms.is_some(),
         statistics.population_spread_ms,
         score,
-        result.pass_count,
+        result.graph_stage_count,
+        result.traffic_equivalent_pass_count,
         result.pass_count_method,
         traffic_multiplier,
         bandwidth_gib_s,

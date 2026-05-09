@@ -1545,7 +1545,7 @@ fn run_smooth_decomposition_cases(context: &wgpu_fft::device::GpuContext) {
         ),
         (
             FftConfig::new_nd([16, 16]).with_normalization(Normalization::None),
-            LargeExecutionKind::AxisDecomposition,
+            LargeExecutionKind::OutOfCoreFourStep,
             1.0e-2,
         ),
         (
@@ -1625,9 +1625,14 @@ fn run_one_case_with_smooth_decomposition(
     )
     .unwrap();
     assert_eq!(plan.route(), C2cRoute::MixedRadix);
+    let expected_route_mode = if expected_kind == LargeExecutionKind::OutOfCoreFourStep {
+        LargeRouteMode::LargeOutOfCore
+    } else {
+        LargeRouteMode::LargeChunk
+    };
     assert_eq!(
         plan.large_routing_policy().route_mode(),
-        LargeRouteMode::LargeChunk
+        expected_route_mode
     );
     assert_eq!(plan.large_routing_policy().execution_kind(), expected_kind);
 

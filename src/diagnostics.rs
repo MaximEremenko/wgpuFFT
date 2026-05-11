@@ -414,6 +414,20 @@ pub(crate) fn stage_summaries_for_route(
                 Some(required_bytes),
             ));
         }
+        LargeExecutionKind::SegmentedFullVolume => {
+            stages.push(FftStageSummary::new(
+                "segmented-volume-window-schedule",
+                "window-schedule",
+                route.clone(),
+                Some(required_bytes),
+            ));
+            stages.push(FftStageSummary::new(
+                "segmented-volume-stage-graph",
+                "stage-graph",
+                route,
+                Some(required_bytes),
+            ));
+        }
         LargeExecutionKind::OutOfCoreUnsupported => {
             stages.push(FftStageSummary::new(
                 "out-of-core-required",
@@ -493,7 +507,7 @@ pub(crate) fn stage_route_for_label(label: &str, default_route: &str) -> String 
         "direct-dft"
     } else if label.starts_with("large-chunk-") {
         "large-chunk"
-    } else if label.starts_with("four-step-") {
+    } else if label.starts_with("four-step-") || label.starts_with("segmented-volume-") {
         "large-out-of-core"
     } else if label.starts_with("large-axis-sequence-") || label.starts_with("axis-sequence-") {
         "axis-sequence"
@@ -730,6 +744,14 @@ mod tests {
         assert_eq!(
             stage_route_for_label("fused-smooth-workgroup-stage", "r2c"),
             "mixed-radix"
+        );
+    }
+
+    #[test]
+    fn segmented_volume_stages_are_attributed_to_large_out_of_core() {
+        assert_eq!(
+            stage_route_for_label("segmented-volume-axis-slab-gather", "axis-sequence"),
+            "large-out-of-core"
         );
     }
 

@@ -22,6 +22,8 @@ async fn run_cases() {
         eprintln!("skipping GPU test; no suitable wgpu adapter was found");
         return;
     };
+    #[cfg(windows)]
+    let context = std::mem::ManuallyDrop::new(context);
     eprintln!("adapter: {:?}", context.adapter.get_info());
     eprintln!(
         "limits: maxStorageBufferBindingSize={} maxBufferSize={} storageAlignment={}",
@@ -94,13 +96,10 @@ async fn run_cases() {
         );
     }
     assert_strided_io_is_explicitly_deferred(&context);
-    assert_full_volume_above_max_buffer_stays_unsupported(&context);
+    assert_full_volume_above_max_buffer_selects_segmented(&context);
     run_real_oversized_sampled_case(&context);
     run_real_oversized_rank3_sampled_case(&context);
     run_real_oversized_prime_sampled_case(&context);
-
-    #[cfg(windows)]
-    std::mem::forget(context);
 }
 
 fn run_forced_rank_nd_equivalence(
@@ -716,10 +715,10 @@ fn assert_strided_io_is_explicitly_deferred(context: &wgpu_fft::device::GpuConte
     ));
 }
 
-fn assert_full_volume_above_max_buffer_stays_unsupported(context: &wgpu_fft::device::GpuContext) {
+fn assert_full_volume_above_max_buffer_selects_segmented(context: &wgpu_fft::device::GpuContext) {
     let config = FftConfig::new_nd([15, 14]).with_normalization(Normalization::None);
     let required = config.required_buffer_size_bytes().unwrap();
-    let error = match FftPlan::c2c_with_large_policy_limits_for_testing(
+    let plan = FftPlan::c2c_with_large_policy_limits_for_testing(
         &context.device,
         &context.queue,
         config,
@@ -727,31 +726,28 @@ fn assert_full_volume_above_max_buffer_stays_unsupported(context: &wgpu_fft::dev
             max_storage_buffer_binding_size: 256,
             max_buffer_size: required - 8,
         },
-    ) {
-        Ok(_) => panic!("full volume above maxBufferSize unexpectedly built a plan"),
-        Err(error) => error,
-    };
+    )
+    .unwrap();
     assert_eq!(
-        error,
-        FftError::OutOfCoreExecutionUnsupported {
-            reason: "four-step full volume exceeds maxBufferSize; segmented full-volume execution is not implemented",
-        }
+        plan.large_routing_policy().execution_kind(),
+        LargeExecutionKind::SegmentedFullVolume
     );
-    let diagnostics = error.diagnostics();
+    let diagnostics = plan.diagnostics();
     assert_eq!(
         diagnostics.route().large_route_mode.as_deref(),
         Some("large-out-of-core")
     );
     assert_eq!(
         diagnostics.route().execution_kind.as_deref(),
-        Some("out-of-core-unsupported")
+        Some("segmented-full-volume")
     );
-    assert!(diagnostics.blockers().iter().any(|blocker| {
-        blocker.route.as_deref() == Some("large-out-of-core")
-            && blocker.stage.as_deref() == Some("out-of-core-execution")
-            && blocker.layout.as_deref() == Some("segmented full-volume GPU execution")
-            && blocker.helper_buffer.as_deref() == Some("segmented-full-volume")
-    }));
+    let arena_bytes = diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role == "helper:segmented-volume-arena")
+        .map(|requirement| requirement.required_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(arena_bytes, [required - 8, 8]);
 }
 
 fn run_real_oversized_sampled_case(context: &wgpu_fft::device::GpuContext) {

@@ -31,6 +31,7 @@ use crate::runtime::pipeline_cache::{
     PipelineLayoutCacheKey, ShaderCacheKey,
 };
 use crate::runtime::rader_axis::{rader_bfft, rader_permutation, RaderAxis, RaderAxisConfig};
+use crate::runtime::segmented_volume::SegmentedVolumeC2cPlan;
 use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
 };
@@ -175,6 +176,7 @@ enum C2cExecution {
     LargeBridge(LargeBridgeC2cPlan),
     LargeAxisSequence(LargeAxisSequenceC2cPlan),
     FourStep(FourStepC2cPlan),
+    SegmentedVolume(SegmentedVolumeC2cPlan),
 }
 
 enum C2cRouteImpl {
@@ -503,6 +505,11 @@ impl C2cPlan {
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
         config.validate()?;
+        let device_policy_limits = LargePolicyLimits::from(&device.limits());
+        let effective_policy_limits = policy_limits
+            .unwrap_or(device_policy_limits)
+            .componentwise_min(device_policy_limits);
+        let policy_limits = Some(effective_policy_limits);
         let len = config.total_complex_len_u32()?;
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
         let mut large_routing_policy =
@@ -686,22 +693,37 @@ impl C2cPlan {
                 let limits =
                     policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
                 if config.required_buffer_size_bytes()? > limits.max_buffer_size {
-                    return Err(FftError::OutOfCoreExecutionUnsupported {
-                        reason: "four-step full volume exceeds maxBufferSize; segmented full-volume execution is not implemented",
-                    });
+                    if let Some((index, kind)) = axis_kinds
+                        .iter()
+                        .enumerate()
+                        .find(|(_, kind)| **kind != AxisKind::Mixed)
+                    {
+                        let axis = config.axes()[index];
+                        return Err(FftError::UnsupportedAxisKind {
+                            axis,
+                            len: config.shape()[axis],
+                            kind: kind.as_str(),
+                        });
+                    }
+                    let plan = SegmentedVolumeC2cPlan::new(device, queue, &config, limits)?;
+                    large_routing_policy = large_routing_policy
+                        .with_execution_kind(LargeExecutionKind::SegmentedFullVolume)
+                        .with_diagnostics(None, plan.factor_splits(), plan.staging_bytes(), None);
+                    C2cExecution::SegmentedVolume(plan)
+                } else {
+                    let plan = FourStepC2cPlan::new(device, queue, &config, limits)?;
+                    large_routing_policy = large_routing_policy
+                        .with_execution_kind(LargeExecutionKind::OutOfCoreFourStep)
+                        .with_diagnostics(None, plan.factor_splits(), plan.staging_bytes(), None);
+                    C2cExecution::FourStep(plan)
                 }
-                let plan = FourStepC2cPlan::new(device, queue, &config, limits)?;
-                large_routing_policy = large_routing_policy
-                    .with_execution_kind(LargeExecutionKind::OutOfCoreFourStep)
-                    .with_diagnostics(None, plan.factor_splits(), plan.staging_bytes(), None);
-                C2cExecution::FourStep(plan)
             }
         };
         let axis_factors = match &execution {
             C2cExecution::Normal(route_impl) => axis_factors_for_route_impl(&config, route_impl)?,
             C2cExecution::LargeChunk(plan) => plan.child.axis_factors().to_vec(),
             C2cExecution::LargeAxisSequence(plan) => plan.axis_factors(),
-            C2cExecution::FourStep(_) => config
+            C2cExecution::FourStep(_) | C2cExecution::SegmentedVolume(_) => config
                 .axes()
                 .iter()
                 .zip(&axis_kinds)
@@ -768,7 +790,7 @@ impl C2cPlan {
             C2cExecution::SmoothDecomposition(_) => 0,
             C2cExecution::LargeBridge(_) => 0,
             C2cExecution::LargeAxisSequence(_) => 0,
-            C2cExecution::FourStep(_) => 0,
+            C2cExecution::FourStep(_) | C2cExecution::SegmentedVolume(_) => 0,
         }
     }
 
@@ -786,6 +808,7 @@ impl C2cPlan {
                 })
             }
             C2cExecution::FourStep(plan) => plan.twiddle_lut_storage_bytes(),
+            C2cExecution::SegmentedVolume(plan) => plan.twiddle_lut_storage_bytes(),
         }
     }
 
@@ -810,6 +833,7 @@ impl C2cPlan {
             }
             C2cExecution::LargeAxisSequence(plan) => Ok(plan.graph_plan.graph().clone()),
             C2cExecution::FourStep(plan) => Ok(plan.graph_plan().graph().clone()),
+            C2cExecution::SegmentedVolume(plan) => Ok(plan.graph_plan().graph().clone()),
         }
     }
 
@@ -990,6 +1014,9 @@ impl C2cPlan {
         if let C2cExecution::FourStep(plan) = &self.execution {
             return plan.execute_views(device, encoder, input, output);
         }
+        if let C2cExecution::SegmentedVolume(plan) = &self.execution {
+            return plan.execute_views(device, encoder, input, output);
+        }
         if let C2cExecution::LargeChunk(plan) = &self.execution {
             return plan.execute_views(device, encoder, input, output);
         }
@@ -1063,6 +1090,12 @@ impl C2cPlan {
         output: C2cIoLayout<'_>,
         workspace: Option<BufferView<'_>>,
     ) -> Result<()> {
+        if matches!(&self.execution, C2cExecution::SegmentedVolume(_)) {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "segmented-volume-logical-io",
+                reason: "segmented full-volume execution requires a single zero-offset contiguous endpoint buffer",
+            });
+        }
         if matches!(&self.execution, C2cExecution::FourStep(_)) {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "four-step-logical-io",
@@ -1244,7 +1277,8 @@ impl C2cPlan {
             }
             C2cExecution::LargeBridge(_)
             | C2cExecution::LargeAxisSequence(_)
-            | C2cExecution::FourStep(_) => Err(FftError::LargeRouteWorkspaceUnsupported {
+            | C2cExecution::FourStep(_)
+            | C2cExecution::SegmentedVolume(_) => Err(FftError::LargeRouteWorkspaceUnsupported {
                 route_mode: self.large_routing_policy.route_mode().as_str(),
             }),
         }
@@ -1308,6 +1342,7 @@ impl C2cPlan {
                 | C2cExecution::LargeBridge(_)
                 | C2cExecution::LargeAxisSequence(_)
                 | C2cExecution::FourStep(_)
+                | C2cExecution::SegmentedVolume(_)
         )
     }
 

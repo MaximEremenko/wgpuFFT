@@ -1355,11 +1355,13 @@ pub(crate) fn effective_scheduler_limits(
     stored: LargePolicyLimits,
     device: &wgpu::Limits,
 ) -> SchedulerLimits {
+    let max_buffer_size = stored.max_buffer_size.min(device.max_buffer_size);
     SchedulerLimits {
         max_storage_buffer_binding_size: stored
             .max_storage_buffer_binding_size
-            .min(device.max_storage_buffer_binding_size),
-        max_buffer_size: stored.max_buffer_size.min(device.max_buffer_size),
+            .min(device.max_storage_buffer_binding_size)
+            .min(max_buffer_size),
+        max_buffer_size,
         storage_alignment: u64::from(device.min_storage_buffer_offset_alignment.max(1)),
         copy_alignment: 4,
     }
@@ -1845,6 +1847,22 @@ mod tests {
         assert_eq!(limits.max_storage_buffer_binding_size, 512);
         assert_eq!(limits.max_buffer_size, 8192);
         assert_eq!(limits.storage_alignment, 256);
+    }
+
+    #[test]
+    fn effective_limits_cap_bindings_to_the_effective_buffer_size() {
+        let mut device = wgpu::Limits::defaults();
+        device.max_storage_buffer_binding_size = 4096;
+        device.max_buffer_size = 8192;
+        let limits = effective_scheduler_limits(
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 1024,
+                max_buffer_size: 256,
+            },
+            &device,
+        );
+        assert_eq!(limits.max_storage_buffer_binding_size, 256);
+        assert_eq!(limits.max_buffer_size, 256);
     }
 
     #[test]

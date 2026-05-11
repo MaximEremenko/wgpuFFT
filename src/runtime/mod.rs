@@ -16,6 +16,7 @@ pub(crate) mod nd_wgsl;
 pub mod pipeline_cache;
 pub(crate) mod rader_axis;
 pub mod real;
+pub(crate) mod segmented_volume;
 pub(crate) mod smooth_decompose;
 pub(crate) mod stage_executor;
 pub(crate) mod twiddle;

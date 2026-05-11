@@ -5,7 +5,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use wgpu_fft::{
-    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, Normalization,
+    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, LargePolicyLimits,
+    Normalization,
 };
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
@@ -66,6 +67,14 @@ struct Options {
     iter_cap: u64,
     max_cases: Option<usize>,
     wait_timeout: Duration,
+    plan_max_bind_bytes: Option<u64>,
+    compare_max_buffer_bytes: Option<CompareMaxBufferBytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompareMaxBufferBytes {
+    unsharded: u64,
+    sharded: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +89,7 @@ struct BenchCase {
 #[derive(Debug)]
 struct CaseResult {
     route: String,
+    execution_kind: String,
     axis_kinds: String,
     graph_stage_count: u64,
     traffic_equivalent_pass_count: u64,
@@ -89,7 +99,53 @@ struct CaseResult {
     initialization_seed_bytes: u64,
     plan_workspace_requirement_bytes: u64,
     diagnostic_helper_requirement_bytes: u64,
+    diagnostic_helper_requirements: String,
+    arena_segment_bytes: Vec<u64>,
     num_iter: u64,
+    run_pair_ms: Vec<f64>,
+}
+
+#[derive(Debug)]
+struct CompareVariantResult {
+    label: &'static str,
+    requested_max_buffer_bytes: u64,
+    effective_max_bind_bytes: u64,
+    effective_max_buffer_bytes: u64,
+    result: CaseResult,
+}
+
+#[derive(Debug)]
+struct CompareCaseResult {
+    unsharded: CompareVariantResult,
+    sharded: CompareVariantResult,
+}
+
+#[derive(Debug)]
+struct PlanPairMetadata {
+    route: String,
+    execution_kind: String,
+    axis_kinds: String,
+    graph_stage_count: u64,
+    traffic_equivalent_pass_count: u64,
+    pass_count_method: String,
+    plan_workspace_requirement_bytes: u64,
+    diagnostic_helper_requirement_bytes: u64,
+    diagnostic_helper_requirements: String,
+    arena_segment_bytes: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+struct VariantAccumulator {
+    route: Option<String>,
+    execution_kind: Option<String>,
+    axis_kinds: Option<String>,
+    graph_stage_count: Option<u64>,
+    traffic_equivalent_pass_count: Option<u64>,
+    pass_count_method: Option<String>,
+    plan_workspace_requirement_bytes: Option<u64>,
+    diagnostic_helper_requirement_bytes: Option<u64>,
+    diagnostic_helper_requirements: Option<String>,
+    arena_segment_bytes: Option<Vec<u64>>,
     run_pair_ms: Vec<f64>,
 }
 
@@ -240,6 +296,18 @@ async fn run() -> BenchResult<()> {
     if options.suite == Suite::Custom {
         println!("CUSTOM SHAPE SMOKE MODE: this case is outside the standard suite grids");
     }
+    if let (Some(max_bind_bytes), Some(max_buffer_bytes)) = (
+        options.plan_max_bind_bytes,
+        options.compare_max_buffer_bytes,
+    ) {
+        println!(
+            "CUSTOM SHAPE SEGMENT-CAP COMPARISON: plan_max_bind_bytes={} unsharded_max_buffer_bytes={} sharded_max_buffer_bytes={}",
+            max_bind_bytes, max_buffer_bytes.unsharded, max_buffer_bytes.sharded
+        );
+        println!(
+            "comparison method: recreate and time both variants in every run; variant order alternates by run"
+        );
+    }
     if options.runs != DEFAULT_RUNS
         || options.iter_cap != DEFAULT_ITER_CAP
         || options.max_cases.is_some()
@@ -312,6 +380,29 @@ async fn run_cases(
             case.shape,
             case.batch,
         );
+
+        if options.compare_max_buffer_bytes.is_some() {
+            let result = run_compare_case(device, queue, case, options).await;
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| contextual_error("polling after a comparison case", error))?;
+            let cache_cleared = clear_thread_local_pipeline_cache(device);
+            println!("pipeline_cache_cleared_after_case={cache_cleared}");
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| contextual_error("reclaiming cleared cache resources", error))?;
+            let result = result.map_err(|error| {
+                contextual_boxed_error(
+                    format!(
+                        "running segment-cap comparison {} shape={:?} batch={}",
+                        case.label, case.shape, case.batch
+                    ),
+                    error,
+                )
+            })?;
+            print_compare_result(case, options, &result)?;
+            continue;
+        }
 
         let result = run_case(device, queue, case, options).await;
         device
@@ -428,12 +519,15 @@ async fn run_case(
     fill_initialization_seed(&initialization_seed)?;
 
     let mut route = None;
+    let mut execution_kind = None;
     let mut axis_kinds = None;
     let mut graph_stage_count = None;
     let mut traffic_equivalent_pass_count = None;
     let mut pass_count_method = None;
     let mut plan_workspace_requirement_bytes = None;
     let mut diagnostic_helper_requirement_total = None;
+    let mut diagnostic_helper_requirements = None;
+    let mut arena_segment_layout = None;
     let mut run_pair_ms = Vec::with_capacity(options.runs);
 
     for run_index in 0..options.runs {
@@ -481,6 +575,9 @@ async fn run_case(
             diagnostic_helper_requirement_bytes(&forward_diagnostics)?
                 .checked_add(diagnostic_helper_requirement_bytes(&inverse_diagnostics)?)
                 .ok_or_else(|| input_error("combined plan helper requirement overflow"))?;
+        let this_diagnostic_helper_requirements =
+            combined_helper_requirement_inventory(&forward_diagnostics, &inverse_diagnostics)?;
+        let this_arena_segment_bytes = arena_segment_bytes(&forward_diagnostics);
         let (forward_graph_stages, forward_passes, forward_pass_method) =
             compute_pass_count(&forward_diagnostics)?;
         let (inverse_graph_stages, inverse_passes, inverse_pass_method) =
@@ -508,6 +605,21 @@ async fn run_case(
                 "forward/inverse route mismatch: {this_route} versus {inverse_route}"
             )));
         }
+        let this_execution_kind = forward_diagnostics
+            .route()
+            .execution_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        let inverse_execution_kind = inverse_diagnostics
+            .route()
+            .execution_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned());
+        if this_execution_kind != inverse_execution_kind {
+            return Err(input_error(format!(
+                "forward/inverse execution-kind mismatch: {this_execution_kind} versus {inverse_execution_kind}"
+            )));
+        }
         let this_axis_kinds = format!("{:?}", forward.axis_kinds());
         let inverse_axis_kinds = format!("{:?}", inverse.axis_kinds());
         if this_axis_kinds != inverse_axis_kinds {
@@ -517,6 +629,7 @@ async fn run_case(
         }
 
         ensure_consistent(&mut route, this_route, "route")?;
+        ensure_consistent(&mut execution_kind, this_execution_kind, "execution kind")?;
         ensure_consistent(&mut axis_kinds, this_axis_kinds, "axis kinds")?;
         ensure_consistent(
             &mut graph_stage_count,
@@ -542,6 +655,16 @@ async fn run_case(
             &mut diagnostic_helper_requirement_total,
             this_diagnostic_helper_requirement_bytes,
             "combined diagnostic plan helper bytes",
+        )?;
+        ensure_consistent(
+            &mut diagnostic_helper_requirements,
+            this_diagnostic_helper_requirements,
+            "diagnostic helper requirement inventory",
+        )?;
+        ensure_consistent_debug(
+            &mut arena_segment_layout,
+            this_arena_segment_bytes,
+            "segmented arena layout",
         )?;
 
         // Plan construction queues parameter and LUT uploads. Flush and wait for
@@ -632,6 +755,8 @@ async fn run_case(
 
     Ok(CaseResult {
         route: route.ok_or_else(|| input_error("benchmark produced no route"))?,
+        execution_kind: execution_kind
+            .ok_or_else(|| input_error("benchmark produced no execution kind"))?,
         axis_kinds: axis_kinds.ok_or_else(|| input_error("benchmark produced no axis kinds"))?,
         graph_stage_count: graph_stage_count
             .ok_or_else(|| input_error("benchmark produced no graph stage count"))?,
@@ -646,9 +771,581 @@ async fn run_case(
             .ok_or_else(|| input_error("benchmark produced no plan workspace requirement"))?,
         diagnostic_helper_requirement_bytes: diagnostic_helper_requirement_total
             .ok_or_else(|| input_error("benchmark produced no plan helper requirement"))?,
+        diagnostic_helper_requirements: diagnostic_helper_requirements
+            .ok_or_else(|| input_error("benchmark produced no plan helper inventory"))?,
+        arena_segment_bytes: arena_segment_layout
+            .ok_or_else(|| input_error("benchmark produced no segmented arena layout"))?,
         num_iter,
         run_pair_ms,
     })
+}
+
+impl VariantAccumulator {
+    fn record(&mut self, metadata: PlanPairMetadata, pair_ms: f64) -> BenchResult<()> {
+        ensure_consistent(&mut self.route, metadata.route, "route")?;
+        ensure_consistent(
+            &mut self.execution_kind,
+            metadata.execution_kind,
+            "execution kind",
+        )?;
+        ensure_consistent(&mut self.axis_kinds, metadata.axis_kinds, "axis kinds")?;
+        ensure_consistent(
+            &mut self.graph_stage_count,
+            metadata.graph_stage_count,
+            "graph stage count",
+        )?;
+        ensure_consistent(
+            &mut self.traffic_equivalent_pass_count,
+            metadata.traffic_equivalent_pass_count,
+            "traffic-equivalent pass count",
+        )?;
+        ensure_consistent(
+            &mut self.pass_count_method,
+            metadata.pass_count_method,
+            "pass-count method",
+        )?;
+        ensure_consistent(
+            &mut self.plan_workspace_requirement_bytes,
+            metadata.plan_workspace_requirement_bytes,
+            "combined plan workspace requirement bytes",
+        )?;
+        ensure_consistent(
+            &mut self.diagnostic_helper_requirement_bytes,
+            metadata.diagnostic_helper_requirement_bytes,
+            "combined diagnostic plan helper bytes",
+        )?;
+        ensure_consistent(
+            &mut self.diagnostic_helper_requirements,
+            metadata.diagnostic_helper_requirements,
+            "diagnostic helper requirement inventory",
+        )?;
+        ensure_consistent_debug(
+            &mut self.arena_segment_bytes,
+            metadata.arena_segment_bytes,
+            "segmented arena layout",
+        )?;
+        self.run_pair_ms.push(pair_ms);
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        buffer_size: u64,
+        external_io_bytes: u64,
+        initialization_seed_bytes: u64,
+        num_iter: u64,
+    ) -> BenchResult<CaseResult> {
+        Ok(CaseResult {
+            route: self
+                .route
+                .ok_or_else(|| input_error("comparison variant produced no route"))?,
+            execution_kind: self
+                .execution_kind
+                .ok_or_else(|| input_error("comparison variant produced no execution kind"))?,
+            axis_kinds: self
+                .axis_kinds
+                .ok_or_else(|| input_error("comparison variant produced no axis kinds"))?,
+            graph_stage_count: self
+                .graph_stage_count
+                .ok_or_else(|| input_error("comparison variant produced no graph stage count"))?,
+            traffic_equivalent_pass_count: self.traffic_equivalent_pass_count.ok_or_else(|| {
+                input_error("comparison variant produced no traffic-equivalent pass count")
+            })?,
+            pass_count_method: self
+                .pass_count_method
+                .ok_or_else(|| input_error("comparison variant produced no pass-count method"))?,
+            buffer_size,
+            external_io_bytes,
+            initialization_seed_bytes,
+            plan_workspace_requirement_bytes: self.plan_workspace_requirement_bytes.ok_or_else(
+                || input_error("comparison variant produced no workspace requirement"),
+            )?,
+            diagnostic_helper_requirement_bytes: self
+                .diagnostic_helper_requirement_bytes
+                .ok_or_else(|| input_error("comparison variant produced no helper requirement"))?,
+            diagnostic_helper_requirements: self.diagnostic_helper_requirements.ok_or_else(
+                || input_error("comparison variant produced no helper requirement inventory"),
+            )?,
+            arena_segment_bytes: self
+                .arena_segment_bytes
+                .ok_or_else(|| input_error("comparison variant produced no arena layout"))?,
+            num_iter,
+            run_pair_ms: self.run_pair_ms,
+        })
+    }
+}
+
+async fn run_compare_case(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    case: &BenchCase,
+    options: &Options,
+) -> BenchResult<CompareCaseResult> {
+    let requested_max_bind_bytes = options
+        .plan_max_bind_bytes
+        .ok_or_else(|| input_error("comparison mode is missing --plan-max-bind-bytes"))?;
+    let caps = options
+        .compare_max_buffer_bytes
+        .ok_or_else(|| input_error("comparison mode is missing --compare-max-buffer-bytes"))?;
+    let logical_elements = checked_case_elements(case)?;
+    let expected_buffer_size = u64::try_from(logical_elements)
+        .map_err(|_| input_error("logical element count does not fit u64"))?
+        .checked_mul(COMPLEX_F32_BYTES)
+        .ok_or_else(|| input_error("logical buffer size overflow"))?;
+    benchmark_config(case, false).validate()?;
+    benchmark_config(case, true).validate()?;
+
+    let device_limits = device.limits();
+    let real_max_buffer_size = device_limits.max_buffer_size;
+    if expected_buffer_size > real_max_buffer_size {
+        return Err(input_error(format!(
+            "comparison endpoints require {expected_buffer_size} bytes but the real device max_buffer_size is {real_max_buffer_size}"
+        )));
+    }
+    let effective_unsharded_cap = caps.unsharded.min(real_max_buffer_size);
+    let effective_sharded_cap = caps.sharded.min(real_max_buffer_size);
+    let device_max_bind = device_limits.max_storage_buffer_binding_size;
+    let effective_unsharded_bind = requested_max_bind_bytes
+        .min(device_max_bind)
+        .min(effective_unsharded_cap);
+    let effective_sharded_bind = requested_max_bind_bytes
+        .min(device_max_bind)
+        .min(effective_sharded_cap);
+    if effective_unsharded_bind != effective_sharded_bind {
+        return Err(input_error(format!(
+            "comparison must isolate maxBufferSize while keeping one effective binding cap: unsharded {effective_unsharded_bind}, sharded {effective_sharded_bind}; choose --plan-max-bind-bytes no larger than both effective buffer caps"
+        )));
+    }
+    if effective_unsharded_bind >= expected_buffer_size {
+        return Err(input_error(format!(
+            "comparison requires a plan binding cap below the logical buffer size: effective bind cap {effective_unsharded_bind}, buffer {expected_buffer_size}"
+        )));
+    }
+    if effective_unsharded_cap < expected_buffer_size {
+        return Err(input_error(format!(
+            "unsharded max-buffer cap must cover the logical buffer: effective cap {effective_unsharded_cap}, buffer {expected_buffer_size}"
+        )));
+    }
+    if effective_sharded_cap >= expected_buffer_size {
+        return Err(input_error(format!(
+            "sharded max-buffer cap must be below the logical buffer: effective cap {effective_sharded_cap}, buffer {expected_buffer_size}"
+        )));
+    }
+
+    let external_io_bytes = expected_buffer_size
+        .checked_mul(2)
+        .ok_or_else(|| input_error("out-of-place I/O allocation size overflow"))?;
+    let initialization_seed_bytes = expected_buffer_size.min(INITIALIZATION_SEED_BYTES);
+    let num_iter = (ITER_TRAFFIC_BUDGET_BYTES / expected_buffer_size)
+        .clamp(1, DEFAULT_ITER_CAP)
+        .min(options.iter_cap);
+    println!(
+        "SEGMENT_CAP_VARIANTS logical_elements={} logical_buffer_bytes={} real_device_max_buffer_bytes={} requested_plan_max_bind_bytes={} unsharded_effective_max_bind_bytes={} sharded_effective_max_bind_bytes={} unsharded_requested_max_buffer_bytes={} unsharded_effective_max_buffer_bytes={} sharded_requested_max_buffer_bytes={} sharded_effective_max_buffer_bytes={} num_iter={}",
+        logical_elements,
+        expected_buffer_size,
+        real_max_buffer_size,
+        requested_max_bind_bytes,
+        effective_unsharded_bind,
+        effective_sharded_bind,
+        caps.unsharded,
+        effective_unsharded_cap,
+        caps.sharded,
+        effective_sharded_cap,
+        num_iter,
+    );
+
+    let usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let error_scopes = push_gpu_error_scopes(device);
+    let buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.compare.buffer_a"),
+        size: expected_buffer_size,
+        usage,
+        mapped_at_creation: false,
+    });
+    let buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.compare.buffer_b"),
+        size: expected_buffer_size,
+        usage,
+        mapped_at_creation: false,
+    });
+    let initialization_seed = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.compare.initialization_seed"),
+        size: initialization_seed_bytes,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    pop_gpu_error_scopes(error_scopes, "allocating comparison data buffers").await?;
+    fill_initialization_seed(&initialization_seed)?;
+
+    let mut unsharded = VariantAccumulator::default();
+    let mut sharded = VariantAccumulator::default();
+    for run_index in 0..options.runs {
+        let order = if run_index % 2 == 0 {
+            [("unsharded", caps.unsharded), ("sharded", caps.sharded)]
+        } else {
+            [("sharded", caps.sharded), ("unsharded", caps.unsharded)]
+        };
+        println!(
+            "comparison run {}/{} variant_order={},{}",
+            run_index + 1,
+            options.runs,
+            order[0].0,
+            order[1].0
+        );
+        for (variant_label, max_buffer_bytes) in order {
+            initialize_buffers(
+                device,
+                queue,
+                &initialization_seed,
+                &buffer_a,
+                &buffer_b,
+                expected_buffer_size,
+                options.wait_timeout,
+            )?;
+            let limits = LargePolicyLimits {
+                max_storage_buffer_binding_size: requested_max_bind_bytes,
+                max_buffer_size: max_buffer_bytes,
+            };
+            let error_scopes = push_gpu_error_scopes(device);
+            let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
+                let forward = FftPlan::c2c_with_large_policy_limits_for_testing(
+                    device,
+                    queue,
+                    benchmark_config(case, false),
+                    limits,
+                )?;
+                let inverse = FftPlan::c2c_with_large_policy_limits_for_testing(
+                    device,
+                    queue,
+                    benchmark_config(case, true),
+                    limits,
+                )?;
+                Ok((forward, inverse))
+            })();
+            pop_gpu_error_scopes(
+                error_scopes,
+                &format!("creating {variant_label} forward and inverse FFT plans"),
+            )
+            .await?;
+            let (forward, inverse) = plans?;
+            let metadata = inspect_plan_pair(&forward, &inverse, expected_buffer_size)?;
+
+            wait_for_submission(
+                device,
+                queue.submit([]),
+                &format!("flushing {variant_label} plan uploads before timing"),
+                options.wait_timeout,
+            )?;
+
+            let error_scopes = push_gpu_error_scopes(device);
+            let command_buffer = (|| -> BenchResult<wgpu::CommandBuffer> {
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("wgpu_fft.bench.compare.pairs"),
+                });
+                for iteration in 0..num_iter {
+                    forward
+                        .execute_checked(device, &mut encoder, &buffer_a, &buffer_b)
+                        .map_err(|error| {
+                            contextual_error(
+                                format!(
+                                    "recording {variant_label} forward FFT for iteration {iteration}"
+                                ),
+                                error,
+                            )
+                        })?;
+                    inverse
+                        .execute_checked(device, &mut encoder, &buffer_b, &buffer_a)
+                        .map_err(|error| {
+                            contextual_error(
+                                format!(
+                                    "recording {variant_label} inverse FFT for iteration {iteration}"
+                                ),
+                                error,
+                            )
+                        })?;
+                }
+                Ok(encoder.finish())
+            })();
+            pop_gpu_error_scopes(
+                error_scopes,
+                &format!("recording the timed {variant_label} FFT command buffer"),
+            )
+            .await?;
+            let command_buffer = command_buffer?;
+
+            let submit_error_scopes = push_gpu_error_scopes(device);
+            let start = Instant::now();
+            let submission = queue.submit([command_buffer]);
+            let wait_result = wait_for_submission(
+                device,
+                submission,
+                &format!("waiting for timed {variant_label} FFT submission"),
+                options.wait_timeout,
+            );
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let submit_scope_result = pop_gpu_error_scopes(
+                submit_error_scopes,
+                &format!("submitting and executing timed {variant_label} FFT work"),
+            )
+            .await;
+            wait_result?;
+            submit_scope_result?;
+            let pair_ms = elapsed_ms / num_iter as f64;
+            if !pair_ms.is_finite() || pair_ms <= 0.0 {
+                return Err(input_error(format!(
+                    "invalid {variant_label} elapsed time: total {elapsed_ms} ms, per pair {pair_ms} ms"
+                )));
+            }
+            println!(
+                "comparison run {}/{} variant={} total_ms={:.6} pair_ms={:.6} route={} execution_kind={}",
+                run_index + 1,
+                options.runs,
+                variant_label,
+                elapsed_ms,
+                pair_ms,
+                metadata.route,
+                metadata.execution_kind,
+            );
+            match variant_label {
+                "unsharded" => unsharded.record(metadata, pair_ms)?,
+                "sharded" => sharded.record(metadata, pair_ms)?,
+                _ => return Err(input_error("internal comparison variant label error")),
+            }
+
+            drop((forward, inverse));
+            device.poll(wgpu::PollType::Poll).map_err(|error| {
+                contextual_error(
+                    format!("reclaiming {variant_label} plan resources between runs"),
+                    error,
+                )
+            })?;
+        }
+    }
+
+    let result = CompareCaseResult {
+        unsharded: CompareVariantResult {
+            label: "unsharded",
+            requested_max_buffer_bytes: caps.unsharded,
+            effective_max_bind_bytes: effective_unsharded_bind,
+            effective_max_buffer_bytes: effective_unsharded_cap,
+            result: unsharded.finish(
+                expected_buffer_size,
+                external_io_bytes,
+                initialization_seed_bytes,
+                num_iter,
+            )?,
+        },
+        sharded: CompareVariantResult {
+            label: "sharded",
+            requested_max_buffer_bytes: caps.sharded,
+            effective_max_bind_bytes: effective_sharded_bind,
+            effective_max_buffer_bytes: effective_sharded_cap,
+            result: sharded.finish(
+                expected_buffer_size,
+                external_io_bytes,
+                initialization_seed_bytes,
+                num_iter,
+            )?,
+        },
+    };
+    if result.unsharded.result.execution_kind != "out-of-core-four-step" {
+        return Err(input_error(format!(
+            "unsharded comparison variant selected unexpected execution kind {}; expected out-of-core-four-step",
+            result.unsharded.result.execution_kind
+        )));
+    }
+    if result.sharded.result.execution_kind != "segmented-full-volume" {
+        return Err(input_error(format!(
+            "sharded comparison variant selected unexpected execution kind {}; expected segmented-full-volume",
+            result.sharded.result.execution_kind
+        )));
+    }
+    if !result.unsharded.result.arena_segment_bytes.is_empty() {
+        return Err(input_error(format!(
+            "unsharded comparison variant unexpectedly reported segmented arena buffers {:?}",
+            result.unsharded.result.arena_segment_bytes
+        )));
+    }
+    if result.sharded.result.arena_segment_bytes.len() < 2 {
+        return Err(input_error(format!(
+            "sharded comparison variant reported fewer than two arena segments: {:?}",
+            result.sharded.result.arena_segment_bytes
+        )));
+    }
+    let sharded_arena_bytes = result
+        .sharded
+        .result
+        .arena_segment_bytes
+        .iter()
+        .try_fold(0u64, |total, &bytes| total.checked_add(bytes))
+        .ok_or_else(|| input_error("sharded arena segment-byte total overflow"))?;
+    if sharded_arena_bytes != expected_buffer_size
+        || result
+            .sharded
+            .result
+            .arena_segment_bytes
+            .iter()
+            .any(|&bytes| bytes > effective_sharded_cap)
+    {
+        return Err(input_error(format!(
+            "sharded arena layout {:?} does not exactly cover {} bytes within cap {}",
+            result.sharded.result.arena_segment_bytes, expected_buffer_size, effective_sharded_cap
+        )));
+    }
+    Ok(result)
+}
+
+fn inspect_plan_pair(
+    forward: &FftPlan,
+    inverse: &FftPlan,
+    expected_buffer_size: u64,
+) -> BenchResult<PlanPairMetadata> {
+    let forward_size = forward.required_buffer_size_bytes();
+    let inverse_size = inverse.required_buffer_size_bytes();
+    if forward_size != expected_buffer_size || inverse_size != expected_buffer_size {
+        return Err(input_error(format!(
+            "plan buffer-size mismatch: expected {expected_buffer_size}, forward {forward_size}, inverse {inverse_size}"
+        )));
+    }
+    let forward_diagnostics = forward.diagnostics();
+    let inverse_diagnostics = inverse.diagnostics();
+    let route = format!("{:?}", forward.route());
+    let inverse_route = format!("{:?}", inverse.route());
+    if route != inverse_route {
+        return Err(input_error(format!(
+            "forward/inverse route mismatch: {route} versus {inverse_route}"
+        )));
+    }
+    let execution_kind = forward_diagnostics
+        .route()
+        .execution_kind
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    let inverse_execution_kind = inverse_diagnostics
+        .route()
+        .execution_kind
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    if execution_kind != inverse_execution_kind {
+        return Err(input_error(format!(
+            "forward/inverse execution-kind mismatch: {execution_kind} versus {inverse_execution_kind}"
+        )));
+    }
+    let axis_kinds = format!("{:?}", forward.axis_kinds());
+    let inverse_axis_kinds = format!("{:?}", inverse.axis_kinds());
+    if axis_kinds != inverse_axis_kinds {
+        return Err(input_error(format!(
+            "forward/inverse axis-kind mismatch: {axis_kinds} versus {inverse_axis_kinds}"
+        )));
+    }
+    let (forward_graph_stages, forward_passes, forward_pass_method) =
+        compute_pass_count(&forward_diagnostics)?;
+    let (inverse_graph_stages, inverse_passes, inverse_pass_method) =
+        compute_pass_count(&inverse_diagnostics)?;
+    if forward_graph_stages != inverse_graph_stages
+        || forward_passes != inverse_passes
+        || forward_pass_method != inverse_pass_method
+    {
+        return Err(input_error(format!(
+            "forward/inverse pass metadata mismatch: graph {forward_graph_stages}/{inverse_graph_stages}, traffic {forward_passes}/{inverse_passes}, method {forward_pass_method}/{inverse_pass_method}"
+        )));
+    }
+    let plan_workspace_requirement_bytes = forward
+        .workspace_size_bytes()
+        .checked_add(inverse.workspace_size_bytes())
+        .ok_or_else(|| input_error("combined plan workspace requirement overflow"))?;
+    let diagnostic_helper_requirement_bytes =
+        diagnostic_helper_requirement_bytes(&forward_diagnostics)?
+            .checked_add(diagnostic_helper_requirement_bytes(&inverse_diagnostics)?)
+            .ok_or_else(|| input_error("combined plan helper requirement overflow"))?;
+    let forward_arena_segments = arena_segment_bytes(&forward_diagnostics);
+    let inverse_arena_segments = arena_segment_bytes(&inverse_diagnostics);
+    if forward_arena_segments != inverse_arena_segments {
+        return Err(input_error(format!(
+            "forward/inverse segmented arena mismatch: {forward_arena_segments:?} versus {inverse_arena_segments:?}"
+        )));
+    }
+    Ok(PlanPairMetadata {
+        route,
+        execution_kind,
+        axis_kinds,
+        graph_stage_count: forward_graph_stages,
+        traffic_equivalent_pass_count: forward_passes,
+        pass_count_method: forward_pass_method,
+        plan_workspace_requirement_bytes,
+        diagnostic_helper_requirement_bytes,
+        diagnostic_helper_requirements: combined_helper_requirement_inventory(
+            &forward_diagnostics,
+            &inverse_diagnostics,
+        )?,
+        arena_segment_bytes: forward_arena_segments,
+    })
+}
+
+fn print_compare_result(
+    case: &BenchCase,
+    options: &Options,
+    result: &CompareCaseResult,
+) -> BenchResult<()> {
+    for variant in [&result.unsharded, &result.sharded] {
+        let statistics = statistics(&variant.result.run_pair_ms)?;
+        let traffic_multiplier = variant
+            .result
+            .traffic_equivalent_pass_count
+            .checked_mul(4)
+            .ok_or_else(|| input_error("comparison traffic multiplier overflow"))?;
+        let seconds_per_pair = statistics.mean_ms / 1000.0;
+        let traffic_bytes_per_pair = variant.result.buffer_size as f64 * traffic_multiplier as f64;
+        let bandwidth_gib_s = traffic_bytes_per_pair / seconds_per_pair / 1024_f64.powi(3);
+        println!(
+            "COMPARE_VARIANT suite={} label={} variant={} shape={:?} batch={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
+            case.suite,
+            case.label,
+            variant.label,
+            case.shape,
+            case.batch,
+            variant.effective_max_bind_bytes,
+            variant.requested_max_buffer_bytes,
+            variant.effective_max_buffer_bytes,
+            variant.result.buffer_size,
+            options.runs,
+            variant.result.num_iter,
+            variant.result.run_pair_ms,
+            statistics.mean_ms,
+            statistics
+                .stderr_ms
+                .map_or_else(|| "NA".to_owned(), |value| format!("{value:.6}")),
+            statistics.stderr_ms.is_some(),
+            variant.result.route,
+            variant.result.execution_kind,
+            variant.result.graph_stage_count,
+            variant.result.traffic_equivalent_pass_count,
+            variant.result.pass_count_method,
+            traffic_multiplier,
+            bandwidth_gib_s,
+            variant.result.plan_workspace_requirement_bytes,
+            variant.result.diagnostic_helper_requirement_bytes,
+            variant.result.diagnostic_helper_requirements,
+            variant.result.arena_segment_bytes.len(),
+            variant.result.arena_segment_bytes,
+        );
+    }
+    let unsharded_statistics = statistics(&result.unsharded.result.run_pair_ms)?;
+    let sharded_statistics = statistics(&result.sharded.result.run_pair_ms)?;
+    let sharded_over_unsharded = sharded_statistics.mean_ms / unsharded_statistics.mean_ms;
+    println!(
+        "COMPARE_RESULT suite={} label={} shape={:?} batch={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
+        case.suite,
+        case.label,
+        case.shape,
+        case.batch,
+        unsharded_statistics.mean_ms,
+        sharded_statistics.mean_ms,
+        sharded_over_unsharded,
+        (sharded_over_unsharded - 1.0) * 100.0,
+    );
+    Ok(())
 }
 
 fn initialize_buffers(
@@ -720,6 +1417,46 @@ fn diagnostic_helper_requirement_bytes(diagnostics: &FftDiagnostics) -> BenchRes
                 .checked_add(requirement.required_bytes)
                 .ok_or_else(|| input_error("diagnostic helper requirement total overflow"))
         })
+}
+
+fn combined_helper_requirement_inventory(
+    forward: &FftDiagnostics,
+    inverse: &FftDiagnostics,
+) -> BenchResult<String> {
+    let mut requirements = BTreeMap::<(String, String), u64>::new();
+    for diagnostics in [forward, inverse] {
+        for requirement in diagnostics
+            .buffer_requirements()
+            .iter()
+            .filter(|requirement| requirement.role.starts_with("helper:"))
+        {
+            let key = (requirement.role.clone(), requirement.format.clone());
+            let current = requirements.get(&key).copied().unwrap_or(0);
+            requirements.insert(
+                key,
+                current
+                    .checked_add(requirement.required_bytes)
+                    .ok_or_else(|| input_error("diagnostic helper inventory overflow"))?,
+            );
+        }
+    }
+    Ok(format!(
+        "[{}]",
+        requirements
+            .into_iter()
+            .map(|((role, format), bytes)| format!("{role}:{format}:{bytes}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+fn arena_segment_bytes(diagnostics: &FftDiagnostics) -> Vec<u64> {
+    diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role == "helper:segmented-volume-arena")
+        .map(|requirement| requirement.required_bytes)
+        .collect()
 }
 
 fn push_gpu_error_scopes(
@@ -808,7 +1545,9 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
                     | "permutation"
                     | "stripe-transpose"
                     | "scale"
-            ) || (stage.kind == "copy" && stage.label == "four-step-final-copy")
+            ) || (stage.kind == "copy"
+                && (stage.label == "four-step-final-copy"
+                    || stage.label.starts_with("segmented-volume-")))
         })
         .count();
     let mut traffic_count: usize = diagnostics
@@ -818,8 +1557,10 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
             // Windowed transposes and generic axis permutations gather into
             // compact storage, run one kernel, then scatter back: three
             // full-volume read/write traffic passes per logical graph stage.
+            "stripe-transpose" if stage.label.starts_with("segmented-volume-") => 1,
             "stripe-transpose" | "permutation" => 3usize,
             "copy" if stage.label == "four-step-final-copy" => 1,
+            "copy" if stage.label.starts_with("segmented-volume-") => 1,
             "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose" | "scale" => 1,
             _ => 0,
         })
@@ -860,6 +1601,8 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
         } else {
             "exact-four-step-traffic-equivalent"
         }
+    } else if execution_kind == "segmented-full-volume" {
+        "exact-segmented-four-step-traffic-equivalent"
     } else {
         "estimated-graph"
     };
@@ -893,6 +1636,22 @@ where
         if previous != &value {
             return Err(input_error(format!(
                 "{name} changed across recreated runs: {previous} versus {value}"
+            )));
+        }
+    } else {
+        *slot = Some(value);
+    }
+    Ok(())
+}
+
+fn ensure_consistent_debug<T>(slot: &mut Option<T>, value: T, name: &str) -> BenchResult<()>
+where
+    T: PartialEq + fmt::Debug,
+{
+    if let Some(previous) = slot.as_ref() {
+        if previous != &value {
+            return Err(input_error(format!(
+                "{name} changed across recreated runs: {previous:?} versus {value:?}"
             )));
         }
     } else {
@@ -1021,6 +1780,8 @@ fn parse_options() -> BenchResult<Options> {
         iter_cap: DEFAULT_ITER_CAP,
         max_cases: None,
         wait_timeout: Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS),
+        plan_max_bind_bytes: None,
+        compare_max_buffer_bytes: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -1059,12 +1820,38 @@ fn parse_options() -> BenchResult<Options> {
                 options.custom_batch =
                     parse_positive::<usize>(next_value(&mut args, "--batch")?, "--batch")?;
             }
+            "--plan-max-bind-bytes" => {
+                if suite != Suite::Custom {
+                    return Err(input_error(
+                        "--plan-max-bind-bytes is valid only in custom shape mode",
+                    ));
+                }
+                options.plan_max_bind_bytes = Some(parse_positive::<u64>(
+                    next_value(&mut args, "--plan-max-bind-bytes")?,
+                    "--plan-max-bind-bytes",
+                )?);
+            }
+            "--compare-max-buffer-bytes" => {
+                if suite != Suite::Custom {
+                    return Err(input_error(
+                        "--compare-max-buffer-bytes is valid only in custom shape mode",
+                    ));
+                }
+                options.compare_max_buffer_bytes = Some(parse_compare_max_buffer_bytes(
+                    next_value(&mut args, "--compare-max-buffer-bytes")?,
+                )?);
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
             }
             _ => return Err(input_error(format!("unknown argument {argument:?}"))),
         }
+    }
+    if options.plan_max_bind_bytes.is_some() != options.compare_max_buffer_bytes.is_some() {
+        return Err(input_error(
+            "--plan-max-bind-bytes and --compare-max-buffer-bytes must be provided together",
+        ));
     }
     Ok(options)
 }
@@ -1110,9 +1897,43 @@ fn parse_shape(value: &str) -> BenchResult<Vec<usize>> {
     Ok(shape)
 }
 
+fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBufferBytes> {
+    let mut caps = value.split(',').map(str::trim);
+    let unsharded = caps
+        .next()
+        .ok_or_else(|| {
+            input_error("--compare-max-buffer-bytes requires unsharded,sharded byte caps")
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            contextual_error(
+                format!("parsing unsharded max-buffer cap from {value:?}"),
+                error,
+            )
+        })?;
+    let sharded = caps
+        .next()
+        .ok_or_else(|| {
+            input_error("--compare-max-buffer-bytes requires unsharded,sharded byte caps")
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            contextual_error(
+                format!("parsing sharded max-buffer cap from {value:?}"),
+                error,
+            )
+        })?;
+    if caps.next().is_some() || unsharded == 0 || sharded == 0 {
+        return Err(input_error(
+            "--compare-max-buffer-bytes requires exactly two positive comma-separated u64 values",
+        ));
+    }
+    Ok(CompareMaxBufferBytes { unsharded, sharded })
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n\nDefaults:\n  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.\n  With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.\n\nExamples:\n  cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2\n  cargo bench --bench fft_bench -- sample0 --adapter 0\n  cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2\n  cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1"
+        "Usage:\n  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n\nDefaults:\n  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.\n  With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.\n  Segment-cap comparison recreates both variants per run and alternates their order.\n\nExamples:\n  cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2\n  cargo bench --bench fft_bench -- sample0 --adapter 0\n  cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2\n  cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1\n  cargo bench --bench fft_bench -- shape 4096x8000 --plan-max-bind-bytes 16777216 --compare-max-buffer-bytes 1073741824,67108864 --adapter 0 --runs 2 --iter-cap 1"
     );
 }
 

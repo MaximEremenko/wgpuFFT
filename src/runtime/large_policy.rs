@@ -44,6 +44,7 @@ pub enum LargeExecutionKind {
     RaderBridge,
     BluesteinBridge,
     OutOfCoreFourStep,
+    SegmentedFullVolume,
     OutOfCoreUnsupported,
 }
 
@@ -57,6 +58,7 @@ impl LargeExecutionKind {
             Self::RaderBridge => "rader-bridge",
             Self::BluesteinBridge => "bluestein-bridge",
             Self::OutOfCoreFourStep => "out-of-core-four-step",
+            Self::SegmentedFullVolume => "segmented-full-volume",
             Self::OutOfCoreUnsupported => "out-of-core-unsupported",
         }
     }
@@ -73,6 +75,19 @@ impl From<&wgpu::Limits> for LargePolicyLimits {
         Self {
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
+        }
+    }
+}
+
+impl LargePolicyLimits {
+    pub(crate) fn componentwise_min(self, other: Self) -> Self {
+        let max_buffer_size = self.max_buffer_size.min(other.max_buffer_size);
+        Self {
+            max_storage_buffer_binding_size: self
+                .max_storage_buffer_binding_size
+                .min(other.max_storage_buffer_binding_size)
+                .min(max_buffer_size),
+            max_buffer_size,
         }
     }
 }
@@ -759,6 +774,20 @@ mod tests {
             max_storage_buffer_binding_size: max_bind,
             max_buffer_size: 1 << 30,
         }
+    }
+
+    #[test]
+    fn effective_policy_never_exposes_a_binding_larger_than_a_buffer() {
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 1024,
+            max_buffer_size: 256,
+        }
+        .componentwise_min(LargePolicyLimits {
+            max_storage_buffer_binding_size: 4096,
+            max_buffer_size: 8192,
+        });
+        assert_eq!(limits.max_storage_buffer_binding_size, 256);
+        assert_eq!(limits.max_buffer_size, 256);
     }
 
     #[test]

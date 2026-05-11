@@ -801,8 +801,9 @@ impl FftPlan {
             )
         });
 
-        let four_step =
-            self.large_routing_policy().execution_kind() == LargeExecutionKind::OutOfCoreFourStep;
+        let four_step = matches!(&self.inner, FftPlanInner::C2c(_))
+            && self.large_routing_policy().execution_kind()
+                == LargeExecutionKind::OutOfCoreFourStep;
         match input_bound {
             Ok(input) => {
                 diagnostics = if four_step {
@@ -1347,7 +1348,7 @@ fn add_four_step_bound_logical_io_diagnostics(
         return diagnostics.with_blocker(
             FftBlocker::new(
                 FftBlockerKind::Unsupported,
-                "phase-A four-step execution does not yet support strided logical I/O",
+                "four-step execution does not yet support strided logical I/O",
             )
             .with_route("large-out-of-core")
             .with_stage(if role == "input" {

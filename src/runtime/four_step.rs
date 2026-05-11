@@ -49,24 +49,28 @@ struct ScaleParams {
 pub(crate) struct FourStepC2cPlan {
     required_buffer_size_bytes: u64,
     limits: LargePolicyLimits,
-    axis0: AxisWindowPlan,
-    axis1: AxisWindowPlan,
-    transpose_forward: StripeTransposePlan,
-    transpose_back: StripeTransposePlan,
+    axes: Vec<FourStepAxisStep>,
     scale: Option<ScaleWindowPlan>,
     scratch: wgpu::Buffer,
     axis_stage_input: wgpu::Buffer,
     axis_stage_output: wgpu::Buffer,
-    stripe_input: wgpu::Buffer,
-    stripe_output: wgpu::Buffer,
-    transpose_pipeline: wgpu::ComputePipeline,
-    transpose_bind_group_layout: wgpu::BindGroupLayout,
+    permutation_input: Option<wgpu::Buffer>,
+    permutation_output: Option<wgpu::Buffer>,
+    transpose_pipeline: Option<wgpu::ComputePipeline>,
+    transpose_bind_group_layout: Option<wgpu::BindGroupLayout>,
     scale_pipeline: Option<wgpu::ComputePipeline>,
     scale_bind_group_layout: Option<wgpu::BindGroupLayout>,
     graph_plan: LargeExecutionPlan,
     staging_bytes: Vec<u64>,
     factor_splits: Vec<LargeFactorSplit>,
     twiddle_lut_storage_bytes: u64,
+}
+
+struct FourStepAxisStep {
+    axis: usize,
+    fft: AxisWindowPlan,
+    to_front: Option<TiledTransposePlan>,
+    from_front: Option<TiledTransposePlan>,
 }
 
 struct AxisWindowPlan {
@@ -82,13 +86,21 @@ struct AxisWindowDispatch {
     plan_index: usize,
 }
 
-struct StripeTransposePlan {
+struct TiledTransposePlan {
     nx: usize,
     ny: usize,
-    batch: usize,
-    max_stripe_width: usize,
-    max_stripe_bytes: u64,
-    params_by_width: HashMap<usize, wgpu::Buffer>,
+    repetitions: usize,
+    max_tile_width: usize,
+    max_tile_height: usize,
+    max_tile_bytes: u64,
+    params_by_shape: HashMap<(usize, usize), wgpu::Buffer>,
+}
+
+#[derive(Clone, Copy)]
+struct FourStepGraphAxis<'a> {
+    axis: usize,
+    stages: &'a [AxisStageKind],
+    workspace_bytes: &'a [u64],
 }
 
 struct ScaleWindowPlan {
@@ -108,10 +120,11 @@ impl FourStepC2cPlan {
         config: &FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        if config.shape().len() != 2 || config.axes() != [0, 1] {
+        let rank = config.shape().len();
+        if rank < 2 {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "four-step-plan",
-                reason: "phase-A four-step execution requires rank-2 axes [0, 1]",
+                reason: "four-step execution requires rank >= 2",
             });
         }
 
@@ -130,38 +143,77 @@ impl FourStepC2cPlan {
             });
         }
 
-        let n0 = config.shape()[0];
-        let n1 = config.shape()[1];
         let total_complex = required_buffer_size_bytes / COMPLEX_F32_BYTES;
         let storage_alignment = effective_limits.storage_alignment;
         let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
-        let axis0 = AxisWindowPlan::new(
-            device,
-            queue,
-            n0,
-            n1.checked_mul(config.batch())
-                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?,
-            config,
-            planning_limits,
-            storage_alignment,
-            &mut twiddle_lut_pool,
-        )?;
-        let axis1 = AxisWindowPlan::new(
-            device,
-            queue,
-            n1,
-            n0.checked_mul(config.batch())
-                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?,
-            config,
-            planning_limits,
-            storage_alignment,
-            &mut twiddle_lut_pool,
-        )?;
-
-        let transpose_forward =
-            StripeTransposePlan::new(device, n0, n1, config.batch(), effective_limits)?;
-        let transpose_back =
-            StripeTransposePlan::new(device, n1, n0, config.batch(), effective_limits)?;
+        let per_batch_complex = config.shape().iter().try_fold(1usize, |total, &dim| {
+            total
+                .checked_mul(dim)
+                .ok_or(FftError::LengthTooLarge { len: usize::MAX })
+        })?;
+        let mut axes = Vec::with_capacity(config.axes().len());
+        for &axis in config.axes() {
+            let axis_len = config.shape()[axis];
+            crate::runtime::factor_supported_length(axis_len)?;
+            let lines_total = per_batch_complex
+                .checked_div(axis_len)
+                .and_then(|lines| lines.checked_mul(config.batch()))
+                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+            let fft = AxisWindowPlan::new(
+                device,
+                queue,
+                axis_len,
+                lines_total,
+                config,
+                planning_limits,
+                storage_alignment,
+                &mut twiddle_lut_pool,
+            )?;
+            let (to_front, from_front) = if axis == 0 {
+                (None, None)
+            } else {
+                let prefix = config.shape()[..axis]
+                    .iter()
+                    .try_fold(1usize, |total, &dim| {
+                        total
+                            .checked_mul(dim)
+                            .ok_or(FftError::LengthTooLarge { len: usize::MAX })
+                    })?;
+                let suffix =
+                    config.shape()[axis + 1..]
+                        .iter()
+                        .try_fold(1usize, |total, &dim| {
+                            total
+                                .checked_mul(dim)
+                                .ok_or(FftError::LengthTooLarge { len: usize::MAX })
+                        })?;
+                let repetitions = suffix
+                    .checked_mul(config.batch())
+                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                (
+                    Some(TiledTransposePlan::new(
+                        device,
+                        prefix,
+                        axis_len,
+                        repetitions,
+                        effective_limits,
+                    )?),
+                    Some(TiledTransposePlan::new(
+                        device,
+                        axis_len,
+                        prefix,
+                        repetitions,
+                        effective_limits,
+                    )?),
+                )
+            };
+            axes.push(FourStepAxisStep {
+                axis,
+                fft,
+                to_front,
+                from_front,
+            });
+        }
 
         let scale_value = config.scale()?;
         let scale = if (scale_value - 1.0).abs() > f32::EPSILON {
@@ -176,13 +228,18 @@ impl FourStepC2cPlan {
             None
         };
 
-        let axis_stage_bytes = axis0
-            .max_window_bytes
-            .max(axis1.max_window_bytes)
+        let axis_stage_bytes = axes
+            .iter()
+            .map(|step| step.fft.max_window_bytes)
+            .max()
+            .ok_or(FftError::ZeroLength)?
             .max(scale.as_ref().map_or(0, |plan| plan.max_window_bytes));
-        let stripe_bytes = transpose_forward
-            .max_stripe_bytes
-            .max(transpose_back.max_stripe_bytes);
+        let permutation_bytes = axes
+            .iter()
+            .flat_map(|step| [step.to_front.as_ref(), step.from_front.as_ref()])
+            .flatten()
+            .map(|plan| plan.max_tile_bytes)
+            .max();
 
         let scratch = create_four_step_buffer(
             device,
@@ -202,40 +259,63 @@ impl FourStepC2cPlan {
             axis_stage_bytes,
             effective_limits.max_buffer_size,
         )?;
-        let stripe_input = create_four_step_buffer(
-            device,
-            "wgpu_fft.four_step.stripe_input",
-            stripe_bytes,
-            effective_limits.max_buffer_size,
-        )?;
-        let stripe_output = create_four_step_buffer(
-            device,
-            "wgpu_fft.four_step.stripe_output",
-            stripe_bytes,
-            effective_limits.max_buffer_size,
-        )?;
-
-        let transpose_key = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
-            FourStepKernelKind::StripeTranspose,
-            TRANSPOSE_WORKGROUP_SIZE,
-        ));
-        let transpose_bind_group_layout = with_device_pipeline_cache(device, |cache| {
-            cache.get_bind_group_layout(device, transpose_key.layout)
-        });
-        let transpose_pipeline = with_device_pipeline_cache(device, |cache| {
-            cache.get_compute_pipeline(
-                device,
-                &transpose_key,
-                "wgpu_fft.four_step.stripe_transpose.pipeline",
-                "wgpu_fft.four_step.stripe_transpose.shader",
-                || {
-                    generate_four_step_wgsl_for_key(match &transpose_key.shader {
-                        crate::runtime::pipeline_cache::ShaderCacheKey::FourStepStage(key) => key,
-                        _ => unreachable!(),
-                    })
-                },
+        let (permutation_input, permutation_output) = if let Some(bytes) = permutation_bytes {
+            let input_label = if rank == 2 {
+                "wgpu_fft.four_step.stripe_input"
+            } else {
+                "wgpu_fft.four_step.permutation_input"
+            };
+            let output_label = if rank == 2 {
+                "wgpu_fft.four_step.stripe_output"
+            } else {
+                "wgpu_fft.four_step.permutation_output"
+            };
+            (
+                Some(create_four_step_buffer(
+                    device,
+                    input_label,
+                    bytes,
+                    effective_limits.max_buffer_size,
+                )?),
+                Some(create_four_step_buffer(
+                    device,
+                    output_label,
+                    bytes,
+                    effective_limits.max_buffer_size,
+                )?),
             )
-        });
+        } else {
+            (None, None)
+        };
+
+        let (transpose_pipeline, transpose_bind_group_layout) = if permutation_bytes.is_some() {
+            let transpose_key = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
+                FourStepKernelKind::StripeTranspose,
+                TRANSPOSE_WORKGROUP_SIZE,
+            ));
+            let layout = with_device_pipeline_cache(device, |cache| {
+                cache.get_bind_group_layout(device, transpose_key.layout)
+            });
+            let pipeline = with_device_pipeline_cache(device, |cache| {
+                cache.get_compute_pipeline(
+                    device,
+                    &transpose_key,
+                    "wgpu_fft.four_step.stripe_transpose.pipeline",
+                    "wgpu_fft.four_step.stripe_transpose.shader",
+                    || {
+                        generate_four_step_wgsl_for_key(match &transpose_key.shader {
+                            crate::runtime::pipeline_cache::ShaderCacheKey::FourStepStage(key) => {
+                                key
+                            }
+                            _ => unreachable!(),
+                        })
+                    },
+                )
+            });
+            (Some(pipeline), Some(layout))
+        } else {
+            (None, None)
+        };
 
         let (scale_pipeline, scale_bind_group_layout) = if scale.is_some() {
             let scale_key = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
@@ -266,61 +346,61 @@ impl FourStepC2cPlan {
             (None, None)
         };
 
+        let graph_axes = axes
+            .iter()
+            .map(|step| FourStepGraphAxis {
+                axis: step.axis,
+                stages: &step.fft.graph_stage_kinds,
+                workspace_bytes: &step.fft.workspace_bytes,
+            })
+            .collect::<Vec<_>>();
         let graph_plan = build_four_step_graph(
             required_buffer_size_bytes,
             total_complex,
-            &axis0.graph_stage_kinds,
-            &axis1.graph_stage_kinds,
+            rank,
+            &graph_axes,
             scale.is_some(),
             axis_stage_bytes,
-            stripe_bytes,
-            &axis0.workspace_bytes,
-            &axis1.workspace_bytes,
+            permutation_bytes,
             planning_limits,
             storage_alignment,
         )?;
-        let staging_bytes = vec![
+        let mut staging_bytes = vec![
             required_buffer_size_bytes,
             axis_stage_bytes,
             axis_stage_bytes,
-            stripe_bytes,
-            stripe_bytes,
         ];
-        let mut staging_bytes = staging_bytes;
-        staging_bytes.extend(axis0.workspace_bytes.iter().copied());
-        staging_bytes.extend(axis1.workspace_bytes.iter().copied());
-        let factor_splits = vec![
-            LargeFactorSplit {
-                axis: Some(0),
-                len: n0 as u64,
-                factors: crate::runtime::factor_supported_length(n0)?
-                    .into_iter()
-                    .map(|factor| factor as u64)
-                    .collect(),
-            },
-            LargeFactorSplit {
-                axis: Some(1),
-                len: n1 as u64,
-                factors: crate::runtime::factor_supported_length(n1)?
-                    .into_iter()
-                    .map(|factor| factor as u64)
-                    .collect(),
-            },
-        ];
+        if let Some(bytes) = permutation_bytes {
+            staging_bytes.extend([bytes, bytes]);
+        }
+        for step in &axes {
+            staging_bytes.extend(step.fft.workspace_bytes.iter().copied());
+        }
+        let factor_splits = axes
+            .iter()
+            .map(|step| {
+                let len = config.shape()[step.axis];
+                Ok(LargeFactorSplit {
+                    axis: Some(step.axis),
+                    len: len as u64,
+                    factors: crate::runtime::factor_supported_length(len)?
+                        .into_iter()
+                        .map(|factor| factor as u64)
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             required_buffer_size_bytes,
             limits,
-            axis0,
-            axis1,
-            transpose_forward,
-            transpose_back,
+            axes,
             scale,
             scratch,
             axis_stage_input,
             axis_stage_output,
-            stripe_input,
-            stripe_output,
+            permutation_input,
+            permutation_output,
             transpose_pipeline,
             transpose_bind_group_layout,
             scale_pipeline,
@@ -353,58 +433,108 @@ impl FourStepC2cPlan {
             "COPY_SRC|COPY_DST",
         )?;
 
-        self.axis0.execute(
-            device,
-            encoder,
-            &scheduler,
-            &executor,
-            &input,
-            &scratch,
-            &self.axis_stage_input,
-            &self.axis_stage_output,
-        )?;
-        self.transpose_forward.execute(
-            device,
-            encoder,
-            &scheduler,
-            &executor,
-            &scratch,
-            &output,
-            &self.stripe_input,
-            &self.stripe_output,
-            &self.transpose_bind_group_layout,
-            &self.transpose_pipeline,
-        )?;
-        self.axis1.execute(
-            device,
-            encoder,
-            &scheduler,
-            &executor,
-            &output,
-            &scratch,
-            &self.axis_stage_input,
-            &self.axis_stage_output,
-        )?;
-        self.transpose_back.execute(
-            device,
-            encoder,
-            &scheduler,
-            &executor,
-            &scratch,
-            &output,
-            &self.stripe_input,
-            &self.stripe_output,
-            &self.transpose_bind_group_layout,
-            &self.transpose_pipeline,
-        )?;
+        for (step_index, step) in self.axes.iter().enumerate() {
+            let source = if step_index == 0 {
+                &input
+            } else if step_index % 2 == 1 {
+                &scratch
+            } else {
+                &output
+            };
+            let result = if step_index % 2 == 0 {
+                &scratch
+            } else {
+                &output
+            };
+            let intermediate = if step_index % 2 == 0 {
+                &output
+            } else {
+                &scratch
+            };
 
+            if step.axis == 0 {
+                step.fft.execute(
+                    device,
+                    encoder,
+                    &scheduler,
+                    &executor,
+                    source,
+                    result,
+                    &self.axis_stage_input,
+                    &self.axis_stage_output,
+                )?;
+            } else {
+                let tile_input = self
+                    .permutation_input
+                    .as_ref()
+                    .expect("permutation staging exists for a non-front axis");
+                let tile_output = self
+                    .permutation_output
+                    .as_ref()
+                    .expect("permutation staging exists for a non-front axis");
+                let transpose_layout = self
+                    .transpose_bind_group_layout
+                    .as_ref()
+                    .expect("transpose layout exists for a non-front axis");
+                let transpose_pipeline = self
+                    .transpose_pipeline
+                    .as_ref()
+                    .expect("transpose pipeline exists for a non-front axis");
+                step.to_front
+                    .as_ref()
+                    .expect("to-front plan exists for a non-front axis")
+                    .execute(
+                        device,
+                        encoder,
+                        &scheduler,
+                        &executor,
+                        source,
+                        result,
+                        tile_input,
+                        tile_output,
+                        transpose_layout,
+                        transpose_pipeline,
+                    )?;
+                step.fft.execute(
+                    device,
+                    encoder,
+                    &scheduler,
+                    &executor,
+                    result,
+                    intermediate,
+                    &self.axis_stage_input,
+                    &self.axis_stage_output,
+                )?;
+                step.from_front
+                    .as_ref()
+                    .expect("from-front plan exists for a non-front axis")
+                    .execute(
+                        device,
+                        encoder,
+                        &scheduler,
+                        &executor,
+                        intermediate,
+                        result,
+                        tile_input,
+                        tile_output,
+                        transpose_layout,
+                        transpose_pipeline,
+                    )?;
+            }
+        }
+
+        let final_data = if self.axes.len() % 2 == 0 {
+            &output
+        } else {
+            &scratch
+        };
         if let Some(scale) = self.scale.as_ref() {
             scale.execute(
                 device,
                 encoder,
                 &scheduler,
                 &executor,
-                &output,
+                final_data,
                 &self.axis_stage_input,
                 self.scale_bind_group_layout
                     .as_ref()
@@ -412,6 +542,16 @@ impl FourStepC2cPlan {
                 self.scale_pipeline
                     .as_ref()
                     .expect("scale pipeline exists with scale plan"),
+            )?;
+        }
+        if self.axes.len() % 2 == 1 {
+            executor.copy_buffer_to_view_range(
+                encoder,
+                &self.scratch,
+                0,
+                &output,
+                0,
+                self.required_buffer_size_bytes,
             )?;
         }
 
@@ -452,7 +592,7 @@ impl AxisWindowPlan {
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
         if line_bytes > limits.max_storage_buffer_binding_size {
             return Err(FftError::WindowScheduleUnsupported {
-                reason: "phase-A four-step axis line exceeds the binding limit",
+                reason: "four-step axis line exceeds the binding limit",
                 requested_bytes: line_bytes,
                 max_bind_bytes: limits.max_storage_buffer_binding_size,
             });
@@ -589,12 +729,12 @@ impl AxisWindowPlan {
     }
 }
 
-impl StripeTransposePlan {
+impl TiledTransposePlan {
     fn new(
         device: &wgpu::Device,
         nx: usize,
         ny: usize,
-        batch: usize,
+        repetitions: usize,
         limits: SchedulerLimits,
     ) -> Result<Self> {
         if device.limits().max_compute_invocations_per_workgroup < TRANSPOSE_WORKGROUP_SIZE
@@ -606,58 +746,59 @@ impl StripeTransposePlan {
                 reason: "device cannot run the portable 16x16 transpose workgroup",
             });
         }
-        let row_bytes = (ny as u64)
-            .checked_mul(COMPLEX_F32_BYTES)
-            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-        if row_bytes > limits.max_storage_buffer_binding_size {
+        let max_tile_elements = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size)
+            / COMPLEX_F32_BYTES;
+        if max_tile_elements == 0 {
             return Err(FftError::WindowScheduleUnsupported {
-                reason: "four-step transposed axis line exceeds the binding limit",
-                requested_bytes: row_bytes,
+                reason: "four-step transpose cannot fit one complex value",
+                requested_bytes: COMPLEX_F32_BYTES,
                 max_bind_bytes: limits.max_storage_buffer_binding_size,
             });
         }
-        let width_by_bind = limits.max_storage_buffer_binding_size / row_bytes;
-        let width_by_buffer = limits.max_buffer_size / row_bytes;
-        let max_stripe_width = nx.min(width_by_bind as usize).min(width_by_buffer as usize);
-        if max_stripe_width == 0 {
-            return Err(FftError::WindowScheduleUnsupported {
-                reason: "four-step stripe scheduler could not fit one column",
-                requested_bytes: row_bytes,
-                max_bind_bytes: limits.max_storage_buffer_binding_size,
-            });
-        }
-        let max_stripe_bytes = (max_stripe_width as u64)
-            .checked_mul(row_bytes)
+        let max_tile_elements = usize::try_from(max_tile_elements)
+            .map_err(|_| FftError::LengthTooLarge { len: usize::MAX })?;
+        let (max_tile_width, max_tile_height) = choose_transpose_tile(nx, ny, max_tile_elements);
+        let max_tile_bytes = (max_tile_width as u64)
+            .checked_mul(max_tile_height as u64)
+            .and_then(|elements| elements.checked_mul(COMPLEX_F32_BYTES))
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-        let mut params_by_width = HashMap::new();
-        let tail = nx % max_stripe_width;
-        for width in [max_stripe_width, tail] {
-            if width == 0 || params_by_width.contains_key(&width) {
-                continue;
+        let mut params_by_shape = HashMap::new();
+        let tail_width = nx % max_tile_width;
+        let tail_height = ny % max_tile_height;
+        for width in [max_tile_width, tail_width] {
+            for height in [max_tile_height, tail_height] {
+                if width == 0 || height == 0 || params_by_shape.contains_key(&(width, height)) {
+                    continue;
+                }
+                let params = StripeTransposeParams {
+                    width: u32::try_from(width)
+                        .map_err(|_| FftError::LengthTooLarge { len: width })?,
+                    height: u32::try_from(height)
+                        .map_err(|_| FftError::LengthTooLarge { len: height })?,
+                    _pad0: 0,
+                    _pad1: 0,
+                };
+                params_by_shape.insert(
+                    (width, height),
+                    create_uniform_buffer(
+                        device,
+                        "wgpu_fft.four_step.tiled_transpose.params",
+                        bytemuck::bytes_of(&params),
+                    ),
+                );
             }
-            let params = StripeTransposeParams {
-                width: u32::try_from(width).map_err(|_| FftError::LengthTooLarge { len: width })?,
-                height: u32::try_from(ny).map_err(|_| FftError::LengthTooLarge { len: ny })?,
-                _pad0: 0,
-                _pad1: 0,
-            };
-            params_by_width.insert(
-                width,
-                create_uniform_buffer(
-                    device,
-                    "wgpu_fft.four_step.stripe_transpose.params",
-                    bytemuck::bytes_of(&params),
-                ),
-            );
         }
 
         Ok(Self {
             nx,
             ny,
-            batch,
-            max_stripe_width,
-            max_stripe_bytes,
-            params_by_width,
+            repetitions,
+            max_tile_width,
+            max_tile_height,
+            max_tile_bytes,
+            params_by_shape,
         })
     }
 
@@ -670,99 +811,165 @@ impl StripeTransposePlan {
         executor: &StageExecutor<'_>,
         input: &BufferView<'_>,
         output: &BufferView<'_>,
-        stripe_input: &wgpu::Buffer,
-        stripe_output: &wgpu::Buffer,
+        tile_input: &wgpu::Buffer,
+        tile_output: &wgpu::Buffer,
         bind_group_layout: &wgpu::BindGroupLayout,
         pipeline: &wgpu::ComputePipeline,
     ) -> Result<()> {
-        let per_batch_elements = (self.nx as u64)
+        let per_matrix_elements = (self.nx as u64)
             .checked_mul(self.ny as u64)
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-        for batch in 0..self.batch {
-            let batch_base = (batch as u64)
-                .checked_mul(per_batch_elements)
+        for repetition in 0..self.repetitions {
+            let matrix_base = (repetition as u64)
+                .checked_mul(per_matrix_elements)
                 .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-            for x0 in (0..self.nx).step_by(self.max_stripe_width) {
-                let width = self.max_stripe_width.min(self.nx - x0);
-                let stripe_elements = (width as u64)
-                    .checked_mul(self.ny as u64)
-                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                let stripe_bytes = stripe_elements
-                    .checked_mul(COMPLEX_F32_BYTES)
-                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                for y in 0..self.ny {
-                    let source_element = batch_base
-                        .checked_add((y as u64) * self.nx as u64)
-                        .and_then(|value| value.checked_add(x0 as u64))
+            for y0 in (0..self.ny).step_by(self.max_tile_height) {
+                let height = self.max_tile_height.min(self.ny - y0);
+                for x0 in (0..self.nx).step_by(self.max_tile_width) {
+                    let width = self.max_tile_width.min(self.nx - x0);
+                    let tile_elements = (width as u64)
+                        .checked_mul(height as u64)
                         .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                    executor.copy_view_range_to_buffer(
-                        encoder,
-                        input,
-                        source_element * COMPLEX_F32_BYTES,
-                        stripe_input,
-                        (y as u64) * (width as u64) * COMPLEX_F32_BYTES,
-                        (width as u64) * COMPLEX_F32_BYTES,
+                    let tile_bytes = tile_elements
+                        .checked_mul(COMPLEX_F32_BYTES)
+                        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                    if x0 == 0 && width == self.nx {
+                        let source_element = matrix_base
+                            .checked_add((y0 as u64) * self.nx as u64)
+                            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                        executor.copy_view_range_to_buffer(
+                            encoder,
+                            input,
+                            source_element * COMPLEX_F32_BYTES,
+                            tile_input,
+                            0,
+                            tile_bytes,
+                        )?;
+                    } else {
+                        for local_y in 0..height {
+                            let source_element = matrix_base
+                                .checked_add(((y0 + local_y) as u64) * self.nx as u64)
+                                .and_then(|value| value.checked_add(x0 as u64))
+                                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                            executor.copy_view_range_to_buffer(
+                                encoder,
+                                input,
+                                source_element * COMPLEX_F32_BYTES,
+                                tile_input,
+                                (local_y as u64) * (width as u64) * COMPLEX_F32_BYTES,
+                                (width as u64) * COMPLEX_F32_BYTES,
+                            )?;
+                        }
+                    }
+
+                    let tile_input_view = BufferView::whole(tile_input).prefix(tile_bytes)?;
+                    let tile_output_view = BufferView::whole(tile_output).prefix(tile_bytes)?;
+                    let input_resource = scheduler
+                        .storage_binding_resource(&tile_input_view, ElementFormat::ComplexF32)?;
+                    let output_resource = scheduler
+                        .storage_binding_resource(&tile_output_view, ElementFormat::ComplexF32)?;
+                    let params_buffer = &self.params_by_shape[&(width, height)];
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("wgpu_fft.four_step.tiled_transpose.bind_group"),
+                        layout: bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: input_resource,
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: output_resource,
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: params_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("wgpu_fft.four_step.tiled_transpose.pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    let tiles_x = (width as u32).div_ceil(TRANSPOSE_TILE);
+                    let tiles_y = (height as u32).div_ceil(TRANSPOSE_TILE);
+                    let workgroups = tiles_x.checked_mul(tiles_y).ok_or(
+                        FftError::DispatchWorkgroupsUnsupported {
+                            workgroups: u32::MAX,
+                            max_per_dimension: max_workgroups_per_dimension(device),
+                        },
                     )?;
+                    let (x, y, z) =
+                        split_workgroups(workgroups, max_workgroups_per_dimension(device))?;
+                    pass.dispatch_workgroups(x, y, z);
+                    drop(pass);
+
+                    if y0 == 0 && height == self.ny {
+                        let destination_element = matrix_base
+                            .checked_add((x0 as u64) * self.ny as u64)
+                            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                        executor.copy_buffer_to_view_range(
+                            encoder,
+                            tile_output,
+                            0,
+                            output,
+                            destination_element * COMPLEX_F32_BYTES,
+                            tile_bytes,
+                        )?;
+                    } else {
+                        for local_x in 0..width {
+                            let destination_element = matrix_base
+                                .checked_add(((x0 + local_x) as u64) * self.ny as u64)
+                                .and_then(|value| value.checked_add(y0 as u64))
+                                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                            executor.copy_buffer_to_view_range(
+                                encoder,
+                                tile_output,
+                                (local_x as u64) * (height as u64) * COMPLEX_F32_BYTES,
+                                output,
+                                destination_element * COMPLEX_F32_BYTES,
+                                (height as u64) * COMPLEX_F32_BYTES,
+                            )?;
+                        }
+                    }
                 }
-
-                let stripe_input_view = BufferView::whole(stripe_input).prefix(stripe_bytes)?;
-                let stripe_output_view = BufferView::whole(stripe_output).prefix(stripe_bytes)?;
-                let input_resource = scheduler
-                    .storage_binding_resource(&stripe_input_view, ElementFormat::ComplexF32)?;
-                let output_resource = scheduler
-                    .storage_binding_resource(&stripe_output_view, ElementFormat::ComplexF32)?;
-                let params_buffer = &self.params_by_width[&width];
-                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("wgpu_fft.four_step.stripe_transpose.bind_group"),
-                    layout: bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: input_resource,
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: output_resource,
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: params_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("wgpu_fft.four_step.stripe_transpose.pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
-                let tiles_x = (width as u32).div_ceil(TRANSPOSE_TILE);
-                let tiles_y = (self.ny as u32).div_ceil(TRANSPOSE_TILE);
-                let workgroups = tiles_x.checked_mul(tiles_y).ok_or(
-                    FftError::DispatchWorkgroupsUnsupported {
-                        workgroups: u32::MAX,
-                        max_per_dimension: max_workgroups_per_dimension(device),
-                    },
-                )?;
-                let (x, y, z) = split_workgroups(workgroups, max_workgroups_per_dimension(device))?;
-                pass.dispatch_workgroups(x, y, z);
-                drop(pass);
-
-                let destination_element = batch_base
-                    .checked_add((x0 as u64) * self.ny as u64)
-                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                executor.copy_buffer_to_view_range(
-                    encoder,
-                    stripe_output,
-                    0,
-                    output,
-                    destination_element * COMPLEX_F32_BYTES,
-                    stripe_bytes,
-                )?;
             }
         }
         Ok(())
     }
+}
+
+fn choose_transpose_tile(nx: usize, ny: usize, max_elements: usize) -> (usize, usize) {
+    debug_assert!(nx > 0 && ny > 0 && max_elements > 0);
+    let mut candidates = Vec::with_capacity(2);
+    if ny <= max_elements {
+        candidates.push((nx.min(max_elements / ny).max(1), ny));
+    }
+    if nx <= max_elements {
+        candidates.push((nx, ny.min(max_elements / nx).max(1)));
+    }
+    if let Some(&(width, height)) = candidates.iter().min_by_key(|&&(width, height)| {
+        let x_tiles = nx.div_ceil(width) as u128;
+        let y_tiles = ny.div_ceil(height) as u128;
+        let gather_per_tile = if width == nx { 1 } else { height as u128 };
+        let scatter_per_tile = if height == ny { 1 } else { width as u128 };
+        (
+            x_tiles * y_tiles * (gather_per_tile + scatter_per_tile),
+            std::cmp::Reverse((width as u128) * (height as u128)),
+        )
+    }) {
+        return (width, height);
+    }
+
+    let mut width = 1usize;
+    while width <= max_elements / width {
+        width += 1;
+    }
+    width = width.saturating_sub(1).max(1).min(nx);
+    let height = ny.min(max_elements / width).max(1);
+    (width, height)
 }
 
 impl ScaleWindowPlan {
@@ -977,13 +1184,11 @@ fn create_uniform_buffer(device: &wgpu::Device, label: &'static str, bytes: &[u8
 fn build_four_step_graph(
     required_bytes: u64,
     total_complex: u64,
-    axis0_stages: &[AxisStageKind],
-    axis1_stages: &[AxisStageKind],
+    rank: usize,
+    axes: &[FourStepGraphAxis<'_>],
     has_scale: bool,
     axis_stage_bytes: u64,
-    stripe_bytes: u64,
-    axis0_workspace_bytes: &[u64],
-    axis1_workspace_bytes: &[u64],
+    permutation_bytes: Option<u64>,
     limits: LargePolicyLimits,
     storage_alignment: u64,
 ) -> Result<LargeExecutionPlan> {
@@ -997,7 +1202,11 @@ fn build_four_step_graph(
         )
     };
     let range = |buffer| LogicalRange::new(buffer, 0, required_bytes, ElementFormat::ComplexF32);
-    let mut graph = LargeExecutionGraph::new("c2c-four-step-rank2");
+    let mut graph = LargeExecutionGraph::new(if rank == 2 {
+        "c2c-four-step-rank2"
+    } else {
+        "c2c-four-step-rank-nd"
+    });
     graph.push_stage(
         LargeStage::WindowedHelper {
             label: "four-step-transpose-scratch",
@@ -1023,14 +1232,11 @@ fn build_four_step_graph(
         )?;
     }
     let mut workspace_stage_index = 4u32;
-    for (axis, workspaces) in [
-        (0usize, axis0_workspace_bytes),
-        (1usize, axis1_workspace_bytes),
-    ] {
-        for (index, &workspace_bytes) in workspaces.iter().enumerate() {
+    for graph_axis in axes {
+        for (index, &workspace_bytes) in graph_axis.workspace_bytes.iter().enumerate() {
             graph.push_stage(
                 LargeStage::WindowedHelper {
-                    label: four_step_axis_workspace_label(axis, index),
+                    label: four_step_axis_workspace_label(graph_axis.axis, index),
                     range: LogicalRange::new(
                         LogicalBufferId::Stage(workspace_stage_index),
                         0,
@@ -1045,75 +1251,163 @@ fn build_four_step_graph(
                 .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
         }
     }
-    for (label, index) in [
-        ("four-step-stripe-input", 2),
-        ("four-step-stripe-output", 3),
-    ] {
-        graph.push_stage(
-            LargeStage::WindowedHelper {
-                label,
-                range: LogicalRange::new(
-                    LogicalBufferId::Stage(index),
-                    0,
-                    stripe_bytes,
-                    ElementFormat::ComplexF32,
-                )?,
-            },
-            requirements(stripe_bytes)?,
-        )?;
+    if let Some(bytes) = permutation_bytes {
+        let labels = if rank == 2 {
+            ["four-step-stripe-input", "four-step-stripe-output"]
+        } else {
+            [
+                "four-step-permutation-input",
+                "four-step-permutation-output",
+            ]
+        };
+        for (label, index) in labels.into_iter().zip([2, 3]) {
+            graph.push_stage(
+                LargeStage::WindowedHelper {
+                    label,
+                    range: LogicalRange::new(
+                        LogicalBufferId::Stage(index),
+                        0,
+                        bytes,
+                        ElementFormat::ComplexF32,
+                    )?,
+                },
+                requirements(bytes)?,
+            )?;
+        }
     }
 
-    for &kind in axis0_stages {
-        graph.push_stage(
-            LargeStage::WindowedKernel {
-                label: four_step_axis_stage_label(0, kind),
-                input: range(LogicalBufferId::Input)?,
-                output: range(LogicalBufferId::Temp(0))?,
-                work_items: total_complex,
-            },
-            requirements(axis_stage_bytes)?,
-        )?;
+    for (step_index, graph_axis) in axes.iter().enumerate() {
+        let source_buffer = if step_index == 0 {
+            LogicalBufferId::Input
+        } else if step_index % 2 == 1 {
+            LogicalBufferId::Temp(0)
+        } else {
+            LogicalBufferId::Output
+        };
+        let result_buffer = if step_index % 2 == 0 {
+            LogicalBufferId::Temp(0)
+        } else {
+            LogicalBufferId::Output
+        };
+        let intermediate_buffer = if step_index % 2 == 0 {
+            LogicalBufferId::Output
+        } else {
+            LogicalBufferId::Temp(0)
+        };
+
+        let fft_input = if graph_axis.axis == 0 {
+            source_buffer
+        } else {
+            let bytes = permutation_bytes.ok_or(FftError::LargeGraphStageUnsupported {
+                stage: "four-step-permutation",
+                reason: "non-front axis is missing permutation staging",
+            })?;
+            push_four_step_permutation_stage(
+                &mut graph,
+                rank,
+                graph_axis.axis,
+                true,
+                range(source_buffer)?,
+                range(result_buffer)?,
+                total_complex,
+                requirements(bytes)?,
+            )?;
+            result_buffer
+        };
+        let fft_output = if graph_axis.axis == 0 {
+            result_buffer
+        } else {
+            intermediate_buffer
+        };
+        for &kind in graph_axis.stages {
+            graph.push_stage(
+                LargeStage::WindowedKernel {
+                    label: four_step_axis_stage_label(graph_axis.axis, kind),
+                    input: range(fft_input)?,
+                    output: range(fft_output)?,
+                    work_items: total_complex,
+                },
+                requirements(axis_stage_bytes)?,
+            )?;
+        }
+        if graph_axis.axis != 0 {
+            let bytes = permutation_bytes.expect("checked above for a non-front axis");
+            push_four_step_permutation_stage(
+                &mut graph,
+                rank,
+                graph_axis.axis,
+                false,
+                range(intermediate_buffer)?,
+                range(result_buffer)?,
+                total_complex,
+                requirements(bytes)?,
+            )?;
+        }
     }
-    graph.push_stage(
-        LargeStage::StripeTranspose {
-            label: "four-step-stripe-transpose-forward",
-            input: range(LogicalBufferId::Temp(0))?,
-            output: range(LogicalBufferId::Output)?,
-            work_items: total_complex,
-        },
-        requirements(stripe_bytes)?,
-    )?;
-    for &kind in axis1_stages {
-        graph.push_stage(
-            LargeStage::WindowedKernel {
-                label: four_step_axis_stage_label(1, kind),
-                input: range(LogicalBufferId::Output)?,
-                output: range(LogicalBufferId::Temp(0))?,
-                work_items: total_complex,
-            },
-            requirements(axis_stage_bytes)?,
-        )?;
-    }
-    graph.push_stage(
-        LargeStage::StripeTranspose {
-            label: "four-step-stripe-transpose-back",
-            input: range(LogicalBufferId::Temp(0))?,
-            output: range(LogicalBufferId::Output)?,
-            work_items: total_complex,
-        },
-        requirements(stripe_bytes)?,
-    )?;
+    let final_buffer = if axes.len() % 2 == 0 {
+        LogicalBufferId::Output
+    } else {
+        LogicalBufferId::Temp(0)
+    };
     if has_scale {
         graph.push_stage(
             LargeStage::Scale {
                 label: "four-step-scale",
-                range: range(LogicalBufferId::Output)?,
+                range: range(final_buffer)?,
                 work_items: total_complex,
             },
             requirements(axis_stage_bytes)?,
         )?;
     }
+    if axes.len() % 2 == 1 {
+        graph.push_stage(
+            LargeStage::Copy {
+                label: "four-step-final-copy",
+                src: range(LogicalBufferId::Temp(0))?,
+                dst: range(LogicalBufferId::Output)?,
+            },
+            requirements(0)?,
+        )?;
+    }
     Ok(LargeExecutionPlan::new(graph))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_four_step_permutation_stage(
+    graph: &mut LargeExecutionGraph,
+    rank: usize,
+    axis: usize,
+    to_front: bool,
+    input: LogicalRange,
+    output: LogicalRange,
+    work_items: u64,
+    requirements: StageRequirements,
+) -> Result<()> {
+    if rank == 2 && axis == 1 {
+        graph.push_stage(
+            LargeStage::StripeTranspose {
+                label: if to_front {
+                    "four-step-stripe-transpose-forward"
+                } else {
+                    "four-step-stripe-transpose-back"
+                },
+                input,
+                output,
+                work_items,
+            },
+            requirements,
+        )
+    } else {
+        graph.push_stage(
+            LargeStage::Permutation {
+                label: four_step_permutation_label(axis, to_front),
+                input,
+                output,
+                work_items,
+            },
+            requirements,
+        )
+    }
 }
 
 fn four_step_axis_stage_label(axis: usize, kind: AxisStageKind) -> &'static str {
@@ -1124,7 +1418,26 @@ fn four_step_axis_stage_label(axis: usize, kind: AxisStageKind) -> &'static str 
         (1, AxisStageKind::Stockham { .. }) => "four-step-axis1-windowed-stockham-stage",
         (1, AxisStageKind::FusedPow2 { .. }) => "four-step-axis1-windowed-fused-pow2",
         (1, AxisStageKind::FusedSmooth { .. }) => "four-step-axis1-windowed-fused-smooth",
+        (2, AxisStageKind::Stockham { .. }) => "four-step-axis2-windowed-stockham-stage",
+        (2, AxisStageKind::FusedPow2 { .. }) => "four-step-axis2-windowed-fused-pow2",
+        (2, AxisStageKind::FusedSmooth { .. }) => "four-step-axis2-windowed-fused-smooth",
+        (3, AxisStageKind::Stockham { .. }) => "four-step-axis3-windowed-stockham-stage",
+        (3, AxisStageKind::FusedPow2 { .. }) => "four-step-axis3-windowed-fused-pow2",
+        (3, AxisStageKind::FusedSmooth { .. }) => "four-step-axis3-windowed-fused-smooth",
         _ => "four-step-axis-windowed-stage",
+    }
+}
+
+fn four_step_permutation_label(axis: usize, to_front: bool) -> &'static str {
+    match (axis, to_front) {
+        (1, true) => "four-step-axis1-permute-to-front",
+        (1, false) => "four-step-axis1-permute-from-front",
+        (2, true) => "four-step-axis2-permute-to-front",
+        (2, false) => "four-step-axis2-permute-from-front",
+        (3, true) => "four-step-axis3-permute-to-front",
+        (3, false) => "four-step-axis3-permute-from-front",
+        (_, true) => "four-step-axis-permute-to-front",
+        (_, false) => "four-step-axis-permute-from-front",
     }
 }
 
@@ -1134,8 +1447,14 @@ fn four_step_axis_workspace_label(axis: usize, index: usize) -> &'static str {
         (0, 1) => "four-step-axis0-child-workspace-tail",
         (1, 0) => "four-step-axis1-child-workspace-main",
         (1, 1) => "four-step-axis1-child-workspace-tail",
+        (2, 0) => "four-step-axis2-child-workspace-main",
+        (2, 1) => "four-step-axis2-child-workspace-tail",
+        (3, 0) => "four-step-axis3-child-workspace-main",
+        (3, 1) => "four-step-axis3-child-workspace-tail",
         (0, _) => "four-step-axis0-child-workspace-extra",
         (1, _) => "four-step-axis1-child-workspace-extra",
+        (2, _) => "four-step-axis2-child-workspace-extra",
+        (3, _) => "four-step-axis3-child-workspace-extra",
         _ => "four-step-axis-child-workspace",
     }
 }
@@ -1256,19 +1575,31 @@ mod tests {
 
     #[test]
     fn graph_reports_logical_passes_and_every_owned_workspace() {
+        let axis0_stages = [AxisStageKind::FusedSmooth { axis_length: 15 }];
+        let axis1_stages = [
+            AxisStageKind::Stockham { radix: 8, ns: 8 },
+            AxisStageKind::Stockham { radix: 2, ns: 16 },
+        ];
+        let axes = [
+            FourStepGraphAxis {
+                axis: 0,
+                stages: &axis0_stages,
+                workspace_bytes: &[128],
+            },
+            FourStepGraphAxis {
+                axis: 1,
+                stages: &axis1_stages,
+                workspace_bytes: &[1024, 64],
+            },
+        ];
         let graph = build_four_step_graph(
             2048,
             256,
-            &[AxisStageKind::FusedSmooth { axis_length: 15 }],
-            &[
-                AxisStageKind::Stockham { radix: 8, ns: 8 },
-                AxisStageKind::Stockham { radix: 2, ns: 16 },
-            ],
+            2,
+            &axes,
             true,
             256,
-            512,
-            &[128],
-            &[1024, 64],
+            Some(512),
             LargePolicyLimits {
                 max_storage_buffer_binding_size: 512,
                 max_buffer_size: 4096,
@@ -1305,5 +1636,66 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn transpose_tiles_split_both_dimensions_within_the_binding_budget() {
+        assert_eq!(choose_transpose_tile(15, 14, 32), (15, 2));
+        assert_eq!(
+            choose_transpose_tile(256, 1_048_576, 268_435_455),
+            (256, 1_048_575)
+        );
+        let (width, height) = choose_transpose_tile(4096, 1_048_576, 32);
+        assert!(width > 0 && height > 0);
+        assert!(width * height <= 32);
+        assert!(width < 4096 && height < 1_048_576);
+    }
+
+    #[test]
+    fn rank3_graph_reports_permutations_and_final_copy() {
+        let stages = [AxisStageKind::FusedSmooth { axis_length: 9 }];
+        let axes = [
+            FourStepGraphAxis {
+                axis: 0,
+                stages: &stages,
+                workspace_bytes: &[],
+            },
+            FourStepGraphAxis {
+                axis: 1,
+                stages: &stages,
+                workspace_bytes: &[],
+            },
+            FourStepGraphAxis {
+                axis: 2,
+                stages: &stages,
+                workspace_bytes: &[],
+            },
+        ];
+        let graph = build_four_step_graph(
+            2520,
+            315,
+            3,
+            &axes,
+            false,
+            256,
+            Some(256),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 256,
+                max_buffer_size: 4096,
+            },
+            32,
+        )
+        .unwrap();
+        let stages = graph.graph().stages();
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|stage| matches!(stage, LargeStage::Permutation { .. }))
+                .count(),
+            4
+        );
+        assert!(stages.iter().any(|stage| {
+            stage.label() == "four-step-final-copy" && matches!(stage, LargeStage::Copy { .. })
+        }));
     }
 }

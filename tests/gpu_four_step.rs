@@ -38,12 +38,98 @@ async fn run_cases() {
     ] {
         run_forced_equivalence(&context, config);
     }
+    for config in [
+        FftConfig::new_nd([5, 7, 9])
+            .with_batch(3)
+            .with_normalization(Normalization::None),
+        FftConfig::inverse_nd([5, 7, 9]).with_batch(3),
+    ] {
+        run_forced_rank_nd_equivalence(&context, config, true);
+    }
+    for config in [
+        FftConfig::new_nd([3, 5, 7, 11])
+            .with_axes([3, 1])
+            .with_batch(2)
+            .with_normalization(Normalization::None),
+        FftConfig::inverse_nd([3, 5, 7, 11])
+            .with_axes([3, 1])
+            .with_batch(2),
+    ] {
+        run_forced_rank_nd_equivalence(&context, config, false);
+    }
     assert_strided_io_is_explicitly_deferred(&context);
     assert_full_volume_above_max_buffer_stays_unsupported(&context);
     run_real_oversized_sampled_case(&context);
+    run_real_oversized_rank3_sampled_case(&context);
 
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+fn run_forced_rank_nd_equivalence(
+    context: &wgpu_fft::device::GpuContext,
+    config: FftConfig,
+    exercise_views: bool,
+) {
+    let input = test_signal(config.total_complex_len().unwrap());
+    let expected = reference_f64(&input, &config);
+    let baseline = FftPlan::c2c(&context.device, &context.queue, config.clone()).unwrap();
+    let forced = FftPlan::c2c_with_large_policy_limits_for_testing(
+        &context.device,
+        &context.queue,
+        config.clone(),
+        LargePolicyLimits {
+            max_storage_buffer_binding_size: 256,
+            max_buffer_size: config.required_buffer_size_bytes().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        forced.large_routing_policy().route_mode(),
+        LargeRouteMode::LargeOutOfCore
+    );
+    assert_eq!(
+        forced.large_routing_policy().execution_kind(),
+        LargeExecutionKind::OutOfCoreFourStep
+    );
+    let expected_permutations = config.axes().iter().filter(|&&axis| axis != 0).count() * 2;
+    assert_eq!(
+        forced
+            .diagnostics()
+            .stages()
+            .iter()
+            .filter(|stage| stage.kind == "permutation")
+            .count(),
+        expected_permutations,
+        "rank-N diagnostics must expose both permutations for every nonzero axis"
+    );
+    assert!(forced
+        .diagnostics()
+        .stages()
+        .iter()
+        .any(|stage| stage.kind == "windowed-kernel"));
+    if config.axes().contains(&3) {
+        assert!(forced
+            .diagnostics()
+            .stages()
+            .iter()
+            .any(|stage| stage.label.starts_with("four-step-axis3-windowed-")));
+    }
+
+    let baseline_output = execute_plan(context, &baseline, &input, "rank-N-baseline");
+    let forced_output = execute_plan(context, &forced, &input, "rank-N-four-step");
+    assert_close_f32(
+        &forced_output,
+        &baseline_output,
+        "rank-N forced versus baseline",
+    );
+    assert_matches_reference(&forced_output, &expected, "rank-N forced versus f64");
+    if exercise_views {
+        let offset_output = execute_plan_with_offset(context, &forced, &input);
+        assert_matches_reference(&offset_output, &expected, "rank-N offset versus f64");
+        let segmented_output = execute_plan_with_segments(context, &forced, &input);
+        assert_matches_reference(&segmented_output, &expected, "rank-N segmented versus f64");
+    }
 }
 
 fn run_forced_equivalence(context: &wgpu_fft::device::GpuContext, config: FftConfig) {
@@ -631,6 +717,163 @@ fn run_real_oversized_sampled_case(context: &wgpu_fft::device::GpuContext) {
         }
     }
     eprintln!("real oversized four-step passed: shape=[{n0}, {n1}] sampled_lines={sampled_k1:?}");
+}
+
+fn run_real_oversized_rank3_sampled_case(context: &wgpu_fft::device::GpuContext) {
+    let Some((n0, n1, n2, byte_len)) = real_oversized_rank3_shape(&context.device.limits()) else {
+        eprintln!(
+            "skipping real oversized rank-3 case: adapter limits do not admit a safe smooth shape"
+        );
+        return;
+    };
+    eprintln!(
+        "real oversized rank-3 start: shape=[{n0}, {n1}, {n2}] bytes={byte_len} maxBind={}",
+        context.device.limits().max_storage_buffer_binding_size
+    );
+    let config = FftConfig::new_nd([n0, n1, n2]).with_normalization(Normalization::None);
+    let plan = FftPlan::c2c(&context.device, &context.queue, config).unwrap();
+    assert_eq!(
+        plan.large_routing_policy().route_mode(),
+        LargeRouteMode::LargeOutOfCore
+    );
+    assert_eq!(
+        plan.large_routing_policy().execution_kind(),
+        LargeExecutionKind::OutOfCoreFourStep
+    );
+    assert_eq!(
+        plan.diagnostics()
+            .stages()
+            .iter()
+            .filter(|stage| stage.kind == "permutation")
+            .count(),
+        4
+    );
+
+    let usages =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let input = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.four_step.rank3_oversized_input"),
+        size: byte_len,
+        usage: usages,
+        mapped_at_creation: false,
+    });
+    let output = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.four_step.rank3_oversized_output"),
+        size: byte_len,
+        usage: usages,
+        mapped_at_creation: false,
+    });
+    let mut clear_encoder =
+        context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_fft.test.four_step.rank3_oversized_clear"),
+            });
+    clear_encoder.clear_buffer(&input, 0, None);
+    context.queue.submit([clear_encoder.finish()]);
+    context
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+
+    let impulses = [
+        (3usize, 5usize, 7usize, Complex64::new(0.75, -0.25)),
+        (n0 - 7, n1 - 11, n2 - 13, Complex64::new(-0.4, 0.6)),
+    ];
+    for &(x, y, z, value) in &impulses {
+        let offset = (((z as u64) * (n1 as u64) + y as u64) * (n0 as u64) + x as u64) * 8;
+        context.queue.write_buffer(
+            &input,
+            offset,
+            bytemuck::cast_slice(&[value.re as f32, value.im as f32]),
+        );
+    }
+
+    let sampled_lines = [(0usize, 0usize), (1, 2), (n1 - 1, n2 - 1)];
+    let line_bytes = (n0 as u64) * 8;
+    let readback = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.four_step.rank3_oversized_readback"),
+        size: line_bytes * sampled_lines.len() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.test.four_step.rank3_oversized_encoder"),
+        });
+    plan.execute_checked(&context.device, &mut encoder, &input, &output)
+        .unwrap();
+    for (sample_index, &(k1, k2)) in sampled_lines.iter().enumerate() {
+        let source_offset = ((k2 as u64) * (n1 as u64) + k1 as u64) * line_bytes;
+        encoder.copy_buffer_to_buffer(
+            &output,
+            source_offset,
+            &readback,
+            (sample_index as u64) * line_bytes,
+            line_bytes,
+        );
+    }
+    context.queue.submit([encoder.finish()]);
+    let actual = read_f32(&context.device, &readback);
+    for (sample_index, &(k1, k2)) in sampled_lines.iter().enumerate() {
+        let line = &actual[sample_index * n0 * 2..(sample_index + 1) * n0 * 2];
+        for (k0, pair) in line.chunks_exact(2).enumerate() {
+            let expected =
+                impulses
+                    .iter()
+                    .fold(Complex64::new(0.0, 0.0), |sum, &(x, y, z, value)| {
+                        let angle = -std::f64::consts::TAU
+                            * ((k0 * x) as f64 / n0 as f64
+                                + (k1 * y) as f64 / n1 as f64
+                                + (k2 * z) as f64 / n2 as f64);
+                        let twiddle = Complex64::new(angle.cos(), angle.sin());
+                        Complex64::new(
+                            sum.re + value.re * twiddle.re - value.im * twiddle.im,
+                            sum.im + value.re * twiddle.im + value.im * twiddle.re,
+                        )
+                    });
+            let error = (f64::from(pair[0]) - expected.re).hypot(f64::from(pair[1]) - expected.im);
+            assert!(
+                error.is_finite() && error < 7.5e-4,
+                "rank-3 sample k0={k0} k1={k1} k2={k2}: actual=({}, {}), expected=({}, {}), error={error}",
+                pair[0], pair[1], expected.re, expected.im,
+            );
+        }
+    }
+    eprintln!(
+        "real oversized rank-3 passed: shape=[{n0}, {n1}, {n2}] sampled_lines={sampled_lines:?}"
+    );
+}
+
+fn real_oversized_rank3_shape(limits: &wgpu::Limits) -> Option<(usize, usize, usize, u64)> {
+    let max_bind = limits.max_storage_buffer_binding_size;
+    let max_buffer = limits.max_buffer_size;
+    if max_bind < 32 || max_bind >= max_buffer {
+        return None;
+    }
+    let n0 = 4096usize;
+    let n1 = 256usize;
+    let plane_bytes = (n0 as u64).checked_mul(n1 as u64)?.checked_mul(8)?;
+    if (n0 as u64) * 8 > max_bind || (n1 as u64) * 8 > max_bind {
+        return None;
+    }
+    let first_n2 = usize::try_from(max_bind / plane_bytes)
+        .ok()?
+        .checked_add(1)?;
+    let n2 = (first_n2..first_n2.checked_add(100_000)?).find(|&candidate| is_smooth(candidate))?;
+    let byte_len = plane_bytes.checked_mul(n2 as u64)?;
+    let total_complex = (n0 as u64).checked_mul(n1 as u64)?.checked_mul(n2 as u64)?;
+    if n2 <= 13
+        || byte_len <= max_bind
+        || byte_len > max_buffer
+        || (n2 as u64) * 8 > max_bind
+        || total_complex > u64::from(u32::MAX)
+        || byte_len > 3 * 1024 * 1024 * 1024
+    {
+        return None;
+    }
+    Some((n0, n1, n2, byte_len))
 }
 
 fn real_oversized_shape(limits: &wgpu::Limits) -> Option<(usize, usize, u64)> {

@@ -100,6 +100,7 @@ async fn run_gpu_case() {
         None,
         LargeRouteMode::Normal,
     );
+    run_real_four_step_child_case(&context);
 
     for (config, route) in [
         (
@@ -261,6 +262,134 @@ async fn run_gpu_case() {
         trace_gpu_step("forget gpu context to avoid native backend teardown hang");
         std::mem::forget(context);
     }
+}
+
+fn run_real_four_step_child_case(context: &wgpu_fft::device::GpuContext) {
+    let forward = FftConfig::new_nd([15, 14]).with_normalization(Normalization::None);
+    let inverse = FftConfig::inverse_nd([15, 14]);
+    let limits = LargePolicyLimits {
+        max_storage_buffer_binding_size: 256,
+        max_buffer_size: forward.required_buffer_size_bytes().unwrap(),
+    };
+    let real = real_input_for_config(&forward);
+    let packed = reference_r2c_packed_interleaved(&real, &forward).unwrap();
+
+    let r2c = FftPlan::r2c_with_large_policy_limits_for_testing(
+        &context.device,
+        &context.queue,
+        forward,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        r2c.large_routing_policy().execution_kind(),
+        wgpu_fft::LargeExecutionKind::OutOfCoreFourStep
+    );
+    let real_input = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.r2c_input"),
+        size: r2c.required_input_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let packed_output = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.r2c_output"),
+        size: r2c.required_output_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    context
+        .queue
+        .write_buffer(&real_input, 0, bytemuck::cast_slice(&real));
+    assert!(r2c
+        .diagnostics_for_views(
+            &context.device,
+            BufferView::whole(&real_input),
+            BufferView::whole(&packed_output),
+        )
+        .blockers()
+        .is_empty());
+    let r2c_readback = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.r2c_readback"),
+        size: r2c.required_output_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.test.real.four_step.r2c_encoder"),
+        });
+    r2c.execute_checked(&context.device, &mut encoder, &real_input, &packed_output)
+        .unwrap();
+    encoder.copy_buffer_to_buffer(
+        &packed_output,
+        0,
+        &r2c_readback,
+        0,
+        r2c.required_output_buffer_size_bytes(),
+    );
+    context.queue.submit([encoder.finish()]);
+    let actual_packed = read_f32(context, &r2c_readback, "r2c four-step child");
+    assert_close(&actual_packed, &packed, "r2c four-step child");
+
+    let c2r = FftPlan::c2r_with_large_policy_limits_for_testing(
+        &context.device,
+        &context.queue,
+        inverse.clone(),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        c2r.large_routing_policy().execution_kind(),
+        wgpu_fft::LargeExecutionKind::OutOfCoreFourStep
+    );
+    let packed_input = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.c2r_input"),
+        size: c2r.required_input_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let real_output = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.c2r_output"),
+        size: c2r.required_output_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    context
+        .queue
+        .write_buffer(&packed_input, 0, bytemuck::cast_slice(&packed));
+    assert!(c2r
+        .diagnostics_for_views(
+            &context.device,
+            BufferView::whole(&packed_input),
+            BufferView::whole(&real_output),
+        )
+        .blockers()
+        .is_empty());
+    let c2r_readback = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.real.four_step.c2r_readback"),
+        size: c2r.required_output_buffer_size_bytes(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.test.real.four_step.c2r_encoder"),
+        });
+    c2r.execute_checked(&context.device, &mut encoder, &packed_input, &real_output)
+        .unwrap();
+    encoder.copy_buffer_to_buffer(
+        &real_output,
+        0,
+        &c2r_readback,
+        0,
+        c2r.required_output_buffer_size_bytes(),
+    );
+    context.queue.submit([encoder.finish()]);
+    let actual_real = read_f32(context, &c2r_readback, "c2r four-step child");
+    let expected_real = reference_c2r_from_packed_interleaved(&packed, &inverse).unwrap();
+    assert_close(&actual_real, &expected_real, "c2r four-step child");
 }
 
 #[derive(Debug, Clone, Copy)]

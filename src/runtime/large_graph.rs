@@ -98,6 +98,7 @@ pub(crate) enum LargeStageKind {
     WindowedKernel,
     TwiddleTranspose,
     StripeTranspose,
+    Permutation,
     Scale,
     HostWindow,
 }
@@ -147,6 +148,12 @@ pub(crate) enum LargeStage {
         output: LogicalRange,
         work_items: u64,
     },
+    Permutation {
+        label: &'static str,
+        input: LogicalRange,
+        output: LogicalRange,
+        work_items: u64,
+    },
     Scale {
         label: &'static str,
         range: LogicalRange,
@@ -169,6 +176,7 @@ impl LargeStage {
             Self::WindowedKernel { .. } => LargeStageKind::WindowedKernel,
             Self::TwiddleTranspose { .. } => LargeStageKind::TwiddleTranspose,
             Self::StripeTranspose { .. } => LargeStageKind::StripeTranspose,
+            Self::Permutation { .. } => LargeStageKind::Permutation,
             Self::Scale { .. } => LargeStageKind::Scale,
             Self::HostWindow { .. } => LargeStageKind::HostWindow,
         }
@@ -184,6 +192,7 @@ impl LargeStage {
             | Self::WindowedKernel { label, .. }
             | Self::TwiddleTranspose { label, .. }
             | Self::StripeTranspose { label, .. }
+            | Self::Permutation { label, .. }
             | Self::Scale { label, .. }
             | Self::HostWindow { label, .. } => label,
         }
@@ -200,7 +209,8 @@ impl LargeStage {
             Self::Kernel { input, output, .. }
             | Self::WindowedKernel { input, output, .. }
             | Self::TwiddleTranspose { input, output, .. }
-            | Self::StripeTranspose { input, output, .. } => vec![*input, *output],
+            | Self::StripeTranspose { input, output, .. }
+            | Self::Permutation { input, output, .. } => vec![*input, *output],
             Self::HostWindow { range, .. } => vec![*range],
         }
     }
@@ -212,6 +222,7 @@ impl LargeStage {
             | Self::WindowedHelper { .. }
             | Self::WindowedKernel { .. }
             | Self::StripeTranspose { .. }
+            | Self::Permutation { .. }
             | Self::Scale { .. }
             | Self::HostWindow { .. } => Vec::new(),
             Self::HelperWindow { range, .. } => vec![*range],
@@ -234,9 +245,9 @@ impl LargeStage {
                 Some(*work_items)
             }
             Self::WindowedKernel { work_items, .. } => Some(*work_items),
-            Self::StripeTranspose { work_items, .. } | Self::Scale { work_items, .. } => {
-                Some(*work_items)
-            }
+            Self::StripeTranspose { work_items, .. }
+            | Self::Permutation { work_items, .. }
+            | Self::Scale { work_items, .. } => Some(*work_items),
             Self::GatherScatter {
                 stride_elements, ..
             } => Some(*stride_elements),
@@ -438,5 +449,25 @@ mod tests {
                 max_bind_bytes: 1024,
             })
         ));
+    }
+
+    #[test]
+    fn permutation_is_a_windowed_logical_stage() {
+        let input =
+            LogicalRange::new(LogicalBufferId::Input, 0, 128, ElementFormat::ComplexF32).unwrap();
+        let output =
+            LogicalRange::new(LogicalBufferId::Output, 0, 128, ElementFormat::ComplexF32).unwrap();
+        let stage = LargeStage::Permutation {
+            label: "adjacent-axis-swap",
+            input,
+            output,
+            work_items: 16,
+        };
+
+        assert_eq!(stage.kind(), LargeStageKind::Permutation);
+        assert_eq!(stage.ranges(), vec![input, output]);
+        assert!(stage.storage_ranges().is_empty());
+        assert!(stage.copy_ranges().is_empty());
+        assert_eq!(stage.work_items(), Some(16));
     }
 }

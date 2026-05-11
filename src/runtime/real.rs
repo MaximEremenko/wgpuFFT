@@ -435,6 +435,17 @@ fn remap_child_stage(
             output: remap_child_range(output, child_input, child_output, stage_index_base)?,
             work_items,
         },
+        LargeStage::Permutation {
+            label,
+            input,
+            output,
+            work_items,
+        } => LargeStage::Permutation {
+            label,
+            input: remap_child_range(input, child_input, child_output, stage_index_base)?,
+            output: remap_child_range(output, child_input, child_output, stage_index_base)?,
+            work_items,
+        },
         LargeStage::Scale {
             label,
             range,
@@ -494,9 +505,8 @@ fn stage_scratch_bytes(stage: &LargeStage) -> u64 {
         LargeStage::Kernel { input, output, .. }
         | LargeStage::WindowedKernel { input, output, .. }
         | LargeStage::TwiddleTranspose { input, output, .. }
-        | LargeStage::StripeTranspose { input, output, .. } => {
-            input.size_bytes.max(output.size_bytes)
-        }
+        | LargeStage::StripeTranspose { input, output, .. }
+        | LargeStage::Permutation { input, output, .. } => input.size_bytes.max(output.size_bytes),
         LargeStage::Copy { src, dst, .. } | LargeStage::GatherScatter { src, dst, .. } => {
             src.size_bytes.max(dst.size_bytes)
         }
@@ -1511,13 +1521,13 @@ impl R2cNormalPlan {
             device,
             "wgpu_fft.r2c.full_input",
             sizes.full_complex_bytes,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )?;
         let full_output_buffer = create_internal_buffer(
             device,
             "wgpu_fft.r2c.full_output",
             sizes.full_complex_bytes,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )?;
         let real_to_complex = RealKernel::new(
             device,
@@ -1806,13 +1816,13 @@ impl C2rNormalPlan {
             device,
             "wgpu_fft.c2r.full_input",
             sizes.full_complex_bytes,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )?;
         let full_output_buffer = create_internal_buffer(
             device,
             "wgpu_fft.c2r.full_output",
             sizes.full_complex_bytes,
-            wgpu::BufferUsages::empty(),
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         )?;
         let unpack = RealKernel::new(
             device,

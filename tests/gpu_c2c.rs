@@ -1989,10 +1989,10 @@ fn run_large_bridge_cases(context: &wgpu_fft::device::GpuContext) {
 fn run_large_axis_sequence_cases(context: &wgpu_fft::device::GpuContext) {
     for config in [
         FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
-        FftConfig::new_nd([34, 4]).with_normalization(Normalization::None),
+        FftConfig::new_nd([34, 16]).with_normalization(Normalization::None),
         FftConfig::inverse_nd([17, 4]),
         FftConfig::inverse_nd([17, 4]).with_batch(2),
-        FftConfig::inverse_nd([34, 4]),
+        FftConfig::inverse_nd([34, 16]),
     ] {
         trace_gpu_step(&format!("start large-axis-sequence config={config:?}"));
         let input = input_for_config(&config);

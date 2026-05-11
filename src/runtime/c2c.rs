@@ -20,8 +20,8 @@ use crate::runtime::large_graph::{
     LogicalBufferId, LogicalRange, StageRequirements,
 };
 use crate::runtime::large_policy::{
-    line_bytes_for_axis_len, resolve_large_routing_policy, LargeExecutionKind, LargePolicyLimits,
-    LargeRouteMode, LargeRoutingPolicy, LargeRoutingPolicyInput,
+    line_bytes_for_axis_len, resolve_large_routing_policy, LargeExecutionKind, LargeFactorSplit,
+    LargePolicyLimits, LargeRouteMode, LargeRoutingPolicy, LargeRoutingPolicyInput,
 };
 use crate::runtime::logical_io::{FftEndpointFormat, FftLogicalView};
 use crate::runtime::nd_wgsl::{format_wgsl_f32, stride_for_axis, wgsl_line_base_fn};
@@ -198,6 +198,13 @@ struct LargeAxisSequenceC2cPlan {
     graph_plan: LargeExecutionPlan,
     temp_buffer: Option<wgpu::Buffer>,
     required_buffer_size_bytes: u64,
+}
+
+pub(crate) struct WindowedPrimeBridge {
+    plan: LargeBridgeC2cPlan,
+    required_bytes: u64,
+    graph: LargeExecutionGraph,
+    factor_splits: Vec<LargeFactorSplit>,
 }
 
 enum LargeBridgeC2cPlan {
@@ -489,7 +496,7 @@ impl C2cPlan {
         Self::new_with_large_policy_limits(device, queue, config, Some(limits))
     }
 
-    fn new_with_large_policy_limits(
+    pub(crate) fn new_with_large_policy_limits(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: FftConfig,
@@ -697,7 +704,13 @@ impl C2cPlan {
             C2cExecution::FourStep(_) => config
                 .axes()
                 .iter()
-                .map(|&axis| crate::runtime::factor_supported_length(config.shape()[axis]))
+                .zip(&axis_kinds)
+                .map(|(&axis, kind)| match kind {
+                    AxisKind::Mixed => {
+                        crate::runtime::factor_supported_length(config.shape()[axis])
+                    }
+                    AxisKind::Rader | AxisKind::Bluestein => Ok(Vec::new()),
+                })
                 .collect::<Result<Vec<_>>>()?,
             C2cExecution::SmoothDecomposition(_) | C2cExecution::LargeBridge(_) => config
                 .axes()
@@ -1648,6 +1661,51 @@ impl LargeBridgeC2cPlan {
             executor.copy_buffer_to_view_range(encoder, buffer, 0, &output, 0, required_bytes)?;
         }
         Ok(())
+    }
+}
+
+impl WindowedPrimeBridge {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &FftConfig,
+        route: LargeBridgeRoute,
+        limits: LargePolicyLimits,
+    ) -> Result<Self> {
+        let required_bytes = config.required_buffer_size_bytes()?;
+        let bridge_plan = plan_large_bridge(config, route, limits)?;
+        let factor_splits = bridge_plan.factor_splits();
+        let plan = LargeBridgeC2cPlan::new(device, queue, config, bridge_plan, limits)?;
+        let graph = plan.execution_graph(required_bytes)?;
+        Ok(Self {
+            plan,
+            required_bytes,
+            graph,
+            factor_splits,
+        })
+    }
+
+    pub(crate) fn execute_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
+        self.plan
+            .execute_views(device, encoder, input, output, self.required_bytes)
+    }
+
+    pub(crate) fn execution_graph(&self) -> &LargeExecutionGraph {
+        &self.graph
+    }
+
+    pub(crate) fn factor_splits(&self) -> &[LargeFactorSplit] {
+        &self.factor_splits
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        large_bridge_twiddle_lut_storage_bytes(&self.plan)
     }
 }
 
@@ -5117,12 +5175,14 @@ fn resolve_c2c_large_routing_policy(
         .collect::<Result<Vec<_>>>()?;
     let bytes_per_batch = bytes_per_batch(config)?;
     let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
-    let four_step_mixed_supported = config.shape().len() >= 2
-        && config.axes().len() >= 2
-        && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
-        && line_bytes
-            .iter()
-            .all(|&bytes| bytes <= limits.max_storage_buffer_binding_size);
+    let four_step_supported =
+        four_step_route_shape_supported(
+            config.shape().len(),
+            config.axes().len(),
+            axis_kinds,
+            &line_bytes,
+            limits.max_storage_buffer_binding_size,
+        ) && four_step_axis_resources_supported(config, axis_kinds, &line_bytes, limits);
 
     resolve_large_routing_policy(LargeRoutingPolicyInput {
         limits,
@@ -5130,11 +5190,56 @@ fn resolve_c2c_large_routing_policy(
         line_bytes: &line_bytes,
         axis_kinds: Some(axis_kinds),
         axis_lengths: Some(&axis_lengths),
-        allow_out_of_core: four_step_mixed_supported,
+        allow_non_mixed_bounded_slicing: true,
+        allow_out_of_core: four_step_supported,
         rank: config.shape().len(),
         bytes_per_batch: Some(bytes_per_batch),
         ..LargeRoutingPolicyInput::new(limits, &[])
     })
+}
+
+fn four_step_axis_resources_supported(
+    config: &FftConfig,
+    axis_kinds: &[AxisKind],
+    line_bytes: &[u64],
+    limits: LargePolicyLimits,
+) -> bool {
+    config.axes().iter().zip(axis_kinds).zip(line_bytes).all(
+        |((&axis, &kind), &bytes)| match kind {
+            AxisKind::Mixed => true,
+            AxisKind::Rader | AxisKind::Bluestein => {
+                let route =
+                    if kind == AxisKind::Rader && bytes > limits.max_storage_buffer_binding_size {
+                        LargeBridgeRoute::Bluestein
+                    } else if kind == AxisKind::Rader {
+                        LargeBridgeRoute::Rader
+                    } else {
+                        LargeBridgeRoute::Bluestein
+                    };
+                let line_config = FftConfig::new(config.shape()[axis])
+                    .with_direction(config.direction())
+                    .with_normalization(Normalization::None);
+                plan_large_bridge(&line_config, route, limits).is_ok()
+            }
+        },
+    )
+}
+
+fn four_step_route_shape_supported(
+    rank: usize,
+    selected_axis_count: usize,
+    axis_kinds: &[AxisKind],
+    line_bytes: &[u64],
+    max_bind_bytes: u64,
+) -> bool {
+    rank >= 2
+        && selected_axis_count >= 2
+        && axis_kinds.len() == selected_axis_count
+        && line_bytes.len() == selected_axis_count
+        && axis_kinds
+            .iter()
+            .zip(line_bytes)
+            .all(|(&kind, &bytes)| kind != AxisKind::Mixed || bytes <= max_bind_bytes)
 }
 
 fn create_view_staging_buffer(
@@ -6999,6 +7104,65 @@ impl DirectDftPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_step_route_requires_rank_and_two_selected_axes() {
+        let kinds = [AxisKind::Rader, AxisKind::Mixed];
+        let line_bytes = [272, 40];
+        assert!(four_step_route_shape_supported(
+            2,
+            2,
+            &kinds,
+            &line_bytes,
+            256
+        ));
+        assert!(!four_step_route_shape_supported(
+            1,
+            2,
+            &kinds,
+            &line_bytes,
+            256
+        ));
+        assert!(!four_step_route_shape_supported(
+            2,
+            1,
+            &kinds[..1],
+            &line_bytes[..1],
+            256
+        ));
+
+        // Non-mixed lines may use a bounded bridge, while the current mixed
+        // window executor still requires a complete line binding.
+        assert!(!four_step_route_shape_supported(
+            2,
+            2,
+            &[AxisKind::Mixed, AxisKind::Rader],
+            &line_bytes,
+            256
+        ));
+
+        let config = FftConfig::new_nd([17, 4]);
+        let kinds = [AxisKind::Rader, AxisKind::Mixed];
+        let line_bytes = [136, 32];
+        assert!(!four_step_axis_resources_supported(
+            &config,
+            &kinds,
+            &line_bytes,
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 64,
+                max_buffer_size: 1 << 20,
+            },
+        ));
+        assert!(four_step_axis_resources_supported(
+            &config,
+            &kinds,
+            &line_bytes,
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 128,
+                max_buffer_size: 1 << 20,
+            },
+        ));
+    }
 
     #[test]
     fn generated_twiddle_kernels_use_host_luts_without_shader_trig() {

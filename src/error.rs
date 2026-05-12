@@ -136,6 +136,14 @@ pub enum FftError {
         requested_bytes: u64,
         max_buffer_size: u64,
     },
+    GpuPlanResourceAllocationFailed {
+        route: &'static str,
+        resource: &'static str,
+        requested_bytes: u64,
+        buffer_count: usize,
+        kind: &'static str,
+        details: String,
+    },
     LargeBridgeUnsupported {
         route: &'static str,
         reason: &'static str,
@@ -388,6 +396,17 @@ impl fmt::Display for FftError {
             } => write!(
                 f,
                 "FFT helper buffer {helper_buffer} is too large: requested {requested_bytes} bytes, max buffer size {max_buffer_size}"
+            ),
+            Self::GpuPlanResourceAllocationFailed {
+                route,
+                resource,
+                requested_bytes,
+                buffer_count,
+                kind,
+                details,
+            } => write!(
+                f,
+                "GPU FFT plan resource allocation failed for {route}: {kind} while creating {resource} (diagnostics report {requested_bytes} bytes across {buffer_count} helper requirements): {details}"
             ),
             Self::LargeBridgeUnsupported { route, reason } => {
                 write!(f, "large FFT {route} bridge is unsupported: {reason}")
@@ -676,6 +695,18 @@ impl FftError {
                 }
                 blocker
             }
+            Self::GpuPlanResourceAllocationFailed {
+                route,
+                resource,
+                requested_bytes,
+                kind,
+                ..
+            } => FftBlocker::new(gpu_plan_resource_blocker_kind(kind), self.to_string())
+                .with_route(*route)
+                .with_stage("plan-resource-allocation")
+                .with_layout("GPU resource allocation")
+                .with_helper_buffer(*resource)
+                .with_required_bytes(*requested_bytes),
             Self::LargeBridgeUnsupported { .. } => unreachable!("handled above"),
             Self::OutOfCoreExecutionUnsupported { .. } => unreachable!("handled above"),
             Self::UnsupportedAxisKind { axis, len, kind } => {
@@ -1068,6 +1099,13 @@ fn transform_for_route(route: &str) -> &'static str {
         "c2r" => "c2r",
         "real" => "real",
         "logical-io" => "unknown",
+        "c2c-plan"
+        | "normal"
+        | "batch-chunk"
+        | "smooth-1d-decomposition"
+        | "axis-decomposition"
+        | "out-of-core-four-step"
+        | "segmented-full-volume" => "c2c",
         "direct-dft"
         | "mixed-radix"
         | "rader"
@@ -1078,6 +1116,14 @@ fn transform_for_route(route: &str) -> &'static str {
         | "bluestein-bridge"
         | "smooth-decomposition" => "c2c",
         _ => "unknown",
+    }
+}
+
+fn gpu_plan_resource_blocker_kind(kind: &str) -> FftBlockerKind {
+    if kind == "validation" {
+        FftBlockerKind::Validation
+    } else {
+        FftBlockerKind::HelperBuffer
     }
 }
 
@@ -1952,6 +1998,48 @@ mod tests {
         );
         assert_eq!(blocker.required_bytes, Some(2048));
         assert_eq!(blocker.limit_bytes, Some(1024));
+    }
+
+    #[test]
+    fn gpu_plan_resource_allocation_errors_are_structured_and_diagnostic() {
+        let error = FftError::GpuPlanResourceAllocationFailed {
+            route: "segmented-full-volume",
+            resource: "plan-owned-gpu-resources",
+            requested_bytes: 102_400,
+            buffer_count: 6,
+            kind: "out-of-memory",
+            details: "device allocation failed".to_owned(),
+        };
+        assert_eq!(error.clone(), error);
+        assert_eq!(
+            error.to_string(),
+            "GPU FFT plan resource allocation failed for segmented-full-volume: out-of-memory while creating plan-owned-gpu-resources (diagnostics report 102400 bytes across 6 helper requirements): device allocation failed"
+        );
+
+        let diagnostics = error.diagnostics();
+        let blocker = &diagnostics.blockers()[0];
+        assert_eq!(diagnostics.route().transform, "c2c");
+        assert_eq!(diagnostics.route().route, "segmented-full-volume");
+        assert_eq!(blocker.kind, FftBlockerKind::HelperBuffer);
+        assert_eq!(blocker.route.as_deref(), Some("segmented-full-volume"));
+        assert_eq!(blocker.stage.as_deref(), Some("plan-resource-allocation"));
+        assert_eq!(blocker.layout.as_deref(), Some("GPU resource allocation"));
+        assert_eq!(
+            blocker.helper_buffer.as_deref(),
+            Some("plan-owned-gpu-resources")
+        );
+        assert_eq!(blocker.required_bytes, Some(102_400));
+
+        let validation = FftError::GpuPlanResourceAllocationFailed {
+            route: "c2c-plan",
+            resource: "plan-owned-gpu-resources",
+            requested_bytes: 512,
+            buffer_count: 0,
+            kind: "validation",
+            details: "invalid resource descriptor".to_owned(),
+        }
+        .diagnostics();
+        assert_eq!(validation.blockers()[0].kind, FftBlockerKind::Validation);
     }
 
     #[test]

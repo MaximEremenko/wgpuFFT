@@ -31,7 +31,9 @@ use crate::runtime::pipeline_cache::{
     PipelineLayoutCacheKey, ShaderCacheKey,
 };
 use crate::runtime::rader_axis::{rader_bfft, rader_permutation, RaderAxis, RaderAxisConfig};
-use crate::runtime::segmented_volume::SegmentedVolumeC2cPlan;
+use crate::runtime::segmented_volume::{
+    validate_segmented_burst_depth, SegmentedVolumeC2cPlan, DEFAULT_SEGMENTED_BURST_DEPTH,
+};
 use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
 };
@@ -498,12 +500,46 @@ impl C2cPlan {
         Self::new_with_large_policy_limits(device, queue, config, Some(limits))
     }
 
+    #[doc(hidden)]
+    pub fn new_with_large_policy_limits_and_burst_depth_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+        limits: LargePolicyLimits,
+        burst_depth: usize,
+    ) -> Result<Self> {
+        Self::new_with_large_policy_limits_and_burst_depth(
+            device,
+            queue,
+            config,
+            Some(limits),
+            burst_depth,
+        )
+    }
+
     pub(crate) fn new_with_large_policy_limits(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: FftConfig,
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
+        Self::new_with_large_policy_limits_and_burst_depth(
+            device,
+            queue,
+            config,
+            policy_limits,
+            DEFAULT_SEGMENTED_BURST_DEPTH,
+        )
+    }
+
+    fn new_with_large_policy_limits_and_burst_depth(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+        policy_limits: Option<LargePolicyLimits>,
+        segmented_burst_depth: usize,
+    ) -> Result<Self> {
+        validate_segmented_burst_depth(segmented_burst_depth)?;
         config.validate()?;
         let device_policy_limits = LargePolicyLimits::from(&device.limits());
         let effective_policy_limits = policy_limits
@@ -705,7 +741,13 @@ impl C2cPlan {
                             kind: kind.as_str(),
                         });
                     }
-                    let plan = SegmentedVolumeC2cPlan::new(device, queue, &config, limits)?;
+                    let plan = SegmentedVolumeC2cPlan::new(
+                        device,
+                        queue,
+                        &config,
+                        limits,
+                        segmented_burst_depth,
+                    )?;
                     large_routing_policy = large_routing_policy
                         .with_execution_kind(LargeExecutionKind::SegmentedFullVolume)
                         .with_diagnostics(None, plan.factor_splits(), plan.staging_bytes(), None);

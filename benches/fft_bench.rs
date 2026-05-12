@@ -18,6 +18,7 @@ const ITER_TRAFFIC_BUDGET_BYTES: u64 = 3 * 4096 * 1024 * 1024;
 const TARGET_COMPLEX_ELEMENTS: usize = 1 << 27;
 const COMPLEX_F32_BYTES: u64 = 2 * std::mem::size_of::<f32>() as u64;
 const INITIALIZATION_SEED_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_SEGMENTED_BURST_DEPTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Suite {
@@ -69,6 +70,7 @@ struct Options {
     wait_timeout: Duration,
     plan_max_bind_bytes: Option<u64>,
     compare_max_buffer_bytes: Option<CompareMaxBufferBytes>,
+    segmented_burst_depth: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,7 @@ struct CaseResult {
     diagnostic_helper_requirement_bytes: u64,
     diagnostic_helper_requirements: String,
     arena_segment_bytes: Vec<u64>,
+    segmented_burst_depth: usize,
     num_iter: u64,
     run_pair_ms: Vec<f64>,
 }
@@ -132,6 +135,7 @@ struct PlanPairMetadata {
     diagnostic_helper_requirement_bytes: u64,
     diagnostic_helper_requirements: String,
     arena_segment_bytes: Vec<u64>,
+    segmented_burst_depth: usize,
 }
 
 #[derive(Debug, Default)]
@@ -146,6 +150,7 @@ struct VariantAccumulator {
     diagnostic_helper_requirement_bytes: Option<u64>,
     diagnostic_helper_requirements: Option<String>,
     arena_segment_bytes: Option<Vec<u64>>,
+    segmented_burst_depth: Option<usize>,
     run_pair_ms: Vec<f64>,
 }
 
@@ -301,8 +306,11 @@ async fn run() -> BenchResult<()> {
         options.compare_max_buffer_bytes,
     ) {
         println!(
-            "CUSTOM SHAPE SEGMENT-CAP COMPARISON: plan_max_bind_bytes={} unsharded_max_buffer_bytes={} sharded_max_buffer_bytes={}",
-            max_bind_bytes, max_buffer_bytes.unsharded, max_buffer_bytes.sharded
+            "CUSTOM SHAPE SEGMENT-CAP COMPARISON: plan_max_bind_bytes={} unsharded_max_buffer_bytes={} sharded_max_buffer_bytes={} segmented_burst_depth={}",
+            max_bind_bytes,
+            max_buffer_bytes.unsharded,
+            max_buffer_bytes.sharded,
+            options.segmented_burst_depth,
         );
         println!(
             "comparison method: recreate and time both variants in every run; variant order alternates by run"
@@ -528,6 +536,7 @@ async fn run_case(
     let mut diagnostic_helper_requirement_total = None;
     let mut diagnostic_helper_requirements = None;
     let mut arena_segment_layout = None;
+    let mut segmented_burst_depth = None;
     let mut run_pair_ms = Vec::with_capacity(options.runs);
 
     for run_index in 0..options.runs {
@@ -578,6 +587,15 @@ async fn run_case(
         let this_diagnostic_helper_requirements =
             combined_helper_requirement_inventory(&forward_diagnostics, &inverse_diagnostics)?;
         let this_arena_segment_bytes = arena_segment_bytes(&forward_diagnostics);
+        let this_segmented_burst_depth =
+            segmented_burst_depth_from_diagnostics(&forward_diagnostics)?;
+        let inverse_segmented_burst_depth =
+            segmented_burst_depth_from_diagnostics(&inverse_diagnostics)?;
+        if this_segmented_burst_depth != inverse_segmented_burst_depth {
+            return Err(input_error(format!(
+                "forward/inverse segmented burst-depth mismatch: {this_segmented_burst_depth} versus {inverse_segmented_burst_depth}"
+            )));
+        }
         let (forward_graph_stages, forward_passes, forward_pass_method) =
             compute_pass_count(&forward_diagnostics)?;
         let (inverse_graph_stages, inverse_passes, inverse_pass_method) =
@@ -665,6 +683,11 @@ async fn run_case(
             &mut arena_segment_layout,
             this_arena_segment_bytes,
             "segmented arena layout",
+        )?;
+        ensure_consistent(
+            &mut segmented_burst_depth,
+            this_segmented_burst_depth,
+            "segmented burst depth",
         )?;
 
         // Plan construction queues parameter and LUT uploads. Flush and wait for
@@ -775,6 +798,8 @@ async fn run_case(
             .ok_or_else(|| input_error("benchmark produced no plan helper inventory"))?,
         arena_segment_bytes: arena_segment_layout
             .ok_or_else(|| input_error("benchmark produced no segmented arena layout"))?,
+        segmented_burst_depth: segmented_burst_depth
+            .ok_or_else(|| input_error("benchmark produced no segmented burst depth"))?,
         num_iter,
         run_pair_ms,
     })
@@ -824,6 +849,11 @@ impl VariantAccumulator {
             metadata.arena_segment_bytes,
             "segmented arena layout",
         )?;
+        ensure_consistent(
+            &mut self.segmented_burst_depth,
+            metadata.segmented_burst_depth,
+            "segmented burst depth",
+        )?;
         self.run_pair_ms.push(pair_ms);
         Ok(())
     }
@@ -869,6 +899,9 @@ impl VariantAccumulator {
             arena_segment_bytes: self
                 .arena_segment_bytes
                 .ok_or_else(|| input_error("comparison variant produced no arena layout"))?,
+            segmented_burst_depth: self.segmented_burst_depth.ok_or_else(|| {
+                input_error("comparison variant produced no segmented burst depth")
+            })?,
             num_iter,
             run_pair_ms: self.run_pair_ms,
         })
@@ -1009,18 +1042,24 @@ async fn run_compare_case(
             };
             let error_scopes = push_gpu_error_scopes(device);
             let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
-                let forward = FftPlan::c2c_with_large_policy_limits_for_testing(
-                    device,
-                    queue,
-                    benchmark_config(case, false),
-                    limits,
-                )?;
-                let inverse = FftPlan::c2c_with_large_policy_limits_for_testing(
-                    device,
-                    queue,
-                    benchmark_config(case, true),
-                    limits,
-                )?;
+                let create = |inverse| {
+                    let config = benchmark_config(case, inverse);
+                    if variant_label == "sharded" {
+                        FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
+                            device,
+                            queue,
+                            config,
+                            limits,
+                            options.segmented_burst_depth,
+                        )
+                    } else {
+                        FftPlan::c2c_with_large_policy_limits_for_testing(
+                            device, queue, config, limits,
+                        )
+                    }
+                };
+                let forward = create(false)?;
+                let inverse = create(true)?;
                 Ok((forward, inverse))
             })();
             pop_gpu_error_scopes(
@@ -1161,6 +1200,18 @@ async fn run_compare_case(
             result.sharded.result.execution_kind
         )));
     }
+    if result.unsharded.result.segmented_burst_depth != 0 {
+        return Err(input_error(format!(
+            "unsharded comparison variant unexpectedly reported burst depth {}",
+            result.unsharded.result.segmented_burst_depth
+        )));
+    }
+    if result.sharded.result.segmented_burst_depth != options.segmented_burst_depth {
+        return Err(input_error(format!(
+            "sharded comparison variant reported burst depth {}, expected {}",
+            result.sharded.result.segmented_burst_depth, options.segmented_burst_depth
+        )));
+    }
     if !result.unsharded.result.arena_segment_bytes.is_empty() {
         return Err(input_error(format!(
             "unsharded comparison variant unexpectedly reported segmented arena buffers {:?}",
@@ -1266,6 +1317,13 @@ fn inspect_plan_pair(
             "forward/inverse segmented arena mismatch: {forward_arena_segments:?} versus {inverse_arena_segments:?}"
         )));
     }
+    let forward_burst_depth = segmented_burst_depth_from_diagnostics(&forward_diagnostics)?;
+    let inverse_burst_depth = segmented_burst_depth_from_diagnostics(&inverse_diagnostics)?;
+    if forward_burst_depth != inverse_burst_depth {
+        return Err(input_error(format!(
+            "forward/inverse segmented burst-depth mismatch: {forward_burst_depth} versus {inverse_burst_depth}"
+        )));
+    }
     Ok(PlanPairMetadata {
         route,
         execution_kind,
@@ -1280,6 +1338,7 @@ fn inspect_plan_pair(
             &inverse_diagnostics,
         )?,
         arena_segment_bytes: forward_arena_segments,
+        segmented_burst_depth: forward_burst_depth,
     })
 }
 
@@ -1299,12 +1358,13 @@ fn print_compare_result(
         let traffic_bytes_per_pair = variant.result.buffer_size as f64 * traffic_multiplier as f64;
         let bandwidth_gib_s = traffic_bytes_per_pair / seconds_per_pair / 1024_f64.powi(3);
         println!(
-            "COMPARE_VARIANT suite={} label={} variant={} shape={:?} batch={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
+            "COMPARE_VARIANT suite={} label={} variant={} shape={:?} batch={} segmented_burst_depth={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
             case.suite,
             case.label,
             variant.label,
             case.shape,
             case.batch,
+            variant.result.segmented_burst_depth,
             variant.effective_max_bind_bytes,
             variant.requested_max_buffer_bytes,
             variant.effective_max_buffer_bytes,
@@ -1335,11 +1395,12 @@ fn print_compare_result(
     let sharded_statistics = statistics(&result.sharded.result.run_pair_ms)?;
     let sharded_over_unsharded = sharded_statistics.mean_ms / unsharded_statistics.mean_ms;
     println!(
-        "COMPARE_RESULT suite={} label={} shape={:?} batch={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
+        "COMPARE_RESULT suite={} label={} shape={:?} batch={} segmented_burst_depth={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
         case.suite,
         case.label,
         case.shape,
         case.batch,
+        result.sharded.result.segmented_burst_depth,
         unsharded_statistics.mean_ms,
         sharded_statistics.mean_ms,
         sharded_over_unsharded,
@@ -1457,6 +1518,25 @@ fn arena_segment_bytes(diagnostics: &FftDiagnostics) -> Vec<u64> {
         .filter(|requirement| requirement.role == "helper:segmented-volume-arena")
         .map(|requirement| requirement.required_bytes)
         .collect()
+}
+
+fn segmented_burst_depth_from_diagnostics(diagnostics: &FftDiagnostics) -> BenchResult<usize> {
+    let stage_a = diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role == "helper:segmented-volume-burst-stage-a")
+        .count();
+    let stage_b = diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role == "helper:segmented-volume-burst-stage-b")
+        .count();
+    if stage_a != stage_b {
+        return Err(input_error(format!(
+            "segmented burst-ring helper mismatch: stage-a={stage_a}, stage-b={stage_b}"
+        )));
+    }
+    Ok(stage_a)
 }
 
 fn push_gpu_error_scopes(
@@ -1782,7 +1862,9 @@ fn parse_options() -> BenchResult<Options> {
         wait_timeout: Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS),
         plan_max_bind_bytes: None,
         compare_max_buffer_bytes: None,
+        segmented_burst_depth: DEFAULT_SEGMENTED_BURST_DEPTH,
     };
+    let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--runs" => {
@@ -1841,6 +1923,23 @@ fn parse_options() -> BenchResult<Options> {
                     next_value(&mut args, "--compare-max-buffer-bytes")?,
                 )?);
             }
+            "--segmented-burst-depth" => {
+                if suite != Suite::Custom {
+                    return Err(input_error(
+                        "--segmented-burst-depth is valid only in custom shape mode",
+                    ));
+                }
+                options.segmented_burst_depth = parse_positive::<usize>(
+                    next_value(&mut args, "--segmented-burst-depth")?,
+                    "--segmented-burst-depth",
+                )?;
+                segmented_burst_depth_was_set = true;
+                if options.segmented_burst_depth > 3 {
+                    return Err(input_error(
+                        "--segmented-burst-depth must be in the range 1..=3",
+                    ));
+                }
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -1851,6 +1950,11 @@ fn parse_options() -> BenchResult<Options> {
     if options.plan_max_bind_bytes.is_some() != options.compare_max_buffer_bytes.is_some() {
         return Err(input_error(
             "--plan-max-bind-bytes and --compare-max-buffer-bytes must be provided together",
+        ));
+    }
+    if segmented_burst_depth_was_set && options.compare_max_buffer_bytes.is_none() {
+        return Err(input_error(
+            "--segmented-burst-depth requires the segment-cap comparison flags",
         ));
     }
     Ok(options)
@@ -1933,7 +2037,23 @@ fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBuffer
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n\nDefaults:\n  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.\n  With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.\n  Segment-cap comparison recreates both variants per run and alternates their order.\n\nExamples:\n  cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2\n  cargo bench --bench fft_bench -- sample0 --adapter 0\n  cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2\n  cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1\n  cargo bench --bench fft_bench -- shape 4096x8000 --plan-max-bind-bytes 16777216 --compare-max-buffer-bytes 1073741824,67108864 --adapter 0 --runs 2 --iter-cap 1"
+        r#"Usage:
+  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+
+Defaults:
+  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.
+  With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.
+  Segment-cap comparison recreates both variants per run and alternates their order.
+  Segmented burst depth defaults to 2 and is valid only in comparison mode.
+
+Examples:
+  cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2
+  cargo bench --bench fft_bench -- sample0 --adapter 0
+  cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2
+  cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1
+  cargo bench --bench fft_bench -- shape 320x320x320 --plan-max-bind-bytes 16777216 --compare-max-buffer-bytes 1073741824,67108864 --segmented-burst-depth 2 --adapter 0 --runs 2 --iter-cap 1"#
     );
 }
 

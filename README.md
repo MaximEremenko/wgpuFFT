@@ -92,6 +92,9 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   workspace-aware variants for all three view layers, and
   `*_with_diagnostics` APIs validate endpoint size, layout, usage, alignment,
   workspace, helper buffers, stage graph windows, and device limits.
+- Async `FftPlan::c2c_checked` and `c2c_checked_with_diagnostics` constructors
+  additionally capture validation, internal, and out-of-memory errors raised
+  during C2C plan construction.
 - Large-route policy classifies normal, large-chunk, and large-out-of-core
   plans, with execution metadata for normal, batch chunk, smooth 1D
   decomposition, axis decomposition, Rader/Bluestein bridge routes, and
@@ -110,10 +113,12 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   layout afterward. No host or disk staging is required for this route.
 - Rank>=2 smooth C2C volumes above the active policy `maxBufferSize` can use a
   plan-owned segmented GPU arena. Axis rows and non-front slabs are staged
-  through binding-safe windows, with one segmented normalization pass and no
-  host or disk staging. On hardware where the logical volume itself exceeds the
-  real device `maxBufferSize`, caller-segmented endpoints are still required and
-  remain deferred; the implemented route is directly executable when an
+  through a measured two-slot ring of binding-safe A/B window pairs, with one
+  segmented normalization pass and no host or disk staging. The burst depth is
+  currently an internal policy choice; a public tuning override is deferred.
+  On hardware where the logical volume itself exceeds the real device
+  `maxBufferSize`, caller-segmented endpoints are still required and remain
+  deferred; the implemented route is directly executable when an
   internal/tuning cap is below the real endpoint limit. Prime axes inside a
   segmented volume, segmented/strided caller views, and caller-workspace reuse
   remain structured-unsupported.

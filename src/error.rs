@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::config::FftPrecision;
 use crate::diagnostics::{
     large_route_blocker, FftBlocker, FftBlockerKind, FftDiagnostics, FftRouteSummary,
 };
@@ -19,6 +20,11 @@ pub enum FftError {
     },
     UnsupportedLength {
         len: usize,
+    },
+    PrecisionUnsupported {
+        requested: FftPrecision,
+        route: &'static str,
+        reason: &'static str,
     },
     EmptyAxes,
     InvalidAxis {
@@ -230,6 +236,15 @@ impl fmt::Display for FftError {
             Self::UnsupportedLength { len } => write!(
                 f,
                 "FFT length {len} is not supported by the current mixed-radix milestone"
+            ),
+            Self::PrecisionUnsupported {
+                requested,
+                route,
+                reason,
+            } => write!(
+                f,
+                "FFT precision {} is unsupported for {route}: {reason}",
+                requested.as_str()
             ),
             Self::EmptyAxes => write!(f, "FFT axes must not be empty"),
             Self::InvalidAxis { axis, rank } => write!(
@@ -737,6 +752,21 @@ impl FftError {
                     .with_layout("length")
                     .with_required_bytes(*len as u64)
             }
+            Self::PrecisionUnsupported {
+                requested,
+                route,
+                reason,
+            } => {
+                let kind = if *reason == "device-missing-shader-f64" {
+                    FftBlockerKind::DeviceLimit
+                } else {
+                    FftBlockerKind::Unsupported
+                };
+                FftBlocker::new(kind, self.to_string())
+                    .with_route(*route)
+                    .with_stage("precision-capability")
+                    .with_layout(format!("complex-{}", requested.as_str()))
+            }
         };
         let route = route_summary_for_blocker(&blocker);
         FftDiagnostics::new(route).with_blocker(blocker)
@@ -1099,12 +1129,14 @@ fn transform_for_route(route: &str) -> &'static str {
         "c2r" => "c2r",
         "real" => "real",
         "logical-io" => "unknown",
-        "c2c-plan"
+        "c2c"
+        | "c2c-plan"
         | "normal"
         | "batch-chunk"
         | "smooth-1d-decomposition"
         | "axis-decomposition"
         | "out-of-core-four-step"
+        | "four-step"
         | "segmented-full-volume" => "c2c",
         "direct-dft"
         | "mixed-radix"
@@ -2082,6 +2114,36 @@ mod tests {
             assert_eq!(blocker.stage.as_deref(), Some(stage));
             assert_eq!(blocker.helper_buffer.as_deref(), Some(label));
         }
+    }
+
+    #[test]
+    fn precision_errors_distinguish_device_and_route_support() {
+        let missing_feature = FftError::PrecisionUnsupported {
+            requested: FftPrecision::F64,
+            route: "c2c",
+            reason: "device-missing-shader-f64",
+        };
+        assert_eq!(
+            missing_feature.to_string(),
+            "FFT precision f64 is unsupported for c2c: device-missing-shader-f64"
+        );
+        let diagnostics = missing_feature.diagnostics();
+        let blocker = &diagnostics.blockers()[0];
+        assert_eq!(diagnostics.route().transform, "c2c");
+        assert_eq!(blocker.kind, FftBlockerKind::DeviceLimit);
+        assert_eq!(blocker.route.as_deref(), Some("c2c"));
+        assert_eq!(blocker.stage.as_deref(), Some("precision-capability"));
+        assert_eq!(blocker.layout.as_deref(), Some("complex-f64"));
+
+        let unsupported_route = FftError::PrecisionUnsupported {
+            requested: FftPrecision::F64,
+            route: "r2c",
+            reason: "real-f64-not-implemented",
+        };
+        assert_eq!(
+            unsupported_route.diagnostics().blockers()[0].kind,
+            FftBlockerKind::Unsupported
+        );
     }
 
     #[test]

@@ -37,9 +37,10 @@ pub struct BufferRange<'a> {
 
 /// Logical FFT buffer layout expressed in endpoint element units.
 ///
-/// For C2C endpoints one element is an interleaved complex `f32` pair, for
-/// real endpoints one element is a scalar `f32`, and for packed real-spectrum
-/// endpoints one element is an interleaved complex `f32` pair.
+/// For C2C endpoints one element is an interleaved complex pair in the plan's
+/// configured precision. For real endpoints one element is a scalar `f32`, and
+/// for packed real-spectrum endpoints one element is an interleaved complex
+/// `f32` pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferLayout {
     pub element_offset: u64,

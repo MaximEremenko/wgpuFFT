@@ -3,6 +3,7 @@ use crate::error::{FftError, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ElementFormat {
     ComplexF32,
+    ComplexF64,
     RealF32,
     PackedComplexF32,
     U32,
@@ -12,6 +13,7 @@ impl ElementFormat {
     pub(crate) const fn bytes_per_element(self) -> u64 {
         match self {
             Self::ComplexF32 | Self::PackedComplexF32 => 8,
+            Self::ComplexF64 => 16,
             Self::RealF32 | Self::U32 => 4,
         }
     }

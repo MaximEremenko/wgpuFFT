@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::config::{FftConfig, FftDirection, Normalization};
+use crate::config::{FftConfig, FftDirection, FftPrecision, Normalization};
 use crate::error::{FftError, Result};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -36,9 +36,35 @@ pub(crate) enum AxisLayout {
     Interleaved,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AxisPrecision {
     F32,
+    F64,
+}
+
+impl AxisPrecision {
+    pub(crate) const fn complex_size_bytes(self) -> u64 {
+        match self {
+            Self::F32 => 8,
+            Self::F64 => 16,
+        }
+    }
+
+    pub(crate) const fn element_format(self) -> ElementFormat {
+        match self {
+            Self::F32 => ElementFormat::ComplexF32,
+            Self::F64 => ElementFormat::ComplexF64,
+        }
+    }
+}
+
+impl From<FftPrecision> for AxisPrecision {
+    fn from(precision: FftPrecision) -> Self {
+        match precision {
+            FftPrecision::F32 => Self::F32,
+            FftPrecision::F64 => Self::F64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +220,7 @@ impl AxisPlanConfig {
             normalization: config.normalization(),
             scale_override_bits: None,
             layout: AxisLayout::Interleaved,
-            precision: AxisPrecision::F32,
+            precision: config.precision().into(),
         }
     }
 
@@ -212,7 +238,7 @@ impl AxisPlanConfig {
         }
 
         match (self.layout, self.precision) {
-            (AxisLayout::Interleaved, AxisPrecision::F32) => {}
+            (AxisLayout::Interleaved, AxisPrecision::F32 | AxisPrecision::F64) => {}
         }
 
         let rank = self.shape.len();
@@ -275,9 +301,10 @@ impl AxisPlanConfig {
     pub(crate) fn stockham_workspace_size_bytes(&self) -> Result<u64> {
         self.validate()?;
         let stage_count = self.stockham_stage_count()?;
-        Ok(workspace_size_bytes_for_stage_count(
+        Ok(workspace_size_bytes_for_stage_count_with_precision(
             stage_count,
             self.total_complex()?,
+            self.precision,
         ))
     }
 
@@ -308,6 +335,13 @@ impl AxisPlan {
         twiddle_lut_pool: &mut AxisTwiddleLutPool,
     ) -> Result<Self> {
         config.validate()?;
+        if config.precision == AxisPrecision::F64 {
+            return Err(FftError::PrecisionUnsupported {
+                requested: FftPrecision::F64,
+                route: "mixed-radix",
+                reason: "native-f64-c2c-kernels-not-implemented",
+            });
+        }
 
         let total_complex = config.total_complex()?;
         let total_complex_u32 = total_complex as u32;
@@ -505,9 +539,13 @@ impl AxisPlan {
         };
         queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
 
-        let required_buffer_size_bytes = total_complex as u64 * COMPLEX_F32_BYTES;
-        let workspace_size_bytes =
-            workspace_size_bytes_for_stage_count(stages.len(), total_complex);
+        let required_buffer_size_bytes =
+            total_complex as u64 * config.precision.complex_size_bytes();
+        let workspace_size_bytes = workspace_size_bytes_for_stage_count_with_precision(
+            stages.len(),
+            total_complex,
+            config.precision,
+        );
         let temp_buffer = if workspace_size_bytes > 0 {
             Some(create_axis_temp_buffer(
                 device,
@@ -626,10 +664,9 @@ impl AxisPlan {
                 self.resolve_buffer(src_slot, input.clone(), output.clone(), workspace.clone())?;
             let dst =
                 self.resolve_buffer(dst_slot, input.clone(), output.clone(), workspace.clone())?;
-            let src_resource =
-                scheduler.storage_binding_resource(&src, ElementFormat::ComplexF32)?;
-            let dst_resource =
-                scheduler.storage_binding_resource(&dst, ElementFormat::ComplexF32)?;
+            let element_format = self.config.precision.element_format();
+            let src_resource = scheduler.storage_binding_resource(&src, element_format)?;
+            let dst_resource = scheduler.storage_binding_resource(&dst, element_format)?;
             let twiddle_lut = &self.twiddle_luts[stage.twiddle_lut_index];
             let twiddle_view = BufferView::whole(twiddle_lut.buffer.as_ref());
             let twiddle_resource =
@@ -727,12 +764,13 @@ impl AxisPlan {
     }
 }
 
-pub(crate) fn workspace_size_bytes_for_stage_count(
+fn workspace_size_bytes_for_stage_count_with_precision(
     stage_count: usize,
     total_complex: usize,
+    precision: AxisPrecision,
 ) -> u64 {
     if stage_count > 1 {
-        total_complex as u64 * COMPLEX_F32_BYTES
+        total_complex as u64 * precision.complex_size_bytes()
     } else {
         0
     }
@@ -2230,5 +2268,11 @@ mod tests {
 
         let nd_batched = AxisPlanConfig::from_c2c_config(&FftConfig::new_nd([4, 3]).with_batch(2));
         assert_eq!(nd_batched.stockham_workspace_size_bytes().unwrap(), 24 * 8);
+
+        let f64 =
+            AxisPlanConfig::from_c2c_config(&FftConfig::new(16).with_precision(FftPrecision::F64));
+        assert_eq!(f64.precision, AxisPrecision::F64);
+        assert_eq!(f64.stockham_workspace_size_bytes().unwrap(), 16 * 16);
+        assert_eq!(f64.precision.element_format(), ElementFormat::ComplexF64);
     }
 }

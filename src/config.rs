@@ -1,5 +1,35 @@
 use crate::error::{FftError, Result};
 
+/// Scalar precision used by an FFT plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FftPrecision {
+    /// Native 32-bit floating-point storage and arithmetic.
+    #[default]
+    F32,
+    /// Native 64-bit floating-point storage and arithmetic.
+    F64,
+}
+
+impl FftPrecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    pub const fn scalar_size_bytes(self) -> u64 {
+        match self {
+            Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    pub const fn complex_size_bytes(self) -> u64 {
+        self.scalar_size_bytes() * 2
+    }
+}
+
 /// Direction of a complex-to-complex transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FftDirection {
@@ -32,7 +62,7 @@ impl Default for Normalization {
     }
 }
 
-/// Configuration for C2C f32 transforms over interleaved complex buffers.
+/// Configuration for transforms over interleaved complex buffers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FftConfig {
     shape: Vec<usize>,
@@ -40,6 +70,7 @@ pub struct FftConfig {
     batch: usize,
     direction: FftDirection,
     normalization: Normalization,
+    precision: FftPrecision,
 }
 
 impl FftConfig {
@@ -56,6 +87,7 @@ impl FftConfig {
             batch: 1,
             direction: FftDirection::Forward,
             normalization: Normalization::Inverse,
+            precision: FftPrecision::F32,
         }
     }
 
@@ -87,6 +119,11 @@ impl FftConfig {
         self
     }
 
+    pub fn with_precision(mut self, precision: FftPrecision) -> Self {
+        self.precision = precision;
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.shape.first().copied().unwrap_or(0)
     }
@@ -113,6 +150,10 @@ impl FftConfig {
 
     pub fn normalization(&self) -> Normalization {
         self.normalization
+    }
+
+    pub fn precision(&self) -> FftPrecision {
+        self.precision
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -175,20 +216,45 @@ impl FftConfig {
         checked_product(&self.shape)
     }
 
-    pub fn required_f32_len(&self) -> Result<usize> {
+    /// Number of interleaved scalar values in the logical complex buffer.
+    pub fn required_scalar_len(&self) -> Result<usize> {
         self.validate()?;
         self.total_complex_len()?
             .checked_mul(2)
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })
     }
 
+    /// Legacy name for [`Self::required_scalar_len`].
+    ///
+    /// The return value is a scalar count for both precisions; use
+    /// [`Self::required_buffer_size_bytes`] when allocating storage.
+    pub fn required_f32_len(&self) -> Result<usize> {
+        self.required_scalar_len()
+    }
+
     pub fn required_buffer_size_bytes(&self) -> Result<u64> {
-        Ok((self.required_f32_len()? * std::mem::size_of::<f32>()) as u64)
+        self.validate()?;
+        (self.total_complex_len()? as u64)
+            .checked_mul(self.precision.complex_size_bytes())
+            .ok_or(FftError::LengthTooLarge { len: usize::MAX })
     }
 
     pub fn scale(&self) -> Result<f32> {
         self.validate()?;
         let len = self.logical_complex_len()? as f32;
+        let scale = match (self.direction, self.normalization) {
+            (_, Normalization::None) => 1.0,
+            (FftDirection::Forward, Normalization::Forward) => 1.0 / len,
+            (FftDirection::Inverse, Normalization::Inverse) => 1.0 / len,
+            (_, Normalization::Orthogonal) => 1.0 / len.sqrt(),
+            _ => 1.0,
+        };
+        Ok(scale)
+    }
+
+    pub fn scale_f64(&self) -> Result<f64> {
+        self.validate()?;
+        let len = self.logical_complex_len()? as f64;
         let scale = match (self.direction, self.normalization) {
             (_, Normalization::None) => 1.0,
             (FftDirection::Forward, Normalization::Forward) => 1.0 / len,
@@ -270,6 +336,47 @@ mod tests {
         assert_eq!(nd.total_complex_len().unwrap(), 24);
         assert_eq!(nd.required_f32_len().unwrap(), 48);
         assert_eq!(nd.required_buffer_size_bytes().unwrap(), 192);
+
+        let f64 = nd.with_precision(FftPrecision::F64);
+        assert_eq!(f64.required_scalar_len().unwrap(), 48);
+        assert_eq!(f64.required_f32_len().unwrap(), 48);
+        assert_eq!(f64.required_buffer_size_bytes().unwrap(), 384);
+    }
+
+    #[test]
+    fn required_buffer_size_preserves_config_validation_errors() {
+        assert_eq!(
+            FftConfig::new(0).required_buffer_size_bytes(),
+            Err(FftError::ZeroLength)
+        );
+        assert_eq!(
+            FftConfig::new(8)
+                .with_batch(0)
+                .with_precision(FftPrecision::F64)
+                .required_buffer_size_bytes(),
+            Err(FftError::ZeroBatch)
+        );
+        assert_eq!(
+            FftConfig::new_nd([4, 4])
+                .with_axes(Vec::<usize>::new())
+                .required_buffer_size_bytes(),
+            Err(FftError::EmptyAxes)
+        );
+    }
+
+    #[test]
+    fn precision_defaults_to_f32_and_has_stable_element_sizes() {
+        assert_eq!(FftConfig::new(8).precision(), FftPrecision::F32);
+        assert_eq!(FftPrecision::F32.scalar_size_bytes(), 4);
+        assert_eq!(FftPrecision::F32.complex_size_bytes(), 8);
+        assert_eq!(FftPrecision::F64.scalar_size_bytes(), 8);
+        assert_eq!(FftPrecision::F64.complex_size_bytes(), 16);
+        assert_eq!(
+            FftConfig::new(8)
+                .with_precision(FftPrecision::F64)
+                .precision(),
+            FftPrecision::F64
+        );
     }
 
     #[test]
@@ -297,5 +404,9 @@ mod tests {
             0.5
         );
         assert_eq!(FftConfig::inverse_nd([2, 3]).scale().unwrap(), 1.0 / 6.0);
+        assert_eq!(
+            FftConfig::inverse_nd([2, 3]).scale_f64().unwrap(),
+            1.0 / 6.0
+        );
     }
 }

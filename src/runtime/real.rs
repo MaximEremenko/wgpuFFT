@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
-use crate::config::{FftConfig, FftDirection};
+use crate::config::{FftConfig, FftDirection, FftPrecision};
+use crate::device::device_supports_precision;
 use crate::error::{FftError, Result};
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::buffer_view::BufferView;
@@ -28,6 +29,28 @@ use crate::runtime::window_scheduler::WindowScheduler;
 const WORKGROUP_SIZE: u32 = 64;
 const F32_BYTES: u64 = 4;
 const COMPLEX_F32_BYTES: u64 = 8;
+
+fn validate_real_precision(
+    device: &wgpu::Device,
+    config: &FftConfig,
+    route: &'static str,
+) -> Result<()> {
+    if config.precision() != FftPrecision::F64 {
+        return Ok(());
+    }
+    if !device_supports_precision(device, FftPrecision::F64) {
+        return Err(FftError::PrecisionUnsupported {
+            requested: FftPrecision::F64,
+            route,
+            reason: "device-missing-shader-f64",
+        });
+    }
+    Err(FftError::PrecisionUnsupported {
+        requested: FftPrecision::F64,
+        route,
+        reason: "real-f64-not-implemented",
+    })
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -666,6 +689,7 @@ impl R2cPlan {
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
         validate_real_config(&config, RealTransform::R2c)?;
+        validate_real_precision(device, &config, "r2c")?;
         let packed_shape = packed_shape_for(config.shape())?;
         let sizes = RealPlanSizes::new(&config, &packed_shape)?;
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
@@ -944,6 +968,7 @@ impl C2rPlan {
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
         validate_real_config(&config, RealTransform::C2r)?;
+        validate_real_precision(device, &config, "c2r")?;
         let packed_shape = packed_shape_for(config.shape())?;
         let sizes = RealPlanSizes::new(&config, &packed_shape)?;
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
@@ -1317,7 +1342,7 @@ fn execute_real_logical_views(
         dispatch_real_strided_copy(
             device,
             encoder,
-            strided_pack_kind(input.format),
+            strided_pack_kind(input.format)?,
             input.format,
             &strided_source,
             &BufferView::whole(&buffer).prefix(required_input_bytes)?,
@@ -1371,7 +1396,7 @@ fn execute_real_logical_views(
         dispatch_real_strided_copy(
             device,
             encoder,
-            strided_unpack_kind(output.format),
+            strided_unpack_kind(output.format)?,
             output.format,
             &BufferView::whole(buffer).prefix(required_output_bytes)?,
             &strided_target,
@@ -1395,22 +1420,36 @@ fn execute_real_logical_views(
     Ok(())
 }
 
-fn strided_pack_kind(format: FftEndpointFormat) -> RealKernelKind {
-    match format {
+fn strided_pack_kind(format: FftEndpointFormat) -> Result<RealKernelKind> {
+    Ok(match format {
         FftEndpointFormat::RealF32 => RealKernelKind::PackRealStrided,
         FftEndpointFormat::ComplexF32 | FftEndpointFormat::PackedComplexF32 => {
             RealKernelKind::PackComplexStrided
         }
-    }
+        FftEndpointFormat::ComplexF64 => {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::F64,
+                route: "real",
+                reason: "real-f64-not-implemented",
+            });
+        }
+    })
 }
 
-fn strided_unpack_kind(format: FftEndpointFormat) -> RealKernelKind {
-    match format {
+fn strided_unpack_kind(format: FftEndpointFormat) -> Result<RealKernelKind> {
+    Ok(match format {
         FftEndpointFormat::RealF32 => RealKernelKind::UnpackRealStrided,
         FftEndpointFormat::ComplexF32 | FftEndpointFormat::PackedComplexF32 => {
             RealKernelKind::UnpackComplexStrided
         }
-    }
+        FftEndpointFormat::ComplexF64 => {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::F64,
+                route: "real",
+                reason: "real-f64-not-implemented",
+            });
+        }
+    })
 }
 
 fn real_strided_kind_matches_format(kind: RealKernelKind, format: FftEndpointFormat) -> bool {

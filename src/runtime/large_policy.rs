@@ -1,8 +1,6 @@
 use crate::error::{FftError, Result};
 use crate::runtime::axis_policy::{next_power_of_two_at_least, next_smooth_at_least, AxisKind};
 
-const COMPLEX_F32_BYTES: u64 = 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LargeRouteMode {
     Normal,
@@ -300,6 +298,13 @@ pub struct OutOfCorePlan {
 pub fn resolve_large_routing_policy(
     input: LargeRoutingPolicyInput<'_>,
 ) -> Result<LargeRoutingPolicy> {
+    resolve_large_routing_policy_with_complex_element_bytes(input, 8)
+}
+
+pub(crate) fn resolve_large_routing_policy_with_complex_element_bytes(
+    input: LargeRoutingPolicyInput<'_>,
+    complex_element_bytes: u64,
+) -> Result<LargeRoutingPolicy> {
     let max_bind_bytes = input.limits.max_storage_buffer_binding_size;
     let max_buffer_size = input.limits.max_buffer_size;
     let mut reason_codes = Vec::new();
@@ -325,6 +330,7 @@ pub fn resolve_large_routing_policy(
     let axis_supported = evaluate_axis_support(
         input.axis_kinds,
         input.axis_lengths,
+        complex_element_bytes,
         max_bind_bytes,
         max_buffer_size,
         input.allow_non_mixed_bounded_slicing,
@@ -604,15 +610,16 @@ pub fn plan_out_of_core_windows(input: OutOfCorePlanInput) -> Result<OutOfCorePl
     })
 }
 
-pub(crate) fn line_bytes_for_axis_len(axis_len: usize) -> Result<u64> {
+pub(crate) fn line_bytes_for_axis_len(axis_len: usize, complex_element_bytes: u64) -> Result<u64> {
     (axis_len as u64)
-        .checked_mul(COMPLEX_F32_BYTES)
+        .checked_mul(complex_element_bytes)
         .ok_or(FftError::LengthTooLarge { len: usize::MAX })
 }
 
 fn evaluate_axis_support(
     axis_kinds: Option<&[AxisKind]>,
     axis_lengths: Option<&[usize]>,
+    complex_element_bytes: u64,
     max_bind_bytes: u64,
     max_buffer_size: u64,
     allow_non_mixed_bounded_slicing: bool,
@@ -620,7 +627,7 @@ fn evaluate_axis_support(
     let (Some(axis_kinds), Some(axis_lengths)) = (axis_kinds, axis_lengths) else {
         return None;
     };
-    if axis_kinds.len() != axis_lengths.len() {
+    if axis_kinds.len() != axis_lengths.len() || complex_element_bytes == 0 {
         return None;
     }
 
@@ -628,22 +635,28 @@ fn evaluate_axis_support(
         axis_kinds
             .iter()
             .zip(axis_lengths)
-            .map(|(&kind, &len)| match kind {
-                AxisKind::Mixed => {
-                    can_axis_len_fit_or_two_step(len, max_bind_bytes, max_buffer_size)
-                }
-                AxisKind::Rader | AxisKind::Bluestein => {
-                    let line_bytes = line_bytes_for_axis_len(len).unwrap_or(u64::MAX);
-                    if allow_non_mixed_bounded_slicing {
-                        non_mixed_axis_window_supported(
-                            kind,
-                            len,
-                            line_bytes,
-                            max_bind_bytes,
-                            max_buffer_size,
-                        )
-                    } else {
-                        line_bytes <= max_bind_bytes
+            .map(|(&kind, &len)| {
+                let line_bytes =
+                    line_bytes_for_axis_len(len, complex_element_bytes).unwrap_or(u64::MAX);
+                match kind {
+                    AxisKind::Mixed => can_axis_len_fit_or_two_step(
+                        len,
+                        line_bytes,
+                        max_bind_bytes,
+                        max_buffer_size,
+                    ),
+                    AxisKind::Rader | AxisKind::Bluestein => {
+                        if allow_non_mixed_bounded_slicing {
+                            non_mixed_axis_window_supported(
+                                kind,
+                                len,
+                                line_bytes,
+                                max_bind_bytes,
+                                max_buffer_size,
+                            )
+                        } else {
+                            line_bytes <= max_bind_bytes
+                        }
                     }
                 }
             })
@@ -664,7 +677,7 @@ fn supported_non_mixed_axis_failed(
         .any(|(&kind, &supported)| kind != AxisKind::Mixed && !supported)
 }
 
-fn non_mixed_axis_window_supported(
+pub(crate) fn non_mixed_axis_window_supported(
     kind: AxisKind,
     axis_len: usize,
     line_bytes: u64,
@@ -688,7 +701,16 @@ fn non_mixed_axis_window_supported(
     let Some(convolution_len) = non_mixed_convolution_len(effective_kind, axis_len) else {
         return false;
     };
-    let Ok(convolution_bytes) = line_bytes_for_axis_len(convolution_len) else {
+    let Some(complex_element_bytes) = line_bytes.checked_div(axis_len as u64) else {
+        return false;
+    };
+    if complex_element_bytes == 0
+        || complex_element_bytes.checked_mul(axis_len as u64) != Some(line_bytes)
+    {
+        return false;
+    }
+    let Ok(convolution_bytes) = line_bytes_for_axis_len(convolution_len, complex_element_bytes)
+    else {
         return false;
     };
     convolution_bytes <= max_buffer_size
@@ -710,12 +732,13 @@ fn non_mixed_convolution_len(kind: AxisKind, axis_len: usize) -> Option<usize> {
 
 fn can_axis_len_fit_or_two_step(
     axis_len: usize,
+    line_bytes: u64,
     max_bind_bytes: u64,
     max_buffer_size: u64,
 ) -> bool {
-    let Ok(line_bytes) = line_bytes_for_axis_len(axis_len) else {
+    if axis_len == 0 {
         return false;
-    };
+    }
     if line_bytes > max_buffer_size {
         return false;
     }
@@ -723,7 +746,13 @@ fn can_axis_len_fit_or_two_step(
         return true;
     }
 
-    let max_axis_elems = (max_bind_bytes / COMPLEX_F32_BYTES) as usize;
+    let complex_element_bytes = line_bytes / axis_len as u64;
+    if complex_element_bytes == 0
+        || complex_element_bytes.checked_mul(axis_len as u64) != Some(line_bytes)
+    {
+        return false;
+    }
+    let max_axis_elems = (max_bind_bytes / complex_element_bytes) as usize;
     if max_axis_elems < 2 {
         return false;
     }
@@ -806,6 +835,39 @@ mod tests {
         assert_eq!(p.attempted_routes, ["direct"]);
         assert!(p.reason_codes.contains(&"within-bindings"));
         assert!(p.reason_codes.contains(&"normal"));
+    }
+
+    #[test]
+    fn axis_support_is_independent_of_representation_line_width_inventory() {
+        let p = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits: limits(256),
+            required_binding_bytes: &[64],
+            // Real plans report real, full-complex, and packed line widths here,
+            // while axis metadata still has one entry per transformed axis.
+            line_bytes: &[64, 128, 40],
+            axis_kinds: Some(&[AxisKind::Mixed, AxisKind::Mixed]),
+            axis_lengths: Some(&[8, 5]),
+            ..LargeRoutingPolicyInput::new(limits(256), &[])
+        })
+        .unwrap();
+
+        assert_eq!(p.axis_supported, Some(vec![true, true]));
+    }
+
+    #[test]
+    fn c2c_axis_support_uses_the_requested_complex_element_size() {
+        let input = || LargeRoutingPolicyInput {
+            limits: limits(128),
+            required_binding_bytes: &[64],
+            line_bytes: &[64],
+            axis_kinds: Some(&[AxisKind::Mixed]),
+            axis_lengths: Some(&[13]),
+            ..LargeRoutingPolicyInput::new(limits(128), &[])
+        };
+        let f32 = resolve_large_routing_policy_with_complex_element_bytes(input(), 8).unwrap();
+        let f64 = resolve_large_routing_policy_with_complex_element_bytes(input(), 16).unwrap();
+        assert_eq!(f32.axis_supported, Some(vec![true]));
+        assert_eq!(f64.axis_supported, Some(vec![false]));
     }
 
     #[test]

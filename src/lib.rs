@@ -44,7 +44,7 @@ pub mod math;
 pub mod plan;
 pub mod runtime;
 
-pub use config::{FftConfig, FftDirection, Normalization};
+pub use config::{FftConfig, FftDirection, FftPrecision, Normalization};
 pub use diagnostics::{
     FftBlocker, FftBlockerKind, FftBufferRequirement, FftDeviceLimits, FftDiagnostics,
     FftRouteSummary, FftStageSummary,

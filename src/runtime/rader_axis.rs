@@ -982,6 +982,7 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         key.workgroup_size,
         "scratch",
         "twiddle_forward",
+        AxisPrecision::F32,
     );
     let inverse_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -990,6 +991,7 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         key.workgroup_size,
         "scratch",
         "twiddle_inverse",
+        AxisPrecision::F32,
     );
 
     format!(

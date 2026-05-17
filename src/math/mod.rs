@@ -19,7 +19,8 @@ impl Complex32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 pub struct Complex64 {
     pub re: f64,
     pub im: f64,

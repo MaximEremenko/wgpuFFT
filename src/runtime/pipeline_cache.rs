@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::config::FftDirection;
+use crate::runtime::axis_plan::AxisPrecision;
 
 pub const PIPELINE_CACHE_SNAPSHOT_SCHEMA: &str = "wgpu-fft.pipeline-cache";
 pub const PIPELINE_CACHE_SNAPSHOT_VERSION: u32 = 1;
@@ -137,6 +138,7 @@ pub fn import_pipeline_cache_snapshot(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PipelineLayoutCacheKey {
     AxisPlanInterleavedF32Lut,
+    AxisPlanInterleavedF64Lut,
     BridgeReadWriteReadF32,
     BridgeReadWriteUniformF32,
     BridgeTwoWriteUniformF32,
@@ -145,7 +147,9 @@ pub(crate) enum PipelineLayoutCacheKey {
     C2cSmoothBinaryF32,
     C2cSmoothTwiddleLutF32,
     C2cStridedBinaryF32,
+    C2cStridedBinaryF64,
     DirectDftInterleavedF32Lut,
+    DirectDftInterleavedF64Lut,
     FusedPrimeInterleavedF32,
     FourStepUnaryF32,
     RealBinaryF32,
@@ -161,6 +165,7 @@ impl PipelineLayoutCacheKey {
     fn stable_key(self) -> &'static str {
         match self {
             Self::AxisPlanInterleavedF32Lut => "axis-plan/interleaved-f32-lut",
+            Self::AxisPlanInterleavedF64Lut => "axis-plan/interleaved-f64-lut",
             Self::BridgeReadWriteReadF32 => "bridge/read-write-read-f32",
             Self::BridgeReadWriteUniformF32 => "bridge/read-write-uniform-f32",
             Self::BridgeTwoWriteUniformF32 => "bridge/two-write-uniform-f32",
@@ -169,7 +174,9 @@ impl PipelineLayoutCacheKey {
             Self::C2cSmoothBinaryF32 => "c2c-smooth/binary-f32",
             Self::C2cSmoothTwiddleLutF32 => "c2c-smooth/twiddle-lut-f32",
             Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
+            Self::C2cStridedBinaryF64 => "c2c-strided/binary-f64",
             Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
+            Self::DirectDftInterleavedF64Lut => "direct-dft/interleaved-f64-lut",
             Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
             Self::FourStepUnaryF32 => "four-step/unary-f32",
             Self::RealBinaryF32 => "real/binary-f32",
@@ -344,7 +351,7 @@ pub(crate) enum ShaderCacheKey {
     RealStage(RealStageKey),
     C2cSmoothStage(C2cSmoothStageKey),
     C2cStridedStage(C2cStridedStageKey),
-    DirectDftC2cF32Lut,
+    DirectDftC2cLut(AxisPrecision),
 }
 
 impl ShaderCacheKey {
@@ -360,15 +367,19 @@ impl ShaderCacheKey {
             Self::RealStage(key) => key.stable_key(),
             Self::C2cSmoothStage(key) => key.stable_key(),
             Self::C2cStridedStage(key) => key.stable_key(),
-            Self::DirectDftC2cF32Lut => {
-                String::from("shader:v2:direct-dft/c2c-f32:twiddle=host-f64-f32-v1")
-            }
+            Self::DirectDftC2cLut(precision) => format!(
+                "shader:v3:direct-dft/c2c-{}:twiddle=host-f64-{}-v1",
+                precision.as_str(),
+                precision.as_str()
+            ),
         }
     }
 
     fn fallback_source(&self) -> String {
         match self {
-            Self::StockhamStage(_) => String::new(),
+            Self::StockhamStage(key) => {
+                crate::runtime::axis_plan::generate_stockham_radix_stage_wgsl_for_key(key)
+            }
             Self::FusedPow2Stage(key) => {
                 crate::runtime::axis_plan::generate_fused_pow2_stage_wgsl_for_key(key)
             }
@@ -393,11 +404,18 @@ impl ShaderCacheKey {
             Self::C2cStridedStage(key) => {
                 crate::runtime::c2c::generate_c2c_strided_wgsl_for_key(key)
             }
-            Self::DirectDftC2cF32Lut => crate::kernels::C2C_DFT_WGSL.to_owned(),
+            Self::DirectDftC2cLut(precision) => {
+                crate::runtime::c2c::generate_direct_dft_wgsl(*precision)
+            }
         }
     }
 
     fn is_supported_on_device(&self, device: &wgpu::Device) -> bool {
+        if self.precision() == Some(AxisPrecision::F64)
+            && !device.features().contains(wgpu::Features::SHADER_F64)
+        {
+            return false;
+        }
         match self {
             Self::FusedPow2Stage(key) => {
                 let limits = device.limits();
@@ -426,6 +444,17 @@ impl ShaderCacheKey {
             _ => true,
         }
     }
+
+    fn precision(&self) -> Option<AxisPrecision> {
+        match self {
+            Self::StockhamStage(key) => Some(key.precision),
+            Self::FusedPow2Stage(key) => Some(key.precision),
+            Self::FusedSmoothStage(key) => Some(key.precision),
+            Self::DirectDftC2cLut(precision) => Some(*precision),
+            Self::C2cStridedStage(key) => Some(key.precision),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -437,24 +466,27 @@ pub(crate) struct ComputePipelineCacheKey {
 
 impl ComputePipelineCacheKey {
     pub(crate) fn stockham_stage(shader: StockhamStageKey) -> Self {
+        let layout = axis_plan_layout_for_precision(shader.precision);
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+            layout,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::StockhamStage(shader),
         }
     }
 
     pub(crate) fn fused_pow2_stage(shader: FusedPow2StageKey) -> Self {
+        let layout = axis_plan_layout_for_precision(shader.precision);
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+            layout,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedPow2Stage(shader),
         }
     }
 
     pub(crate) fn fused_smooth_stage(shader: FusedSmoothStageKey) -> Self {
+        let layout = axis_plan_layout_for_precision(shader.precision);
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+            layout,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedSmoothStage(shader),
         }
@@ -480,12 +512,20 @@ impl ComputePipelineCacheKey {
         }
     }
 
-    pub(crate) fn direct_dft_c2c_f32() -> Self {
+    pub(crate) fn direct_dft_c2c(precision: AxisPrecision) -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::DirectDftInterleavedF32Lut,
+            layout: match precision {
+                AxisPrecision::F32 => PipelineLayoutCacheKey::DirectDftInterleavedF32Lut,
+                AxisPrecision::F64 => PipelineLayoutCacheKey::DirectDftInterleavedF64Lut,
+            },
             entry_point: String::from("main"),
-            shader: ShaderCacheKey::DirectDftC2cF32Lut,
+            shader: ShaderCacheKey::DirectDftC2cLut(precision),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_dft_c2c_f32() -> Self {
+        Self::direct_dft_c2c(AxisPrecision::F32)
     }
 
     pub(crate) fn real_stage(shader: RealStageKey) -> Self {
@@ -497,8 +537,12 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn c2c_strided_stage(shader: C2cStridedStageKey) -> Self {
+        let layout = match shader.precision {
+            AxisPrecision::F32 => PipelineLayoutCacheKey::C2cStridedBinaryF32,
+            AxisPrecision::F64 => PipelineLayoutCacheKey::C2cStridedBinaryF64,
+        };
         Self {
-            layout: PipelineLayoutCacheKey::C2cStridedBinaryF32,
+            layout,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::C2cStridedStage(shader),
         }
@@ -564,6 +608,13 @@ impl ComputePipelineCacheKey {
             self.entry_point,
             self.shader.stable_key()
         )
+    }
+}
+
+fn axis_plan_layout_for_precision(precision: AxisPrecision) -> PipelineLayoutCacheKey {
+    match precision {
+        AxisPrecision::F32 => PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+        AxisPrecision::F64 => PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut,
     }
 }
 
@@ -775,20 +826,27 @@ impl C2cSmoothStageKey {
 pub(crate) struct C2cStridedStageKey {
     pub(crate) kind: C2cStridedKernelKind,
     pub(crate) workgroup_size: u32,
+    pub(crate) precision: AxisPrecision,
 }
 
 impl C2cStridedStageKey {
-    pub(crate) const fn new(kind: C2cStridedKernelKind, workgroup_size: u32) -> Self {
+    pub(crate) const fn new(
+        kind: C2cStridedKernelKind,
+        workgroup_size: u32,
+        precision: AxisPrecision,
+    ) -> Self {
         Self {
             kind,
             workgroup_size,
+            precision,
         }
     }
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v1:c2c-strided:{}:workgroup={}",
+            "shader:v2:c2c-strided:{}:precision={}:workgroup={}",
             self.kind.as_str(),
+            self.precision.as_str(),
             self.workgroup_size
         )
     }
@@ -973,6 +1031,7 @@ impl RaderStageKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct StockhamStageKey {
+    pub(crate) precision: AxisPrecision,
     pub(crate) rank: usize,
     pub(crate) axis: usize,
     pub(crate) dims: Vec<usize>,
@@ -983,11 +1042,12 @@ pub(crate) struct StockhamStageKey {
     pub(crate) direction: FftDirection,
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
-    scale_bits: u32,
+    scale_bits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FusedPow2StageKey {
+    pub(crate) precision: AxisPrecision,
     pub(crate) rank: usize,
     pub(crate) axis: usize,
     pub(crate) dims: Vec<usize>,
@@ -996,11 +1056,12 @@ pub(crate) struct FusedPow2StageKey {
     pub(crate) direction: FftDirection,
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
-    scale_bits: u32,
+    scale_bits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FusedSmoothStageKey {
+    pub(crate) precision: AxisPrecision,
     pub(crate) rank: usize,
     pub(crate) axis: usize,
     pub(crate) dims: Vec<usize>,
@@ -1010,7 +1071,7 @@ pub(crate) struct FusedSmoothStageKey {
     pub(crate) direction: FftDirection,
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
-    scale_bits: u32,
+    scale_bits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1129,7 +1190,8 @@ impl FusedSmoothStageKey {
         direction: FftDirection,
         workgroup_size: u32,
         apply_scale: bool,
-        scale_factor: f32,
+        scale_factor: f64,
+        precision: AxisPrecision,
     ) -> Self {
         debug_assert_eq!(rank, dims.len());
         debug_assert!(axis < rank);
@@ -1138,13 +1200,10 @@ impl FusedSmoothStageKey {
         debug_assert_eq!(factors.iter().product::<usize>(), axis_length);
         debug_assert!(scale_factor.is_finite());
 
-        let scale_bits = if apply_scale {
-            scale_factor.to_bits()
-        } else {
-            1.0f32.to_bits()
-        };
+        let scale_bits = axis_scale_bits(precision, apply_scale, scale_factor);
 
         Self {
+            precision,
             rank,
             axis,
             dims: dims.to_vec(),
@@ -1158,13 +1217,14 @@ impl FusedSmoothStageKey {
         }
     }
 
-    pub(crate) fn scale_factor(&self) -> f32 {
-        f32::from_bits(self.scale_bits)
+    pub(crate) fn scale_factor(&self) -> f64 {
+        axis_scale_factor(self.precision, self.scale_bits)
     }
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v2:fused-smooth:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
+            "shader:v3:fused-smooth:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            self.precision.as_str(),
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1174,7 +1234,8 @@ impl FusedSmoothStageKey {
             direction_key(self.direction),
             self.workgroup_size,
             self.apply_scale,
-            self.scale_bits
+            axis_scale_bits_key(self.precision, self.scale_bits),
+            self.precision.as_str(),
         )
     }
 
@@ -1184,7 +1245,10 @@ impl FusedSmoothStageKey {
         max_invocations_per_workgroup: u32,
         max_workgroup_size_x: u32,
     ) -> bool {
-        let Some(scratch_bytes) = self.axis_length.checked_mul(8) else {
+        let Some(scratch_bytes) = self
+            .axis_length
+            .checked_mul(self.precision.complex_size_bytes() as usize)
+        else {
             return false;
         };
         scratch_bytes as u64 <= max_workgroup_storage_bytes
@@ -1204,7 +1268,8 @@ impl FusedPow2StageKey {
         direction: FftDirection,
         workgroup_size: u32,
         apply_scale: bool,
-        scale_factor: f32,
+        scale_factor: f64,
+        precision: AxisPrecision,
     ) -> Self {
         debug_assert_eq!(rank, dims.len());
         debug_assert!(axis < rank);
@@ -1212,13 +1277,10 @@ impl FusedPow2StageKey {
         debug_assert!(axis_length.is_power_of_two());
         debug_assert!(scale_factor.is_finite());
 
-        let scale_bits = if apply_scale {
-            scale_factor.to_bits()
-        } else {
-            1.0f32.to_bits()
-        };
+        let scale_bits = axis_scale_bits(precision, apply_scale, scale_factor);
 
         Self {
+            precision,
             rank,
             axis,
             dims: dims.to_vec(),
@@ -1231,13 +1293,14 @@ impl FusedPow2StageKey {
         }
     }
 
-    pub(crate) fn scale_factor(&self) -> f32 {
-        f32::from_bits(self.scale_bits)
+    pub(crate) fn scale_factor(&self) -> f64 {
+        axis_scale_factor(self.precision, self.scale_bits)
     }
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v2:fused-pow2:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
+            "shader:v3:fused-pow2:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            self.precision.as_str(),
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1246,7 +1309,8 @@ impl FusedPow2StageKey {
             direction_key(self.direction),
             self.workgroup_size,
             self.apply_scale,
-            self.scale_bits
+            axis_scale_bits_key(self.precision, self.scale_bits),
+            self.precision.as_str(),
         )
     }
 
@@ -1256,7 +1320,10 @@ impl FusedPow2StageKey {
         max_invocations_per_workgroup: u32,
         max_workgroup_size_x: u32,
     ) -> bool {
-        let Some(scratch_bytes) = self.axis_length.checked_mul(8) else {
+        let Some(scratch_bytes) = self
+            .axis_length
+            .checked_mul(self.precision.complex_size_bytes() as usize)
+        else {
             return false;
         };
         scratch_bytes as u64 <= max_workgroup_storage_bytes
@@ -1278,20 +1345,18 @@ impl StockhamStageKey {
         direction: FftDirection,
         workgroup_size: u32,
         apply_scale: bool,
-        scale_factor: f32,
+        scale_factor: f64,
+        precision: AxisPrecision,
     ) -> Self {
         debug_assert_eq!(rank, dims.len());
         debug_assert!(axis < rank);
         debug_assert_eq!(axis_length, dims[axis]);
         debug_assert!(scale_factor.is_finite());
 
-        let scale_bits = if apply_scale {
-            scale_factor.to_bits()
-        } else {
-            1.0f32.to_bits()
-        };
+        let scale_bits = axis_scale_bits(precision, apply_scale, scale_factor);
 
         Self {
+            precision,
             rank,
             axis,
             dims: dims.to_vec(),
@@ -1306,13 +1371,14 @@ impl StockhamStageKey {
         }
     }
 
-    pub(crate) fn scale_factor(&self) -> f32 {
-        f32::from_bits(self.scale_bits)
+    pub(crate) fn scale_factor(&self) -> f64 {
+        axis_scale_factor(self.precision, self.scale_bits)
     }
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v2:stockham:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
+            "shader:v3:stockham:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            self.precision.as_str(),
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1323,8 +1389,31 @@ impl StockhamStageKey {
             direction_key(self.direction),
             self.workgroup_size,
             self.apply_scale,
-            self.scale_bits
+            axis_scale_bits_key(self.precision, self.scale_bits),
+            self.precision.as_str(),
         )
+    }
+}
+
+fn axis_scale_bits(precision: AxisPrecision, apply_scale: bool, scale_factor: f64) -> u64 {
+    let value = if apply_scale { scale_factor } else { 1.0 };
+    match precision {
+        AxisPrecision::F32 => u64::from((value as f32).to_bits()),
+        AxisPrecision::F64 => value.to_bits(),
+    }
+}
+
+fn axis_scale_factor(precision: AxisPrecision, bits: u64) -> f64 {
+    match precision {
+        AxisPrecision::F32 => f64::from(f32::from_bits(bits as u32)),
+        AxisPrecision::F64 => f64::from_bits(bits),
+    }
+}
+
+fn axis_scale_bits_key(precision: AxisPrecision, bits: u64) -> String {
+    match precision {
+        AxisPrecision::F32 => format!("0x{:08x}", bits as u32),
+        AxisPrecision::F64 => format!("0x{bits:016x}"),
     }
 }
 
@@ -1356,6 +1445,7 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
     match key {
         PipelineLayoutCacheKey::C2cSmoothBinaryF32
         | PipelineLayoutCacheKey::C2cStridedBinaryF32
+        | PipelineLayoutCacheKey::C2cStridedBinaryF64
         | PipelineLayoutCacheKey::RealBinaryF32
         | PipelineLayoutCacheKey::RaderWriteY0InterleavedF32 => {
             vec![
@@ -1365,7 +1455,9 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
             ]
         }
         PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut
-        | PipelineLayoutCacheKey::DirectDftInterleavedF32Lut => vec![
+        | PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut
+        | PipelineLayoutCacheKey::DirectDftInterleavedF32Lut
+        | PipelineLayoutCacheKey::DirectDftInterleavedF64Lut => vec![
             storage_entry(0, true),
             storage_entry(1, false),
             uniform_entry(2),
@@ -1497,12 +1589,13 @@ mod tests {
             64,
             true,
             1.0 / 12.0,
+            AxisPrecision::F32,
         );
 
-        assert_eq!(key.scale_factor(), 1.0 / 12.0);
+        assert_eq!(key.scale_factor(), f64::from(1.0f32 / 12.0));
         assert_eq!(
             key.stable_key(),
-            "shader:v2:stockham:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=host-f64-f32-v1"
+            "shader:v3:stockham:precision=f32:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=host-f64-f32-v1"
         );
     }
 
@@ -1520,6 +1613,7 @@ mod tests {
             64,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let b = StockhamStageKey::new(
             1,
@@ -1533,6 +1627,7 @@ mod tests {
             64,
             false,
             0.125,
+            AxisPrecision::F32,
         );
 
         assert_eq!(a, b);
@@ -1551,16 +1646,17 @@ mod tests {
             256,
             true,
             1.0 / 1024.0,
+            AxisPrecision::F32,
         );
 
         assert_eq!(key.scale_factor(), 1.0 / 1024.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v2:fused-pow2:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000:twiddle=host-f64-f32-v1"
+            "shader:v3:fused-pow2:precision=f32:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000:twiddle=host-f64-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_pow2_stage(key);
         assert!(pipeline.stable_key().starts_with(
-            "pipeline:v1:layout=axis-plan/interleaved-f32-lut:entry=main:shader:v2:fused-pow2:"
+            "pipeline:v1:layout=axis-plan/interleaved-f32-lut:entry=main:shader:v3:fused-pow2:"
         ));
     }
 
@@ -1576,6 +1672,7 @@ mod tests {
             256,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let b = FusedPow2StageKey::new(
             1,
@@ -1587,6 +1684,7 @@ mod tests {
             256,
             false,
             1.0 / 4096.0,
+            AxisPrecision::F32,
         );
         assert_eq!(a, b);
         assert_eq!(a.scale_factor(), 1.0);
@@ -1604,11 +1702,75 @@ mod tests {
             256,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         assert!(key.is_supported_by_limits(32 * 1024, 256, 256));
         assert!(!key.is_supported_by_limits(16 * 1024, 256, 256));
         assert!(!key.is_supported_by_limits(32 * 1024, 255, 256));
         assert!(!key.is_supported_by_limits(32 * 1024, 256, 255));
+    }
+
+    #[test]
+    fn native_f64_axis_direct_and_strided_keys_are_precision_distinct() {
+        let make_pow2 = |precision| {
+            FusedPow2StageKey::new(
+                1,
+                0,
+                &[2048],
+                2048,
+                1,
+                FftDirection::Inverse,
+                256,
+                true,
+                1.0 / 2048.0,
+                precision,
+            )
+        };
+        let f32_key = make_pow2(AxisPrecision::F32);
+        let f64_key = make_pow2(AxisPrecision::F64);
+        assert_ne!(f32_key, f64_key);
+        assert!(f64_key.stable_key().contains("precision=f64"));
+        assert!(f64_key.stable_key().contains("scale_bits=0x"));
+        assert!(f64_key.is_supported_by_limits(32 * 1024, 256, 256));
+        assert!(!FusedPow2StageKey::new(
+            1,
+            0,
+            &[4096],
+            4096,
+            1,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+            AxisPrecision::F64,
+        )
+        .is_supported_by_limits(48 * 1024, 256, 256));
+
+        let f32_pipeline = ComputePipelineCacheKey::fused_pow2_stage(f32_key);
+        let f64_pipeline = ComputePipelineCacheKey::fused_pow2_stage(f64_key);
+        assert_eq!(
+            f32_pipeline.layout,
+            PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut
+        );
+        assert_eq!(
+            f64_pipeline.layout,
+            PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut
+        );
+        assert_ne!(f32_pipeline.stable_key(), f64_pipeline.stable_key());
+
+        assert_eq!(
+            ComputePipelineCacheKey::direct_dft_c2c(AxisPrecision::F64).layout,
+            PipelineLayoutCacheKey::DirectDftInterleavedF64Lut
+        );
+        assert_eq!(
+            ComputePipelineCacheKey::c2c_strided_stage(C2cStridedStageKey::new(
+                C2cStridedKernelKind::Pack,
+                64,
+                AxisPrecision::F64,
+            ))
+            .layout,
+            PipelineLayoutCacheKey::C2cStridedBinaryF64
+        );
     }
 
     #[test]
@@ -1624,16 +1786,17 @@ mod tests {
             256,
             true,
             1.0 / 4096.0,
+            AxisPrecision::F32,
         );
 
         assert_eq!(key.scale_factor(), 1.0 / 4096.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v2:fused-smooth:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000:twiddle=host-f64-f32-v1"
+            "shader:v3:fused-smooth:precision=f32:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000:twiddle=host-f64-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_smooth_stage(key);
-        assert!(pipeline.stable_key().contains("shader:v2:fused-smooth:"));
-        assert!(!pipeline.stable_key().contains("shader:v2:fused-pow2:"));
+        assert!(pipeline.stable_key().contains("shader:v3:fused-smooth:"));
+        assert!(!pipeline.stable_key().contains("shader:v3:fused-pow2:"));
     }
 
     #[test]
@@ -1649,6 +1812,7 @@ mod tests {
             256,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let b = FusedSmoothStageKey::new(
             1,
@@ -1661,6 +1825,7 @@ mod tests {
             256,
             false,
             1.0 / 3000.0,
+            AxisPrecision::F32,
         );
         assert_eq!(a, b);
         assert_eq!(a.scale_factor(), 1.0);
@@ -1751,6 +1916,7 @@ mod tests {
             64,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let pipeline = ComputePipelineCacheKey::stockham_stage(shader);
 
@@ -1761,7 +1927,7 @@ mod tests {
 
         assert_eq!(
             ComputePipelineCacheKey::direct_dft_c2c_f32().stable_key(),
-            "pipeline:v1:layout=direct-dft/interleaved-f32-lut:entry=main:shader:v2:direct-dft/c2c-f32:twiddle=host-f64-f32-v1"
+            "pipeline:v1:layout=direct-dft/interleaved-f32-lut:entry=main:shader:v3:direct-dft/c2c-f32:twiddle=host-f64-f32-v1"
         );
     }
 
@@ -1779,6 +1945,7 @@ mod tests {
             64,
             false,
             1.0,
+            AxisPrecision::F32,
         ));
         let pipeline = ComputePipelineCacheKey::stockham_stage(match &shader {
             ShaderCacheKey::StockhamStage(key) => key.clone(),
@@ -1791,7 +1958,7 @@ mod tests {
             ShaderCacheKey::RealStage(_) => unreachable!(),
             ShaderCacheKey::C2cSmoothStage(_) => unreachable!(),
             ShaderCacheKey::C2cStridedStage(_) => unreachable!(),
-            ShaderCacheKey::DirectDftC2cF32Lut => unreachable!(),
+            ShaderCacheKey::DirectDftC2cLut(_) => unreachable!(),
         });
         let snapshot = PipelineCacheSnapshot::from_entries(
             vec![SnapshotShaderEntry {
@@ -1879,13 +2046,13 @@ mod tests {
 
     #[test]
     fn c2c_strided_pipeline_key_uses_typed_helper_layout_and_shader_key() {
-        let shader = C2cStridedStageKey::new(C2cStridedKernelKind::Pack, 64);
+        let shader = C2cStridedStageKey::new(C2cStridedKernelKind::Pack, 64, AxisPrecision::F32);
         let pipeline = ComputePipelineCacheKey::c2c_strided_stage(shader);
 
         assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cStridedBinaryF32);
         assert_eq!(
             pipeline.stable_key(),
-            "pipeline:v1:layout=c2c-strided/binary-f32:entry=main:shader:v1:c2c-strided:pack-c2c-strided:workgroup=64"
+            "pipeline:v1:layout=c2c-strided/binary-f32:entry=main:shader:v2:c2c-strided:pack-c2c-strided:precision=f32:workgroup=64"
         );
     }
 

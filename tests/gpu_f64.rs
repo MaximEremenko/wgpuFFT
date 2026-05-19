@@ -5,13 +5,16 @@ use std::sync::mpsc;
 
 use wgpu_fft::math::{from_interleaved_f64, reference_c2c_nd_f64, Complex64};
 use wgpu_fft::{
-    BufferLayout, BufferView, C2cRoute, FftConfig, FftError, FftIoView, FftPlan, FftPrecision,
-    LargePolicyLimits, Normalization,
+    export_pipeline_cache_snapshot, import_pipeline_cache_snapshot, BufferLayout, BufferView,
+    C2cRoute, FftConfig, FftError, FftIoView, FftPlan, FftPrecision, LargePolicyLimits,
+    Normalization,
 };
 
 const F64_RMS_LIMIT: f64 = 1.0e-13;
 const FUSED_POW2_LABEL: &str = "fused-pow2-workgroup-stage";
 const FUSED_SMOOTH_LABEL: &str = "fused-smooth-workgroup-stage";
+const RADER_FUSED_LABEL: &str = "rader-fused-workgroup-stage";
+const BLUESTEIN_FUSED_LABEL: &str = "bluestein-fused-workgroup-stage";
 const STOCKHAM_LABEL: &str = "mixed-radix-stockham-stage";
 
 #[test]
@@ -59,10 +62,12 @@ async fn run_f64_cases() {
 
     verify_deferred_route_gates(&context.device, &context.queue);
     run_small_normal_cases(&context.device, &context.queue);
+    verify_precision_cache_coexistence(&context.device, &context.queue);
     run_strided_normal_case(&context.device, &context.queue);
 
     let low_storage = request_low_storage_f64_device(&context).await;
     run_fused_and_multipass_cases(&context, low_storage.as_ref());
+    run_prime_cases(&context, low_storage.as_ref());
 }
 
 async fn verify_missing_feature_gate(context: &wgpu_fft::device::GpuContext) {
@@ -238,6 +243,48 @@ fn run_small_normal_cases(device: &wgpu::Device, queue: &wgpu::Queue) {
             "{label}: unexpected C2C route"
         );
     }
+}
+
+fn verify_precision_cache_coexistence(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let _f32 = FftPlan::c2c(
+        device,
+        queue,
+        FftConfig::new(64).with_normalization(Normalization::None),
+    )
+    .unwrap();
+    let _f64 = FftPlan::c2c(
+        device,
+        queue,
+        FftConfig::new(64)
+            .with_normalization(Normalization::None)
+            .with_precision(FftPrecision::F64),
+    )
+    .unwrap();
+
+    let snapshot = export_pipeline_cache_snapshot(device);
+    let f32_key = snapshot
+        .pipeline_keys()
+        .iter()
+        .find(|key| {
+            key.contains(":n=64:")
+                && key.contains("precision=f32")
+                && key.contains("layout=axis-plan/interleaved-f32-lut")
+        })
+        .unwrap_or_else(|| panic!("missing typed f32 N=64 cache key"));
+    let f64_key = snapshot
+        .pipeline_keys()
+        .iter()
+        .find(|key| {
+            key.contains(":n=64:")
+                && key.contains("precision=f64")
+                && key.contains("layout=axis-plan/interleaved-f64-lut")
+        })
+        .unwrap_or_else(|| panic!("missing typed f64 N=64 cache key"));
+    assert_ne!(f32_key, f64_key);
+
+    let imported = import_pipeline_cache_snapshot(device, &snapshot);
+    assert!(imported.pipeline_keys().contains(f32_key));
+    assert!(imported.pipeline_keys().contains(f64_key));
 }
 
 fn run_strided_normal_case(device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -417,6 +464,221 @@ fn run_fused_and_multipass_cases(
         3000,
         context.device.limits().max_compute_workgroup_storage_size,
         "smooth-forward-n3000-native",
+    );
+}
+
+fn run_prime_cases(
+    context: &wgpu_fft::device::GpuContext,
+    low_storage: Option<&ManuallyDrop<(wgpu::Device, wgpu::Queue)>>,
+) {
+    let storage_limit = context.device.limits().max_compute_workgroup_storage_size as usize;
+
+    // Rader N=509 uses M=1024: 16*M bytes of f64 scratch plus one
+    // complex-f64 reduction slot. It fuses at 48 KiB but not at 16 KiB.
+    for inverse in [false, true] {
+        let label = format!("rader-n509-inverse={inverse}");
+        let config = prime_config_1d(509, 1, inverse);
+        let (_, plan) =
+            execute_prime_reference_case(&context.device, &context.queue, &label, config);
+        if storage_limit >= 16 * 1024 + 16 {
+            assert_fused_prime_plan(
+                &plan,
+                C2cRoute::Rader,
+                RADER_FUSED_LABEL,
+                &["rader-permutation-helper", "rader-bfft-helper"],
+                &label,
+            );
+        } else {
+            assert_rader_multipass_plan(&plan, &label);
+        }
+    }
+
+    // Bluestein N=515 uses M=1029: just over 16 KiB in f64, while
+    // remaining comfortably inside a 48 KiB limit.
+    for inverse in [false, true] {
+        let label = format!("bluestein-n515-inverse={inverse}");
+        let config = prime_config_1d(515, 1, inverse);
+        let (_, plan) =
+            execute_prime_reference_case(&context.device, &context.queue, &label, config);
+        if storage_limit >= 1029 * 16 {
+            assert_fused_prime_plan(
+                &plan,
+                C2cRoute::Bluestein,
+                BLUESTEIN_FUSED_LABEL,
+                &["bluestein-chirp-helper", "bluestein-bfft-helper"],
+                &label,
+            );
+        } else {
+            assert_bluestein_multipass_plan(&plan, &label);
+        }
+    }
+
+    // These convolution sizes fit the f32 fused gate but exceed 48 KiB
+    // after native-f64 doubles each scratch element.
+    let (_, rader_multipass) = execute_prime_reference_case(
+        &context.device,
+        &context.queue,
+        "rader-n1601-native-storage-fallback",
+        prime_config_1d(1601, 1, false),
+    );
+    if storage_limit < 3200 * 16 + 16 {
+        assert_rader_multipass_plan(&rader_multipass, "rader-n1601-native-storage-fallback");
+        assert!(
+            kernel_labels(&rader_multipass)
+                .iter()
+                .any(|stage| stage.contains("stockham")),
+            "Rader N=1601 should also use multipass child FFTs at this storage limit"
+        );
+    } else {
+        assert_fused_prime_plan(
+            &rader_multipass,
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            "rader-n1601-native-storage-fallback",
+        );
+    }
+
+    let (_, bluestein_multipass) = execute_prime_reference_case(
+        &context.device,
+        &context.queue,
+        "bluestein-n1544-native-storage-fallback",
+        prime_config_1d(1544, 1, false),
+    );
+    if storage_limit < 3087 * 16 {
+        assert_bluestein_multipass_plan(
+            &bluestein_multipass,
+            "bluestein-n1544-native-storage-fallback",
+        );
+        assert!(
+            kernel_labels(&bluestein_multipass)
+                .iter()
+                .any(|stage| stage.contains("stockham")),
+            "Bluestein N=1544 should also use multipass child FFTs at this storage limit"
+        );
+    } else {
+        assert_fused_prime_plan(
+            &bluestein_multipass,
+            C2cRoute::Bluestein,
+            BLUESTEIN_FUSED_LABEL,
+            &["bluestein-chirp-helper", "bluestein-bfft-helper"],
+            "bluestein-n1544-native-storage-fallback",
+        );
+    }
+
+    for (shape, prime_route, prime_stage, prime_helpers) in [
+        (
+            [2, 509],
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"][..],
+        ),
+        (
+            [2, 515],
+            C2cRoute::Bluestein,
+            BLUESTEIN_FUSED_LABEL,
+            &["bluestein-chirp-helper", "bluestein-bfft-helper"][..],
+        ),
+    ] {
+        for inverse in [false, true] {
+            let label = format!("axis-sequence-{shape:?}-batch2-inverse={inverse}");
+            let config = if inverse {
+                FftConfig::inverse_nd(shape)
+            } else {
+                FftConfig::new_nd(shape).with_normalization(Normalization::None)
+            }
+            .with_batch(2)
+            .with_precision(FftPrecision::F64);
+            let (_, plan) =
+                execute_prime_reference_case(&context.device, &context.queue, &label, config);
+            assert_axis_sequence_prime_plan(&plan, prime_route, prime_stage, prime_helpers, &label);
+        }
+    }
+
+    if let Some(low_storage) = low_storage {
+        if storage_limit >= 16 * 1024 + 16 {
+            compare_fused_prime_with_low_storage(
+                context,
+                low_storage,
+                509,
+                C2cRoute::Rader,
+                RADER_FUSED_LABEL,
+                "rader-n509-fused-vs-16k",
+            );
+        }
+        if storage_limit >= 1029 * 16 {
+            compare_fused_prime_with_low_storage(
+                context,
+                low_storage,
+                515,
+                C2cRoute::Bluestein,
+                BLUESTEIN_FUSED_LABEL,
+                "bluestein-n515-fused-vs-16k",
+            );
+        }
+    }
+}
+
+fn prime_config_1d(length: usize, batch: usize, inverse: bool) -> FftConfig {
+    if inverse {
+        FftConfig::inverse(length)
+    } else {
+        FftConfig::new(length).with_normalization(Normalization::None)
+    }
+    .with_batch(batch)
+    .with_precision(FftPrecision::F64)
+}
+
+fn execute_prime_reference_case(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    config: FftConfig,
+) -> (Vec<f64>, FftPlan) {
+    let input = test_signal(config.total_complex_len().unwrap());
+    let expected = reference_c2c_nd_f64(&input, &config).unwrap();
+    let (actual, plan) = execute_c2c_f64(device, queue, config, &input, label);
+    assert_f64_accuracy(label, &actual, &expected);
+    (actual, plan)
+}
+
+fn compare_fused_prime_with_low_storage(
+    context: &wgpu_fft::device::GpuContext,
+    low_storage: &ManuallyDrop<(wgpu::Device, wgpu::Queue)>,
+    length: usize,
+    route: C2cRoute,
+    fused_stage: &str,
+    label: &str,
+) {
+    let config = prime_config_1d(length, 1, false);
+    let input = test_signal(length);
+    let expected = reference_c2c_nd_f64(&input, &config).unwrap();
+    let (fused, fused_plan) = execute_c2c_f64(
+        &context.device,
+        &context.queue,
+        config.clone(),
+        &input,
+        label,
+    );
+    let (multipass, multipass_plan) =
+        execute_c2c_f64(&low_storage.0, &low_storage.1, config, &input, label);
+    let helpers = match route {
+        C2cRoute::Rader => &["rader-permutation-helper", "rader-bfft-helper"][..],
+        C2cRoute::Bluestein => &["bluestein-chirp-helper", "bluestein-bfft-helper"][..],
+        _ => unreachable!("prime comparison route"),
+    };
+    assert_fused_prime_plan(&fused_plan, route, fused_stage, helpers, label);
+    match route {
+        C2cRoute::Rader => assert_rader_multipass_plan(&multipass_plan, label),
+        C2cRoute::Bluestein => assert_bluestein_multipass_plan(&multipass_plan, label),
+        _ => unreachable!("prime comparison route"),
+    }
+    assert_f64_accuracy(&format!("{label}-fused"), &fused, &expected);
+    assert_f64_accuracy(&format!("{label}-multipass"), &multipass, &expected);
+    assert_f64_accuracy(
+        &format!("{label}-equivalence"),
+        &multipass,
+        &from_interleaved_f64(&fused),
     );
 }
 
@@ -652,11 +914,201 @@ fn assert_stockham_plan(plan: &FftPlan, len: usize, label: &str) {
     );
 }
 
+fn assert_fused_prime_plan(
+    plan: &FftPlan,
+    route: C2cRoute,
+    fused_stage: &str,
+    expected_helpers: &[&str],
+    label: &str,
+) {
+    assert_eq!(plan.route(), route, "{label}: prime route");
+    assert_eq!(
+        kernel_labels(plan),
+        vec![fused_stage.to_owned()],
+        "{label}: fused prime kernel inventory"
+    );
+    assert_eq!(
+        helper_labels(plan),
+        expected_helpers
+            .iter()
+            .map(|helper| (*helper).to_owned())
+            .collect::<Vec<_>>(),
+        "{label}: fused prime helper inventory"
+    );
+    assert_eq!(plan.workspace_size_bytes(), 0, "{label}: plan workspace");
+    assert!(
+        plan.diagnostics().blockers().is_empty(),
+        "{label}: blockers"
+    );
+    match route {
+        C2cRoute::Rader => assert_helper_format(plan, "rader-bfft-helper", "complex-f64", label),
+        C2cRoute::Bluestein => {
+            assert_helper_format(plan, "bluestein-chirp-helper", "complex-f64", label);
+            assert_helper_format(plan, "bluestein-bfft-helper", "complex-f64", label);
+        }
+        _ => unreachable!("fused prime route"),
+    }
+}
+
+fn assert_rader_multipass_plan(plan: &FftPlan, label: &str) {
+    assert_eq!(plan.route(), C2cRoute::Rader, "{label}: Rader route");
+    let kernels = kernel_labels(plan);
+    assert!(
+        !kernels.iter().any(|stage| stage == RADER_FUSED_LABEL),
+        "{label}: whole-pipeline Rader fusion should be disabled: {kernels:?}"
+    );
+    for expected in [
+        "rader-sum",
+        "rader-pack",
+        "rader-mul",
+        "rader-write-y0",
+        "rader-post",
+    ] {
+        assert!(
+            kernels.iter().any(|stage| stage == expected),
+            "{label}: missing {expected}: {kernels:?}"
+        );
+    }
+    let helpers = helper_labels(plan);
+    for expected in [
+        "rader-permutation-helper",
+        "rader-bfft-helper",
+        "rader-sum-helper",
+        "rader-x0-helper",
+        "rader-work-helper",
+        "rader-fft-helper",
+    ] {
+        assert!(
+            helpers.iter().any(|helper| helper == expected),
+            "{label}: missing {expected}: {helpers:?}"
+        );
+    }
+    assert_eq!(plan.workspace_size_bytes(), 0, "{label}: plan workspace");
+    assert!(
+        plan.diagnostics().blockers().is_empty(),
+        "{label}: blockers"
+    );
+    for helper in [
+        "rader-bfft-helper",
+        "rader-sum-helper",
+        "rader-x0-helper",
+        "rader-work-helper",
+        "rader-fft-helper",
+    ] {
+        assert_helper_format(plan, helper, "complex-f64", label);
+    }
+}
+
+fn assert_bluestein_multipass_plan(plan: &FftPlan, label: &str) {
+    assert_eq!(
+        plan.route(),
+        C2cRoute::Bluestein,
+        "{label}: Bluestein route"
+    );
+    let kernels = kernel_labels(plan);
+    assert!(
+        !kernels.iter().any(|stage| stage == BLUESTEIN_FUSED_LABEL),
+        "{label}: whole-pipeline Bluestein fusion should be disabled: {kernels:?}"
+    );
+    for expected in ["bluestein-pack", "bluestein-mul", "bluestein-post"] {
+        assert!(
+            kernels.iter().any(|stage| stage == expected),
+            "{label}: missing {expected}: {kernels:?}"
+        );
+    }
+    let helpers = helper_labels(plan);
+    for expected in [
+        "bluestein-chirp-helper",
+        "bluestein-bfft-helper",
+        "bluestein-work-helper",
+        "bluestein-fft-helper",
+    ] {
+        assert!(
+            helpers.iter().any(|helper| helper == expected),
+            "{label}: missing {expected}: {helpers:?}"
+        );
+        assert_helper_format(plan, expected, "complex-f64", label);
+    }
+    assert_eq!(plan.workspace_size_bytes(), 0, "{label}: plan workspace");
+    assert!(
+        plan.diagnostics().blockers().is_empty(),
+        "{label}: blockers"
+    );
+}
+
+fn assert_axis_sequence_prime_plan(
+    plan: &FftPlan,
+    prime_route: C2cRoute,
+    prime_stage: &str,
+    prime_helpers: &[&str],
+    label: &str,
+) {
+    assert_eq!(
+        plan.route(),
+        C2cRoute::AxisSequence,
+        "{label}: AxisSequence route"
+    );
+    assert!(matches!(prime_route, C2cRoute::Rader | C2cRoute::Bluestein));
+    assert_eq!(
+        kernel_labels(plan),
+        vec![
+            "axis-sequence-mixed-fused-pow2-stage".to_owned(),
+            prime_stage.to_owned(),
+        ],
+        "{label}: AxisSequence kernel order"
+    );
+    let mut expected_helpers = vec!["axis-sequence-workspace".to_owned()];
+    expected_helpers.extend(prime_helpers.iter().map(|helper| (*helper).to_owned()));
+    assert_eq!(
+        helper_labels(plan),
+        expected_helpers,
+        "{label}: AxisSequence helper inventory"
+    );
+    assert_eq!(
+        plan.workspace_size_bytes(),
+        plan.required_input_buffer_size_bytes(),
+        "{label}: AxisSequence workspace must hold one complete f64 volume"
+    );
+    assert!(
+        plan.diagnostics().blockers().is_empty(),
+        "{label}: blockers"
+    );
+    assert_helper_format(plan, "axis-sequence-workspace", "complex-f64", label);
+    match prime_route {
+        C2cRoute::Rader => assert_helper_format(plan, "rader-bfft-helper", "complex-f64", label),
+        C2cRoute::Bluestein => {
+            assert_helper_format(plan, "bluestein-chirp-helper", "complex-f64", label);
+            assert_helper_format(plan, "bluestein-bfft-helper", "complex-f64", label);
+        }
+        _ => unreachable!("AxisSequence prime route"),
+    }
+}
+
+fn assert_helper_format(plan: &FftPlan, helper: &str, format: &str, label: &str) {
+    let role = format!("helper:{helper}");
+    let diagnostics = plan.diagnostics();
+    let requirement = diagnostics
+        .buffer_requirements()
+        .iter()
+        .find(|requirement| requirement.role == role)
+        .unwrap_or_else(|| panic!("{label}: missing buffer requirement {role}"));
+    assert_eq!(requirement.format, format, "{label}: {role} format");
+}
+
 fn kernel_labels(plan: &FftPlan) -> Vec<String> {
     plan.diagnostics()
         .stages()
         .iter()
         .filter(|stage| stage.kind == "kernel")
+        .map(|stage| stage.label.clone())
+        .collect()
+}
+
+fn helper_labels(plan: &FftPlan) -> Vec<String> {
+    plan.diagnostics()
+        .stages()
+        .iter()
+        .filter(|stage| stage.kind == "helper-buffer-window")
         .map(|stage| stage.label.clone())
         .collect()
 }

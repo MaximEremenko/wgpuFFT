@@ -167,3 +167,13 @@ is set. The native test helper excludes the GL backend by default because EGL
 can crash on WSL/Linux systems where `/dev/dri` nodes exist but are not readable
 by the current user. Set `WGPU_BACKEND=gl` explicitly only when GL/EGL access is
 known to work; use `WGPU_BACKEND=vulkan` to force Vulkan.
+
+The portable-df64 arithmetic groundwork has a separate exact-word GPU canary.
+Run `cargo test --test gpu_df64_canary --release -- --nocapture` once with
+`WGPU_BACKEND=vulkan` and once with `WGPU_BACKEND=dx12` (and
+`WGPU_FFT_RUN_GPU_TESTS=1` in both cases). Optimization is the hazard: WGSL
+provides no no-contract/`precise` qualifier, so these release-backend canaries
+are part of the arithmetic support contract. Metal's fast-math compilation
+makes it the riskiest backend for the error-free transforms; it is currently
+untested. Double-float also retains the `f32` exponent range, and preservation
+of subnormals is backend-dependent.

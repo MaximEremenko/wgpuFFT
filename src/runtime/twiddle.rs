@@ -1,6 +1,6 @@
 use crate::config::FftPrecision;
 use crate::error::{FftError, Result};
-use crate::math::{Complex32, Complex64};
+use crate::math::{Complex32, Complex64, ComplexDoubleFloat};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TwoLevelTwiddleLutF32 {
@@ -24,6 +24,15 @@ pub(crate) fn twiddle_lut_f64(len: usize) -> Vec<Complex64> {
     assert!(len > 0, "a twiddle table requires a non-zero length");
     (0..len)
         .map(|index| canonical_twiddle_f64(len, index))
+        .collect()
+}
+
+/// Builds canonical forward roots from host `f64` trigonometry and splits
+/// every component into an unevaluated `f32` hi/lo pair for df64 shaders.
+pub(crate) fn twiddle_lut_df64(len: usize) -> Vec<ComplexDoubleFloat> {
+    assert!(len > 0, "a twiddle table requires a non-zero length");
+    (0..len)
+        .map(|index| canonical_twiddle_df64(len, index))
         .collect()
 }
 
@@ -88,12 +97,20 @@ pub(crate) fn create_twiddle_lut_buffer_for_len_with_precision(
     precision: FftPrecision,
 ) -> Result<wgpu::Buffer> {
     validate_twiddle_lut_len_with_precision(device, label, len, precision)?;
-    if precision == FftPrecision::F64 {
-        let values = twiddle_lut_f64(len);
-        return create_twiddle_lut_buffer_f64(device, queue, label, &values);
+    match precision {
+        FftPrecision::F64 => {
+            let values = twiddle_lut_f64(len);
+            create_twiddle_lut_buffer_f64(device, queue, label, &values)
+        }
+        FftPrecision::Df64 => {
+            let values = twiddle_lut_df64(len);
+            create_twiddle_lut_buffer_df64(device, queue, label, &values)
+        }
+        FftPrecision::F32 => {
+            let values = twiddle_lut_f32(len);
+            create_twiddle_lut_buffer(device, queue, label, &values)
+        }
     }
-    let values = twiddle_lut_f32(len);
-    create_twiddle_lut_buffer(device, queue, label, &values)
 }
 
 fn create_twiddle_lut_buffer_f64(
@@ -104,6 +121,24 @@ fn create_twiddle_lut_buffer_f64(
 ) -> Result<wgpu::Buffer> {
     let requested_bytes =
         validate_twiddle_lut_len_with_precision(device, label, values.len(), FftPrecision::F64)?;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: requested_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(values));
+    Ok(buffer)
+}
+
+fn create_twiddle_lut_buffer_df64(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    values: &[ComplexDoubleFloat],
+) -> Result<wgpu::Buffer> {
+    let requested_bytes =
+        validate_twiddle_lut_len_with_precision(device, label, values.len(), FftPrecision::Df64)?;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: requested_bytes,
@@ -176,6 +211,11 @@ fn canonical_twiddle_f64(len: usize, index: usize) -> Complex64 {
     Complex64::new(cos, sin)
 }
 
+fn canonical_twiddle_df64(len: usize, index: usize) -> ComplexDoubleFloat {
+    let value = canonical_twiddle_f64(len, index);
+    ComplexDoubleFloat::from_f64(value.re, value.im)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +244,27 @@ mod tests {
             let (sin, cos) = angle.sin_cos();
             assert_eq!(lut[index].re.to_bits(), cos.to_bits());
             assert_eq!(lut[index].im.to_bits(), sin.to_bits());
+        }
+    }
+
+    #[test]
+    fn df64_lut_splits_host_f64_sin_cos_into_vec4_storage_order() {
+        let len = 4096;
+        let lut = twiddle_lut_df64(len);
+        assert_eq!(std::mem::size_of::<ComplexDoubleFloat>(), 16);
+        for index in [0, 1, 17, 1023, 2048, 4095] {
+            let expected = canonical_twiddle_f64(len, index);
+            let actual = lut[index];
+            assert_eq!(actual.re_hi.to_bits(), (expected.re as f32).to_bits());
+            assert_eq!(actual.im_hi.to_bits(), (expected.im as f32).to_bits());
+            assert_eq!(
+                actual.re_lo.to_bits(),
+                ((expected.re - f64::from(actual.re_hi)) as f32).to_bits()
+            );
+            assert_eq!(
+                actual.im_lo.to_bits(),
+                ((expected.im - f64::from(actual.im_hi)) as f32).to_bits()
+            );
         }
     }
 

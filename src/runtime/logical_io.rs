@@ -5,6 +5,7 @@ use crate::runtime::buffer_view::{BufferLayout, BufferRange, BufferView, FftIoVi
 pub enum FftEndpointFormat {
     ComplexF32,
     ComplexF64,
+    ComplexDf64,
     RealF32,
     PackedComplexF32,
 }
@@ -13,7 +14,7 @@ impl FftEndpointFormat {
     pub const fn bytes_per_element(self) -> u64 {
         match self {
             Self::ComplexF32 | Self::PackedComplexF32 => 8,
-            Self::ComplexF64 => 16,
+            Self::ComplexF64 | Self::ComplexDf64 => 16,
             Self::RealF32 => 4,
         }
     }
@@ -22,6 +23,7 @@ impl FftEndpointFormat {
         match self {
             Self::ComplexF32 => "complex-f32",
             Self::ComplexF64 => "complex-f64",
+            Self::ComplexDf64 => "complex-df64",
             Self::RealF32 => "real-f32",
             Self::PackedComplexF32 => "packed-complex-f32",
         }
@@ -362,6 +364,8 @@ mod tests {
         assert_eq!(FftEndpointFormat::RealF32.bytes_per_element(), 4);
         assert_eq!(FftEndpointFormat::ComplexF32.bytes_per_element(), 8);
         assert_eq!(FftEndpointFormat::ComplexF64.bytes_per_element(), 16);
+        assert_eq!(FftEndpointFormat::ComplexDf64.bytes_per_element(), 16);
+        assert_eq!(FftEndpointFormat::ComplexDf64.as_str(), "complex-df64");
         assert_eq!(
             FftEndpointFormat::PackedComplexF32.as_str(),
             "packed-complex-f32"

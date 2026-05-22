@@ -8,6 +8,11 @@ pub enum FftPrecision {
     F32,
     /// Native 64-bit floating-point storage and arithmetic.
     F64,
+    /// Portable double-float arithmetic stored as unevaluated `f32` hi/lo pairs.
+    ///
+    /// This provides roughly 44-48 effective mantissa bits without requiring a
+    /// device feature, while retaining the exponent range of `f32`.
+    Df64,
 }
 
 impl FftPrecision {
@@ -15,13 +20,14 @@ impl FftPrecision {
         match self {
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::Df64 => "df64",
         }
     }
 
     pub const fn scalar_size_bytes(self) -> u64 {
         match self {
             Self::F32 => 4,
-            Self::F64 => 8,
+            Self::F64 | Self::Df64 => 8,
         }
     }
 
@@ -226,7 +232,7 @@ impl FftConfig {
 
     /// Legacy name for [`Self::required_scalar_len`].
     ///
-    /// The return value is a scalar count for both precisions; use
+    /// The return value is a scalar count for all precisions; use
     /// [`Self::required_buffer_size_bytes`] when allocating storage.
     pub fn required_f32_len(&self) -> Result<usize> {
         self.required_scalar_len()
@@ -341,6 +347,10 @@ mod tests {
         assert_eq!(f64.required_scalar_len().unwrap(), 48);
         assert_eq!(f64.required_f32_len().unwrap(), 48);
         assert_eq!(f64.required_buffer_size_bytes().unwrap(), 384);
+
+        let df64 = f64.with_precision(FftPrecision::Df64);
+        assert_eq!(df64.required_scalar_len().unwrap(), 48);
+        assert_eq!(df64.required_buffer_size_bytes().unwrap(), 384);
     }
 
     #[test]
@@ -371,6 +381,9 @@ mod tests {
         assert_eq!(FftPrecision::F32.complex_size_bytes(), 8);
         assert_eq!(FftPrecision::F64.scalar_size_bytes(), 8);
         assert_eq!(FftPrecision::F64.complex_size_bytes(), 16);
+        assert_eq!(FftPrecision::Df64.scalar_size_bytes(), 8);
+        assert_eq!(FftPrecision::Df64.complex_size_bytes(), 16);
+        assert_eq!(FftPrecision::Df64.as_str(), "df64");
         assert_eq!(
             FftConfig::new(8)
                 .with_precision(FftPrecision::F64)

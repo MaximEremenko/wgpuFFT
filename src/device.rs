@@ -17,7 +17,7 @@ impl GpuContext {
 /// Returns whether the features enabled on `device` support `precision`.
 pub fn device_supports_precision(device: &wgpu::Device, precision: FftPrecision) -> bool {
     match precision {
-        FftPrecision::F32 => true,
+        FftPrecision::F32 | FftPrecision::Df64 => true,
         FftPrecision::F64 => device.features().contains(wgpu::Features::SHADER_F64),
     }
 }

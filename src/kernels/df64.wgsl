@@ -52,37 +52,14 @@ fn df64_quick_two_sum(a: f32, b: f32) -> Df64 {
     return Df64(sum, df64_sub_rounded(b, recovered_b));
 }
 
-fn df64_split_raw(a: f32) -> Df64 {
-    let split = df64_mul_rounded(4097.0, a);
-    let hi = df64_sub_rounded(split, df64_sub_rounded(split, a));
-    return Df64(hi, df64_sub_rounded(a, hi));
-}
-
 fn df64_split(a: f32) -> Df64 {
-    // Exact power-of-two scaling prevents 4097*a from overflowing for large
-    // finite values and gives tiny normal values enough headroom to split.
-    // WebGPU may flush subnormals, so preservation below the normal range is
-    // intentionally not part of the portable contract.
-    let upper: f32 = 1.2676506002282294e30;
-    let lower: f32 = 7.888609052210118e-31;
-    let scale_up: f32 = 268435456.0;
-    let scale_down: f32 = 3.725290298461914e-9;
-    let magnitude = abs(a);
-    if (magnitude > upper) {
-        let split = df64_split_raw(df64_mul_rounded(a, scale_down));
-        return Df64(
-            df64_mul_rounded(split.hi, scale_up),
-            df64_mul_rounded(split.lo, scale_up),
-        );
-    }
-    if (magnitude != 0.0 && magnitude < lower) {
-        let split = df64_split_raw(df64_mul_rounded(a, scale_up));
-        return Df64(
-            df64_mul_rounded(split.hi, scale_down),
-            df64_mul_rounded(split.lo, scale_down),
-        );
-    }
-    return df64_split_raw(a);
+    // Retain the sign, exponent, and upper 11 fraction bits (12 significant
+    // bits including the implicit leading one). Clearing the lower 12 bits is
+    // the exact mantissa equivalent of Dekker's binary32 split, without the
+    // splitter-multiply overflow at values adjacent to f32::MAX.
+    let hi_bits = bitcast<u32>(a) & 0xfffff000u;
+    let hi = bitcast<f32>(hi_bits);
+    return Df64(hi, df64_sub_rounded(a, hi));
 }
 
 fn df64_two_prod(a: f32, b: f32) -> Df64 {
@@ -166,4 +143,11 @@ fn df64_complex_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
     let real = df64_sub(df64_mul(ar, br), df64_mul(ai, bi));
     let imag = df64_add(df64_mul(ar, bi), df64_mul(ai, br));
     return df64_complex_pack(real, imag);
+}
+
+fn df64_complex_scale(a: vec4<f32>, scale: Df64) -> vec4<f32> {
+    return df64_complex_pack(
+        df64_mul(df64_complex_real(a), scale),
+        df64_mul(df64_complex_imag(a), scale),
+    );
 }

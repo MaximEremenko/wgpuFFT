@@ -527,6 +527,7 @@ fn element_format_label(format: ElementFormat) -> &'static str {
     match format {
         ElementFormat::ComplexF32 => "complex-f32",
         ElementFormat::ComplexF64 => "complex-f64",
+        ElementFormat::ComplexDf64 => "complex-df64",
         ElementFormat::RealF32 => "real-f32",
         ElementFormat::PackedComplexF32 => "packed-complex-f32",
         ElementFormat::U32 => "u32",

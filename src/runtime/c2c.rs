@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, FftPrecision, Normalization};
 use crate::device::device_supports_precision;
 use crate::error::{FftError, Result};
-use crate::math::to_interleaved_f32;
+use crate::math::{to_interleaved_f32, DoubleFloat};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
@@ -56,11 +56,9 @@ const WORKGROUP_SIZE: u32 = 64;
 const COMPLEX_F32_BYTES: u64 = 8;
 
 fn validate_c2c_precision_feature(device: &wgpu::Device, config: &FftConfig) -> Result<()> {
-    if config.precision() == FftPrecision::F64
-        && !device_supports_precision(device, FftPrecision::F64)
-    {
+    if !device_supports_precision(device, config.precision()) {
         return Err(FftError::PrecisionUnsupported {
-            requested: FftPrecision::F64,
+            requested: config.precision(),
             route: "c2c",
             reason: "device-missing-shader-f64",
         });
@@ -68,19 +66,36 @@ fn validate_c2c_precision_feature(device: &wgpu::Device, config: &FftConfig) -> 
     Ok(())
 }
 
-fn phase_a_f64_route_error(
+fn extended_precision_route_error(
     config: &FftConfig,
     axis_kinds: &[AxisKind],
     limits: LargePolicyLimits,
-    _route: C2cRoute,
+    route: C2cRoute,
     compute_limits: &wgpu::Limits,
 ) -> Result<()> {
-    if config.precision() != FftPrecision::F64 {
+    let precision = config.precision();
+    if precision == FftPrecision::F32 {
         return Ok(());
+    }
+    if precision == FftPrecision::Df64
+        && !matches!(route, C2cRoute::DirectDft | C2cRoute::MixedRadix)
+    {
+        let reason = match route {
+            C2cRoute::Rader => "rader-df64-not-implemented",
+            C2cRoute::Bluestein => "bluestein-df64-not-implemented",
+            C2cRoute::AxisSequence => "axis-sequence-prime-df64-not-implemented",
+            C2cRoute::DirectDft | C2cRoute::MixedRadix => unreachable!(),
+        };
+        return Err(FftError::PrecisionUnsupported {
+            requested: precision,
+            route: route.as_str(),
+            reason,
+        });
     }
     let required_bytes = config.required_buffer_size_bytes()?;
     let bytes_per_batch = bytes_per_batch(config)?;
-    let prime_helper_bytes = f64_prime_max_binding_bytes(config, axis_kinds, compute_limits)?;
+    let prime_helper_bytes =
+        extended_precision_prime_max_binding_bytes(config, axis_kinds, compute_limits)?;
     let normal_binding_bytes = required_bytes.max(prime_helper_bytes);
     let needs_large_mode = normal_binding_bytes > limits.max_storage_buffer_binding_size
         || normal_binding_bytes > limits.max_buffer_size;
@@ -93,33 +108,61 @@ fn phase_a_f64_route_error(
         return Ok(());
     }
     let (route, reason) = if !four_step_eligible {
-        ("large-chunk", "large-chunk-f64-not-implemented")
+        (
+            "large-chunk",
+            match precision {
+                FftPrecision::F64 => "large-chunk-f64-not-implemented",
+                FftPrecision::Df64 => "large-chunk-df64-not-implemented",
+                FftPrecision::F32 => unreachable!(),
+            },
+        )
     } else if required_bytes > limits.max_buffer_size
         && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
     {
         (
             "segmented-full-volume",
-            "segmented-volume-f64-not-implemented",
+            match precision {
+                FftPrecision::F64 => "segmented-volume-f64-not-implemented",
+                FftPrecision::Df64 => "segmented-volume-df64-not-implemented",
+                FftPrecision::F32 => unreachable!(),
+            },
         )
     } else if required_bytes > limits.max_buffer_size {
-        ("large-chunk", "large-chunk-f64-not-implemented")
+        (
+            "large-chunk",
+            match precision {
+                FftPrecision::F64 => "large-chunk-f64-not-implemented",
+                FftPrecision::Df64 => "large-chunk-df64-not-implemented",
+                FftPrecision::F32 => unreachable!(),
+            },
+        )
     } else {
-        ("out-of-core-four-step", "four-step-f64-not-implemented")
+        (
+            "out-of-core-four-step",
+            match precision {
+                FftPrecision::F64 => "four-step-f64-not-implemented",
+                FftPrecision::Df64 => "four-step-df64-not-implemented",
+                FftPrecision::F32 => unreachable!(),
+            },
+        )
     };
     Err(FftError::PrecisionUnsupported {
-        requested: FftPrecision::F64,
+        requested: precision,
         route,
         reason,
     })
 }
 
-fn f64_prime_max_binding_bytes(
+fn extended_precision_prime_max_binding_bytes(
     config: &FftConfig,
     axis_kinds: &[AxisKind],
     compute_limits: &wgpu::Limits,
 ) -> Result<u64> {
     let total_complex = config.total_complex_len_u32()? as usize;
-    let complex_bytes = FftPrecision::F64.complex_size_bytes();
+    let precision = config.precision();
+    debug_assert_ne!(precision, FftPrecision::F32);
+    let axis_precision = precision.into();
+    let complex_bytes = precision.complex_size_bytes();
     config
         .axes()
         .iter()
@@ -136,14 +179,14 @@ fn f64_prime_max_binding_bytes(
                 AxisKind::Mixed => false,
                 AxisKind::Rader => fused_rader_supported_by_limits(
                     m,
-                    AxisPrecision::F64,
+                    axis_precision,
                     u64::from(compute_limits.max_compute_workgroup_storage_size),
                     compute_limits.max_compute_invocations_per_workgroup,
                     compute_limits.max_compute_workgroup_size_x,
                 ),
                 AxisKind::Bluestein => fused_bluestein_supported_by_limits(
                     m,
-                    AxisPrecision::F64,
+                    axis_precision,
                     u64::from(compute_limits.max_compute_workgroup_storage_size),
                     compute_limits.max_compute_invocations_per_workgroup,
                     compute_limits.max_compute_workgroup_size_x,
@@ -222,6 +265,15 @@ struct DirectParamsF64 {
     inverse: u32,
     scale: f64,
     _pad: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct DirectParamsDf64 {
+    len: u32,
+    inverse: u32,
+    scale_hi: f32,
+    scale_lo: f32,
 }
 
 #[repr(C)]
@@ -718,7 +770,7 @@ impl C2cPlan {
         let len = config.total_complex_len_u32()?;
         let route = select_route(&config);
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
-        phase_a_f64_route_error(
+        extended_precision_route_error(
             &config,
             &axis_kinds,
             effective_policy_limits,
@@ -1294,6 +1346,15 @@ impl C2cPlan {
         output: C2cIoLayout<'_>,
         workspace: Option<BufferView<'_>>,
     ) -> Result<()> {
+        if self.config.precision() == FftPrecision::Df64
+            && (!input.contiguous || !output.contiguous)
+        {
+            return Err(FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "c2c-strided",
+                reason: "strided-df64-not-implemented",
+            });
+        }
         if matches!(&self.execution, C2cExecution::SegmentedVolume(_)) {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "segmented-volume-logical-io",
@@ -1588,6 +1649,7 @@ impl C2cPlan {
         match self.config.precision() {
             FftPrecision::F32 => ElementFormat::ComplexF32,
             FftPrecision::F64 => ElementFormat::ComplexF64,
+            FftPrecision::Df64 => ElementFormat::ComplexDf64,
         }
     }
 
@@ -1595,6 +1657,7 @@ impl C2cPlan {
         match self.config.precision() {
             FftPrecision::F32 => FftEndpointFormat::ComplexF32,
             FftPrecision::F64 => FftEndpointFormat::ComplexF64,
+            FftPrecision::Df64 => FftEndpointFormat::ComplexDf64,
         }
     }
 }
@@ -7055,6 +7118,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     match key.precision {
         AxisPrecision::F32 => source,
         AxisPrecision::F64 => source.replace("vec2<f32>", "vec2<f64>"),
+        AxisPrecision::Df64 => {
+            unreachable!("df64 strided copies are added by the strided-I/O phase")
+        }
     }
 }
 
@@ -7366,6 +7432,11 @@ pub(crate) fn generate_direct_dft_wgsl(precision: AxisPrecision) -> String {
         AxisPrecision::F64 => source
             .replace("scale: f32", "scale: f64")
             .replace("vec2<f32>", "vec2<f64>"),
+        AxisPrecision::Df64 => format!(
+            "{}\n{}",
+            crate::kernels::DF64_WGSL,
+            crate::kernels::C2C_DFT_DF64_WGSL
+        ),
     }
 }
 
@@ -7423,6 +7494,16 @@ impl DirectDftPlan {
                 _pad: [0; 2],
             })
             .to_vec(),
+            AxisPrecision::Df64 => {
+                let scale = DoubleFloat::from_f64(config.scale_f64()?);
+                bytemuck::bytes_of(&DirectParamsDf64 {
+                    len,
+                    inverse,
+                    scale_hi: scale.hi,
+                    scale_lo: scale.lo,
+                })
+                .to_vec()
+            }
         };
 
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
@@ -7542,7 +7623,7 @@ mod tests {
         let normal = FftConfig::new(8).with_precision(FftPrecision::F64);
         let normal_kinds = resolve_axis_kinds_for_axes(normal.shape(), normal.axes()).unwrap();
         assert_eq!(
-            phase_a_f64_route_error(
+            extended_precision_route_error(
                 &normal,
                 &normal_kinds,
                 LargePolicyLimits {
@@ -7558,7 +7639,7 @@ mod tests {
         let error_for = |config: FftConfig, max_buffer_size| {
             let route = select_route(&config);
             let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
-            phase_a_f64_route_error(
+            extended_precision_route_error(
                 &config,
                 &axis_kinds,
                 LargePolicyLimits {
@@ -7574,7 +7655,7 @@ mod tests {
         let prime = FftConfig::new(17).with_precision(FftPrecision::F64);
         let prime_kinds = resolve_axis_kinds_for_axes(prime.shape(), prime.axes()).unwrap();
         assert_eq!(
-            phase_a_f64_route_error(
+            extended_precision_route_error(
                 &prime,
                 &prime_kinds,
                 LargePolicyLimits {
@@ -7593,7 +7674,7 @@ mod tests {
             let kinds =
                 resolve_axis_kinds_for_axes(normal_prime.shape(), normal_prime.axes()).unwrap();
             assert_eq!(
-                phase_a_f64_route_error(
+                extended_precision_route_error(
                     &normal_prime,
                     &kinds,
                     LargePolicyLimits {
@@ -7629,7 +7710,7 @@ mod tests {
             let kinds =
                 resolve_axis_kinds_for_axes(helper_limited.shape(), helper_limited.axes()).unwrap();
             assert!(matches!(
-                phase_a_f64_route_error(
+                extended_precision_route_error(
                     &helper_limited,
                     &kinds,
                     LargePolicyLimits {
@@ -7727,6 +7808,106 @@ mod tests {
     }
 
     #[test]
+    fn phase_b_df64_boundary_allows_normal_mixed_only_and_gates_deferred_routes() {
+        let compute_limits = wgpu::Limits::default();
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 4096,
+            max_buffer_size: 4096,
+        };
+        for config in [
+            FftConfig::new(1).with_precision(FftPrecision::Df64),
+            FftConfig::new(24).with_precision(FftPrecision::Df64),
+            FftConfig::new_nd([8, 15]).with_precision(FftPrecision::Df64),
+        ] {
+            let kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
+            assert_eq!(
+                extended_precision_route_error(
+                    &config,
+                    &kinds,
+                    limits,
+                    select_route(&config),
+                    &compute_limits,
+                ),
+                Ok(())
+            );
+        }
+
+        let error_for = |config: FftConfig, limits: LargePolicyLimits| {
+            let kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
+            extended_precision_route_error(
+                &config,
+                &kinds,
+                limits,
+                select_route(&config),
+                &compute_limits,
+            )
+            .unwrap_err()
+        };
+        assert!(matches!(
+            error_for(
+                FftConfig::new(17).with_precision(FftPrecision::Df64),
+                limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "rader",
+                reason: "rader-df64-not-implemented",
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new(34).with_precision(FftPrecision::Df64),
+                limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "bluestein",
+                reason: "bluestein-df64-not-implemented",
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([2, 17]).with_precision(FftPrecision::Df64),
+                limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "axis-sequence",
+                reason: "axis-sequence-prime-df64-not-implemented",
+            }
+        ));
+
+        let small_binding_limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 128,
+            max_buffer_size: 4096,
+        };
+        assert!(matches!(
+            error_for(
+                FftConfig::new(8)
+                    .with_batch(2)
+                    .with_precision(FftPrecision::Df64),
+                small_binding_limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "large-chunk",
+                reason: "large-chunk-df64-not-implemented",
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([8, 8]).with_precision(FftPrecision::Df64),
+                small_binding_limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "out-of-core-four-step",
+                reason: "four-step-df64-not-implemented",
+            }
+        ));
+    }
+
+    #[test]
     fn four_step_route_requires_rank_and_two_selected_axes() {
         let kinds = [AxisKind::Rader, AxisKind::Mixed];
         let line_bytes = [272, 40];
@@ -7808,12 +7989,18 @@ mod tests {
     fn direct_dft_and_strided_copy_sources_follow_precision() {
         let direct_f32 = generate_direct_dft_wgsl(AxisPrecision::F32);
         let direct_f64 = generate_direct_dft_wgsl(AxisPrecision::F64);
+        let direct_df64 = generate_direct_dft_wgsl(AxisPrecision::Df64);
         assert_eq!(direct_f32, crate::kernels::C2C_DFT_WGSL);
         assert!(direct_f64.contains("scale: f64"));
         assert!(direct_f64.contains("array<vec2<f64>>"));
         assert!(!direct_f64.contains("vec2<f32>"));
+        assert!(direct_df64.contains("array<vec4<f32>>"));
+        assert!(direct_df64.contains("df64_complex_mul"));
+        assert!(direct_df64.contains("df64_complex_scale(sum, scale)"));
+        assert!(!direct_df64.contains("vec2<f64>"));
         assert_eq!(std::mem::size_of::<DirectParams>(), 16);
         assert_eq!(std::mem::size_of::<DirectParamsF64>(), 24);
+        assert_eq!(std::mem::size_of::<DirectParamsDf64>(), 16);
 
         let f64_key = C2cStridedStageKey::new(
             C2cStridedKernelKind::Pack,

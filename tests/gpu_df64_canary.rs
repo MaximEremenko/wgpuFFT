@@ -8,7 +8,7 @@ use wgpu_fft::math::{
     quick_two_sum_f32, split_f32, two_prod_f32, two_sum_f32, ComplexDoubleFloat, DoubleFloat,
 };
 
-const WORDS_PER_CASE: usize = 22;
+const WORDS_PER_CASE: usize = 24;
 
 #[test]
 fn gpu_df64_error_free_transform_canaries() {
@@ -183,6 +183,9 @@ fn expected_words(input: [[f32; 4]; 2]) -> [u32; WORDS_PER_CASE] {
     let complex_add = a_complex.add_df(b_complex);
     let complex_mul = a_complex.mul_df(b_complex);
     let (edge_prod_hi, edge_prod_lo) = two_prod_f32(f32::MAX, f32::MIN_POSITIVE);
+    let compile_time_scale = DoubleFloat::from_f64(1.0 / 34.0);
+    let compile_time_product =
+        DoubleFloat::new(1.0, f32::from_bits(0x3080_0000)).mul_df(compile_time_scale);
     [
         sum_hi.to_bits(),
         sum_lo.to_bits(),
@@ -206,6 +209,8 @@ fn expected_words(input: [[f32; 4]; 2]) -> [u32; WORDS_PER_CASE] {
         complex_mul.im_lo.to_bits(),
         edge_prod_hi.to_bits(),
         edge_prod_lo.to_bits(),
+        compile_time_product.hi.to_bits(),
+        compile_time_product.lo.to_bits(),
     ]
 }
 
@@ -226,11 +231,17 @@ fn assert_canaries_are_adversarial(expected: &[u32]) {
         "each two_prod canary must require a nonzero error word"
     );
     let edge = two_prod_f32(f32::MAX, f32::MIN_POSITIVE);
+    let compile_time_scale = DoubleFloat::from_f64(1.0 / 34.0);
+    assert_ne!(compile_time_scale.lo, 0.0);
+    let compile_time_product =
+        DoubleFloat::new(1.0, f32::from_bits(0x3080_0000)).mul_df(compile_time_scale);
     for words in expected.chunks_exact(WORDS_PER_CASE) {
         assert_eq!(words[20], edge.0.to_bits());
         assert_eq!(words[21], edge.1.to_bits());
         assert!(f32::from_bits(words[20]).is_finite());
         assert!(f32::from_bits(words[21]).is_finite());
+        assert_eq!(words[22], compile_time_product.hi.to_bits());
+        assert_eq!(words[23], compile_time_product.lo.to_bits());
     }
 }
 
@@ -275,7 +286,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let case_index = gid.x;
     let a = inputs[case_index * 2u];
     let b = inputs[case_index * 2u + 1u];
-    let base = case_index * 22u;
+    let base = case_index * 24u;
     store_df64(base, df64_two_sum(a.x, b.x));
     store_df64(base + 2u, df64_quick_two_sum(a.z, b.z));
     store_df64(base + 4u, df64_split(a.w));
@@ -289,6 +300,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_df64(base + 20u, df64_two_prod(
         bitcast<f32>(0x7f7fffffu),
         bitcast<f32>(0x00800000u),
+    ));
+    store_df64(base + 22u, df64_mul(
+        Df64(1.0, bitcast<f32>(0x30800000u)),
+        Df64(bitcast<f32>(0x3cf0f0f1u), bitcast<f32>(0xaef0f0f1u)),
     ));
 }
 "#;

@@ -23,7 +23,9 @@ const DEFAULT_SEGMENTED_BURST_DEPTH: usize = 2;
 enum PrecisionMode {
     F32,
     F64,
+    Df64,
     Both,
+    Df64F64,
 }
 
 impl PrecisionMode {
@@ -31,7 +33,9 @@ impl PrecisionMode {
         match value.to_ascii_lowercase().as_str() {
             "f32" => Some(Self::F32),
             "f64" => Some(Self::F64),
+            "df64" => Some(Self::Df64),
             "both" => Some(Self::Both),
+            "df64-f64" | "df64_f64" | "df64f64" => Some(Self::Df64F64),
             _ => None,
         }
     }
@@ -40,7 +44,9 @@ impl PrecisionMode {
         match self {
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::Df64 => "df64",
             Self::Both => "both",
+            Self::Df64F64 => "df64-f64",
         }
     }
 
@@ -48,19 +54,22 @@ impl PrecisionMode {
         match self {
             Self::F32 => vec![FftPrecision::F32],
             Self::F64 => vec![FftPrecision::F64],
+            Self::Df64 => vec![FftPrecision::Df64],
             Self::Both => vec![FftPrecision::F32, FftPrecision::F64],
+            Self::Df64F64 => vec![FftPrecision::Df64, FftPrecision::F64],
         }
     }
 
     fn needs_f64(self) -> bool {
-        matches!(self, Self::F64 | Self::Both)
+        matches!(self, Self::F64 | Self::Both | Self::Df64F64)
     }
 
     fn single_precision(self) -> Option<FftPrecision> {
         match self {
             Self::F32 => Some(FftPrecision::F32),
             Self::F64 => Some(FftPrecision::F64),
-            Self::Both => None,
+            Self::Df64 => Some(FftPrecision::Df64),
+            Self::Both | Self::Df64F64 => None,
         }
     }
 }
@@ -552,6 +561,46 @@ async fn run_cases(
                 f32_result.num_iter,
                 f64_result.num_iter,
                 f32_statistics.mean_ms,
+                f64_statistics.mean_ms,
+                ratio,
+            );
+        }
+        if case.report && options.precision == PrecisionMode::Df64F64 {
+            let df64_result = completed_results
+                .iter()
+                .find(|result| result.precision == FftPrecision::Df64)
+                .ok_or_else(|| input_error("df64-f64 comparison produced no df64 result"))?;
+            let f64_result = completed_results
+                .iter()
+                .find(|result| result.precision == FftPrecision::F64)
+                .ok_or_else(|| input_error("df64-f64 comparison produced no native-f64 result"))?;
+            if df64_result.buffer_size != f64_result.buffer_size
+                || df64_result.external_io_bytes != f64_result.external_io_bytes
+                || df64_result.num_iter != f64_result.num_iter
+            {
+                return Err(input_error(format!(
+                    "df64-f64 topology mismatch: df64 buffer/io/iterations={}/{}/{} versus f64={}/{}/{}",
+                    df64_result.buffer_size,
+                    df64_result.external_io_bytes,
+                    df64_result.num_iter,
+                    f64_result.buffer_size,
+                    f64_result.external_io_bytes,
+                    f64_result.num_iter,
+                )));
+            }
+            let df64_statistics = statistics(&df64_result.run_pair_ms)?;
+            let f64_statistics = statistics(&f64_result.run_pair_ms)?;
+            let ratio = df64_statistics.mean_ms / f64_statistics.mean_ms;
+            println!(
+                "DF64_F64_COMPARE suite={} label={} shape={:?} batch={} logical_buffer_bytes={} external_io_bytes={} num_iter={} df64_avg_pair_ms={:.9} f64_avg_pair_ms={:.9} df64_over_f64_avg_pair_time_ratio={:.9} precision_order=df64-then-f64 same_process=true same_adapter=true same_device=true identical_topology=true",
+                case.suite,
+                case.label,
+                case.shape,
+                case.batch,
+                df64_result.buffer_size,
+                df64_result.external_io_bytes,
+                df64_result.num_iter,
+                df64_statistics.mean_ms,
                 f64_statistics.mean_ms,
                 ratio,
             );
@@ -1608,8 +1657,12 @@ fn fill_initialization_seed(seed: &wgpu::Buffer, precision: FftPrecision) -> Ben
             let complex_count = mapped.len() / FftPrecision::Df64.complex_size_bytes() as usize;
             let mut values = vec![[0.0f32; 4]; complex_count];
             for (index, value) in values.iter_mut().enumerate() {
-                let re = ((index as u64).wrapping_mul(17) % 251 + 1) as f64 / 251.0;
-                let im = -(((index as u64).wrapping_mul(29) % 251 + 1) as f64 / 251.0);
+                // Match the native-f64 scalar sequence exactly so df64-f64
+                // comparison mode differs only in arithmetic representation.
+                let re_index = (index as u64).wrapping_mul(2);
+                let im_index = re_index + 1;
+                let re = (re_index.wrapping_mul(17) % 251 + 1) as f64 / 251.0;
+                let im = -((im_index.wrapping_mul(17) % 251 + 1) as f64 / 251.0);
                 let re_hi = re as f32;
                 let im_hi = im as f32;
                 *value = [
@@ -2045,7 +2098,7 @@ fn parse_options() -> BenchResult<Options> {
                 let value = next_value(&mut args, "--precision")?;
                 options.precision = PrecisionMode::parse(&value).ok_or_else(|| {
                     input_error(format!(
-                        "unknown --precision value {value:?}; expected f32, f64, or both"
+                        "unknown --precision value {value:?}; expected f32, f64, df64, both, or df64-f64"
                     ))
                 })?;
             }
@@ -2139,9 +2192,10 @@ fn parse_options() -> BenchResult<Options> {
             "--segmented-burst-depth requires the segment-cap comparison flags",
         ));
     }
-    if options.precision == PrecisionMode::Both && options.compare_max_buffer_bytes.is_some() {
+    if options.precision.single_precision().is_none() && options.compare_max_buffer_bytes.is_some()
+    {
         return Err(input_error(
-            "--precision both is not supported with the segment-cap comparison flags; run separate f32 and f64 comparisons",
+            "multi-precision modes are not supported with the segment-cap comparison flags; run each precision separately",
         ));
     }
     Ok(options)
@@ -2225,16 +2279,17 @@ fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBuffer
 fn print_usage() {
     eprintln!(
         r#"Usage:
-  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|both] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|both] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|df64|both|df64-f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|df64|both|df64-f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64|df64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
 
 Defaults:
   precision=f32, runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.
   With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.
-  Precision f64/both requires adapter SHADER_F64 support; both reports an f64/f32 pair-time ratio.
+  Precision f64/both/df64-f64 requests SHADER_F64; df64 alone requests no optional features.
+  `both` reports f64/f32 timing; `df64-f64` reports the df64/native-f64 ratio with identical 16-byte-complex topology.
   Segment-cap comparison recreates both variants per run and alternates their order.
-  Segmented burst depth defaults to 2 and is valid only in comparison mode; precision=both is rejected there.
+  Segmented burst depth defaults to 2 and is valid only in comparison mode; multi-precision modes are rejected there.
 
 Examples:
   cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2
@@ -2242,6 +2297,8 @@ Examples:
   cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2
   cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1
   cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision both --adapter 0 --runs 2 --iter-cap 200
+  cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision df64-f64 --adapter 0 --runs 2 --iter-cap 200
+  cargo bench --bench fft_bench -- shape 2048 --batch 32768 --precision df64-f64 --adapter 0 --runs 2 --iter-cap 200
   cargo bench --bench fft_bench -- shape 320x320x320 --plan-max-bind-bytes 16777216 --compare-max-buffer-bytes 1073741824,67108864 --segmented-burst-depth 2 --adapter 0 --runs 2 --iter-cap 1"#
     );
 }

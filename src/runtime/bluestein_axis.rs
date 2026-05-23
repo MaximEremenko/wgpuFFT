@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd_f64, Complex32, Complex64};
+use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
     AxisStageKind, AxisTwiddleLutPool,
@@ -12,7 +12,8 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
-    format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
+    format_wgsl_f32, format_wgsl_f32_roundtrip, lines_per_batch, product, stride_for_axis,
+    wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, BluesteinKernelKind, BluesteinStageKey, ComputePipelineCacheKey,
@@ -129,7 +130,7 @@ impl BluesteinAxisConfig {
                     _ => 1.0,
                 })
             }
-            AxisPrecision::F64 => {
+            AxisPrecision::F64 | AxisPrecision::Df64 => {
                 let total = product(&self.shape) as f64;
                 match (self.direction, self.normalization) {
                     (_, Normalization::None) => 1.0,
@@ -138,9 +139,6 @@ impl BluesteinAxisConfig {
                     (_, Normalization::Orthogonal) => 1.0 / total.sqrt(),
                     _ => 1.0,
                 }
-            }
-            AxisPrecision::Df64 => {
-                unreachable!("df64 Bluestein plans are rejected before scale generation")
             }
         })
     }
@@ -153,14 +151,6 @@ impl BluesteinAxis {
         config: BluesteinAxisConfig,
     ) -> Result<Self> {
         config.validate()?;
-        if config.precision == AxisPrecision::Df64 {
-            return Err(FftError::PrecisionUnsupported {
-                requested: crate::config::FftPrecision::Df64,
-                route: "bluestein",
-                reason: "bluestein-df64-not-implemented",
-            });
-        }
-
         let n = config.shape[config.axis];
         let m = bluestein_convolution_length(n)?;
         let factors = crate::runtime::factor_supported_length(m)?;
@@ -207,7 +197,11 @@ impl BluesteinAxis {
                 queue.write_buffer(&chirp_buffer, 0, bytemuck::cast_slice(&chirp));
             }
             AxisPrecision::Df64 => {
-                unreachable!("df64 Bluestein plans are rejected before chirp upload")
+                let values = chirp
+                    .iter()
+                    .map(|value| ComplexDoubleFloat::from_f64(value.re, value.im))
+                    .collect::<Vec<_>>();
+                queue.write_buffer(&chirp_buffer, 0, bytemuck::cast_slice(&values));
             }
         }
 
@@ -230,7 +224,11 @@ impl BluesteinAxis {
                 queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft));
             }
             AxisPrecision::Df64 => {
-                unreachable!("df64 Bluestein plans are rejected before bfft upload")
+                let values = bfft
+                    .iter()
+                    .map(|value| ComplexDoubleFloat::from_f64(value.re, value.im))
+                    .collect::<Vec<_>>();
+                queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&values));
             }
         }
 
@@ -900,15 +898,26 @@ pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) ->
     let m_slot_count = m.div_ceil(key.workgroup_size as usize);
     let n_slot_count = n.div_ceil(key.workgroup_size as usize);
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    let scale = key.precision.format_wgsl_scalar(key.scale_factor());
+    let scale = match key.precision {
+        AxisPrecision::Df64 => format_df64(key.scale_factor()),
+        _ => key.precision.format_wgsl_scalar(key.scale_factor()),
+    };
     let inverse_m = match key.precision {
         AxisPrecision::F32 => key
             .precision
             .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
         AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
-        AxisPrecision::Df64 => {
-            unreachable!("df64 fused Bluestein shaders are not implemented in Phase B")
-        }
+        AxisPrecision::Df64 => format_df64(1.0 / m as f64),
+    };
+    let scale_ref = if key.precision == AxisPrecision::Df64 {
+        scale.as_str()
+    } else {
+        "SCALE"
+    };
+    let inverse_m_ref = if key.precision == AxisPrecision::Df64 {
+        inverse_m.as_str()
+    } else {
+        "INVERSE_M"
     };
     let forward_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -929,8 +938,17 @@ pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) ->
         key.precision,
     );
 
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let zero = complex_zero(key.precision);
+    let twiddle_inverse_value = match key.precision {
+        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
+        _ => "vec2<f32>(value.x, -value.y)",
+    };
+    let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
+    let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
+
+    specialize_bluestein_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -965,7 +983,7 @@ fn twiddle_forward(index: u32) -> vec2<f32> {{
 
 fn twiddle_inverse(index: u32) -> vec2<f32> {{
   let value: vec2<f32> = axisTwiddles[index];
-  return vec2<f32>(value.x, -value.y);
+  return {twiddle_inverse_value};
 }}
 
 const N: u32 = {n}u;
@@ -996,7 +1014,7 @@ fn main({entry_params}) {{
       if (t < N) {{
         scratch[t] = c_mul(input[base + t * STRIDE], chirp[t]);
       }} else {{
-        scratch[t] = vec2<f32>(0.0, 0.0);
+        scratch[t] = {zero};
       }}
     }}
   }}
@@ -1015,19 +1033,21 @@ fn main({entry_params}) {{
   for (var slot: u32 = 0u; slot < N_SLOT_COUNT; slot = slot + 1u) {{
     let t: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (t < N) {{
-      let convolution: vec2<f32> = scratch[t] * vec2<f32>(INVERSE_M, INVERSE_M);
+      let convolution: vec2<f32> = {scaled_convolution};
       let value: vec2<f32> = c_mul(convolution, chirp[t]);
-      output[base + t * STRIDE] = value * vec2<f32>(SCALE, SCALE);
+      output[base + t * STRIDE] = {scaled_value};
     }}
   }}
 }}
 "#,
-        stride = key.stride_complex,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
-        scalar = key.precision.wgsl_scalar_type(),
-    ))
+            stride = key.stride_complex,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+            scalar = staged_scalar_type(key.precision),
+        ),
+        key.precision,
+    )
 }
 
 pub(crate) fn generate_bluestein_wgsl_for_key(key: &BluesteinStageKey) -> String {
@@ -1041,8 +1061,10 @@ pub(crate) fn generate_bluestein_wgsl_for_key(key: &BluesteinStageKey) -> String
 fn generate_bluestein_pack_wgsl(key: &BluesteinStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let complex_mul = complex_mul_wgsl();
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let zero = complex_zero(key.precision);
+    specialize_bluestein_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1070,7 +1092,7 @@ fn main({entry_params}) {{
   let t: u32 = i - lineLocal * M;
   let dst: u32 = lineLocal * M + t;
   if (t >= N) {{
-    work[dst] = vec2<f32>(0.0, 0.0);
+    work[dst] = {zero};
     return;
   }}
 
@@ -1078,25 +1100,28 @@ fn main({entry_params}) {{
   work[dst] = c_mul(input[base + t * STRIDE], chirp[t]);
 }}
 "#,
-        n = key.axis_length,
-        m = key.convolution_length,
-        stride = key.stride_complex,
-        complex_mul = complex_mul,
-        line_base_fn = line_base_fn,
-        workgroup_size = WORKGROUP_SIZE,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "i",
-            "params.lines * M",
-            WORKGROUP_SIZE,
+            n = key.axis_length,
+            m = key.convolution_length,
+            stride = key.stride_complex,
+            complex_mul = complex_mul,
+            line_base_fn = line_base_fn,
+            workgroup_size = WORKGROUP_SIZE,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.lines * M",
+                WORKGROUP_SIZE,
+            ),
         ),
-    ))
+        key.precision,
+    )
 }
 
 fn generate_bluestein_mul_wgsl(key: &BluesteinStageKey) -> String {
     let complex_mul = complex_mul_wgsl();
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    specialize_bluestein_wgsl(
+        format!(
+            r#"struct Params {{
   total: u32,
   pad0: u32,
   pad1: u32,
@@ -1118,21 +1143,33 @@ fn main({entry_params}) {{
   work[i] = c_mul(work[i], bfft[t]);
 }}
 "#,
-        m = key.convolution_length,
-        complex_mul = complex_mul,
-        workgroup_size = WORKGROUP_SIZE,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index =
-            crate::runtime::dispatch::wgsl_flat_index_stmts("i", "params.total", WORKGROUP_SIZE),
-    ))
+            m = key.convolution_length,
+            complex_mul = complex_mul,
+            workgroup_size = WORKGROUP_SIZE,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.total",
+                WORKGROUP_SIZE
+            ),
+        ),
+        key.precision,
+    )
 }
 
 fn generate_bluestein_post_wgsl(key: &BluesteinStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let complex_mul = complex_mul_wgsl();
     let scale = format_staged_scalar(key.precision, key.scale_factor());
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let scale_ref = if key.precision == AxisPrecision::Df64 {
+        scale.as_str()
+    } else {
+        "SCALE"
+    };
+    let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
+    specialize_bluestein_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1162,35 +1199,107 @@ fn main({entry_params}) {{
   let baseWork: u32 = lineLocal * M;
   let baseOutput: u32 = line_base(params.lineOffset + lineLocal);
   let value: vec2<f32> = c_mul(conv[baseWork + t], chirp[t]);
-  output[baseOutput + t * STRIDE] = value * vec2<f32>(SCALE, SCALE);
+  output[baseOutput + t * STRIDE] = {scaled_value};
 }}
 "#,
-        n = key.axis_length,
-        m = key.convolution_length,
-        stride = key.stride_complex,
-        scale = scale,
-        complex_mul = complex_mul,
-        line_base_fn = line_base_fn,
-        workgroup_size = WORKGROUP_SIZE,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "i",
-            "params.lines * N",
-            WORKGROUP_SIZE,
+            n = key.axis_length,
+            m = key.convolution_length,
+            stride = key.stride_complex,
+            scale = scale,
+            complex_mul = complex_mul,
+            line_base_fn = line_base_fn,
+            workgroup_size = WORKGROUP_SIZE,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.lines * N",
+                WORKGROUP_SIZE,
+            ),
+            scalar = staged_scalar_type(key.precision),
         ),
-        scalar = key.precision.wgsl_scalar_type(),
-    ))
+        key.precision,
+    )
 }
 
 fn format_staged_scalar(precision: AxisPrecision, value: f64) -> String {
     match precision {
         AxisPrecision::F32 => format_wgsl_f32(value as f32),
         AxisPrecision::F64 => precision.format_wgsl_scalar(value),
-        AxisPrecision::Df64 => {
-            unreachable!("df64 Bluestein shader constants are not implemented in Phase B")
-        }
+        AxisPrecision::Df64 => format_df64(value),
     }
 }
+
+fn format_df64(value: f64) -> String {
+    let value = DoubleFloat::from_f64(value);
+    format!(
+        "Df64({}, {})",
+        format_wgsl_f32_roundtrip(value.hi),
+        format_wgsl_f32_roundtrip(value.lo)
+    )
+}
+
+fn staged_scalar_type(precision: AxisPrecision) -> &'static str {
+    match precision {
+        AxisPrecision::Df64 => "Df64",
+        _ => precision.wgsl_scalar_type(),
+    }
+}
+
+fn complex_zero(precision: AxisPrecision) -> &'static str {
+    match precision {
+        AxisPrecision::Df64 => "vec4<f32>(0.0, 0.0, 0.0, 0.0)",
+        _ => "vec2<f32>(0.0, 0.0)",
+    }
+}
+
+fn complex_scale_expr(precision: AxisPrecision, value: &str, scale: &str) -> String {
+    match precision {
+        AxisPrecision::Df64 => format!("df64_complex_scale({value}, {scale})"),
+        _ => format!("{value} * vec2<f32>({scale}, {scale})"),
+    }
+}
+
+fn specialize_bluestein_wgsl(source: String, precision: AxisPrecision) -> String {
+    if precision != AxisPrecision::Df64 {
+        return precision.specialize_wgsl(source);
+    }
+    let source = source
+        .replace(F32_COMPLEX_HELPERS, DF64_COMPLEX_HELPERS)
+        .replace(complex_mul_wgsl(), DF64_COMPLEX_MUL_HELPER)
+        .replace("vec2<f32>", "vec4<f32>");
+    format!("{}\n{source}", crate::kernels::DF64_WGSL)
+}
+
+const F32_COMPLEX_HELPERS: &str = r#"fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return a + b;
+}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return a - b;
+}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}"#;
+
+const DF64_COMPLEX_HELPERS: &str = r#"fn c_add(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_add(a, b);
+}
+
+fn c_sub(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_sub(a, b);
+}
+
+fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_mul(a, b);
+}"#;
+
+const DF64_COMPLEX_MUL_HELPER: &str = r#"fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_mul(a, b);
+}"#;
 
 #[cfg(test)]
 mod tests {
@@ -1240,6 +1349,20 @@ mod tests {
             256,
             255
         ));
+        assert!(fused_bluestein_supported_by_limits(
+            3072,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_bluestein_supported_by_limits(
+            3073,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
     }
 
     #[test]
@@ -1271,6 +1394,89 @@ mod tests {
         assert!(wgsl.contains("let wgFlat: u32"));
         assert!(!wgsl.contains("sin("));
         assert!(!wgsl.contains("cos("));
+    }
+
+    #[test]
+    fn fused_bluestein_f32_scale_uses_roundtrip_literal() {
+        let factors = crate::runtime::factor_supported_length(2048).unwrap();
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Bluestein,
+            1,
+            0,
+            &[1017],
+            1017,
+            1,
+            2048,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 1017.0,
+            AxisPrecision::F32,
+        );
+        let wgsl = generate_fused_bluestein_wgsl_for_key(&key);
+        let scale = format_wgsl_f32_roundtrip(1.0f32 / 1017.0);
+        assert!(wgsl.contains(&format!("const SCALE: f32 = {scale};")));
+        assert_ne!(scale, format_wgsl_f32(1.0f32 / 1017.0));
+    }
+
+    #[test]
+    fn df64_bluestein_generators_use_split_chirp_bfft_and_scales() {
+        let factors = crate::runtime::factor_supported_length(441).unwrap();
+        let fused_key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Bluestein,
+            1,
+            0,
+            &[221],
+            221,
+            1,
+            441,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 221.0,
+            AxisPrecision::Df64,
+        );
+        let fused = generate_fused_bluestein_wgsl_for_key(&fused_key);
+        assert!(fused.starts_with(crate::kernels::DF64_WGSL));
+        assert!(fused.contains("array<vec4<f32>, 441>"));
+        assert!(fused.contains("const INVERSE_M: Df64 = Df64("));
+        assert!(fused.contains("return vec4<f32>(value.x, value.y, -value.z, -value.w)"));
+        assert!(fused.contains("df64_complex_scale(value, Df64("));
+        assert!(!fused.contains("vec2<f64>"));
+
+        for kind in [
+            BluesteinKernelKind::Pack,
+            BluesteinKernelKind::Mul,
+            BluesteinKernelKind::Post,
+        ] {
+            let key = BluesteinStageKey::new(
+                kind,
+                1,
+                0,
+                &[34],
+                34,
+                1,
+                70,
+                WORKGROUP_SIZE,
+                true,
+                1.0 / 34.0,
+                AxisPrecision::Df64,
+            );
+            let wgsl = generate_bluestein_wgsl_for_key(&key);
+            assert!(wgsl.starts_with(crate::kernels::DF64_WGSL));
+            assert!(wgsl.contains("array<vec4<f32>>"));
+            assert!(!wgsl.contains("vec2<f64>"));
+            assert!(!wgsl.contains("sin("));
+            assert!(!wgsl.contains("cos("));
+            if kind == BluesteinKernelKind::Post {
+                assert!(wgsl.contains(&format!(
+                    "df64_complex_scale(value, {})",
+                    format_df64(1.0 / 34.0)
+                )));
+            }
+        }
     }
 
     #[test]

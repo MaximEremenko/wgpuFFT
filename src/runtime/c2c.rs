@@ -70,27 +70,12 @@ fn extended_precision_route_error(
     config: &FftConfig,
     axis_kinds: &[AxisKind],
     limits: LargePolicyLimits,
-    route: C2cRoute,
+    _route: C2cRoute,
     compute_limits: &wgpu::Limits,
 ) -> Result<()> {
     let precision = config.precision();
     if precision == FftPrecision::F32 {
         return Ok(());
-    }
-    if precision == FftPrecision::Df64
-        && !matches!(route, C2cRoute::DirectDft | C2cRoute::MixedRadix)
-    {
-        let reason = match route {
-            C2cRoute::Rader => "rader-df64-not-implemented",
-            C2cRoute::Bluestein => "bluestein-df64-not-implemented",
-            C2cRoute::AxisSequence => "axis-sequence-prime-df64-not-implemented",
-            C2cRoute::DirectDft | C2cRoute::MixedRadix => unreachable!(),
-        };
-        return Err(FftError::PrecisionUnsupported {
-            requested: precision,
-            route: route.as_str(),
-            reason,
-        });
     }
     let required_bytes = config.required_buffer_size_bytes()?;
     let bytes_per_batch = bytes_per_batch(config)?;
@@ -1346,15 +1331,6 @@ impl C2cPlan {
         output: C2cIoLayout<'_>,
         workspace: Option<BufferView<'_>>,
     ) -> Result<()> {
-        if self.config.precision() == FftPrecision::Df64
-            && (!input.contiguous || !output.contiguous)
-        {
-            return Err(FftError::PrecisionUnsupported {
-                requested: FftPrecision::Df64,
-                route: "c2c-strided",
-                reason: "strided-df64-not-implemented",
-            });
-        }
         if matches!(&self.execution, C2cExecution::SegmentedVolume(_)) {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "segmented-volume-logical-io",
@@ -7118,9 +7094,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     match key.precision {
         AxisPrecision::F32 => source,
         AxisPrecision::F64 => source.replace("vec2<f32>", "vec2<f64>"),
-        AxisPrecision::Df64 => {
-            unreachable!("df64 strided copies are added by the strided-I/O phase")
-        }
+        AxisPrecision::Df64 => source.replace("vec2<f32>", "vec4<f32>"),
     }
 }
 
@@ -7808,7 +7782,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_df64_boundary_allows_normal_mixed_only_and_gates_deferred_routes() {
+    fn phase_c_df64_boundary_allows_all_normal_c2c_routes_and_gates_large_routes() {
         let compute_limits = wgpu::Limits::default();
         let limits = LargePolicyLimits {
             max_storage_buffer_binding_size: 4096,
@@ -7818,6 +7792,9 @@ mod tests {
             FftConfig::new(1).with_precision(FftPrecision::Df64),
             FftConfig::new(24).with_precision(FftPrecision::Df64),
             FftConfig::new_nd([8, 15]).with_precision(FftPrecision::Df64),
+            FftConfig::new(17).with_precision(FftPrecision::Df64),
+            FftConfig::new(34).with_precision(FftPrecision::Df64),
+            FftConfig::new_nd([2, 17]).with_precision(FftPrecision::Df64),
         ] {
             let kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
             assert_eq!(
@@ -7843,40 +7820,6 @@ mod tests {
             )
             .unwrap_err()
         };
-        assert!(matches!(
-            error_for(
-                FftConfig::new(17).with_precision(FftPrecision::Df64),
-                limits,
-            ),
-            FftError::PrecisionUnsupported {
-                requested: FftPrecision::Df64,
-                route: "rader",
-                reason: "rader-df64-not-implemented",
-            }
-        ));
-        assert!(matches!(
-            error_for(
-                FftConfig::new(34).with_precision(FftPrecision::Df64),
-                limits,
-            ),
-            FftError::PrecisionUnsupported {
-                requested: FftPrecision::Df64,
-                route: "bluestein",
-                reason: "bluestein-df64-not-implemented",
-            }
-        ));
-        assert!(matches!(
-            error_for(
-                FftConfig::new_nd([2, 17]).with_precision(FftPrecision::Df64),
-                limits,
-            ),
-            FftError::PrecisionUnsupported {
-                requested: FftPrecision::Df64,
-                route: "axis-sequence",
-                reason: "axis-sequence-prime-df64-not-implemented",
-            }
-        ));
-
         let small_binding_limits = LargePolicyLimits {
             max_storage_buffer_binding_size: 128,
             max_buffer_size: 4096,
@@ -7886,6 +7829,17 @@ mod tests {
                 FftConfig::new(8)
                     .with_batch(2)
                     .with_precision(FftPrecision::Df64),
+                small_binding_limits,
+            ),
+            FftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                route: "large-chunk",
+                reason: "large-chunk-df64-not-implemented",
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new(17).with_precision(FftPrecision::Df64),
                 small_binding_limits,
             ),
             FftError::PrecisionUnsupported {
@@ -8010,6 +7964,22 @@ mod tests {
         let strided_f64 = generate_c2c_strided_wgsl_for_key(&f64_key);
         assert!(strided_f64.contains("array<vec2<f64>>"));
         assert!(!strided_f64.contains("vec2<f32>"));
+
+        for kind in [C2cStridedKernelKind::Pack, C2cStridedKernelKind::Unpack] {
+            let key = C2cStridedStageKey::new(kind, WORKGROUP_SIZE, AxisPrecision::Df64);
+            let source = generate_c2c_strided_wgsl_for_key(&key);
+            assert!(source.contains("array<vec4<f32>>"));
+            assert!(!source.contains("vec2<f32>"));
+            assert!(!source.contains("struct Df64"));
+            match kind {
+                C2cStridedKernelKind::Pack => {
+                    assert!(source.contains("output[i] = input[physical_index];"));
+                }
+                C2cStridedKernelKind::Unpack => {
+                    assert!(source.contains("output[physical_index] = input[i];"));
+                }
+            }
+        }
     }
 
     #[test]

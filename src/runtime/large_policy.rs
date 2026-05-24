@@ -88,6 +88,27 @@ impl LargePolicyLimits {
             max_buffer_size,
         }
     }
+
+    /// Resolves optional tuning limits against immutable device caps.
+    ///
+    /// An override may only reduce a device limit. Bindings are additionally
+    /// capped by the effective maximum buffer size.
+    pub(crate) fn effective_with_overrides(
+        device: &wgpu::Limits,
+        max_storage_buffer_binding_size: Option<u64>,
+        max_buffer_size: Option<u64>,
+    ) -> Self {
+        let max_buffer_size = max_buffer_size
+            .unwrap_or(device.max_buffer_size)
+            .min(device.max_buffer_size);
+        Self {
+            max_storage_buffer_binding_size: max_storage_buffer_binding_size
+                .unwrap_or(device.max_storage_buffer_binding_size)
+                .min(device.max_storage_buffer_binding_size)
+                .min(max_buffer_size),
+            max_buffer_size,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,13 +330,15 @@ pub(crate) fn resolve_large_routing_policy_with_complex_element_bytes(
     let max_buffer_size = input.limits.max_buffer_size;
     let mut reason_codes = Vec::new();
     let mut attempted_routes = vec!["direct"];
-    let needs_large_mode = input
+    let exceeds_binding_limits = input
         .required_binding_bytes
         .iter()
         .any(|&bytes| bytes > max_bind_bytes);
+    let needs_large_mode =
+        exceeds_binding_limits || input.requested_large_route != LargeRoutePreference::Auto;
     let oversized_line_mode = input.line_bytes.iter().any(|&bytes| bytes > max_bind_bytes);
 
-    if needs_large_mode {
+    if exceeds_binding_limits {
         push_unique(&mut reason_codes, "requires-large-bindings");
         push_unique(&mut attempted_routes, "dispatch-split");
         push_unique(&mut attempted_routes, "batch-chunk");
@@ -566,9 +589,26 @@ pub fn resolve_out_of_core_axis_window_policy(
 }
 
 pub fn plan_out_of_core_windows(input: OutOfCorePlanInput) -> Result<OutOfCorePlan> {
+    plan_out_of_core_windows_impl(input, true)
+}
+
+pub(crate) fn plan_out_of_core_windows_for_independent_buffers(
+    input: OutOfCorePlanInput,
+) -> Result<OutOfCorePlan> {
+    plan_out_of_core_windows_impl(input, false)
+}
+
+fn plan_out_of_core_windows_impl(
+    input: OutOfCorePlanInput,
+    aggregate_staging: bool,
+) -> Result<OutOfCorePlan> {
     let axis_policy = resolve_out_of_core_axis_window_policy(input.axis_window)?;
     let window_bytes = checked_mul_u64(axis_policy.lines_per_chunk as u64, axis_policy.line_bytes)?;
-    let staging_buffer_bytes = checked_mul_u64(window_bytes, axis_policy.num_axis_uploads as u64)?;
+    let staging_buffer_bytes = if aggregate_staging {
+        checked_mul_u64(window_bytes, axis_policy.num_axis_uploads as u64)?
+    } else {
+        window_bytes
+    };
     if staging_buffer_bytes > input.max_buffer_size {
         return Err(FftError::LargeChunkUnsupported {
             reason: "out-of-core staging windows exceed the GPU buffer size limit",
@@ -820,6 +860,35 @@ mod tests {
     }
 
     #[test]
+    fn tuning_limit_overrides_only_reduce_device_caps() {
+        let mut device = wgpu::Limits::default();
+        device.max_storage_buffer_binding_size = 4096;
+        device.max_buffer_size = 8192;
+
+        assert_eq!(
+            LargePolicyLimits::effective_with_overrides(&device, None, None),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 4096,
+                max_buffer_size: 8192,
+            }
+        );
+        assert_eq!(
+            LargePolicyLimits::effective_with_overrides(&device, Some(16 * 1024), Some(1024),),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 1024,
+                max_buffer_size: 1024,
+            }
+        );
+        assert_eq!(
+            LargePolicyLimits::effective_with_overrides(&device, Some(512), Some(16 * 1024)),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 512,
+                max_buffer_size: 8192,
+            }
+        );
+    }
+
+    #[test]
     fn normal_route_when_all_required_bindings_fit() {
         let p = resolve_large_routing_policy(LargeRoutingPolicyInput {
             limits: limits(256),
@@ -942,6 +1011,39 @@ mod tests {
         assert!(p.attempted_routes.contains(&"out-of-core-four-step"));
         assert!(p.reason_codes.contains(&"bytes-per-batch-exceeds-bind"));
         assert!(p.reason_codes.contains(&"out-of-core-eligible"));
+    }
+
+    #[test]
+    fn explicit_large_route_preferences_are_live_within_binding_limits() {
+        let within = [128u64, 128];
+        let chunk = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits: limits(256),
+            required_binding_bytes: &within,
+            bytes_per_batch: Some(64),
+            requested_large_route: LargeRoutePreference::Chunk,
+            ..LargeRoutingPolicyInput::new(limits(256), &[])
+        })
+        .unwrap();
+        assert_eq!(chunk.route_mode(), LargeRouteMode::LargeChunk);
+        assert!(chunk.reason_codes().contains(&"forced-route-chunk"));
+
+        let out_of_core = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits: limits(256),
+            required_binding_bytes: &within,
+            line_bytes: &[64, 64],
+            axis_kinds: Some(&[AxisKind::Mixed, AxisKind::Mixed]),
+            axis_lengths: Some(&[8, 8]),
+            allow_out_of_core: true,
+            rank: 2,
+            bytes_per_batch: Some(128),
+            requested_large_route: LargeRoutePreference::OutOfCore,
+            ..LargeRoutingPolicyInput::new(limits(256), &[])
+        })
+        .unwrap();
+        assert_eq!(out_of_core.route_mode(), LargeRouteMode::LargeOutOfCore);
+        assert!(out_of_core
+            .reason_codes()
+            .contains(&"forced-route-out-of-core"));
     }
 
     #[test]
@@ -1161,6 +1263,29 @@ mod tests {
                 byte_size: 256,
             }
         );
+    }
+
+    #[test]
+    fn independent_four_step_staging_does_not_apply_an_aggregate_buffer_limit() {
+        let input = OutOfCorePlanInput {
+            axis_window: OutOfCoreAxisWindowPolicyInput {
+                axis_len: 4096,
+                line_bytes: 8,
+                lines_total: 24,
+                max_bind_bytes: 192,
+                axis_kind: AxisKind::Mixed,
+                storage_align: 4,
+                swap_to_2_stage_4_step: 0,
+                swap_to_3_stage_4_step: 1,
+                grouped_batch: None,
+                out_of_core_burst_windows: 1,
+            },
+            max_buffer_size: 100,
+        };
+        assert!(plan_out_of_core_windows(input).is_err());
+        let independent = plan_out_of_core_windows_for_independent_buffers(input).unwrap();
+        assert_eq!(independent.axis_policy.num_axis_uploads, 3);
+        assert!(independent.staging_buffer_bytes <= input.max_buffer_size);
     }
 
     #[test]

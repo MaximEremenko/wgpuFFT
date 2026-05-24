@@ -24,11 +24,18 @@ use crate::runtime::pipeline_cache::{
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
-const WORKGROUP_SIZE: u32 = 64;
-const FUSED_WORKGROUP_SIZE: u32 = 256;
 // At smaller convolution lengths the 256-lane fused kernel is mostly idle and
 // the existing staged path is already inexpensive.
-const FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
+#[cfg(test)]
+const DEFAULT_WORKGROUP_SIZE: u32 = 64;
+#[cfg(test)]
+const DEFAULT_FUSED_WORKGROUP_SIZE: u32 = 256;
+#[cfg(test)]
+const DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
+#[cfg(test)]
+const WORKGROUP_SIZE: u32 = DEFAULT_WORKGROUP_SIZE;
+#[cfg(test)]
+const FUSED_WORKGROUP_SIZE: u32 = DEFAULT_FUSED_WORKGROUP_SIZE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -56,6 +63,9 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) direction: FftDirection,
     pub(crate) normalization: Normalization,
     pub(crate) precision: AxisPrecision,
+    pub(crate) workgroup_size: u32,
+    pub(crate) fused_workgroup_size: u32,
+    pub(crate) fused_min_convolution_length: usize,
 }
 
 pub(crate) struct RaderAxis {
@@ -119,6 +129,18 @@ impl RaderAxisConfig {
         if self.batch == 0 {
             return Err(FftError::ZeroBatch);
         }
+        if self.workgroup_size == 0 || !self.workgroup_size.is_power_of_two() {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "rader-tuning",
+                reason: "staged workgroup size must be a nonzero power of two",
+            });
+        }
+        if self.fused_workgroup_size == 0 {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "rader-tuning",
+                reason: "fused workgroup size must be nonzero",
+            });
+        }
         let n = self.shape[self.axis];
         if !is_prime(n) {
             return Err(FftError::UnsupportedLength { len: n });
@@ -173,6 +195,7 @@ impl RaderAxis {
         let perm = rader_permutation(n)?;
         let bfft = rader_bfft_f64(n, m, config.direction, &perm)?;
         let complex_bytes = config.precision.complex_size_bytes();
+        validate_rader_staged_workgroup(&config, &device.limits())?;
 
         let lines_params_buffer =
             uniform_buffer::<RaderLinesParams>(device, "wgpu_fft.rader.lines_params");
@@ -222,7 +245,13 @@ impl RaderAxis {
             }
         }
 
-        let execution = if fused_rader_supported(m, config.precision, &device.limits()) {
+        let execution = if fused_rader_supported(
+            m,
+            config.precision,
+            config.fused_workgroup_size,
+            config.fused_min_convolution_length,
+            &device.limits(),
+        ) {
             let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
                 device,
                 queue,
@@ -240,7 +269,7 @@ impl RaderAxis {
                 m,
                 &factors,
                 config.direction,
-                FUSED_WORKGROUP_SIZE,
+                config.fused_workgroup_size,
                 apply_scale,
                 scale,
                 config.precision,
@@ -313,6 +342,8 @@ impl RaderAxis {
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
                     precision: config.precision,
+                    workgroup_size: config.workgroup_size,
+                    fused_workgroup_size: config.fused_workgroup_size,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -328,6 +359,8 @@ impl RaderAxis {
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
                     precision: config.precision,
+                    workgroup_size: config.workgroup_size,
+                    fused_workgroup_size: config.fused_workgroup_size,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -342,6 +375,7 @@ impl RaderAxis {
                 apply_scale,
                 scale,
                 config.precision,
+                config.workgroup_size,
             );
             let sum_bind_group_layout = cached_layout(device, keys.sum.layout);
             let pack_bind_group_layout = cached_layout(device, keys.pack.layout);
@@ -356,9 +390,9 @@ impl RaderAxis {
 
             RaderExecution::MultiPass(Box::new(MultiPassRaderExecution {
                 workgroups_sum: lines_u32,
-                workgroups_lines: lines_u32.div_ceil(WORKGROUP_SIZE),
-                workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
-                workgroups_tail: (lines_u32 * l as u32).div_ceil(WORKGROUP_SIZE),
+                workgroups_lines: lines_u32.div_ceil(config.workgroup_size),
+                workgroups_work: total_work_u32.div_ceil(config.workgroup_size),
+                workgroups_tail: (lines_u32 * l as u32).div_ceil(config.workgroup_size),
                 sum_pipeline,
                 sum_bind_group_layout,
                 pack_pipeline,
@@ -748,6 +782,7 @@ impl RaderPipelineKeys {
         apply_scale: bool,
         scale: f64,
         precision: AxisPrecision,
+        workgroup_size: u32,
     ) -> Self {
         let key = |kind| {
             RaderStageKey::new(
@@ -758,7 +793,7 @@ impl RaderPipelineKeys {
                 n,
                 stride_complex,
                 m,
-                WORKGROUP_SIZE,
+                workgroup_size,
                 apply_scale,
                 scale,
                 precision,
@@ -818,10 +853,41 @@ fn cached_fused_pipeline(
     })
 }
 
-fn fused_rader_supported(m: usize, precision: AxisPrecision, limits: &wgpu::Limits) -> bool {
+fn validate_rader_staged_workgroup(config: &RaderAxisConfig, limits: &wgpu::Limits) -> Result<()> {
+    if config.workgroup_size > limits.max_compute_invocations_per_workgroup
+        || config.workgroup_size > limits.max_compute_workgroup_size_x
+    {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "rader-staged-workgroup",
+            reason: "configured workgroup size exceeds the active device compute limits",
+        });
+    }
+    let scratch_bytes = u64::from(config.workgroup_size)
+        .checked_mul(config.precision.complex_size_bytes())
+        .ok_or(FftError::LengthTooLarge {
+            len: config.workgroup_size as usize,
+        })?;
+    if scratch_bytes > u64::from(limits.max_compute_workgroup_storage_size) {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "rader-staged-workgroup",
+            reason: "configured Rader sum scratch exceeds workgroup storage",
+        });
+    }
+    Ok(())
+}
+
+fn fused_rader_supported(
+    m: usize,
+    precision: AxisPrecision,
+    workgroup_size: u32,
+    min_convolution_length: usize,
+    limits: &wgpu::Limits,
+) -> bool {
     fused_rader_supported_by_limits(
         m,
         precision,
+        workgroup_size,
+        min_convolution_length,
         u64::from(limits.max_compute_workgroup_storage_size),
         limits.max_compute_invocations_per_workgroup,
         limits.max_compute_workgroup_size_x,
@@ -831,11 +897,13 @@ fn fused_rader_supported(m: usize, precision: AxisPrecision, limits: &wgpu::Limi
 pub(crate) fn fused_rader_supported_by_limits(
     m: usize,
     precision: AxisPrecision,
+    workgroup_size: u32,
+    min_convolution_length: usize,
     max_workgroup_storage_bytes: u64,
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
 ) -> bool {
-    if m < FUSED_MIN_CONVOLUTION_LENGTH {
+    if m < min_convolution_length {
         return false;
     }
     let complex_bytes = precision.complex_size_bytes() as usize;
@@ -846,8 +914,9 @@ pub(crate) fn fused_rader_supported_by_limits(
         return false;
     };
     workgroup_bytes as u64 <= max_workgroup_storage_bytes
-        && FUSED_WORKGROUP_SIZE <= max_invocations_per_workgroup
-        && FUSED_WORKGROUP_SIZE <= max_workgroup_size_x
+        && workgroup_size > 0
+        && workgroup_size <= max_invocations_per_workgroup
+        && workgroup_size <= max_workgroup_size_x
 }
 
 pub(crate) fn rader_convolution_length(n: usize) -> Result<usize> {
@@ -1606,6 +1675,8 @@ mod tests {
         assert!(fused_rader_supported_by_limits(
             6000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1613,6 +1684,8 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             6000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             16 * 1024,
             256,
             256
@@ -1620,6 +1693,8 @@ mod tests {
         assert!(fused_rader_supported_by_limits(
             2016,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             16 * 1024,
             256,
             256
@@ -1627,6 +1702,8 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             32,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1634,6 +1711,8 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             6000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48_007,
             256,
             256
@@ -1641,6 +1720,8 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             6000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             255,
             256
@@ -1648,6 +1729,8 @@ mod tests {
         assert!(fused_rader_supported_by_limits(
             3071,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1655,6 +1738,8 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             3072,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1662,6 +1747,8 @@ mod tests {
         assert!(fused_rader_supported_by_limits(
             3071,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1669,9 +1756,20 @@ mod tests {
         assert!(!fused_rader_supported_by_limits(
             3072,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
+        ));
+        assert!(fused_rader_supported_by_limits(
+            32,
+            AxisPrecision::F32,
+            64,
+            32,
+            48 * 1024,
+            64,
+            64
         ));
     }
 

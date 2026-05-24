@@ -18,6 +18,7 @@ use crate::runtime::logical_io::{
 use crate::runtime::real::{C2rPlan, R2cPlan};
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::{SchedulerLimits, WindowScheduler};
+use crate::tuning::FftTuningSummary;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FftTransformKind {
@@ -161,8 +162,9 @@ impl FftPlan {
         queue: &wgpu::Queue,
         config: FftConfig,
     ) -> std::result::Result<Self, FftPlanCreationError> {
+        let tuning = config.tuning().clone();
         Self::c2c(device, queue, config)
-            .map_err(|error| FftPlanCreationError::from_error(error, "c2c"))
+            .map_err(|error| FftPlanCreationError::from_error_with_tuning(error, "c2c", tuning))
     }
 
     /// Creates a C2C plan while converting scoped GPU validation, internal,
@@ -185,9 +187,10 @@ impl FftPlan {
         queue: &wgpu::Queue,
         config: FftConfig,
     ) -> std::result::Result<Self, FftPlanCreationError> {
+        let tuning = config.tuning().clone();
         Self::c2c_checked(device, queue, config)
             .await
-            .map_err(|error| FftPlanCreationError::from_error(error, "c2c"))
+            .map_err(|error| FftPlanCreationError::from_error_with_tuning(error, "c2c", tuning))
     }
 
     #[doc(hidden)]
@@ -269,8 +272,9 @@ impl FftPlan {
         queue: &wgpu::Queue,
         config: FftConfig,
     ) -> std::result::Result<Self, FftPlanCreationError> {
+        let tuning = config.tuning().clone();
         Self::r2c(device, queue, config)
-            .map_err(|error| FftPlanCreationError::from_error(error, "r2c"))
+            .map_err(|error| FftPlanCreationError::from_error_with_tuning(error, "r2c", tuning))
     }
 
     #[doc(hidden)]
@@ -298,8 +302,9 @@ impl FftPlan {
         queue: &wgpu::Queue,
         config: FftConfig,
     ) -> std::result::Result<Self, FftPlanCreationError> {
+        let tuning = config.tuning().clone();
         Self::c2r(device, queue, config)
-            .map_err(|error| FftPlanCreationError::from_error(error, "c2r"))
+            .map_err(|error| FftPlanCreationError::from_error_with_tuning(error, "c2r", tuning))
     }
 
     #[doc(hidden)]
@@ -742,13 +747,19 @@ impl FftPlan {
         };
         let route = self.route().as_str().to_owned();
         let policy = self.large_routing_policy();
-        let precision = self.config().precision();
+        let config = self.config();
+        let precision = config.precision();
         let mut diagnostics = FftDiagnostics::new(FftRouteSummary::from_large_policy(
             transform,
             route.clone(),
             policy,
         ))
         .with_device_limits(FftDeviceLimits::from_policy(policy))
+        .with_active_tuning(active_tuning_summary(
+            &config,
+            policy.max_bind_bytes,
+            policy.max_buffer_size,
+        ))
         .with_buffer_requirement(FftBufferRequirement::new(
             "input",
             self.required_input_buffer_size_bytes(),
@@ -1370,6 +1381,19 @@ fn scheduler_limits_from_diagnostics(limits: FftDeviceLimits) -> SchedulerLimits
         storage_alignment: limits.min_storage_buffer_offset_alignment.max(1),
         copy_alignment: 4,
     }
+}
+
+fn active_tuning_summary(
+    config: &FftConfig,
+    effective_max_storage_buffer_binding_size: u64,
+    effective_max_buffer_size: u64,
+) -> FftTuningSummary {
+    let requested = config.tuning().clone();
+    let effective = requested
+        .clone()
+        .with_max_storage_buffer_binding_size(Some(effective_max_storage_buffer_binding_size))
+        .with_max_buffer_size(Some(effective_max_buffer_size));
+    FftTuningSummary::new(requested, effective)
 }
 
 fn fallback_workspace_blocker(error: &FftError, actual: u64, required: u64) -> FftBlocker {
@@ -2112,6 +2136,7 @@ pub fn create_c2r_plan_with_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning::FftTuning;
 
     fn tiny_limits() -> FftDeviceLimits {
         FftDeviceLimits {
@@ -2119,6 +2144,41 @@ mod tests {
             max_buffer_size: 256,
             min_storage_buffer_offset_alignment: 64,
         }
+    }
+
+    #[test]
+    fn active_tuning_resolves_only_effective_large_policy_limits() {
+        let implicit = FftConfig::new(8);
+        let explicit = FftConfig::new(8).with_tuning(FftTuning::default());
+        let implicit_summary = active_tuning_summary(&implicit, 1 << 20, 1 << 24);
+        let explicit_summary = active_tuning_summary(&explicit, 1 << 20, 1 << 24);
+
+        assert_eq!(implicit_summary, explicit_summary);
+        assert_eq!(
+            implicit_summary
+                .requested()
+                .max_storage_buffer_binding_size(),
+            None
+        );
+        assert_eq!(implicit_summary.requested().max_buffer_size(), None);
+        assert_eq!(
+            implicit_summary
+                .effective()
+                .max_storage_buffer_binding_size(),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            implicit_summary.effective().max_buffer_size(),
+            Some(1 << 24)
+        );
+        assert_eq!(
+            implicit_summary.requested().workgroup_size(),
+            implicit_summary.effective().workgroup_size()
+        );
+        assert_eq!(
+            implicit_summary.requested().fused_min_convolution_length(),
+            implicit_summary.effective().fused_min_convolution_length()
+        );
     }
 
     #[test]

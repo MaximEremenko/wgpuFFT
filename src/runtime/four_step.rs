@@ -7,7 +7,7 @@ use crate::error::{FftError, Result};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
-use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
+use crate::runtime::axis_policy::{resolve_axis_kinds_for_config, AxisKind};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::c2c::{C2cPlan, WindowedPrimeBridge};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -17,8 +17,8 @@ use crate::runtime::large_graph::{
     LogicalBufferId, LogicalRange, StageRequirements,
 };
 use crate::runtime::large_policy::{
-    plan_out_of_core_windows, LargeFactorSplit, LargePolicyLimits, OutOfCoreAxisWindowPolicyInput,
-    OutOfCorePlanInput, OutOfCoreWindow,
+    plan_out_of_core_windows_for_independent_buffers, LargeFactorSplit, LargePolicyLimits,
+    OutOfCoreAxisWindowPolicyInput, OutOfCorePlanInput, OutOfCoreWindow,
 };
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FourStepKernelKind, FourStepStageKey,
@@ -170,7 +170,7 @@ impl FourStepC2cPlan {
                 .checked_mul(dim)
                 .ok_or(FftError::LengthTooLarge { len: usize::MAX })
         })?;
-        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        let axis_kinds = resolve_axis_kinds_for_config(config)?;
         let mut axes = Vec::with_capacity(config.axes().len());
         for (&axis, &axis_kind) in config.axes().iter().zip(&axis_kinds) {
             let axis_len = config.shape()[axis];
@@ -240,6 +240,7 @@ impl FourStepC2cPlan {
         let scale = if (scale_value - 1.0).abs() > f32::EPSILON {
             Some(ScaleWindowPlan::new(
                 device,
+                config,
                 total_complex,
                 scale_value,
                 planning_limits,
@@ -591,6 +592,31 @@ impl FourStepC2cPlan {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn configured_axis_window_policy_input(
+    config: &FftConfig,
+    axis_len: usize,
+    line_bytes: u64,
+    lines_total: usize,
+    max_bind_bytes: u64,
+    axis_kind: AxisKind,
+    storage_align: u64,
+) -> OutOfCoreAxisWindowPolicyInput {
+    OutOfCoreAxisWindowPolicyInput {
+        axis_len,
+        line_bytes,
+        lines_total,
+        max_bind_bytes,
+        axis_kind,
+        storage_align,
+        swap_to_2_stage_4_step: config.tuning().swap_to_2_stage_4_step(),
+        swap_to_3_stage_4_step: config.tuning().swap_to_3_stage_4_step(),
+        grouped_batch: config.tuning().grouped_batch(),
+        // The four-step executor does not yet own a multi-window burst ring.
+        out_of_core_burst_windows: 1,
+    }
+}
+
 impl AxisWindowPlan {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -616,9 +642,21 @@ impl AxisWindowPlan {
             });
         }
 
+        let child_tuning = match axis_kind {
+            AxisKind::Mixed => config.tuning().for_internal_child(),
+            AxisKind::Rader => config
+                .tuning()
+                .for_internal_child()
+                .with_force_rader_axes([0]),
+            AxisKind::Bluestein => config
+                .tuning()
+                .for_internal_child()
+                .with_force_bluestein_axes([0]),
+        };
         let line_config = FftConfig::new(axis_len)
             .with_direction(config.direction())
-            .with_normalization(Normalization::None);
+            .with_normalization(Normalization::None)
+            .with_tuning(child_tuning);
         let (bridge_route, bridge_plan, use_bridge, window_max_bind) = match axis_kind {
             AxisKind::Mixed => (None, None, false, limits.max_storage_buffer_binding_size),
             AxisKind::Rader | AxisKind::Bluestein => {
@@ -654,19 +692,16 @@ impl AxisWindowPlan {
                 (Some(route), Some(plan), bridge, max_bind)
             }
         };
-        let window_plan = plan_out_of_core_windows(OutOfCorePlanInput {
-            axis_window: OutOfCoreAxisWindowPolicyInput {
+        let window_plan = plan_out_of_core_windows_for_independent_buffers(OutOfCorePlanInput {
+            axis_window: configured_axis_window_policy_input(
+                config,
                 axis_len,
                 line_bytes,
                 lines_total,
-                max_bind_bytes: window_max_bind,
+                window_max_bind,
                 axis_kind,
-                storage_align: storage_alignment,
-                swap_to_2_stage_4_step: 0,
-                swap_to_3_stage_4_step: 0,
-                grouped_batch: None,
-                out_of_core_burst_windows: 1,
-            },
+                storage_alignment,
+            ),
             max_buffer_size: limits.max_buffer_size,
         })?;
 
@@ -696,6 +731,8 @@ impl AxisWindowPlan {
                                 scale_override_bits: Some(1.0f32.to_bits()),
                                 layout: AxisLayout::Interleaved,
                                 precision: AxisPrecision::F32,
+                                workgroup_size: config.tuning().workgroup_size(),
+                                fused_workgroup_size: config.tuning().fused_workgroup_size(),
                             },
                             twiddle_lut_pool,
                         )?)
@@ -1217,6 +1254,7 @@ fn choose_transpose_tile(nx: usize, ny: usize, max_elements: usize) -> (usize, u
 impl ScaleWindowPlan {
     fn new(
         device: &wgpu::Device,
+        config: &FftConfig,
         total_complex: u64,
         scale: f32,
         limits: LargePolicyLimits,
@@ -1224,19 +1262,16 @@ impl ScaleWindowPlan {
     ) -> Result<Self> {
         let lines_total = usize::try_from(total_complex)
             .map_err(|_| FftError::LengthTooLarge { len: usize::MAX })?;
-        let window_plan = plan_out_of_core_windows(OutOfCorePlanInput {
-            axis_window: OutOfCoreAxisWindowPolicyInput {
-                axis_len: 1,
-                line_bytes: COMPLEX_F32_BYTES,
+        let window_plan = plan_out_of_core_windows_for_independent_buffers(OutOfCorePlanInput {
+            axis_window: configured_axis_window_policy_input(
+                config,
+                1,
+                COMPLEX_F32_BYTES,
                 lines_total,
-                max_bind_bytes: limits.max_storage_buffer_binding_size,
-                axis_kind: crate::runtime::axis_policy::AxisKind::Mixed,
-                storage_align: storage_alignment,
-                swap_to_2_stage_4_step: 0,
-                swap_to_3_stage_4_step: 0,
-                grouped_batch: None,
-                out_of_core_burst_windows: 1,
-            },
+                limits.max_storage_buffer_binding_size,
+                AxisKind::Mixed,
+                storage_alignment,
+            ),
             max_buffer_size: limits.max_buffer_size,
         })?;
         let mut windows = Vec::with_capacity(window_plan.upload_windows.len());
@@ -1830,6 +1865,48 @@ fn main(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning::FftTuning;
+
+    #[test]
+    fn configured_window_policy_uses_public_tuning_and_preserves_defaults() {
+        let default_config = FftConfig::new_nd([8, 8]);
+        let default = configured_axis_window_policy_input(
+            &default_config,
+            4096,
+            264,
+            1024,
+            65536,
+            AxisKind::Bluestein,
+            256,
+        );
+        assert_eq!(default.swap_to_2_stage_4_step, 0);
+        assert_eq!(default.swap_to_3_stage_4_step, 0);
+        assert_eq!(default.grouped_batch, None);
+        assert_eq!(default.out_of_core_burst_windows, 1);
+
+        let tuned_config = FftConfig::new_nd([8, 8]).with_tuning(
+            FftTuning::new()
+                .with_swap_to_2_stage_4_step(1024)
+                .with_swap_to_3_stage_4_step(4096)
+                .with_grouped_batch(Some(8)),
+        );
+        let tuned = configured_axis_window_policy_input(
+            &tuned_config,
+            4096,
+            264,
+            1024,
+            65536,
+            AxisKind::Bluestein,
+            256,
+        );
+        assert_eq!(tuned.swap_to_2_stage_4_step, 1024);
+        assert_eq!(tuned.swap_to_3_stage_4_step, 4096);
+        assert_eq!(tuned.grouped_batch, Some(8));
+        let resolved =
+            crate::runtime::large_policy::resolve_out_of_core_axis_window_policy(tuned).unwrap();
+        assert_eq!(resolved.num_axis_uploads, 3);
+        assert_eq!(resolved.grouped_batch, Some(8));
+    }
 
     #[test]
     fn effective_limits_take_componentwise_minimum() {

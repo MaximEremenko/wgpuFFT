@@ -1,4 +1,5 @@
 use crate::error::{FftError, Result};
+use crate::tuning::FftTuning;
 
 /// Scalar precision used by an FFT plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -77,6 +78,7 @@ pub struct FftConfig {
     direction: FftDirection,
     normalization: Normalization,
     precision: FftPrecision,
+    tuning: FftTuning,
 }
 
 impl FftConfig {
@@ -94,6 +96,7 @@ impl FftConfig {
             direction: FftDirection::Forward,
             normalization: Normalization::Inverse,
             precision: FftPrecision::F32,
+            tuning: FftTuning::default(),
         }
     }
 
@@ -130,6 +133,11 @@ impl FftConfig {
         self
     }
 
+    pub fn with_tuning(mut self, tuning: FftTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.shape.first().copied().unwrap_or(0)
     }
@@ -160,6 +168,10 @@ impl FftConfig {
 
     pub fn precision(&self) -> FftPrecision {
         self.precision
+    }
+
+    pub fn tuning(&self) -> &FftTuning {
+        &self.tuning
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -193,6 +205,7 @@ impl FftConfig {
         }
 
         self.total_complex_len()?;
+        self.tuning.validate_for_config(self)?;
         Ok(())
     }
 
@@ -285,6 +298,7 @@ fn checked_product(values: &[usize]) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuning::{FftLargeRoute, FftTuning, FftTuningErrorKind};
 
     #[test]
     fn rejects_zero_length() {
@@ -421,5 +435,129 @@ mod tests {
             FftConfig::inverse_nd([2, 3]).scale_f64().unwrap(),
             1.0 / 6.0
         );
+    }
+
+    #[test]
+    fn tuning_defaults_are_part_of_config_identity() {
+        let implicit = FftConfig::new_nd([8, 17]);
+        let explicit = implicit.clone().with_tuning(FftTuning::default());
+        assert_eq!(implicit, explicit);
+        assert_eq!(implicit.tuning(), &FftTuning::default());
+        assert_eq!(implicit.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validates_scalar_tuning_controls() {
+        for (tuning, field) in [
+            (
+                FftTuning::default().with_workgroup_size(0),
+                "workgroup_size",
+            ),
+            (
+                FftTuning::default().with_fused_workgroup_size(96),
+                "fused_workgroup_size",
+            ),
+            (
+                FftTuning::default().with_rader_max_prime(1),
+                "rader_max_prime",
+            ),
+            (
+                FftTuning::default().with_large_chunk_max_batches(0),
+                "large_chunk_max_batches",
+            ),
+            (FftTuning::default().with_grouped_batch(0), "grouped_batch"),
+            (
+                FftTuning::default().with_segmented_burst_depth(4),
+                "segmented_burst_depth",
+            ),
+            (
+                FftTuning::default().with_max_storage_buffer_binding_size(0),
+                "max_storage_buffer_binding_size",
+            ),
+            (
+                FftTuning::default().with_max_buffer_size(0),
+                "max_buffer_size",
+            ),
+            (
+                FftTuning::default()
+                    .with_swap_to_2_stage_4_step(4096)
+                    .with_swap_to_3_stage_4_step(1024),
+                "swap_to_2_stage_4_step",
+            ),
+        ] {
+            assert!(matches!(
+                FftConfig::new(8).with_tuning(tuning).validate(),
+                Err(FftError::InvalidTuning {
+                    kind: FftTuningErrorKind::InvalidValue
+                        | FftTuningErrorKind::ConflictingValues,
+                    field: actual,
+                    ..
+                }) if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn validates_forced_axis_tuning() {
+        let invalid_cases = [
+            (
+                FftConfig::new_nd([8, 17])
+                    .with_tuning(FftTuning::default().with_force_rader_axes([1, 1])),
+                FftTuningErrorKind::DuplicateAxis,
+                "force_rader_axes",
+            ),
+            (
+                FftConfig::new_nd([8, 17]).with_tuning(
+                    FftTuning::default()
+                        .with_force_rader_axes([1])
+                        .with_force_bluestein_axes([1]),
+                ),
+                FftTuningErrorKind::ConflictingAxes,
+                "force_rader_axes/force_bluestein_axes",
+            ),
+            (
+                FftConfig::new_nd([8, 17])
+                    .with_tuning(FftTuning::default().with_force_bluestein_axes([2])),
+                FftTuningErrorKind::AxisOutOfRange,
+                "force_bluestein_axes",
+            ),
+            (
+                FftConfig::new_nd([8, 17])
+                    .with_axes([0])
+                    .with_tuning(FftTuning::default().with_force_rader_axes([1])),
+                FftTuningErrorKind::AxisNotSelected,
+                "force_rader_axes",
+            ),
+            (
+                FftConfig::new_nd([8, 17])
+                    .with_tuning(FftTuning::default().with_force_rader_axes([0])),
+                FftTuningErrorKind::AxisAlgorithmIncompatible,
+                "force_rader_axes",
+            ),
+            (
+                FftConfig::new(1).with_tuning(FftTuning::default().with_force_bluestein_axes([0])),
+                FftTuningErrorKind::AxisAlgorithmIncompatible,
+                "force_bluestein_axes",
+            ),
+        ];
+        for (config, kind, field) in invalid_cases {
+            assert!(matches!(
+                config.validate(),
+                Err(FftError::InvalidTuning {
+                    kind: actual_kind,
+                    field: actual_field,
+                    ..
+                }) if actual_kind == kind && actual_field == field
+            ));
+        }
+
+        let valid = FftConfig::new_nd([8, 17]).with_tuning(
+            FftTuning::default()
+                .with_rader_max_prime(13)
+                .with_force_bluestein_axes([0])
+                .with_force_rader_axes([1])
+                .with_large_route(FftLargeRoute::ForceChunk),
+        );
+        assert_eq!(valid.validate(), Ok(()));
     }
 }

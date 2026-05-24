@@ -1,5 +1,7 @@
+use crate::config::FftConfig;
 use crate::error::{FftError, Result};
 use crate::runtime::SUPPORTED_RADICES;
+use crate::tuning::FftTuning;
 
 pub const DEFAULT_RADER_MAX_PRIME: usize = 4096;
 
@@ -28,6 +30,18 @@ pub(crate) fn resolve_axis_kinds_for_axes(
     shape: &[usize],
     axes: &[usize],
 ) -> Result<Vec<AxisKind>> {
+    resolve_axis_kinds_for_axes_with_tuning(shape, axes, &FftTuning::default())
+}
+
+pub(crate) fn resolve_axis_kinds_for_config(config: &FftConfig) -> Result<Vec<AxisKind>> {
+    resolve_axis_kinds_for_axes_with_tuning(config.shape(), config.axes(), config.tuning())
+}
+
+pub(crate) fn resolve_axis_kinds_for_axes_with_tuning(
+    shape: &[usize],
+    axes: &[usize],
+    tuning: &FftTuning,
+) -> Result<Vec<AxisKind>> {
     if shape.is_empty() || shape.iter().any(|&len| len == 0) {
         return Err(FftError::ZeroLength);
     }
@@ -38,15 +52,27 @@ pub(crate) fn resolve_axis_kinds_for_axes(
         if axis >= rank {
             return Err(FftError::InvalidAxis { axis, rank });
         }
-        kinds.push(axis_kind_for_len(shape[axis]));
+        let kind = if tuning.force_rader_axes().contains(&axis) {
+            AxisKind::Rader
+        } else if tuning.force_bluestein_axes().contains(&axis) {
+            AxisKind::Bluestein
+        } else {
+            axis_kind_for_len_with_rader_max(shape[axis], tuning.rader_max_prime())
+        };
+        kinds.push(kind);
     }
     Ok(kinds)
 }
 
+#[cfg(test)]
 pub(crate) fn axis_kind_for_len(len: usize) -> AxisKind {
+    axis_kind_for_len_with_rader_max(len, DEFAULT_RADER_MAX_PRIME)
+}
+
+pub(crate) fn axis_kind_for_len_with_rader_max(len: usize, rader_max_prime: usize) -> AxisKind {
     if crate::runtime::factor_supported_length(len).is_ok() {
         AxisKind::Mixed
-    } else if is_prime(len) && len <= DEFAULT_RADER_MAX_PRIME {
+    } else if is_prime(len) && len <= rader_max_prime {
         AxisKind::Rader
     } else {
         AxisKind::Bluestein
@@ -173,6 +199,30 @@ mod tests {
         assert_eq!(
             resolve_axis_kinds_for_axes(&[8, 29, 34], &[2, 0]).unwrap(),
             [AxisKind::Bluestein, AxisKind::Mixed]
+        );
+    }
+
+    #[test]
+    fn config_tuning_changes_only_requested_axis_policy_choices() {
+        let lowered_rader =
+            FftConfig::new(17).with_tuning(FftTuning::default().with_rader_max_prime(13));
+        assert_eq!(
+            resolve_axis_kinds_for_config(&lowered_rader).unwrap(),
+            [AxisKind::Bluestein]
+        );
+
+        let forced_bluestein = FftConfig::new_nd([17, 8])
+            .with_tuning(FftTuning::default().with_force_bluestein_axes([0]));
+        assert_eq!(
+            resolve_axis_kinds_for_config(&forced_bluestein).unwrap(),
+            [AxisKind::Bluestein, AxisKind::Mixed]
+        );
+
+        let forced_rader_above_auto_threshold =
+            FftConfig::new(4099).with_tuning(FftTuning::default().with_force_rader_axes([0]));
+        assert_eq!(
+            resolve_axis_kinds_for_config(&forced_rader_above_auto_threshold).unwrap(),
+            [AxisKind::Rader]
         );
     }
 

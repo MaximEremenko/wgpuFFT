@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::config::{FftConfig, FftDirection, Normalization};
+use crate::config::{FftConfig, Normalization};
 use crate::error::{FftError, Result};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisTwiddleLutPool,
@@ -27,7 +27,6 @@ const TRANSPOSE_TILE: u32 = 16;
 const TRANSPOSE_WORKGROUP_SIZE: u32 = TRANSPOSE_TILE * TRANSPOSE_TILE;
 const SCALE_WORKGROUP_SIZE: u32 = 64;
 const MIN_SEGMENTED_BURST_DEPTH: usize = 1;
-pub(crate) const DEFAULT_SEGMENTED_BURST_DEPTH: usize = 2;
 const MAX_SEGMENTED_BURST_DEPTH: usize = 3;
 
 #[repr(C)]
@@ -232,7 +231,7 @@ impl SegmentedVolumeC2cPlan {
                 let plan = build_front_row_plan(
                     device,
                     queue,
-                    config.direction(),
+                    config,
                     axis,
                     axis_len,
                     total_complex / axis_len,
@@ -937,7 +936,7 @@ fn segmented_scale_chunk_bytes(max_segment_bytes: u64, limits: SchedulerLimits) 
 fn build_front_row_plan(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    direction: FftDirection,
+    config: &FftConfig,
     axis: usize,
     axis_len: usize,
     lines_total: usize,
@@ -973,7 +972,7 @@ fn build_front_row_plan(
         let plan_index = row_axis_plan_index(
             device,
             queue,
-            direction,
+            config,
             axis_len,
             line_count,
             row_plans,
@@ -1038,7 +1037,7 @@ fn build_slab_axis_plan(
         let plan_index = row_axis_plan_index(
             device,
             queue,
-            config.direction(),
+            config,
             axis_len,
             prefix_count,
             row_plans,
@@ -1079,7 +1078,7 @@ fn build_slab_axis_plan(
 fn row_axis_plan_index(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    direction: FftDirection,
+    config: &FftConfig,
     axis_len: usize,
     line_count: usize,
     row_plans: &mut Vec<AxisPlan>,
@@ -1097,11 +1096,13 @@ fn row_axis_plan_index(
             shape: vec![axis_len],
             axes: vec![0],
             batch: line_count,
-            direction,
+            direction: config.direction(),
             normalization: Normalization::None,
             scale_override_bits: Some(1.0f32.to_bits()),
             layout: AxisLayout::Interleaved,
             precision: AxisPrecision::F32,
+            workgroup_size: config.tuning().workgroup_size(),
+            fused_workgroup_size: config.tuning().fused_workgroup_size(),
         },
         twiddle_lut_pool,
     )?);

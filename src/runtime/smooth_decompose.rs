@@ -1,6 +1,6 @@
 use crate::config::FftConfig;
 use crate::error::{FftError, Result};
-use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
+use crate::runtime::axis_policy::{resolve_axis_kinds_for_config, AxisKind};
 use crate::runtime::factor_supported_length;
 use crate::runtime::large_policy::{LargeExecutionKind, LargeFactorSplit, LargePolicyLimits};
 
@@ -58,7 +58,7 @@ impl SmoothDecompositionPlan {
             });
         }
 
-        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        let axis_kinds = resolve_axis_kinds_for_config(config)?;
         let mut steps = Vec::with_capacity(config.axes().len());
         let total_logical = config.logical_complex_len()? as u64;
 

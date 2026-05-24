@@ -22,11 +22,18 @@ use crate::runtime::pipeline_cache::{
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
-const WORKGROUP_SIZE: u32 = 64;
-const FUSED_WORKGROUP_SIZE: u32 = 256;
 // Avoid a 256-lane whole-pipeline shader when the convolution is too small to
 // keep even half of the workgroup useful; the staged path is already cheap.
-const FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
+#[cfg(test)]
+const DEFAULT_WORKGROUP_SIZE: u32 = 64;
+#[cfg(test)]
+const DEFAULT_FUSED_WORKGROUP_SIZE: u32 = 256;
+#[cfg(test)]
+const DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
+#[cfg(test)]
+const WORKGROUP_SIZE: u32 = DEFAULT_WORKGROUP_SIZE;
+#[cfg(test)]
+const FUSED_WORKGROUP_SIZE: u32 = DEFAULT_FUSED_WORKGROUP_SIZE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -54,6 +61,9 @@ pub(crate) struct BluesteinAxisConfig {
     pub(crate) direction: FftDirection,
     pub(crate) normalization: Normalization,
     pub(crate) precision: AxisPrecision,
+    pub(crate) workgroup_size: u32,
+    pub(crate) fused_workgroup_size: u32,
+    pub(crate) fused_min_convolution_length: usize,
 }
 
 pub(crate) struct BluesteinAxis {
@@ -108,6 +118,18 @@ impl BluesteinAxisConfig {
         }
         if self.batch == 0 {
             return Err(FftError::ZeroBatch);
+        }
+        if self.workgroup_size == 0 || !self.workgroup_size.is_power_of_two() {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "bluestein-tuning",
+                reason: "staged workgroup size must be a nonzero power of two",
+            });
+        }
+        if self.fused_workgroup_size == 0 {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "bluestein-tuning",
+                reason: "fused workgroup size must be nonzero",
+            });
         }
         if self.shape[self.axis] < 2 {
             return Err(FftError::UnsupportedLength {
@@ -164,6 +186,7 @@ impl BluesteinAxis {
         let chirp = bluestein_chirp_f64(n, config.direction);
         let bfft = bluestein_bfft_f64(n, m, config.direction)?;
         let complex_bytes = config.precision.complex_size_bytes();
+        validate_bluestein_staged_workgroup(&config, &device.limits())?;
 
         let lines_params_buffer =
             uniform_buffer::<BluesteinLinesParams>(device, "wgpu_fft.bluestein.lines_params");
@@ -232,7 +255,13 @@ impl BluesteinAxis {
             }
         }
 
-        let execution = if fused_bluestein_supported(m, config.precision, &device.limits()) {
+        let execution = if fused_bluestein_supported(
+            m,
+            config.precision,
+            config.fused_workgroup_size,
+            config.fused_min_convolution_length,
+            &device.limits(),
+        ) {
             let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
                 device,
                 queue,
@@ -250,7 +279,7 @@ impl BluesteinAxis {
                 m,
                 &factors,
                 config.direction,
-                FUSED_WORKGROUP_SIZE,
+                config.fused_workgroup_size,
                 apply_scale,
                 scale,
                 config.precision,
@@ -311,6 +340,8 @@ impl BluesteinAxis {
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
                     precision: config.precision,
+                    workgroup_size: config.workgroup_size,
+                    fused_workgroup_size: config.fused_workgroup_size,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -326,6 +357,8 @@ impl BluesteinAxis {
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
                     precision: config.precision,
+                    workgroup_size: config.workgroup_size,
+                    fused_workgroup_size: config.fused_workgroup_size,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -339,7 +372,7 @@ impl BluesteinAxis {
                     n,
                     stride_complex,
                     m,
-                    WORKGROUP_SIZE,
+                    config.workgroup_size,
                     stage_applies_scale,
                     scale,
                     config.precision,
@@ -365,8 +398,8 @@ impl BluesteinAxis {
             let post_pipeline = cached_bluestein_pipeline(device, &post_key)?;
 
             BluesteinExecution::MultiPass(Box::new(MultiPassBluesteinExecution {
-                workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
-                workgroups_output: (lines_u32 * n as u32).div_ceil(WORKGROUP_SIZE),
+                workgroups_work: total_work_u32.div_ceil(config.workgroup_size),
+                workgroups_output: (lines_u32 * n as u32).div_ceil(config.workgroup_size),
                 pack_pipeline,
                 pack_bind_group_layout,
                 mul_pipeline,
@@ -717,10 +750,33 @@ fn transform_sign(direction: FftDirection) -> f64 {
     }
 }
 
-fn fused_bluestein_supported(m: usize, precision: AxisPrecision, limits: &wgpu::Limits) -> bool {
+fn validate_bluestein_staged_workgroup(
+    config: &BluesteinAxisConfig,
+    limits: &wgpu::Limits,
+) -> Result<()> {
+    if config.workgroup_size > limits.max_compute_invocations_per_workgroup
+        || config.workgroup_size > limits.max_compute_workgroup_size_x
+    {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "bluestein-staged-workgroup",
+            reason: "configured workgroup size exceeds the active device compute limits",
+        });
+    }
+    Ok(())
+}
+
+fn fused_bluestein_supported(
+    m: usize,
+    precision: AxisPrecision,
+    workgroup_size: u32,
+    min_convolution_length: usize,
+    limits: &wgpu::Limits,
+) -> bool {
     fused_bluestein_supported_by_limits(
         m,
         precision,
+        workgroup_size,
+        min_convolution_length,
         u64::from(limits.max_compute_workgroup_storage_size),
         limits.max_compute_invocations_per_workgroup,
         limits.max_compute_workgroup_size_x,
@@ -730,19 +786,22 @@ fn fused_bluestein_supported(m: usize, precision: AxisPrecision, limits: &wgpu::
 pub(crate) fn fused_bluestein_supported_by_limits(
     m: usize,
     precision: AxisPrecision,
+    workgroup_size: u32,
+    min_convolution_length: usize,
     max_workgroup_storage_bytes: u64,
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
 ) -> bool {
-    if m < FUSED_MIN_CONVOLUTION_LENGTH {
+    if m < min_convolution_length {
         return false;
     }
     let Some(scratch_bytes) = m.checked_mul(precision.complex_size_bytes() as usize) else {
         return false;
     };
     scratch_bytes as u64 <= max_workgroup_storage_bytes
-        && FUSED_WORKGROUP_SIZE <= max_invocations_per_workgroup
-        && FUSED_WORKGROUP_SIZE <= max_workgroup_size_x
+        && workgroup_size > 0
+        && workgroup_size <= max_invocations_per_workgroup
+        && workgroup_size <= max_workgroup_size_x
 }
 
 pub(crate) fn bluestein_convolution_length(n: usize) -> Result<usize> {
@@ -1105,12 +1164,12 @@ fn main({entry_params}) {{
             stride = key.stride_complex,
             complex_mul = complex_mul,
             line_base_fn = line_base_fn,
-            workgroup_size = WORKGROUP_SIZE,
+            workgroup_size = key.workgroup_size,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
                 "i",
                 "params.lines * M",
-                WORKGROUP_SIZE,
+                key.workgroup_size,
             ),
         ),
         key.precision,
@@ -1145,12 +1204,12 @@ fn main({entry_params}) {{
 "#,
             m = key.convolution_length,
             complex_mul = complex_mul,
-            workgroup_size = WORKGROUP_SIZE,
+            workgroup_size = key.workgroup_size,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
                 "i",
                 "params.total",
-                WORKGROUP_SIZE
+                key.workgroup_size
             ),
         ),
         key.precision,
@@ -1208,12 +1267,12 @@ fn main({entry_params}) {{
             scale = scale,
             complex_mul = complex_mul,
             line_base_fn = line_base_fn,
-            workgroup_size = WORKGROUP_SIZE,
+            workgroup_size = key.workgroup_size,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
                 "i",
                 "params.lines * N",
-                WORKGROUP_SIZE,
+                key.workgroup_size,
             ),
             scalar = staged_scalar_type(key.precision),
         ),
@@ -1310,6 +1369,8 @@ mod tests {
         assert!(fused_bluestein_supported_by_limits(
             4056,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1317,6 +1378,8 @@ mod tests {
         assert!(!fused_bluestein_supported_by_limits(
             4056,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             16 * 1024,
             256,
             256
@@ -1324,6 +1387,8 @@ mod tests {
         assert!(fused_bluestein_supported_by_limits(
             2016,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             16 * 1024,
             256,
             256
@@ -1331,6 +1396,8 @@ mod tests {
         assert!(!fused_bluestein_supported_by_limits(
             6561,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1338,6 +1405,8 @@ mod tests {
         assert!(!fused_bluestein_supported_by_limits(
             70,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1345,6 +1414,8 @@ mod tests {
         assert!(!fused_bluestein_supported_by_limits(
             4056,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             255
@@ -1352,6 +1423,8 @@ mod tests {
         assert!(fused_bluestein_supported_by_limits(
             3072,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
@@ -1359,9 +1432,20 @@ mod tests {
         assert!(!fused_bluestein_supported_by_limits(
             3073,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
+            DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
             48 * 1024,
             256,
             256
+        ));
+        assert!(fused_bluestein_supported_by_limits(
+            70,
+            AxisPrecision::F32,
+            64,
+            64,
+            48 * 1024,
+            64,
+            64
         ));
     }
 

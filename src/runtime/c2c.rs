@@ -7,7 +7,9 @@ use crate::math::{to_interleaved_f32, DoubleFloat};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
-use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
+#[cfg(test)]
+use crate::runtime::axis_policy::resolve_axis_kinds_for_axes;
+use crate::runtime::axis_policy::{resolve_axis_kinds_for_config, AxisKind};
 use crate::runtime::bluestein_axis::{
     bluestein_bfft, bluestein_chirp, bluestein_convolution_length,
     fused_bluestein_supported_by_limits, BluesteinAxis, BluesteinAxisConfig,
@@ -24,7 +26,8 @@ use crate::runtime::large_graph::{
 use crate::runtime::large_policy::{
     line_bytes_for_axis_len, non_mixed_axis_window_supported,
     resolve_large_routing_policy_with_complex_element_bytes, LargeExecutionKind, LargeFactorSplit,
-    LargePolicyLimits, LargeRouteMode, LargeRoutingPolicy, LargeRoutingPolicyInput,
+    LargePolicyLimits, LargeRouteMode, LargeRoutePreference, LargeRoutingPolicy,
+    LargeRoutingPolicyInput,
 };
 use crate::runtime::logical_io::{FftEndpointFormat, FftLogicalView};
 use crate::runtime::nd_wgsl::{format_wgsl_f32, stride_for_axis, wgsl_line_base_fn};
@@ -37,9 +40,7 @@ use crate::runtime::rader_axis::{
     fused_rader_supported_by_limits, rader_bfft, rader_convolution_length, rader_permutation,
     RaderAxis, RaderAxisConfig,
 };
-use crate::runtime::segmented_volume::{
-    validate_segmented_burst_depth, SegmentedVolumeC2cPlan, DEFAULT_SEGMENTED_BURST_DEPTH,
-};
+use crate::runtime::segmented_volume::{validate_segmented_burst_depth, SegmentedVolumeC2cPlan};
 use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
 };
@@ -51,6 +52,7 @@ use crate::runtime::twiddle::{
     two_level_twiddle_lut_f32,
 };
 use crate::runtime::window_scheduler::{strided_span_elements, WindowScheduler};
+use crate::tuning::{FftLargeRoute, FftTuningErrorKind};
 
 const WORKGROUP_SIZE: u32 = 64;
 const COMPLEX_F32_BYTES: u64 = 8;
@@ -79,8 +81,7 @@ fn extended_precision_route_error(
     }
     let required_bytes = config.required_buffer_size_bytes()?;
     let bytes_per_batch = bytes_per_batch(config)?;
-    let prime_helper_bytes =
-        extended_precision_prime_max_binding_bytes(config, axis_kinds, compute_limits)?;
+    let prime_helper_bytes = prime_max_binding_bytes(config, axis_kinds, compute_limits)?;
     let normal_binding_bytes = required_bytes.max(prime_helper_bytes);
     let needs_large_mode = normal_binding_bytes > limits.max_storage_buffer_binding_size
         || normal_binding_bytes > limits.max_buffer_size;
@@ -138,61 +139,115 @@ fn extended_precision_route_error(
     })
 }
 
-fn extended_precision_prime_max_binding_bytes(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PrimeBindingInventory {
+    max_binding_bytes: u64,
+    fixed_binding_bytes: u64,
+    staged_bytes_per_batch: u64,
+}
+
+fn chunk_batch_cap_for_prime_helpers(
+    inventory: PrimeBindingInventory,
+    limits: LargePolicyLimits,
+) -> Option<usize> {
+    let limit = limits
+        .max_storage_buffer_binding_size
+        .min(limits.max_buffer_size);
+    if inventory.fixed_binding_bytes > limit {
+        return Some(0);
+    }
+    if inventory.staged_bytes_per_batch == 0 {
+        return None;
+    }
+
+    let capacity = limit / inventory.staged_bytes_per_batch;
+    Some(usize::try_from(capacity).unwrap_or(usize::MAX))
+}
+
+fn combine_chunk_batch_caps(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+        (None, None) => None,
+    }
+}
+
+fn prime_max_binding_bytes(
     config: &FftConfig,
     axis_kinds: &[AxisKind],
     compute_limits: &wgpu::Limits,
 ) -> Result<u64> {
+    Ok(prime_binding_inventory(config, axis_kinds, compute_limits)?.max_binding_bytes)
+}
+
+fn prime_binding_inventory(
+    config: &FftConfig,
+    axis_kinds: &[AxisKind],
+    compute_limits: &wgpu::Limits,
+) -> Result<PrimeBindingInventory> {
     let total_complex = config.total_complex_len_u32()? as usize;
     let precision = config.precision();
-    debug_assert_ne!(precision, FftPrecision::F32);
     let axis_precision = precision.into();
     let complex_bytes = precision.complex_size_bytes();
-    config
+    let mut inventory = PrimeBindingInventory::default();
+    for (axis, kind) in config
         .axes()
         .iter()
         .copied()
         .zip(axis_kinds.iter().copied())
-        .try_fold(0u64, |maximum, (axis, kind)| {
-            let n = config.shape()[axis];
-            let m = match kind {
-                AxisKind::Mixed => return Ok(maximum),
-                AxisKind::Rader => rader_convolution_length(n)?,
-                AxisKind::Bluestein => bluestein_convolution_length(n)?,
-            };
-            let fused = match kind {
-                AxisKind::Mixed => false,
-                AxisKind::Rader => fused_rader_supported_by_limits(
-                    m,
-                    axis_precision,
-                    u64::from(compute_limits.max_compute_workgroup_storage_size),
-                    compute_limits.max_compute_invocations_per_workgroup,
-                    compute_limits.max_compute_workgroup_size_x,
-                ),
-                AxisKind::Bluestein => fused_bluestein_supported_by_limits(
-                    m,
-                    axis_precision,
-                    u64::from(compute_limits.max_compute_workgroup_storage_size),
-                    compute_limits.max_compute_invocations_per_workgroup,
-                    compute_limits.max_compute_workgroup_size_x,
-                ),
-            };
-            let helper_complex = if fused {
-                m
-            } else {
-                total_complex
-                    .checked_div(n)
-                    .and_then(|lines| lines.checked_mul(m))
-                    .ok_or(FftError::LengthTooLarge { len: total_complex })?
-            };
-            let helper_bytes = u64::try_from(helper_complex)
-                .ok()
-                .and_then(|value| value.checked_mul(complex_bytes))
-                .ok_or(FftError::LengthTooLarge {
-                    len: helper_complex,
-                })?;
-            Ok(maximum.max(helper_bytes))
-        })
+    {
+        let n = config.shape()[axis];
+        let m = match kind {
+            AxisKind::Mixed => continue,
+            AxisKind::Rader => rader_convolution_length(n)?,
+            AxisKind::Bluestein => bluestein_convolution_length(n)?,
+        };
+        let fused = match kind {
+            AxisKind::Mixed => false,
+            AxisKind::Rader => fused_rader_supported_by_limits(
+                m,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                config.tuning().fused_min_convolution_length(),
+                u64::from(compute_limits.max_compute_workgroup_storage_size),
+                compute_limits.max_compute_invocations_per_workgroup,
+                compute_limits.max_compute_workgroup_size_x,
+            ),
+            AxisKind::Bluestein => fused_bluestein_supported_by_limits(
+                m,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                config.tuning().fused_min_convolution_length(),
+                u64::from(compute_limits.max_compute_workgroup_storage_size),
+                compute_limits.max_compute_invocations_per_workgroup,
+                compute_limits.max_compute_workgroup_size_x,
+            ),
+        };
+        let helper_complex = if fused {
+            m
+        } else {
+            total_complex
+                .checked_div(n)
+                .and_then(|lines| lines.checked_mul(m))
+                .ok_or(FftError::LengthTooLarge { len: total_complex })?
+        };
+        let helper_bytes = u64::try_from(helper_complex)
+            .ok()
+            .and_then(|value| value.checked_mul(complex_bytes))
+            .ok_or(FftError::LengthTooLarge {
+                len: helper_complex,
+            })?;
+        inventory.max_binding_bytes = inventory.max_binding_bytes.max(helper_bytes);
+        if fused {
+            inventory.fixed_binding_bytes = inventory.fixed_binding_bytes.max(helper_bytes);
+        } else {
+            let per_batch = helper_bytes
+                .checked_div(config.batch() as u64)
+                .ok_or(FftError::ZeroBatch)?;
+            inventory.staged_bytes_per_batch = inventory.staged_bytes_per_batch.max(per_batch);
+        }
+    }
+    Ok(inventory)
 }
 
 fn lightweight_four_step_eligible(
@@ -428,6 +483,7 @@ struct RaderBridgeC2cPlan {
     m: usize,
     lines: u64,
     stride_complex: u64,
+    workgroup_size: u32,
     limits: LargePolicyLimits,
     child_forward: Box<C2cPlan>,
     child_inverse: Box<C2cPlan>,
@@ -475,6 +531,7 @@ struct SmoothDecompositionC2cPlan {
     steps: Vec<SmoothExecutionStep>,
     temp_buffer: Option<wgpu::Buffer>,
     axis_twiddle_lut_storage_bytes: u64,
+    workgroup_size: u32,
 }
 
 enum SmoothExecutionStep {
@@ -690,6 +747,31 @@ fn missing_segmented_strided_output_stage_error() -> FftError {
     }
 }
 
+fn forced_route_infeasible(config: &FftConfig, reason: &'static str) -> FftError {
+    FftError::InvalidTuning {
+        kind: FftTuningErrorKind::RouteInfeasible,
+        field: "large_route",
+        value: config.tuning().large_route().as_str().to_owned(),
+        reason,
+    }
+}
+
+fn oversized_forced_rader_axis(
+    config: &FftConfig,
+    limits: LargePolicyLimits,
+) -> Result<Option<usize>> {
+    for &axis in config.tuning().force_rader_axes() {
+        let line_bytes = line_bytes_for_axis_len(
+            config.shape()[axis],
+            config.precision().complex_size_bytes(),
+        )?;
+        if line_bytes > limits.max_storage_buffer_binding_size {
+            return Ok(Some(axis));
+        }
+    }
+    Ok(None)
+}
+
 impl C2cPlan {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {
         Self::new_with_large_policy_limits(device, queue, config, None)
@@ -702,7 +784,12 @@ impl C2cPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Self::new_with_large_policy_limits(device, queue, config, Some(limits))
+        let tuning = config
+            .tuning()
+            .clone()
+            .with_max_storage_buffer_binding_size(Some(limits.max_storage_buffer_binding_size))
+            .with_max_buffer_size(Some(limits.max_buffer_size));
+        Self::new(device, queue, config.with_tuning(tuning))
     }
 
     #[doc(hidden)]
@@ -713,13 +800,13 @@ impl C2cPlan {
         limits: LargePolicyLimits,
         burst_depth: usize,
     ) -> Result<Self> {
-        Self::new_with_large_policy_limits_and_burst_depth(
-            device,
-            queue,
-            config,
-            Some(limits),
-            burst_depth,
-        )
+        let tuning = config
+            .tuning()
+            .clone()
+            .with_max_storage_buffer_binding_size(Some(limits.max_storage_buffer_binding_size))
+            .with_max_buffer_size(Some(limits.max_buffer_size))
+            .with_segmented_burst_depth(burst_depth);
+        Self::new(device, queue, config.with_tuning(tuning))
     }
 
     pub(crate) fn new_with_large_policy_limits(
@@ -728,12 +815,13 @@ impl C2cPlan {
         config: FftConfig,
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
+        let segmented_burst_depth = config.tuning().segmented_burst_depth();
         Self::new_with_large_policy_limits_and_burst_depth(
             device,
             queue,
             config,
             policy_limits,
-            DEFAULT_SEGMENTED_BURST_DEPTH,
+            segmented_burst_depth,
         )
     }
 
@@ -746,15 +834,22 @@ impl C2cPlan {
     ) -> Result<Self> {
         validate_segmented_burst_depth(segmented_burst_depth)?;
         config.validate()?;
+        config.tuning().validate_for_device(&device.limits())?;
         validate_c2c_precision_feature(device, &config)?;
         let device_policy_limits = LargePolicyLimits::from(&device.limits());
+        let tuning_policy_limits = LargePolicyLimits::effective_with_overrides(
+            &device.limits(),
+            config.tuning().max_storage_buffer_binding_size(),
+            config.tuning().max_buffer_size(),
+        );
         let effective_policy_limits = policy_limits
-            .unwrap_or(device_policy_limits)
+            .unwrap_or(tuning_policy_limits)
             .componentwise_min(device_policy_limits);
         let policy_limits = Some(effective_policy_limits);
         let len = config.total_complex_len_u32()?;
         let route = select_route(&config);
-        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        let axis_kinds = resolve_axis_kinds_for_config(&config)?;
+        let oversized_forced_rader = oversized_forced_rader_axis(&config, effective_policy_limits)?;
         extended_precision_route_error(
             &config,
             &axis_kinds,
@@ -763,7 +858,27 @@ impl C2cPlan {
             &device.limits(),
         )?;
         let mut large_routing_policy =
-            resolve_c2c_large_routing_policy(device, &config, &axis_kinds, policy_limits)?;
+            resolve_c2c_large_routing_policy(device, &config, &axis_kinds, policy_limits).map_err(
+                |error| {
+                    if config.tuning().large_route() == FftLargeRoute::Auto {
+                        if let Some(axis) = oversized_forced_rader {
+                            FftError::InvalidTuning {
+                                kind: FftTuningErrorKind::RouteInfeasible,
+                                field: "force_rader_axes",
+                                value: axis.to_string(),
+                                reason: "the required four-step route would replace this oversized Rader axis with Bluestein",
+                            }
+                        } else {
+                            error
+                        }
+                    } else {
+                        forced_route_infeasible(
+                            &config,
+                            "the forced route is infeasible for the active shape, axis algorithms, precision, or device limits",
+                        )
+                    }
+                },
+            )?;
 
         let execution = match large_routing_policy.route_mode() {
             LargeRouteMode::Normal => C2cExecution::Normal(build_route_impl(
@@ -778,120 +893,139 @@ impl C2cPlan {
                 let bytes_per_batch = bytes_per_batch(&config)?;
                 let limits =
                     policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
-                let chunk_plan =
-                    match LargeChunkPlan::new(bytes_per_batch, config.batch() as u64, limits) {
-                        Ok(plan) => plan,
-                        Err(err) => {
-                            if let Some(bridge_route) = large_bridge_route_for(route) {
-                                let bridge_plan = plan_large_bridge(&config, bridge_route, limits)?;
-                                large_routing_policy = large_routing_policy
-                                    .with_execution_kind(match bridge_route {
-                                        LargeBridgeRoute::Rader => LargeExecutionKind::RaderBridge,
-                                        LargeBridgeRoute::Bluestein => {
-                                            LargeExecutionKind::BluesteinBridge
-                                        }
-                                    })
-                                    .with_diagnostics(
-                                        Some(bridge_plan.axis()),
-                                        bridge_plan.factor_splits(),
-                                        bridge_plan.staging_bytes().to_vec(),
-                                        None,
-                                    );
-                                let bridge = LargeBridgeC2cPlan::new(
-                                    device,
-                                    queue,
+                // Staged Rader/Bluestein helpers scale with the child batch count.
+                // Cap chunks so a recursively planned child fits those helper
+                // bindings as well as its input/output binding. Without this cap,
+                // a child can select the same chunk size indefinitely under a
+                // forced small binding limit.
+                let prime_inventory =
+                    prime_binding_inventory(&config, &axis_kinds, &device.limits())?;
+                let helper_batch_cap = chunk_batch_cap_for_prime_helpers(prime_inventory, limits);
+                let chunk_batch_cap = combine_chunk_batch_caps(
+                    config.tuning().large_chunk_max_batches(),
+                    helper_batch_cap,
+                );
+                let chunk_plan = match LargeChunkPlan::new_with_max_batches(
+                    bytes_per_batch,
+                    config.batch() as u64,
+                    limits,
+                    chunk_batch_cap,
+                ) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        if config.tuning().large_route() == FftLargeRoute::ForceChunk {
+                            return Err(forced_route_infeasible(
                                     &config,
-                                    bridge_plan,
-                                    limits,
-                                )?;
-                                let axis_factors = axis_kinds
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, kind)| match kind {
-                                        AxisKind::Mixed => crate::runtime::factor_supported_length(
-                                            config.shape()[config.axes()[index]],
-                                        ),
-                                        AxisKind::Rader | AxisKind::Bluestein => Ok(Vec::new()),
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                let factors = axis_factors.first().cloned().unwrap_or_default();
-                                return Ok(Self {
-                                    config: config.clone(),
-                                    factors,
-                                    axis_factors,
-                                    axis_kinds,
-                                    large_routing_policy,
-                                    route,
-                                    execution: C2cExecution::LargeBridge(bridge),
-                                });
-                            }
-
-                            if route == C2cRoute::AxisSequence {
-                                let sequence =
-                                    LargeAxisSequenceC2cPlan::new(device, queue, &config, limits)?;
-                                large_routing_policy = large_routing_policy
-                                    .with_execution_kind(LargeExecutionKind::AxisDecomposition)
-                                    .with_diagnostics(
-                                        None,
-                                        sequence.factor_splits(),
-                                        sequence.staging_bytes(),
-                                        None,
-                                    );
-                                let axis_factors =
-                                    axis_factors_for_axis_kinds(&config, &axis_kinds)?;
-                                let factors = axis_factors.first().cloned().unwrap_or_default();
-                                return Ok(Self {
-                                    config: config.clone(),
-                                    factors,
-                                    axis_factors,
-                                    axis_kinds,
-                                    large_routing_policy,
-                                    route,
-                                    execution: C2cExecution::LargeAxisSequence(sequence),
-                                });
-                            }
-
-                            if !axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed) {
-                                return Err(err);
-                            }
-
-                            let smooth_plan = SmoothDecompositionPlan::new(&config, limits)?;
+                                    "forced chunk execution requires at least two batches and one whole batch fitting the active binding and buffer limits",
+                                ));
+                        }
+                        if let Some(bridge_route) = large_bridge_route_for(route) {
+                            let bridge_plan = plan_large_bridge(&config, bridge_route, limits)?;
                             large_routing_policy = large_routing_policy
-                                .with_execution_kind(smooth_plan.execution_kind())
+                                .with_execution_kind(match bridge_route {
+                                    LargeBridgeRoute::Rader => LargeExecutionKind::RaderBridge,
+                                    LargeBridgeRoute::Bluestein => {
+                                        LargeExecutionKind::BluesteinBridge
+                                    }
+                                })
                                 .with_diagnostics(
-                                    smooth_plan.selected_axis(),
-                                    smooth_plan.factor_splits(),
-                                    smooth_plan.staging_bytes(),
+                                    Some(bridge_plan.axis()),
+                                    bridge_plan.factor_splits(),
+                                    bridge_plan.staging_bytes().to_vec(),
                                     None,
                                 );
-                            let smooth = SmoothDecompositionC2cPlan::new(
+                            let bridge = LargeBridgeC2cPlan::new(
                                 device,
                                 queue,
                                 &config,
-                                smooth_plan,
+                                bridge_plan,
                                 limits,
                             )?;
+                            let axis_factors = axis_kinds
+                                .iter()
+                                .enumerate()
+                                .map(|(index, kind)| match kind {
+                                    AxisKind::Mixed => crate::runtime::factor_supported_length(
+                                        config.shape()[config.axes()[index]],
+                                    ),
+                                    AxisKind::Rader | AxisKind::Bluestein => Ok(Vec::new()),
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let factors = axis_factors.first().cloned().unwrap_or_default();
                             return Ok(Self {
                                 config: config.clone(),
-                                factors: crate::runtime::factor_supported_length(
-                                    config.shape()[config.axes()[0]],
-                                )?,
-                                axis_factors: config
-                                    .axes()
-                                    .iter()
-                                    .map(|&axis| {
-                                        crate::runtime::factor_supported_length(
-                                            config.shape()[axis],
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>>>()?,
+                                factors,
+                                axis_factors,
                                 axis_kinds,
                                 large_routing_policy,
                                 route,
-                                execution: C2cExecution::SmoothDecomposition(smooth),
+                                execution: C2cExecution::LargeBridge(bridge),
                             });
                         }
-                    };
+
+                        if route == C2cRoute::AxisSequence {
+                            let sequence =
+                                LargeAxisSequenceC2cPlan::new(device, queue, &config, limits)?;
+                            large_routing_policy = large_routing_policy
+                                .with_execution_kind(LargeExecutionKind::AxisDecomposition)
+                                .with_diagnostics(
+                                    None,
+                                    sequence.factor_splits(),
+                                    sequence.staging_bytes(),
+                                    None,
+                                );
+                            let axis_factors = axis_factors_for_axis_kinds(&config, &axis_kinds)?;
+                            let factors = axis_factors.first().cloned().unwrap_or_default();
+                            return Ok(Self {
+                                config: config.clone(),
+                                factors,
+                                axis_factors,
+                                axis_kinds,
+                                large_routing_policy,
+                                route,
+                                execution: C2cExecution::LargeAxisSequence(sequence),
+                            });
+                        }
+
+                        if !axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed) {
+                            return Err(err);
+                        }
+
+                        let smooth_plan = SmoothDecompositionPlan::new(&config, limits)?;
+                        large_routing_policy = large_routing_policy
+                            .with_execution_kind(smooth_plan.execution_kind())
+                            .with_diagnostics(
+                                smooth_plan.selected_axis(),
+                                smooth_plan.factor_splits(),
+                                smooth_plan.staging_bytes(),
+                                None,
+                            );
+                        let smooth = SmoothDecompositionC2cPlan::new(
+                            device,
+                            queue,
+                            &config,
+                            smooth_plan,
+                            limits,
+                        )?;
+                        return Ok(Self {
+                            config: config.clone(),
+                            factors: crate::runtime::factor_supported_length(
+                                config.shape()[config.axes()[0]],
+                            )?,
+                            axis_factors: config
+                                .axes()
+                                .iter()
+                                .map(|&axis| {
+                                    crate::runtime::factor_supported_length(config.shape()[axis])
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                            axis_kinds,
+                            large_routing_policy,
+                            route,
+                            execution: C2cExecution::SmoothDecomposition(smooth),
+                        });
+                    }
+                };
                 large_routing_policy = large_routing_policy.with_diagnostics(
                     None,
                     Vec::new(),
@@ -900,7 +1034,14 @@ impl C2cPlan {
                 );
                 let child_batch = usize::try_from(chunk_plan.chunk_batch_count())
                     .map_err(|_| FftError::LengthTooLarge { len: usize::MAX })?;
-                let child_config = config.clone().with_batch(child_batch);
+                let child_tuning = config
+                    .tuning()
+                    .clone()
+                    .with_large_route(FftLargeRoute::Auto);
+                let child_config = config
+                    .clone()
+                    .with_batch(child_batch)
+                    .with_tuning(child_tuning);
                 let child = Box::new(Self::new_with_large_policy_limits(
                     device,
                     queue,
@@ -941,12 +1082,46 @@ impl C2cPlan {
             LargeRouteMode::LargeOutOfCore => {
                 let limits =
                     policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
-                if config.required_buffer_size_bytes()? > limits.max_buffer_size {
+                let required_bytes = config.required_buffer_size_bytes()?;
+                let use_segmented = match config.tuning().large_route() {
+                    FftLargeRoute::ForceFourStep => {
+                        if required_bytes > limits.max_buffer_size {
+                            return Err(forced_route_infeasible(
+                                &config,
+                                "forced four-step execution requires the complete dataset to fit max_buffer_size",
+                            ));
+                        }
+                        false
+                    }
+                    FftLargeRoute::ForceSegmented => {
+                        if required_bytes <= limits.max_buffer_size {
+                            return Err(forced_route_infeasible(
+                                &config,
+                                "forced segmented execution requires the dataset to exceed max_buffer_size",
+                            ));
+                        }
+                        true
+                    }
+                    FftLargeRoute::Auto => required_bytes > limits.max_buffer_size,
+                    FftLargeRoute::ForceChunk => {
+                        return Err(forced_route_infeasible(
+                            &config,
+                            "forced chunk execution did not resolve to the chunk route",
+                        ));
+                    }
+                };
+                if use_segmented {
                     if let Some((index, kind)) = axis_kinds
                         .iter()
                         .enumerate()
                         .find(|(_, kind)| **kind != AxisKind::Mixed)
                     {
+                        if config.tuning().large_route() == FftLargeRoute::ForceSegmented {
+                            return Err(forced_route_infeasible(
+                                &config,
+                                "forced segmented execution currently requires every selected axis to be smooth-radix",
+                            ));
+                        }
                         let axis = config.axes()[index];
                         return Err(FftError::UnsupportedAxisKind {
                             axis,
@@ -1398,6 +1573,7 @@ impl C2cPlan {
                 self.logical_complex_len_u32()?,
                 self.config.batch() as u32,
                 self.config.precision().into(),
+                self.config.tuning().workgroup_size(),
             )?;
             Some(buffer)
         };
@@ -1469,6 +1645,7 @@ impl C2cPlan {
                     self.logical_complex_len_u32()?,
                     self.config.batch() as u32,
                     self.config.precision().into(),
+                    self.config.tuning().workgroup_size(),
                 )?;
                 if let Some(physical_stage) = output_physical_stage.as_ref() {
                     copy_buffer_to_view(
@@ -1692,12 +1869,20 @@ impl LargeAxisSequenceC2cPlan {
         limits: LargePolicyLimits,
     ) -> Result<Self> {
         let required_buffer_size_bytes = config.required_buffer_size_bytes()?;
+        validate_large_axis_sequence_temp_size(
+            config.axes().len(),
+            required_buffer_size_bytes,
+            limits.max_buffer_size,
+        )?;
         let mut children = Vec::with_capacity(config.axes().len());
-        for (axis_index, &axis) in config.axes().iter().enumerate() {
+        let axis_kinds = resolve_axis_kinds_for_config(config)?;
+        for (axis_index, (&axis, &axis_kind)) in config.axes().iter().zip(&axis_kinds).enumerate() {
             let final_axis = axis_index + 1 == config.axes().len();
+            let child_tuning = tuning_for_axis_child(config, axis, axis_kind);
             let child_config = config
                 .clone()
                 .with_axes([axis])
+                .with_tuning(child_tuning)
                 .with_normalization(if final_axis {
                     config.normalization()
                 } else {
@@ -1873,6 +2058,38 @@ impl LargeAxisSequenceC2cPlan {
                 }
             }
         }
+    }
+}
+
+fn validate_large_axis_sequence_temp_size(
+    axis_count: usize,
+    required_buffer_size_bytes: u64,
+    max_buffer_size: u64,
+) -> Result<()> {
+    if axis_count > 1 && required_buffer_size_bytes > max_buffer_size {
+        return Err(FftError::HelperBufferTooLarge {
+            helper_buffer: "large-axis-sequence-temp",
+            requested_bytes: required_buffer_size_bytes,
+            max_buffer_size,
+        });
+    }
+    Ok(())
+}
+
+fn tuning_for_axis_child(
+    config: &FftConfig,
+    axis: usize,
+    axis_kind: AxisKind,
+) -> crate::tuning::FftTuning {
+    let child = config.tuning().for_internal_child();
+    match axis_kind {
+        AxisKind::Rader if config.tuning().force_rader_axes().contains(&axis) => {
+            child.with_force_rader_axes([axis])
+        }
+        AxisKind::Bluestein if config.tuning().force_bluestein_axes().contains(&axis) => {
+            child.with_force_bluestein_axes([axis])
+        }
+        AxisKind::Mixed | AxisKind::Rader | AxisKind::Bluestein => child,
     }
 }
 
@@ -2351,6 +2568,7 @@ impl RaderBridgeC2cPlan {
         let lines = plan.line_count();
         let stride_complex = stride_for_axis(config.shape(), axis) as u64;
         let scale = config.scale()?;
+        let workgroup_size = config.tuning().workgroup_size();
         let keys = BridgePipelineKeys::rader(
             config.shape().len(),
             axis,
@@ -2358,6 +2576,7 @@ impl RaderBridgeC2cPlan {
             n,
             stride_complex as usize,
             m,
+            workgroup_size,
             (scale - 1.0).abs() > f32::EPSILON,
             scale,
         );
@@ -2407,7 +2626,8 @@ impl RaderBridgeC2cPlan {
             queue,
             FftConfig::new(m)
                 .with_direction(FftDirection::Forward)
-                .with_normalization(Normalization::None),
+                .with_normalization(Normalization::None)
+                .with_tuning(config.tuning().for_internal_child()),
             Some(limits),
         )?);
         let child_inverse = Box::new(C2cPlan::new_with_large_policy_limits(
@@ -2415,7 +2635,8 @@ impl RaderBridgeC2cPlan {
             queue,
             FftConfig::new(m)
                 .with_direction(FftDirection::Inverse)
-                .with_normalization(Normalization::Inverse),
+                .with_normalization(Normalization::Inverse)
+                .with_tuning(config.tuning().for_internal_child()),
             Some(limits),
         )?);
 
@@ -2427,6 +2648,7 @@ impl RaderBridgeC2cPlan {
             m,
             lines,
             stride_complex,
+            workgroup_size,
             limits,
             child_forward,
             child_inverse,
@@ -2535,8 +2757,10 @@ impl RaderBridgeC2cPlan {
         let base = line_base_complex(&self.shape, self.axis, line)?;
         let mut t_offset = 0u64;
         while t_offset < self.n as u64 {
-            let t_count = (self.n as u64 - t_offset)
-                .min(self.max_complex_window().min(u64::from(WORKGROUP_SIZE)));
+            let t_count = (self.n as u64 - t_offset).min(
+                self.max_complex_window()
+                    .min(u64::from(self.workgroup_size)),
+            );
             let input_first =
                 checked_add_u64(base, checked_mul_u64(t_offset, self.stride_complex)?)?;
             let input_span = strided_span_elements(t_count, self.stride_complex)?;
@@ -2797,6 +3021,7 @@ impl BluesteinBridgeC2cPlan {
         let lines = plan.line_count();
         let stride_complex = stride_for_axis(config.shape(), axis) as u64;
         let scale = config.scale()?;
+        let workgroup_size = config.tuning().workgroup_size();
         let keys = BridgePipelineKeys::bluestein(
             config.shape().len(),
             axis,
@@ -2804,6 +3029,7 @@ impl BluesteinBridgeC2cPlan {
             n,
             stride_complex as usize,
             m,
+            workgroup_size,
             (scale - 1.0).abs() > f32::EPSILON,
             scale,
         );
@@ -2842,7 +3068,8 @@ impl BluesteinBridgeC2cPlan {
             queue,
             FftConfig::new(m)
                 .with_direction(FftDirection::Forward)
-                .with_normalization(Normalization::None),
+                .with_normalization(Normalization::None)
+                .with_tuning(config.tuning().for_internal_child()),
             Some(limits),
         )?);
         let child_inverse = Box::new(C2cPlan::new_with_large_policy_limits(
@@ -2850,7 +3077,8 @@ impl BluesteinBridgeC2cPlan {
             queue,
             FftConfig::new(m)
                 .with_direction(FftDirection::Inverse)
-                .with_normalization(Normalization::Inverse),
+                .with_normalization(Normalization::Inverse)
+                .with_tuning(config.tuning().for_internal_child()),
             Some(limits),
         )?);
 
@@ -3061,6 +3289,7 @@ impl BridgePipelineKeys {
         n: usize,
         stride_complex: usize,
         m: usize,
+        workgroup_size: u32,
         apply_scale: bool,
         scale: f32,
     ) -> Self {
@@ -3073,7 +3302,7 @@ impl BridgePipelineKeys {
                 n,
                 stride_complex,
                 m,
-                WORKGROUP_SIZE,
+                workgroup_size,
                 apply_scale,
                 scale,
             ))
@@ -3099,6 +3328,7 @@ impl BridgePipelineKeys {
         n: usize,
         stride_complex: usize,
         m: usize,
+        workgroup_size: u32,
         apply_scale: bool,
         scale: f32,
     ) -> Self {
@@ -3111,7 +3341,7 @@ impl BridgePipelineKeys {
                 n,
                 stride_complex,
                 m,
-                WORKGROUP_SIZE,
+                workgroup_size,
                 apply_scale,
                 scale,
             ))
@@ -3168,11 +3398,15 @@ fn build_smooth_phase_execution(
             AxisPlan::new_with_twiddle_lut_pool(device, queue, config, twiddle_lut_pool)?,
         ));
     }
+    let child_tuning = crate::tuning::FftTuning::new()
+        .with_workgroup_size(config.workgroup_size)
+        .with_fused_workgroup_size(config.fused_workgroup_size);
     let c2c_config = FftConfig::new_nd(config.shape.clone())
         .with_axes(config.axes.clone())
         .with_direction(config.direction)
         .with_normalization(config.normalization)
-        .with_batch(config.batch);
+        .with_batch(config.batch)
+        .with_tuning(child_tuning);
     Ok(SmoothPhaseExecution::C2c(Box::new(
         C2cPlan::new_with_large_policy_limits(device, queue, c2c_config, Some(limits))?,
     )))
@@ -3212,6 +3446,8 @@ impl SmoothDecompositionC2cPlan {
                             },
                             layout: AxisLayout::Interleaved,
                             precision: AxisPrecision::F32,
+                            workgroup_size: config.tuning().workgroup_size(),
+                            fused_workgroup_size: config.tuning().fused_workgroup_size(),
                         },
                         &mut twiddle_lut_pool,
                     )?;
@@ -3244,6 +3480,8 @@ impl SmoothDecompositionC2cPlan {
                         scale_override_bits: None,
                         layout: AxisLayout::Interleaved,
                         precision: AxisPrecision::F32,
+                        workgroup_size: config.tuning().workgroup_size(),
+                        fused_workgroup_size: config.tuning().fused_workgroup_size(),
                     };
                     let phase1 = build_smooth_phase_execution(
                         device,
@@ -3262,6 +3500,8 @@ impl SmoothDecompositionC2cPlan {
                         scale_override_bits: None,
                         layout: AxisLayout::Interleaved,
                         precision: AxisPrecision::F32,
+                        workgroup_size: config.tuning().workgroup_size(),
+                        fused_workgroup_size: config.tuning().fused_workgroup_size(),
                     };
                     let phase2 = build_smooth_phase_execution(
                         device,
@@ -3349,6 +3589,7 @@ impl SmoothDecompositionC2cPlan {
             steps,
             temp_buffer,
             axis_twiddle_lut_storage_bytes,
+            workgroup_size: config.tuning().workgroup_size(),
         })
     }
 
@@ -3416,10 +3657,24 @@ impl SmoothDecompositionC2cPlan {
             let dst = self.resolve_buffer(dst_slot, exec_input.clone(), exec_output.clone())?;
             match step {
                 SmoothExecutionStep::Mixed(step) => {
-                    step.execute(device, encoder, self.plan.shape(), src, dst)?;
+                    step.execute(
+                        device,
+                        encoder,
+                        self.plan.shape(),
+                        src,
+                        dst,
+                        self.workgroup_size,
+                    )?;
                 }
                 SmoothExecutionStep::Smooth(step) => {
-                    step.execute(device, encoder, self.plan.shape(), src, dst)?;
+                    step.execute(
+                        device,
+                        encoder,
+                        self.plan.shape(),
+                        src,
+                        dst,
+                        self.workgroup_size,
+                    )?;
                 }
             }
 
@@ -3476,6 +3731,7 @@ impl MixedAxisExecution {
         shape: &[usize],
         input: BufferView<'_>,
         output: BufferView<'_>,
+        workgroup_size: u32,
     ) -> Result<()> {
         for line in 0..self.step.line_count() {
             let base = line_base_complex(shape, self.step.axis(), line)?;
@@ -3488,6 +3744,7 @@ impl MixedAxisExecution {
                 base,
                 self.step.stride(),
                 self.step.len(),
+                workgroup_size,
             )?;
             self.plan.execute_views(
                 device,
@@ -3504,6 +3761,7 @@ impl MixedAxisExecution {
                 base,
                 self.step.stride(),
                 self.step.len(),
+                workgroup_size,
             )?;
         }
         Ok(())
@@ -3518,6 +3776,7 @@ impl SmoothAxisExecution {
         shape: &[usize],
         input: BufferView<'_>,
         output: BufferView<'_>,
+        workgroup_size: u32,
     ) -> Result<()> {
         let inner = self.step.inner();
         let outer = self.step.outer();
@@ -3544,6 +3803,7 @@ impl SmoothAxisExecution {
                             chunk_outer,
                             offset_start: n1_start,
                         },
+                        workgroup_size,
                     )?;
                     self.phase1.execute_views(
                         device,
@@ -3576,6 +3836,7 @@ impl SmoothAxisExecution {
                             lut_shift: self.twiddle_shift,
                             lut_mask: self.twiddle_mask,
                         },
+                        workgroup_size,
                     )?;
                 }
                 self.phase2.execute_views(
@@ -3601,6 +3862,7 @@ impl SmoothAxisExecution {
                         chunk_outer,
                         offset_start: k1_start,
                     },
+                    workgroup_size,
                 )?;
             }
         }
@@ -5590,7 +5852,9 @@ fn resolve_c2c_large_routing_policy(
     policy_limits: Option<LargePolicyLimits>,
 ) -> Result<LargeRoutingPolicy> {
     let required = config.required_buffer_size_bytes()?;
-    let required_bindings = [required, required];
+    let prime_inventory = prime_binding_inventory(config, axis_kinds, &device.limits())?;
+    let prime_helper_bytes = prime_inventory.max_binding_bytes;
+    let required_bindings = [required, required, prime_helper_bytes];
     let axis_lengths = config
         .axes()
         .iter()
@@ -5600,7 +5864,9 @@ fn resolve_c2c_large_routing_policy(
         .iter()
         .map(|&len| line_bytes_for_axis_len(len, config.precision().complex_size_bytes()))
         .collect::<Result<Vec<_>>>()?;
-    let bytes_per_batch = bytes_per_batch(config)?;
+    let bytes_per_batch = bytes_per_batch(config)?
+        .max(prime_inventory.fixed_binding_bytes)
+        .max(prime_inventory.staged_bytes_per_batch);
     let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
     let four_step_supported =
         four_step_route_shape_supported(
@@ -5622,6 +5888,13 @@ fn resolve_c2c_large_routing_policy(
             allow_out_of_core: four_step_supported,
             rank: config.shape().len(),
             bytes_per_batch: Some(bytes_per_batch),
+            requested_large_route: match config.tuning().large_route() {
+                FftLargeRoute::Auto => LargeRoutePreference::Auto,
+                FftLargeRoute::ForceChunk => LargeRoutePreference::Chunk,
+                FftLargeRoute::ForceFourStep | FftLargeRoute::ForceSegmented => {
+                    LargeRoutePreference::OutOfCore
+                }
+            },
             ..LargeRoutingPolicyInput::new(limits, &[])
         },
         config.precision().complex_size_bytes(),
@@ -5638,6 +5911,12 @@ fn four_step_axis_resources_supported(
         |((&axis, &kind), &bytes)| match kind {
             AxisKind::Mixed => true,
             AxisKind::Rader | AxisKind::Bluestein => {
+                if kind == AxisKind::Rader
+                    && bytes > limits.max_storage_buffer_binding_size
+                    && config.tuning().force_rader_axes().contains(&axis)
+                {
+                    return false;
+                }
                 let route =
                     if kind == AxisKind::Rader && bytes > limits.max_storage_buffer_binding_size {
                         LargeBridgeRoute::Bluestein
@@ -5836,6 +6115,7 @@ fn dispatch_c2c_axis_line_copy_blocks(
     base: u64,
     stride: u64,
     len: u64,
+    workgroup_size: u32,
 ) -> Result<()> {
     let mut done = 0u64;
     while done < len {
@@ -5859,6 +6139,7 @@ fn dispatch_c2c_axis_line_copy_blocks(
                 output_base,
                 stride: u64_to_u32(stride)?,
             },
+            workgroup_size,
         )?;
         done += count;
     }
@@ -5901,6 +6182,7 @@ fn dispatch_c2c_smooth_chunk_copy_blocks(
     input: &BufferView<'_>,
     output: &BufferView<'_>,
     request: SmoothChunkCopyRequest,
+    workgroup_size: u32,
 ) -> Result<()> {
     match smooth_chunk_copy_direction(kind)? {
         SmoothChunkCopyDirection::GatherPhase1 => {
@@ -5950,6 +6232,7 @@ fn dispatch_c2c_smooth_chunk_copy_blocks(
                         _pad1: 0,
                         _pad2: 0,
                     },
+                    workgroup_size,
                 )?;
                 n2_start += n2_count;
             }
@@ -6001,6 +6284,7 @@ fn dispatch_c2c_smooth_chunk_copy_blocks(
                         _pad1: 0,
                         _pad2: 0,
                     },
+                    workgroup_size,
                 )?;
                 k2_start += k2_count;
             }
@@ -6288,7 +6572,7 @@ fn dispatch_bridge_kernel(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        work_items.div_ceil(WORKGROUP_SIZE),
+        work_items.div_ceil(bridge_shader_key.workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -6352,6 +6636,7 @@ fn dispatch_c2c_smooth_axis_line_copy(
     input: &BufferView<'_>,
     output: &BufferView<'_>,
     params: SmoothAxisLineCopyParams,
+    workgroup_size: u32,
 ) -> Result<()> {
     dispatch_c2c_smooth_copy_pipeline(
         device,
@@ -6361,6 +6646,7 @@ fn dispatch_c2c_smooth_axis_line_copy(
         output,
         bytemuck::bytes_of(&params),
         params.total_complex,
+        workgroup_size,
     )
 }
 
@@ -6371,6 +6657,7 @@ fn dispatch_c2c_smooth_axis_chunk_copy(
     input: &BufferView<'_>,
     output: &BufferView<'_>,
     params: SmoothAxisChunkCopyParams,
+    workgroup_size: u32,
 ) -> Result<()> {
     dispatch_c2c_smooth_copy_pipeline(
         device,
@@ -6380,6 +6667,7 @@ fn dispatch_c2c_smooth_axis_chunk_copy(
         output,
         bytemuck::bytes_of(&params),
         params.total_complex,
+        workgroup_size,
     )
 }
 
@@ -6391,11 +6679,12 @@ fn dispatch_c2c_smooth_copy_pipeline(
     output: &BufferView<'_>,
     params_bytes: &[u8],
     work_items: u32,
+    workgroup_size: u32,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let input_resource = scheduler.storage_binding_resource(input, ElementFormat::ComplexF32)?;
     let output_resource = scheduler.storage_binding_resource(output, ElementFormat::ComplexF32)?;
-    let shader_key = C2cSmoothStageKey::new(kind, WORKGROUP_SIZE);
+    let shader_key = C2cSmoothStageKey::new(kind, workgroup_size);
     let pipeline_key = ComputePipelineCacheKey::c2c_smooth_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
         cache.get_bind_group_layout(device, PipelineLayoutCacheKey::C2cSmoothBinaryF32)
@@ -6442,7 +6731,7 @@ fn dispatch_c2c_smooth_copy_pipeline(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        work_items.div_ceil(WORKGROUP_SIZE),
+        work_items.div_ceil(workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -6457,6 +6746,7 @@ fn dispatch_c2c_smooth_twiddle_transpose(
     twiddle_coarse: &wgpu::Buffer,
     twiddle_fine: &wgpu::Buffer,
     params: SmoothTwiddleParams,
+    workgroup_size: u32,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let input_resource = scheduler.storage_binding_resource(input, ElementFormat::ComplexF32)?;
@@ -6468,7 +6758,7 @@ fn dispatch_c2c_smooth_twiddle_transpose(
     let fine_resource =
         scheduler.storage_binding_resource(&fine_view, ElementFormat::ComplexF32)?;
 
-    let shader_key = C2cSmoothStageKey::new(C2cSmoothKernelKind::TwiddleTranspose, WORKGROUP_SIZE);
+    let shader_key = C2cSmoothStageKey::new(C2cSmoothKernelKind::TwiddleTranspose, workgroup_size);
     let pipeline_key = ComputePipelineCacheKey::c2c_smooth_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
         cache.get_bind_group_layout(device, pipeline_key.layout)
@@ -6522,7 +6812,7 @@ fn dispatch_c2c_smooth_twiddle_transpose(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        params.total_complex.div_ceil(WORKGROUP_SIZE),
+        params.total_complex.div_ceil(workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -6569,13 +6859,14 @@ fn dispatch_c2c_strided_copy(
     logical_per_batch: u32,
     batch: u32,
     precision: AxisPrecision,
+    workgroup_size: u32,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let element_format = precision.element_format();
     let input_resource = scheduler.storage_binding_resource(input, element_format)?;
     let output_resource = scheduler.storage_binding_resource(output, element_format)?;
 
-    let shader_key = C2cStridedStageKey::new(kind, WORKGROUP_SIZE, precision);
+    let shader_key = C2cStridedStageKey::new(kind, workgroup_size, precision);
     let pipeline_key = ComputePipelineCacheKey::c2c_strided_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
         cache.get_bind_group_layout(device, pipeline_key.layout)
@@ -6637,7 +6928,7 @@ fn dispatch_c2c_strided_copy(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        total_complex.div_ceil(WORKGROUP_SIZE),
+        total_complex.div_ceil(workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -7103,7 +7394,7 @@ pub fn select_route(config: &FftConfig) -> C2cRoute {
         return C2cRoute::DirectDft;
     }
 
-    if let Ok(axis_kinds) = resolve_axis_kinds_for_axes(config.shape(), config.axes()) {
+    if let Ok(axis_kinds) = resolve_axis_kinds_for_config(config) {
         if axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed) {
             return C2cRoute::MixedRadix;
         }
@@ -7133,6 +7424,8 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
         scale_override_bits: None,
         layout: crate::runtime::axis_plan::AxisLayout::Interleaved,
         precision: config.precision().into(),
+        workgroup_size: config.tuning().workgroup_size(),
+        fused_workgroup_size: config.tuning().fused_workgroup_size(),
     }
 }
 
@@ -7148,6 +7441,9 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
             Normalization::None
         },
         precision: config.precision().into(),
+        workgroup_size: config.tuning().workgroup_size(),
+        fused_workgroup_size: config.tuning().fused_workgroup_size(),
+        fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
     }
 }
 
@@ -7167,6 +7463,9 @@ fn bluestein_config_for_axis(
             Normalization::None
         },
         precision: config.precision().into(),
+        workgroup_size: config.tuning().workgroup_size(),
+        fused_workgroup_size: config.tuning().fused_workgroup_size(),
+        fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
     }
 }
 
@@ -7592,6 +7891,126 @@ mod tests {
     }
 
     #[test]
+    fn prime_binding_inventory_tracks_the_configured_fusion_floor() {
+        let compute_limits = wgpu::Limits::default();
+        let fused = FftConfig::new(101).with_batch(10);
+        let staged = fused.clone().with_tuning(
+            crate::tuning::FftTuning::default().with_fused_min_convolution_length(usize::MAX),
+        );
+        let kinds = [AxisKind::Rader];
+        let m = rader_convolution_length(101).unwrap();
+        assert_eq!(
+            prime_max_binding_bytes(&fused, &kinds, &compute_limits).unwrap(),
+            (m * 8) as u64
+        );
+        assert_eq!(
+            prime_max_binding_bytes(&staged, &kinds, &compute_limits).unwrap(),
+            (10 * m * 8) as u64
+        );
+        assert_eq!(
+            prime_binding_inventory(&fused, &kinds, &compute_limits)
+                .unwrap()
+                .fixed_binding_bytes,
+            (m * 8) as u64
+        );
+        assert_eq!(
+            prime_binding_inventory(&fused, &kinds, &compute_limits)
+                .unwrap()
+                .staged_bytes_per_batch,
+            0
+        );
+        assert_eq!(
+            prime_binding_inventory(&staged, &kinds, &compute_limits)
+                .unwrap()
+                .staged_bytes_per_batch,
+            (m * 8) as u64
+        );
+    }
+
+    #[test]
+    fn staged_prime_helpers_cap_large_chunks_before_recursive_planning() {
+        let inventory = PrimeBindingInventory {
+            max_binding_bytes: 5 * 256,
+            fixed_binding_bytes: 0,
+            staged_bytes_per_batch: 256,
+        };
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 272,
+            max_buffer_size: 4096,
+        };
+        assert_eq!(
+            chunk_batch_cap_for_prime_helpers(inventory, limits),
+            Some(1)
+        );
+        assert_eq!(combine_chunk_batch_caps(Some(3), Some(1)), Some(1));
+
+        let fixed = PrimeBindingInventory {
+            max_binding_bytes: 512,
+            fixed_binding_bytes: 512,
+            staged_bytes_per_batch: 0,
+        };
+        assert_eq!(chunk_batch_cap_for_prime_helpers(fixed, limits), Some(0));
+    }
+
+    #[test]
+    fn large_axis_sequence_temp_respects_the_effective_buffer_cap() {
+        assert!(validate_large_axis_sequence_temp_size(2, 1_024, 1_024).is_ok());
+        assert!(matches!(
+            validate_large_axis_sequence_temp_size(2, 1_025, 1_024),
+            Err(FftError::HelperBufferTooLarge {
+                helper_buffer: "large-axis-sequence-temp",
+                requested_bytes: 1_025,
+                max_buffer_size: 1_024,
+            })
+        ));
+        assert!(validate_large_axis_sequence_temp_size(1, 1_025, 1_024).is_ok());
+    }
+
+    #[test]
+    fn narrowed_axis_children_keep_only_their_resolved_forcing() {
+        let config = FftConfig::new_nd([17, 34]).with_tuning(
+            crate::tuning::FftTuning::default()
+                .with_force_rader_axes([0])
+                .with_force_bluestein_axes([1]),
+        );
+        for (axis, kind) in [(0, AxisKind::Rader), (1, AxisKind::Bluestein)] {
+            let child = config
+                .clone()
+                .with_axes([axis])
+                .with_tuning(tuning_for_axis_child(&config, axis, kind));
+            child.validate().unwrap();
+            assert_eq!(resolve_axis_kinds_for_config(&child).unwrap(), [kind]);
+        }
+
+        let auto_rader = FftConfig::new_nd([101, 34])
+            .with_tuning(crate::tuning::FftTuning::default().with_force_bluestein_axes([1]));
+        let auto_child_tuning = tuning_for_axis_child(&auto_rader, 0, AxisKind::Rader);
+        assert!(auto_child_tuning.force_rader_axes().is_empty());
+        assert!(FftConfig::new_nd([101, 34])
+            .with_axes([0])
+            .with_tuning(auto_child_tuning)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn forced_rader_rejects_oversized_lines_instead_of_switching_algorithms() {
+        let config = FftConfig::new(101)
+            .with_tuning(crate::tuning::FftTuning::default().with_force_rader_axes([0]));
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 512,
+            max_buffer_size: 4096,
+        };
+        assert_eq!(oversized_forced_rader_axis(&config, limits), Ok(Some(0)));
+        assert!(!four_step_axis_resources_supported(
+            &config,
+            &[AxisKind::Rader],
+            &[101 * 8],
+            limits,
+        ));
+    }
+
+    #[test]
     fn phase_c_f64_boundary_allows_normal_routes_and_gates_deferred_resources() {
         let compute_limits = wgpu::Limits::default();
         let normal = FftConfig::new(8).with_precision(FftPrecision::F64);
@@ -7937,6 +8356,52 @@ mod tests {
         assert!(smooth.contains("exponent >> params.lut_shift"));
         assert!(!smooth.contains("sin("));
         assert!(!smooth.contains("cos("));
+    }
+
+    #[test]
+    fn staged_helper_shader_keys_use_configured_workgroup_size() {
+        let keys = BridgePipelineKeys::rader(2, 1, &[3, 17], 17, 1, 32, 128, false, 1.0);
+        for pipeline_key in [
+            keys.rader_sum_init.as_ref().unwrap(),
+            keys.rader_sum_accumulate.as_ref().unwrap(),
+            keys.rader_pack.as_ref().unwrap(),
+            keys.rader_mul.as_ref().unwrap(),
+            keys.rader_write_y0.as_ref().unwrap(),
+            keys.rader_post.as_ref().unwrap(),
+        ] {
+            let ShaderCacheKey::BridgeStage(shader_key) = &pipeline_key.shader else {
+                panic!("bridge helper did not use a bridge shader key");
+            };
+            assert_eq!(shader_key.workgroup_size, 128);
+            assert!(generate_bridge_wgsl_for_key(shader_key)
+                .contains("@compute @workgroup_size(128, 1, 1)"));
+        }
+
+        let default_keys =
+            BridgePipelineKeys::bluestein(1, 0, &[17], 17, 1, 32, WORKGROUP_SIZE, false, 1.0);
+        let default_key = default_keys.bluestein_pack.as_ref().unwrap();
+        let expected_default = ComputePipelineCacheKey::bridge_stage(BridgeStageKey::new(
+            BridgeKernelKind::BluesteinPack,
+            1,
+            0,
+            &[17],
+            17,
+            1,
+            32,
+            WORKGROUP_SIZE,
+            false,
+            1.0,
+        ));
+        assert_eq!(default_key.stable_key(), expected_default.stable_key());
+
+        let smooth_key = C2cSmoothStageKey::new(C2cSmoothKernelKind::GatherAxisLine, 128);
+        assert!(generate_c2c_smooth_wgsl_for_key(&smooth_key)
+            .contains("@compute @workgroup_size(128, 1, 1)"));
+
+        let strided_key =
+            C2cStridedStageKey::new(C2cStridedKernelKind::Pack, 128, AxisPrecision::Df64);
+        assert!(generate_c2c_strided_wgsl_for_key(&strided_key)
+            .contains("@compute @workgroup_size(128, 1, 1)"));
     }
 
     #[test]

@@ -18,10 +18,20 @@ pub(crate) struct LargeChunkRange {
 }
 
 impl LargeChunkPlan {
+    #[cfg(test)]
     pub(crate) fn new(
         bytes_per_batch: u64,
         batch_count: u64,
         limits: LargePolicyLimits,
+    ) -> Result<Self> {
+        Self::new_with_max_batches(bytes_per_batch, batch_count, limits, None)
+    }
+
+    pub(crate) fn new_with_max_batches(
+        bytes_per_batch: u64,
+        batch_count: u64,
+        limits: LargePolicyLimits,
+        max_batches: Option<usize>,
     ) -> Result<Self> {
         if batch_count <= 1 {
             return Err(FftError::LargeChunkUnsupported {
@@ -52,9 +62,24 @@ impl LargeChunkPlan {
             });
         }
 
+        let max_batches = match max_batches {
+            Some(0) => {
+                return Err(FftError::LargeChunkUnsupported {
+                    reason: "large chunk max batches must be at least one",
+                    bytes_per_batch,
+                    max_bind_bytes: limits.max_storage_buffer_binding_size,
+                });
+            }
+            Some(value) => u64::try_from(value).unwrap_or(u64::MAX),
+            None => u64::MAX,
+        };
+
         let bind_capacity = limits.max_storage_buffer_binding_size / bytes_per_batch;
         let buffer_capacity = limits.max_buffer_size / bytes_per_batch;
-        let chunk_batch_count = bind_capacity.min(buffer_capacity).min(batch_count);
+        let chunk_batch_count = bind_capacity
+            .min(buffer_capacity)
+            .min(batch_count)
+            .min(max_batches);
         if chunk_batch_count == 0 {
             return Err(FftError::LargeChunkUnsupported {
                 reason: "no batch chunk can fit within the active device limits",
@@ -202,6 +227,35 @@ mod tests {
                     byte_size: 128,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn optional_batch_cap_limits_chunk_size_without_changing_default() {
+        let uncapped = LargeChunkPlan::new(128, 7, limits(1024)).unwrap();
+        let capped = LargeChunkPlan::new_with_max_batches(128, 7, limits(1024), Some(3)).unwrap();
+        assert_eq!(uncapped.chunk_batch_count(), 7);
+        assert_eq!(uncapped.staging_size_bytes(), 896);
+        assert_eq!(capped.chunk_batch_count(), 3);
+        assert_eq!(capped.staging_size_bytes(), 384);
+        assert_eq!(
+            capped
+                .ranges()
+                .map(|range| range.unwrap().batch_count)
+                .collect::<Vec<_>>(),
+            [3, 3, 1]
+        );
+    }
+
+    #[test]
+    fn zero_batch_cap_is_rejected_structurally() {
+        assert_eq!(
+            LargeChunkPlan::new_with_max_batches(128, 2, limits(1024), Some(0)).unwrap_err(),
+            FftError::LargeChunkUnsupported {
+                reason: "large chunk max batches must be at least one",
+                bytes_per_batch: 128,
+                max_bind_bytes: 1024,
+            }
         );
     }
 

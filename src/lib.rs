@@ -43,6 +43,7 @@ pub mod kernels;
 pub mod math;
 pub mod plan;
 pub mod runtime;
+pub mod tuning;
 
 pub use config::{FftConfig, FftDirection, FftPrecision, Normalization};
 pub use diagnostics::{
@@ -68,3 +69,4 @@ pub use runtime::pipeline_cache::{
     import_pipeline_cache_snapshot, PipelineCacheSnapshot, PIPELINE_CACHE_SNAPSHOT_SCHEMA,
     PIPELINE_CACHE_SNAPSHOT_VERSION,
 };
+pub use tuning::{FftLargeRoute, FftTuning, FftTuningErrorKind, FftTuningSummary};

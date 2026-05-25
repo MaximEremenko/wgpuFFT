@@ -5,7 +5,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use wgpu_fft::{
-    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, FftPrecision,
+    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, FftPrecision, FftTuning,
     LargePolicyLimits, Normalization,
 };
 
@@ -126,6 +126,7 @@ struct Options {
     plan_max_bind_bytes: Option<u64>,
     compare_max_buffer_bytes: Option<CompareMaxBufferBytes>,
     segmented_burst_depth: usize,
+    workgroup_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +339,7 @@ async fn run() -> BenchResult<()> {
 
     println!("wgpuFFT benchmark harness");
     println!(
-        "configuration: suite={} precision={} adapter_selector={} runs={} iter_cap={} max_reported_cases_per_suite={} traffic_budget_bytes={} wait_timeout_secs={}",
+        "configuration: suite={} precision={} adapter_selector={} runs={} iter_cap={} max_reported_cases_per_suite={} traffic_budget_bytes={} wait_timeout_secs={} workgroup_size_override={}",
         options.suite.name(),
         options.precision.name(),
         options.adapter_selector.as_deref().unwrap_or("auto-single-hardware"),
@@ -349,6 +350,9 @@ async fn run() -> BenchResult<()> {
             .map_or_else(|| "unlimited".to_owned(), |value| value.to_string()),
         ITER_TRAFFIC_BUDGET_BYTES,
         options.wait_timeout.as_secs(),
+        options
+            .workgroup_size
+            .map_or_else(|| "default".to_owned(), |value| value.to_string()),
     );
     println!(
         "method: FFT+iFFT pairs, one command encoder, one submit, wall-clock submit-through-device-poll"
@@ -642,8 +646,8 @@ async fn run_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision).validate()?;
-    benchmark_config(case, true, precision).validate()?;
+    benchmark_config(case, false, precision, options.workgroup_size).validate()?;
+    benchmark_config(case, true, precision, options.workgroup_size).validate()?;
     let max_buffer_size = device.limits().max_buffer_size;
     if expected_buffer_size > max_buffer_size {
         return Err(input_error(format!(
@@ -728,12 +732,12 @@ async fn run_case(
             let forward = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, false, precision),
+                benchmark_config(case, false, precision, options.workgroup_size),
             )?;
             let inverse = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, true, precision),
+                benchmark_config(case, true, precision, options.workgroup_size),
             )?;
             Ok((forward, inverse))
         })();
@@ -1104,8 +1108,8 @@ async fn run_compare_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision).validate()?;
-    benchmark_config(case, true, precision).validate()?;
+    benchmark_config(case, false, precision, options.workgroup_size).validate()?;
+    benchmark_config(case, true, precision, options.workgroup_size).validate()?;
 
     let device_limits = device.limits();
     let real_max_buffer_size = device_limits.max_buffer_size;
@@ -1224,7 +1228,7 @@ async fn run_compare_case(
             let error_scopes = push_gpu_error_scopes(device);
             let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
                 let create = |inverse| {
-                    let config = benchmark_config(case, inverse, precision);
+                    let config = benchmark_config(case, inverse, precision, options.workgroup_size);
                     if variant_label == "sharded" {
                         FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
                             device,
@@ -1541,13 +1545,16 @@ fn print_compare_result(
         let traffic_bytes_per_pair = variant.result.buffer_size as f64 * traffic_multiplier as f64;
         let bandwidth_gib_s = traffic_bytes_per_pair / seconds_per_pair / 1024_f64.powi(3);
         println!(
-            "COMPARE_VARIANT suite={} label={} precision={} variant={} shape={:?} batch={} segmented_burst_depth={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
+            "COMPARE_VARIANT suite={} label={} precision={} variant={} shape={:?} batch={} workgroup_size_override={} segmented_burst_depth={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
             case.suite,
             case.label,
             variant.result.precision.as_str(),
             variant.label,
             case.shape,
             case.batch,
+            options
+                .workgroup_size
+                .map_or_else(|| "default".to_owned(), |value| value.to_string()),
             variant.result.segmented_burst_depth,
             variant.effective_max_bind_bytes,
             variant.requested_max_buffer_bytes,
@@ -1579,12 +1586,15 @@ fn print_compare_result(
     let sharded_statistics = statistics(&result.sharded.result.run_pair_ms)?;
     let sharded_over_unsharded = sharded_statistics.mean_ms / unsharded_statistics.mean_ms;
     println!(
-        "COMPARE_RESULT suite={} label={} precision={} shape={:?} batch={} segmented_burst_depth={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
+        "COMPARE_RESULT suite={} label={} precision={} shape={:?} batch={} workgroup_size_override={} segmented_burst_depth={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
         case.suite,
         case.label,
         result.unsharded.result.precision.as_str(),
         case.shape,
         case.batch,
+        options
+            .workgroup_size
+            .map_or_else(|| "default".to_owned(), |value| value.to_string()),
         result.sharded.result.segmented_burst_depth,
         unsharded_statistics.mean_ms,
         sharded_statistics.mean_ms,
@@ -1680,16 +1690,29 @@ fn fill_initialization_seed(seed: &wgpu::Buffer, precision: FftPrecision) -> Ben
     Ok(())
 }
 
-fn benchmark_config(case: &BenchCase, inverse: bool, precision: FftPrecision) -> FftConfig {
+fn benchmark_config(
+    case: &BenchCase,
+    inverse: bool,
+    precision: FftPrecision,
+    workgroup_size: Option<u32>,
+) -> FftConfig {
     let config = if inverse {
         FftConfig::inverse_nd(case.shape.clone())
     } else {
         FftConfig::new_nd(case.shape.clone())
     };
-    config
+    let config = config
         .with_batch(case.batch)
         .with_normalization(Normalization::None)
-        .with_precision(precision)
+        .with_precision(precision);
+    match workgroup_size {
+        Some(workgroup_size) => config.with_tuning(
+            FftTuning::default()
+                .with_workgroup_size(workgroup_size)
+                .with_fused_workgroup_size(workgroup_size),
+        ),
+        None => config,
+    }
 }
 
 fn diagnostic_helper_requirement_bytes(diagnostics: &FftDiagnostics) -> BenchResult<u64> {
@@ -1981,13 +2004,16 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
     let bandwidth_gb_s = traffic_bytes_per_pair / seconds_per_pair / 1_000_000_000.0;
 
     println!(
-        "RESULT suite={} label={} precision={} complex_element_bytes={} shape={:?} batch={} logical_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
+        "RESULT suite={} label={} precision={} complex_element_bytes={} shape={:?} batch={} workgroup_size_override={} logical_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
         case.suite,
         case.label,
         result.precision.as_str(),
         result.precision.complex_size_bytes(),
         case.shape,
         case.batch,
+        options
+            .workgroup_size
+            .map_or_else(|| "default".to_owned(), |value| value.to_string()),
         result.buffer_size,
         result.buffer_size as f64 / 1024_f64.powi(2),
         result.external_io_bytes,
@@ -2090,6 +2116,7 @@ fn parse_options() -> BenchResult<Options> {
         plan_max_bind_bytes: None,
         compare_max_buffer_bytes: None,
         segmented_burst_depth: DEFAULT_SEGMENTED_BURST_DEPTH,
+        workgroup_size: None,
     };
     let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
@@ -2129,6 +2156,12 @@ fn parse_options() -> BenchResult<Options> {
                     "--wait-timeout-secs",
                 )?;
                 options.wait_timeout = Duration::from_secs(seconds);
+            }
+            "--workgroup-size" => {
+                options.workgroup_size = Some(parse_workgroup_size(next_value(
+                    &mut args,
+                    "--workgroup-size",
+                )?)?);
             }
             "--batch" => {
                 if suite != Suite::Custom {
@@ -2220,6 +2253,16 @@ where
     Ok(parsed)
 }
 
+fn parse_workgroup_size(value: String) -> BenchResult<u32> {
+    let parsed = parse_positive::<u32>(value, "--workgroup-size")?;
+    if !parsed.is_power_of_two() {
+        return Err(input_error(
+            "--workgroup-size must be a positive power of two",
+        ));
+    }
+    Ok(parsed)
+}
+
 fn parse_shape(value: &str) -> BenchResult<Vec<usize>> {
     let parts = value.split(['x', 'X', ',']).collect::<Vec<_>>();
     if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
@@ -2279,9 +2322,9 @@ fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBuffer
 fn print_usage() {
     eprintln!(
         r#"Usage:
-  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|df64|both|df64-f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|df64|both|df64-f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64|df64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|df64|both|df64-f64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|df64|both|df64-f64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64|df64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
 
 Defaults:
   precision=f32, runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.
@@ -2290,12 +2333,14 @@ Defaults:
   `both` reports f64/f32 timing; `df64-f64` reports the df64/native-f64 ratio with identical 16-byte-complex topology.
   Segment-cap comparison recreates both variants per run and alternates their order.
   Segmented burst depth defaults to 2 and is valid only in comparison mode; multi-precision modes are rejected there.
+  Workgroup size is unset by default. An explicit positive power of two sets both staged and fused FFT workgroup sizes.
 
 Examples:
   cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2
   cargo bench --bench fft_bench -- sample0 --adapter 0
   cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2
   cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter 0 --runs 1 --iter-cap 1
+  cargo bench --bench fft_bench -- shape 4096 --batch 16384 --workgroup-size 128 --adapter 0 --runs 2 --iter-cap 200
   cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision both --adapter 0 --runs 2 --iter-cap 200
   cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision df64-f64 --adapter 0 --runs 2 --iter-cap 200
   cargo bench --bench fft_bench -- shape 2048 --batch 32768 --precision df64-f64 --adapter 0 --runs 2 --iter-cap 200

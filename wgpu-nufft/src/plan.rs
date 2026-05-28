@@ -1,6 +1,7 @@
 use crate::config::NufftConfig;
 use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
+use crate::gpu::Type2GpuPlan;
 use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::Complex64;
 
@@ -13,15 +14,31 @@ pub enum NufftKind {
 
 /// Reusable NUFFT planning metadata.
 ///
-/// Phase A executes the direct CPU fallback. Later GPU phases add private
-/// pipeline and `wgpu-fft` plan state while preserving this public metadata.
-#[derive(Debug)]
+/// Every plan supports the direct CPU fallback. GPU-prepared plans add private
+/// pipeline and `wgpu-fft` state while preserving the same public metadata.
 pub struct NufftPlan {
     kind: NufftKind,
     config: NufftConfig,
     kernel: EsKernel,
     fine_grid_shape: Vec<usize>,
     centered_kernel_fourier_coefficients: Vec<Vec<f64>>,
+    gpu_type2: Option<Box<Type2GpuPlan>>,
+}
+
+impl std::fmt::Debug for NufftPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NufftPlan")
+            .field("kind", &self.kind)
+            .field("config", &self.config)
+            .field("kernel", &self.kernel)
+            .field("fine_grid_shape", &self.fine_grid_shape)
+            .field(
+                "centered_kernel_fourier_coefficients",
+                &self.centered_kernel_fourier_coefficients,
+            )
+            .field("gpu_type2_ready", &self.gpu_type2.is_some())
+            .finish()
+    }
 }
 
 impl NufftPlan {
@@ -31,6 +48,36 @@ impl NufftPlan {
 
     pub fn type2(config: NufftConfig) -> Result<Self> {
         Self::new(NufftKind::Type2, config)
+    }
+
+    /// Builds a reusable 1D type-2 GPU plan.
+    ///
+    /// Execution is entirely GPU-resident and records commands into a caller
+    /// supplied encoder. The plan is device-specific and may be reused with
+    /// different caller-owned point, coefficient, and output buffers.
+    pub fn type2_gpu(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> Result<Self> {
+        if config.dimensions() != 1 {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-2",
+                actual: config.dimensions(),
+                supported: 1,
+            });
+        }
+        let mut plan = Self::new(NufftKind::Type2, config)?;
+        let gpu = Type2GpuPlan::new(
+            device,
+            queue,
+            &plan.config,
+            plan.kernel,
+            plan.fine_grid_shape[0],
+            &plan.centered_kernel_fourier_coefficients[0],
+        )?;
+        plan.gpu_type2 = Some(Box::new(gpu));
+        Ok(plan)
     }
 
     fn new(kind: NufftKind, config: NufftConfig) -> Result<Self> {
@@ -57,6 +104,7 @@ impl NufftPlan {
             kernel,
             fine_grid_shape,
             centered_kernel_fourier_coefficients,
+            gpu_type2: None,
         })
     }
 
@@ -82,6 +130,62 @@ impl NufftPlan {
         self.centered_kernel_fourier_coefficients
             .get(axis)
             .map(Vec::as_slice)
+    }
+
+    /// Whether this plan owns the GPU resources needed for type-2 execution.
+    pub fn is_gpu_ready(&self) -> bool {
+        self.gpu_type2.is_some()
+    }
+
+    /// Required bytes for `point_count` scalar `f32` coordinates.
+    pub fn required_type2_point_buffer_size_bytes(point_count: usize) -> Result<u64> {
+        Type2GpuPlan::point_buffer_size_bytes(point_count)
+    }
+
+    /// Required bytes for this plan's interleaved-complex `f32` coefficients.
+    pub fn required_type2_coefficient_buffer_size_bytes(&self) -> Result<u64> {
+        Type2GpuPlan::complex_buffer_size_bytes(
+            "type-2 Fourier coefficient buffer",
+            self.config.mode_count()?,
+        )
+    }
+
+    /// Required bytes for `point_count` interleaved-complex `f32` outputs.
+    pub fn required_type2_output_buffer_size_bytes(point_count: usize) -> Result<u64> {
+        Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", point_count)
+    }
+
+    /// Records a 1D type-2 NUFFT into `encoder` without submitting or reading
+    /// data back to the host.
+    ///
+    /// `points` stores `point_count` scalar `f32` coordinates. `coefficients`
+    /// and `output` store interleaved complex values as `(re, im)` `f32`
+    /// pairs. All three buffers require `STORAGE` usage and must belong to the
+    /// same device used to construct the plan. Coordinates must be finite and
+    /// lie in the documented `[-3*pi, 3*pi]` interval.
+    pub fn encode_type2_gpu(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        if self.kind != NufftKind::Type2 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "the plan was built for type-1 execution",
+            });
+        }
+        let gpu = self
+            .gpu_type2
+            .as_deref()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "construct the plan with NufftPlan::type2_gpu",
+            })?;
+        gpu.encode(device, encoder, point_count, points, coefficients, output)
     }
 
     /// Executes the exact direct CPU fallback for this plan's transform kind.

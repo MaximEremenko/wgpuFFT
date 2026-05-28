@@ -70,6 +70,53 @@ pub enum NufftError {
         buffer: &'static str,
         elements: usize,
     },
+    GpuDimensionsUnsupported {
+        kind: &'static str,
+        actual: usize,
+        supported: usize,
+    },
+    GpuExecutionUnavailable {
+        kind: &'static str,
+        reason: &'static str,
+    },
+    GpuBufferTooSmall {
+        buffer: &'static str,
+        required_bytes: u64,
+        actual_bytes: u64,
+    },
+    GpuBufferMissingUsage {
+        buffer: &'static str,
+        required_usage: &'static str,
+    },
+    GpuBufferBindingTooLarge {
+        buffer: &'static str,
+        required_bytes: u64,
+        limit_bytes: u64,
+    },
+    GpuBufferAliasUnsupported {
+        first: &'static str,
+        second: &'static str,
+    },
+    GpuDispatchUnsupported {
+        workgroups: u32,
+        max_per_dimension: u32,
+    },
+    GpuWorkgroupSizeUnsupported {
+        requested: u32,
+        maximum: u32,
+    },
+    GpuFineGridIndexUnsupported {
+        length: usize,
+        maximum: usize,
+    },
+    FftExecutionFailed {
+        stage: &'static str,
+        source: wgpu_fft::FftError,
+    },
+    InvalidKernelFourierCoefficient {
+        mode: i64,
+        value: f64,
+    },
 }
 
 impl fmt::Display for NufftError {
@@ -156,6 +203,66 @@ impl fmt::Display for NufftError {
                 f,
                 "could not allocate {elements} host elements for {buffer}"
             ),
+            Self::GpuDimensionsUnsupported {
+                kind,
+                actual,
+                supported,
+            } => write!(
+                f,
+                "GPU {kind} execution supports {supported} dimension, but the plan has {actual}"
+            ),
+            Self::GpuExecutionUnavailable { kind, reason } => {
+                write!(f, "GPU {kind} execution is unavailable: {reason}")
+            }
+            Self::GpuBufferTooSmall {
+                buffer,
+                required_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "GPU {buffer} buffer has {actual_bytes} bytes; at least {required_bytes} bytes are required"
+            ),
+            Self::GpuBufferMissingUsage {
+                buffer,
+                required_usage,
+            } => write!(
+                f,
+                "GPU {buffer} buffer is missing required {required_usage} usage"
+            ),
+            Self::GpuBufferBindingTooLarge {
+                buffer,
+                required_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "GPU {buffer} binding requires {required_bytes} bytes, exceeding the device limit of {limit_bytes} bytes"
+            ),
+            Self::GpuBufferAliasUnsupported { first, second } => write!(
+                f,
+                "GPU {first} and {second} buffers may not alias in the same compute pass"
+            ),
+            Self::GpuDispatchUnsupported {
+                workgroups,
+                max_per_dimension,
+            } => write!(
+                f,
+                "GPU NUFFT dispatch needs {workgroups} workgroups, which cannot fit a 3D grid with per-dimension limit {max_per_dimension}"
+            ),
+            Self::GpuWorkgroupSizeUnsupported { requested, maximum } => write!(
+                f,
+                "GPU NUFFT workgroup size {requested} exceeds the device limit {maximum}"
+            ),
+            Self::GpuFineGridIndexUnsupported { length, maximum } => write!(
+                f,
+                "GPU NUFFT fine-grid length {length} exceeds the exact f32 shader-index limit {maximum}"
+            ),
+            Self::FftExecutionFailed { stage, source } => {
+                write!(f, "wgpu-fft failed while encoding {stage}: {source}")
+            }
+            Self::InvalidKernelFourierCoefficient { mode, value } => write!(
+                f,
+                "ES kernel Fourier coefficient for mode {mode} cannot be inverted as f32: {value}"
+            ),
         }
     }
 }
@@ -163,7 +270,9 @@ impl fmt::Display for NufftError {
 impl std::error::Error for NufftError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::FftShapeUnsupported { source, .. } => Some(source),
+            Self::FftShapeUnsupported { source, .. } | Self::FftExecutionFailed { source, .. } => {
+                Some(source)
+            }
             _ => None,
         }
     }

@@ -2,9 +2,9 @@
 //!
 //! The crate provides reusable host-side type-1 and type-2 planning metadata,
 //! Direct `f64` reference transforms, and
-//! exponential-of-semicircle kernel tables. Reusable 1D type-2 `f32` plans can
-//! encode deconvolution, a fine-grid C2C transform, and interpolation entirely
-//! on the GPU using caller-owned input and output buffers.
+//! exponential-of-semicircle kernel tables. Reusable 1D `f32` type-1 and
+//! type-2 plans encode spreading or interpolation around a fine-grid C2C
+//! transform entirely on the GPU using caller-owned input and output buffers.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +12,7 @@ mod config;
 mod direct;
 mod error;
 mod gpu;
+mod gpu_type1;
 mod kernel;
 mod plan;
 

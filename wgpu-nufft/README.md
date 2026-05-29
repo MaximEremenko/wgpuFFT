@@ -10,11 +10,13 @@ The current implementation provides:
 - Type-1 and type-2 definitions in one to three dimensions;
 - direct `f64` NDFT execution as the correctness oracle and tiny-problem fallback;
 - `sigma = 2` default exponential-of-semicircle kernel planning;
-- host-`f64` centered-grid kernel Fourier coefficients; and
+- host-`f64` centered-grid kernel Fourier coefficients;
 - even fine-grid selection through `wgpu-fft`'s public supported-length
-  factorization; and
+  factorization;
 - reusable 1D type-2 `f32` GPU plans with caller-owned point, Fourier
-  coefficient, and output buffers.
+  coefficient, and output buffers; and
+- reusable 1D type-1 `f32` GPU plans with caller-owned point, strength, and
+  Fourier-mode output buffers.
 
 The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
 `wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
@@ -28,12 +30,17 @@ complete random-plus-adversarial vector and `8*eps` for each isolated boundary,
 cluster, duplicate, and seeded-random subset. The latter remains stricter than
 the usual float regression factors while preserving the ES parameters.
 
-The next slice adds deterministic no-atomic 1D type-1 spreading. Its planned
-baseline uses exclusive output ownership rather than unavailable WGSL `f32`
-atomics.
+The GPU type-1 route bins point indices with portable `u32` atomics, restores a
+stable input order within each bin, and assigns each fine-grid cell to exactly
+one gathering invocation. It therefore needs no unavailable WGSL `f32`
+atomics, and repeated executions accumulate strengths in deterministic point
+order. The gathered grid passes through a public `wgpu-fft` C2C plan before
+deconvolution and truncation into the caller-owned mode buffer. Both GPU routes
+reuse plan-owned fine-grid scratch and must execute in queue order on a given
+plan.
 
 Deferred work includes 2D/3D GPU execution, type 3, batching, NUFFT `f64`/df64
-GPU arithmetic, and WASM packaging.
+GPU arithmetic, parallel bin scans and sorting, and WASM packaging.
 
 ## Mathematical conventions
 
@@ -54,3 +61,5 @@ There is no normalization. Nonnegative `isign` selects the positive sign;
 negative values select the negative sign. Centered mode order is the default,
 and dimension zero is stored fastest. Coordinates follow the documented
 type-1/type-2 input contract `|x| <= 3*pi` and are periodic modulo `2*pi`.
+With the conventional Hermitian inner product, type-2 with sign `s` is adjoint
+to type-1 with sign `-s`.

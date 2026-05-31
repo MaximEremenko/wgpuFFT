@@ -7,6 +7,7 @@ use crate::config::{NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
+use crate::gpu_dispatch::split_workgroups;
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -906,43 +907,6 @@ fn dispatch_for_elements(
     )
 }
 
-fn split_workgroups(workgroups: u32, maximum: u32) -> Result<(u32, u32, u32)> {
-    if maximum == 0 {
-        return Err(NufftError::GpuDispatchUnsupported {
-            workgroups,
-            max_per_dimension: maximum,
-        });
-    }
-    if workgroups == 0 {
-        return Ok((0, 1, 1));
-    }
-    let total = u64::from(workgroups);
-    let maximum_u64 = u64::from(maximum);
-    let z = total.div_ceil(maximum_u64 * maximum_u64);
-    if z > maximum_u64 {
-        return Err(NufftError::GpuDispatchUnsupported {
-            workgroups,
-            max_per_dimension: maximum,
-        });
-    }
-    let per_slice = total.div_ceil(z);
-    let y = per_slice.div_ceil(maximum_u64);
-    let x = per_slice.div_ceil(y);
-    let covered = x.saturating_mul(y).saturating_mul(z);
-    if x <= maximum_u64 && y <= maximum_u64 && covered <= u64::from(u32::MAX) + 1 {
-        Ok((x as u32, y as u32, z as u32))
-    } else if maximum >= 2048 {
-        // Exactly covers the full u32 index space without overflowing the
-        // shader's flattened workgroup arithmetic.
-        Ok((2048, 2048, 1024))
-    } else {
-        Err(NufftError::GpuDispatchUnsupported {
-            workgroups,
-            max_per_dimension: maximum,
-        })
-    }
-}
-
 fn checked_buffer_size(
     context: &'static str,
     elements: usize,
@@ -1053,19 +1017,6 @@ mod tests {
             assert!(source.contains("const NONNEGATIVE_COUNT: u32 = 9u;"));
             assert!(source.contains("fine_grid[fine_index] * amplitudes[output_index]"));
         }
-    }
-
-    #[test]
-    fn dispatch_split_covers_exactly_the_requested_workgroups() {
-        let maximum = 65_535;
-        for count in [1, maximum, maximum + 1, 4_294_967_295] {
-            let (x, y, z) = split_workgroups(count, maximum).unwrap();
-            assert!(x <= maximum && y <= maximum && z <= maximum);
-            let covered = u64::from(x) * u64::from(y) * u64::from(z);
-            assert!(covered >= u64::from(count));
-            assert!(covered <= u64::from(u32::MAX) + 1);
-        }
-        assert!(split_workgroups(1, 0).is_err());
     }
 
     #[test]

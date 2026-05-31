@@ -105,6 +105,10 @@ pub enum NufftError {
         requested: u32,
         maximum: u32,
     },
+    GpuWorkgroupStorageUnsupported {
+        requested_bytes: u32,
+        maximum_bytes: u32,
+    },
     GpuFineGridIndexUnsupported {
         length: usize,
         maximum: usize,
@@ -251,6 +255,13 @@ impl fmt::Display for NufftError {
             Self::GpuWorkgroupSizeUnsupported { requested, maximum } => write!(
                 f,
                 "GPU NUFFT workgroup size {requested} exceeds the device limit {maximum}"
+            ),
+            Self::GpuWorkgroupStorageUnsupported {
+                requested_bytes,
+                maximum_bytes,
+            } => write!(
+                f,
+                "GPU NUFFT workgroup storage requires {requested_bytes} bytes, exceeding the device limit of {maximum_bytes} bytes"
             ),
             Self::GpuFineGridIndexUnsupported { length, maximum } => write!(
                 f,

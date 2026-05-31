@@ -12,6 +12,10 @@ mod config;
 mod direct;
 mod error;
 mod gpu;
+mod gpu_dispatch;
+// The scan primitive lands one reviewable commit before its type-1 consumer.
+#[allow(dead_code)]
+mod gpu_scan;
 mod gpu_type1;
 mod kernel;
 mod plan;

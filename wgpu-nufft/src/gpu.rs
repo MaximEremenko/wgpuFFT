@@ -6,6 +6,7 @@ use wgpu_fft::{BufferView, FftConfig, FftDirection, FftPlan, FftPrecision, Norma
 use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
+use crate::gpu_dispatch::split_workgroups;
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -561,39 +562,6 @@ fn binding_entry<'a>(
     }
 }
 
-fn split_workgroups(count: u32, max_per_dimension: u32) -> Result<(u32, u32, u32)> {
-    if max_per_dimension == 0 {
-        return Err(NufftError::GpuDispatchUnsupported {
-            workgroups: count,
-            max_per_dimension,
-        });
-    }
-    if count == 0 {
-        return Ok((0, 1, 1));
-    }
-    let count_u64 = u64::from(count);
-    let max = u64::from(max_per_dimension);
-    let z = count_u64.div_ceil(max * max);
-    if z > max {
-        return Err(NufftError::GpuDispatchUnsupported {
-            workgroups: count,
-            max_per_dimension,
-        });
-    }
-    let per_slice = count_u64.div_ceil(z);
-    let y = per_slice.div_ceil(max);
-    let x = per_slice.div_ceil(y);
-    let covered = x.saturating_mul(y).saturating_mul(z);
-    if x <= max && y <= max && covered <= u64::from(u32::MAX) + 1 {
-        Ok((x as u32, y as u32, z as u32))
-    } else {
-        Err(NufftError::GpuDispatchUnsupported {
-            workgroups: count,
-            max_per_dimension,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,14 +584,6 @@ mod tests {
                 matches!(order, ModeOrder::Centered)
             )));
         }
-    }
-
-    #[test]
-    fn dispatch_split_covers_large_point_sets_without_exceeding_limits() {
-        let count = 1_000_000;
-        let (x, y, z) = split_workgroups(count, 65_535).unwrap();
-        assert!(x <= 65_535 && y <= 65_535 && z <= 65_535);
-        assert!(u64::from(x) * u64::from(y) * u64::from(z) >= u64::from(count));
     }
 
     #[test]

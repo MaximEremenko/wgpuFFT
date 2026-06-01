@@ -8,6 +8,7 @@ use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
 use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -26,8 +27,9 @@ pub(crate) struct Type1GpuPlan {
     fine_output: wgpu::Buffer,
     count_pipeline: wgpu::ComputePipeline,
     count_layout: wgpu::BindGroupLayout,
-    prefix_pipeline: wgpu::ComputePipeline,
-    prefix_layout: wgpu::BindGroupLayout,
+    prefix_scan: GpuExclusiveScanU32,
+    terminal_pipeline: wgpu::ComputePipeline,
+    terminal_layout: wgpu::BindGroupLayout,
     scatter_pipeline: wgpu::ComputePipeline,
     scatter_layout: wgpu::BindGroupLayout,
     sort_pipeline: wgpu::ComputePipeline,
@@ -149,12 +151,13 @@ impl Type1GpuPlan {
             &generate_count_wgsl(fine_length),
         );
         let count_layout = count_pipeline.get_bind_group_layout(0);
-        let prefix_pipeline = create_compute_pipeline(
+        let prefix_scan = GpuExclusiveScanU32::new(device, fine_length)?;
+        let terminal_pipeline = create_compute_pipeline(
             device,
-            "wgpu_nufft.type1.bin_prefix",
-            &generate_prefix_wgsl(),
+            "wgpu_nufft.type1.bin_terminal",
+            &generate_terminal_wgsl(),
         );
-        let prefix_layout = prefix_pipeline.get_bind_group_layout(0);
+        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
         let scatter_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1.bin_scatter",
@@ -190,8 +193,9 @@ impl Type1GpuPlan {
             fine_output,
             count_pipeline,
             count_layout,
-            prefix_pipeline,
-            prefix_layout,
+            prefix_scan,
+            terminal_pipeline,
+            terminal_layout,
             scatter_pipeline,
             scatter_layout,
             sort_pipeline,
@@ -349,22 +353,12 @@ impl Type1GpuPlan {
                 },
             ],
         });
-        let prefix_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.bin_prefix.bind_group"),
-            layout: &self.prefix_layout,
+        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.bin_terminal.bind_group"),
+            layout: &self.terminal_layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: bin_counts.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bin_cursors.as_entire_binding(),
-                },
+                binding_entry(0, &bin_counts, count_bytes),
+                binding_entry(1, &bin_offsets, offset_bytes),
             ],
         });
         let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -422,6 +416,7 @@ impl Type1GpuPlan {
         });
 
         encoder.clear_buffer(&bin_counts, 0, None);
+        encoder.clear_buffer(&bin_cursors, 0, None);
         encode_pass(
             encoder,
             "wgpu_nufft.type1.bin_count.pass",
@@ -429,11 +424,13 @@ impl Type1GpuPlan {
             &count_bind_group,
             point_dispatch,
         );
+        self.prefix_scan
+            .encode(device, encoder, &bin_counts, &bin_offsets)?;
         encode_pass(
             encoder,
-            "wgpu_nufft.type1.bin_prefix.pass",
-            &self.prefix_pipeline,
-            &prefix_bind_group,
+            "wgpu_nufft.type1.bin_terminal.pass",
+            &self.terminal_pipeline,
+            &terminal_bind_group,
             (1, 1, 1),
         );
         encode_pass(
@@ -636,21 +633,15 @@ fn main(
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
-fn generate_prefix_wgsl() -> String {
-    r#"@group(0) @binding(0) var<storage, read_write> bin_counts: array<atomic<u32>>;
+fn generate_terminal_wgsl() -> String {
+    r#"@group(0) @binding(0) var<storage, read> bin_counts: array<u32>;
 @group(0) @binding(1) var<storage, read_write> bin_offsets: array<u32>;
-@group(0) @binding(2) var<storage, read_write> bin_cursors: array<atomic<u32>>;
 
 @compute @workgroup_size(1)
 fn main() {
     let bin_count = arrayLength(&bin_counts);
-    var running = 0u;
-    for (var bin = 0u; bin < bin_count; bin = bin + 1u) {
-        bin_offsets[bin] = running;
-        running = running + atomicLoad(&bin_counts[bin]);
-        atomicStore(&bin_cursors[bin], 0u);
-    }
-    bin_offsets[bin_count] = running;
+    bin_offsets[bin_count] =
+        bin_offsets[bin_count - 1u] + bin_counts[bin_count - 1u];
 }
 "#
     .to_owned()
@@ -1005,6 +996,14 @@ mod tests {
         assert!(source.contains("fn heap_sort(start: u32, end: u32)"));
         assert!(source.contains("sorted_indices[start + greatest] <"));
         assert!(source.contains("heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);"));
+    }
+
+    #[test]
+    fn terminal_offset_extends_the_exclusive_scan() {
+        let source = generate_terminal_wgsl();
+        assert!(source.contains("bin_offsets[bin_count - 1u] + bin_counts[bin_count - 1u]"));
+        assert!(!source.contains("for ("));
+        assert!(!source.contains("atomic"));
     }
 
     #[test]

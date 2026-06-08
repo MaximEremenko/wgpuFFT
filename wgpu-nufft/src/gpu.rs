@@ -7,6 +7,8 @@ use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -183,6 +185,62 @@ impl Type2GpuPlan {
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            coefficients,
+            output,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn encode_profiled(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
+    ) -> Result<NufftGpuProfileLayout> {
+        if point_count == 0 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-2 stage profiling",
+                reason: "at least one point is required",
+            });
+        }
+        let layout =
+            NufftGpuProfileLayout::type2(first_query).map_err(|_| NufftError::LengthOverflow {
+                context: "type-2 stage-profile query range",
+            })?;
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            coefficients,
+            output,
+            GpuProfileQueryWriter::enabled(query_set, &layout),
+        )?;
+        Ok(layout)
+    }
+
+    fn encode_impl(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
         if point_count == 0 {
             return Ok(());
         }
@@ -241,7 +299,16 @@ impl Type2GpuPlan {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wgpu_nufft.type2.predeconvolution.pass"),
-                timestamp_writes: None,
+                timestamp_writes: {
+                    #[cfg(feature = "gpu-profiling")]
+                    {
+                        profile.timestamp_writes(Some(0), Some(1))
+                    }
+                    #[cfg(not(feature = "gpu-profiling"))]
+                    {
+                        None
+                    }
+                },
             });
             pass.set_pipeline(&self.predeconvolution_pipeline);
             pass.set_bind_group(0, &predeconvolution_bind_group, &[]);
@@ -279,7 +346,16 @@ impl Type2GpuPlan {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wgpu_nufft.type2.interpolation.pass"),
-                timestamp_writes: None,
+                timestamp_writes: {
+                    #[cfg(feature = "gpu-profiling")]
+                    {
+                        profile.timestamp_writes(Some(2), Some(3))
+                    }
+                    #[cfg(not(feature = "gpu-profiling"))]
+                    {
+                        None
+                    }
+                },
             });
             pass.set_pipeline(&self.interpolation_pipeline);
             pass.set_bind_group(0, &interpolation_bind_group, &[]);
@@ -290,6 +366,11 @@ impl Type2GpuPlan {
             );
         }
         Ok(())
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
+        self.fft.diagnostics()
     }
 }
 

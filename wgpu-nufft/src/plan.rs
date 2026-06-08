@@ -2,6 +2,8 @@ use crate::config::NufftConfig;
 use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
 use crate::gpu::Type2GpuPlan;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::Complex64;
@@ -231,6 +233,53 @@ impl NufftPlan {
         gpu.encode(device, encoder, point_count, points, strengths, output)
     }
 
+    /// Records a type-1 execution with GPU timestamp queries around its
+    /// logical stages.
+    ///
+    /// This diagnostic entry point is available only with the
+    /// `gpu-profiling` crate feature. The device must have been requested with
+    /// [`wgpu::Features::TIMESTAMP_QUERY`], and `query_set` must be a timestamp
+    /// query set with at least [`Self::gpu_profile_query_count`] entries
+    /// available starting at `first_query`. No query resolve or readback is
+    /// recorded by this method.
+    #[cfg(feature = "gpu-profiling")]
+    pub fn encode_type1_gpu_profiled(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
+    ) -> Result<NufftGpuProfileLayout> {
+        self.validate_gpu_profiling(device, "type-1")?;
+        if self.kind != NufftKind::Type1 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-1",
+                reason: "the plan was built for type-2 execution",
+            });
+        }
+        let gpu = self
+            .gpu_type1
+            .as_deref()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind: "type-1",
+                reason: "construct the plan with NufftPlan::type1_gpu",
+            })?;
+        gpu.encode_profiled(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            output,
+            query_set,
+            first_query,
+        )
+    }
+
     /// Required bytes for `point_count` scalar `f32` coordinates.
     pub fn required_type2_point_buffer_size_bytes(point_count: usize) -> Result<u64> {
         Type2GpuPlan::point_buffer_size_bytes(point_count)
@@ -280,6 +329,81 @@ impl NufftPlan {
                 reason: "construct the plan with NufftPlan::type2_gpu",
             })?;
         gpu.encode(device, encoder, point_count, points, coefficients, output)
+    }
+
+    /// Records a type-2 execution with GPU timestamp queries around its
+    /// logical stages. See [`Self::encode_type1_gpu_profiled`] for query-set
+    /// requirements.
+    #[cfg(feature = "gpu-profiling")]
+    pub fn encode_type2_gpu_profiled(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
+    ) -> Result<NufftGpuProfileLayout> {
+        self.validate_gpu_profiling(device, "type-2")?;
+        if self.kind != NufftKind::Type2 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "the plan was built for type-1 execution",
+            });
+        }
+        let gpu = self
+            .gpu_type2
+            .as_deref()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "construct the plan with NufftPlan::type2_gpu",
+            })?;
+        gpu.encode_profiled(
+            device,
+            encoder,
+            point_count,
+            points,
+            coefficients,
+            output,
+            query_set,
+            first_query,
+        )
+    }
+
+    /// Number of timestamp-query slots used by one profiled execution.
+    #[cfg(feature = "gpu-profiling")]
+    pub fn gpu_profile_query_count(&self) -> u32 {
+        match self.kind {
+            NufftKind::Type1 => NufftGpuProfileLayout::type1(0)
+                .expect("the fixed type-1 profile layout must be valid")
+                .query_count(),
+            NufftKind::Type2 => NufftGpuProfileLayout::type2(0)
+                .expect("the fixed type-2 profile layout must be valid")
+                .query_count(),
+        }
+    }
+
+    /// Diagnostics for the wgpu-fft plan embedded in a GPU-ready NUFFT plan.
+    #[cfg(feature = "gpu-profiling")]
+    pub fn gpu_fft_diagnostics(&self) -> Option<wgpu_fft::FftDiagnostics> {
+        match self.kind {
+            NufftKind::Type1 => self.gpu_type1.as_deref().map(Type1GpuPlan::fft_diagnostics),
+            NufftKind::Type2 => self.gpu_type2.as_deref().map(Type2GpuPlan::fft_diagnostics),
+        }
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    fn validate_gpu_profiling(&self, device: &wgpu::Device, kind: &'static str) -> Result<()> {
+        if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            Ok(())
+        } else {
+            Err(NufftError::GpuExecutionUnavailable {
+                kind,
+                reason: "request the device with wgpu::Features::TIMESTAMP_QUERY",
+            })
+        }
     }
 
     /// Executes the exact direct CPU fallback for this plan's transform kind.

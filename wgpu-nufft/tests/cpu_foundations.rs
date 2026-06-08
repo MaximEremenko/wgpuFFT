@@ -33,13 +33,17 @@ fn grid_index(mode: isize, length: usize) -> usize {
 }
 
 fn fft_for_sign(values: &[Complex64], sign: NufftSign) -> Vec<Complex64> {
+    fft_nd_for_sign(values, &[values.len()], sign)
+}
+
+fn fft_nd_for_sign(values: &[Complex64], shape: &[usize], sign: NufftSign) -> Vec<Complex64> {
     let direction = match sign {
         NufftSign::Positive => FftDirection::Inverse,
         NufftSign::Negative => FftDirection::Forward,
     };
     reference_c2c_nd_f64(
         values,
-        &FftConfig::new(values.len())
+        &FftConfig::new_nd(shape.to_vec())
             .with_direction(direction)
             .with_normalization(Normalization::None),
     )
@@ -117,6 +121,110 @@ fn approximate_type2_1d(
                 let value = transformed[unwrapped.rem_euclid(fine_length as isize) as usize];
                 sum.re += value.re * weight;
                 sum.im += value.im * weight;
+            }
+            sum
+        })
+        .collect()
+}
+
+fn approximate_type1_2d(
+    plan: &NufftPlan,
+    coordinates: &[f64],
+    strengths: &[Complex64],
+) -> Vec<Complex64> {
+    let fine = plan.fine_grid_shape();
+    let modes = plan.config().n_modes();
+    let kernel = plan.kernel();
+    let mut grid = vec![Complex64::default(); fine[0] * fine[1]];
+    for (point, &strength) in coordinates.chunks_exact(2).zip(strengths) {
+        let position = [
+            fold_to_grid(point[0], fine[0]),
+            fold_to_grid(point[1], fine[1]),
+        ];
+        let start = [
+            (position[0] - kernel.half_width()).ceil() as isize,
+            (position[1] - kernel.half_width()).ceil() as isize,
+        ];
+        for offset1 in 0..kernel.width() {
+            let unwrapped1 = start[1] + offset1 as isize;
+            let weight1 = kernel.evaluate(unwrapped1 as f64 - position[1]);
+            let grid1 = unwrapped1.rem_euclid(fine[1] as isize) as usize;
+            for offset0 in 0..kernel.width() {
+                let unwrapped0 = start[0] + offset0 as isize;
+                let weight0 = kernel.evaluate(unwrapped0 as f64 - position[0]);
+                let grid0 = unwrapped0.rem_euclid(fine[0] as isize) as usize;
+                let value = &mut grid[grid0 + fine[0] * grid1];
+                let weight = weight0 * weight1;
+                value.re += strength.re * weight;
+                value.im += strength.im * weight;
+            }
+        }
+    }
+    let transformed = fft_nd_for_sign(&grid, fine, plan.config().sign());
+    let coefficient0 = plan.centered_kernel_fourier_coefficients(0).unwrap();
+    let coefficient1 = plan.centered_kernel_fourier_coefficients(1).unwrap();
+    let mut output = vec![Complex64::default(); modes[0] * modes[1]];
+    for index1 in 0..modes[1] {
+        let mode1 = mode_for_index(plan.config().mode_order(), index1, modes[1]);
+        for index0 in 0..modes[0] {
+            let mode0 = mode_for_index(plan.config().mode_order(), index0, modes[0]);
+            let divisor = coefficient0[mode0.unsigned_abs()] * coefficient1[mode1.unsigned_abs()];
+            let value =
+                transformed[grid_index(mode0, fine[0]) + fine[0] * grid_index(mode1, fine[1])];
+            output[index0 + modes[0] * index1] =
+                Complex64::new(value.re / divisor, value.im / divisor);
+        }
+    }
+    output
+}
+
+fn approximate_type2_2d(
+    plan: &NufftPlan,
+    coordinates: &[f64],
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    let fine = plan.fine_grid_shape();
+    let modes = plan.config().n_modes();
+    let kernel = plan.kernel();
+    let coefficient0 = plan.centered_kernel_fourier_coefficients(0).unwrap();
+    let coefficient1 = plan.centered_kernel_fourier_coefficients(1).unwrap();
+    let mut grid = vec![Complex64::default(); fine[0] * fine[1]];
+    for index1 in 0..modes[1] {
+        let mode1 = mode_for_index(plan.config().mode_order(), index1, modes[1]);
+        for index0 in 0..modes[0] {
+            let mode0 = mode_for_index(plan.config().mode_order(), index0, modes[0]);
+            let divisor = coefficient0[mode0.unsigned_abs()] * coefficient1[mode1.unsigned_abs()];
+            let value = input[index0 + modes[0] * index1];
+            grid[grid_index(mode0, fine[0]) + fine[0] * grid_index(mode1, fine[1])] =
+                Complex64::new(value.re / divisor, value.im / divisor);
+        }
+    }
+    let transformed = fft_nd_for_sign(&grid, fine, plan.config().sign());
+    coordinates
+        .chunks_exact(2)
+        .map(|point| {
+            let position = [
+                fold_to_grid(point[0], fine[0]),
+                fold_to_grid(point[1], fine[1]),
+            ];
+            let start = [
+                (position[0] - kernel.half_width()).ceil() as isize,
+                (position[1] - kernel.half_width()).ceil() as isize,
+            ];
+            let mut sum = Complex64::default();
+            for offset1 in 0..kernel.width() {
+                let unwrapped1 = start[1] + offset1 as isize;
+                let weight1 = kernel.evaluate(unwrapped1 as f64 - position[1]);
+                let grid1 = unwrapped1.rem_euclid(fine[1] as isize) as usize;
+                for offset0 in 0..kernel.width() {
+                    let unwrapped0 = start[0] + offset0 as isize;
+                    let weight0 = kernel.evaluate(unwrapped0 as f64 - position[0]);
+                    let grid0 = unwrapped0.rem_euclid(fine[0] as isize) as usize;
+                    let value = transformed[grid0 + fine[0] * grid1];
+                    let weight = weight0 * weight1;
+                    sum.re += value.re * weight;
+                    sum.im += value.im * weight;
+                }
             }
             sum
         })
@@ -360,6 +468,7 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
         NufftPlan::required_type1_point_buffer_size_bytes(7).unwrap(),
         28
     );
+    assert_eq!(type1.required_point_buffer_size_bytes(7).unwrap(), 28);
     assert_eq!(
         NufftPlan::required_type1_strength_buffer_size_bytes(7).unwrap(),
         56
@@ -369,6 +478,7 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
         NufftPlan::required_type2_point_buffer_size_bytes(7).unwrap(),
         28
     );
+    assert_eq!(type2.required_point_buffer_size_bytes(7).unwrap(), 28);
     assert_eq!(
         type2
             .required_type2_coefficient_buffer_size_bytes()
@@ -378,6 +488,18 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
     assert_eq!(
         NufftPlan::required_type2_output_buffer_size_bytes(7).unwrap(),
         56
+    );
+}
+
+#[test]
+fn plan_aware_gpu_point_buffer_size_is_dimension_aware() {
+    let plan = NufftPlan::type2(NufftConfig::new([8, 12], 1.0e-6)).unwrap();
+    assert_eq!(plan.required_point_buffer_size_bytes(7).unwrap(), 56);
+    assert_eq!(
+        plan.required_point_buffer_size_bytes(usize::MAX),
+        Err(NufftError::LengthOverflow {
+            context: "GPU point-coordinate count"
+        })
     );
 }
 
@@ -473,6 +595,53 @@ fn es_host_path_meets_relative_l2_acceptance_against_direct_ndft() {
             assert!(
                 error2 <= 4.0 * eps,
                 "type2 eps={eps} sign={sign:?}: relative l2={error2}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tensor_product_es_host_path_meets_acceptance_in_two_dimensions() {
+    let coordinates = [
+        -PI, PI, -2.71, -1.93, -0.37, 0.11, 0.0, 0.0, 0.0, 0.0, 0.43, -0.82, 2.63, 2.91,
+    ];
+    let strengths = coordinates
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(index, point)| {
+            Complex64::new(
+                (0.31 * point[0] - 0.17 * point[1]).cos() + index as f64 * 0.02,
+                (0.23 * point[0] + 0.41 * point[1]).sin() - index as f64 * 0.03,
+            )
+        })
+        .collect::<Vec<_>>();
+    let coefficients = (0..12 * 20)
+        .map(|index| {
+            let x = index as f64 + 0.5;
+            Complex64::new((0.071 * x).cos(), 0.5 * (0.047 * x).sin())
+        })
+        .collect::<Vec<_>>();
+
+    for eps in [1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6] {
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new([12, 20], eps).with_sign(sign);
+
+            let type1 = NufftPlan::type1(config.clone()).unwrap();
+            let actual1 = approximate_type1_2d(&type1, &coordinates, &strengths);
+            let reference1 = reference_type1_f64(&config, &coordinates, &strengths).unwrap();
+            let error1 = relative_l2(&actual1, &reference1);
+            assert!(
+                error1 <= 8.0 * eps,
+                "2D type1 eps={eps} sign={sign:?}: relative l2={error1}"
+            );
+
+            let type2 = NufftPlan::type2(config.clone()).unwrap();
+            let actual2 = approximate_type2_2d(&type2, &coordinates, &coefficients);
+            let reference2 = reference_type2_f64(&config, &coordinates, &coefficients).unwrap();
+            let error2 = relative_l2(&actual2, &reference2);
+            assert!(
+                error2 <= 8.0 * eps,
+                "2D type2 eps={eps} sign={sign:?}: relative l2={error2}"
             );
         }
     }

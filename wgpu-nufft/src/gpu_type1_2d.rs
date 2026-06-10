@@ -11,6 +11,7 @@ use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::gpu_scan::GpuExclusiveScanU32;
+use crate::gpu_type1_scratch::Type1ScratchBuffers;
 use crate::kernel::EsKernel;
 
 const DIMENSIONS: usize = 2;
@@ -31,6 +32,7 @@ pub(crate) struct Type1GpuPlan2d {
     amplitudes: wgpu::Buffer,
     fine_input: wgpu::Buffer,
     fine_output: wgpu::Buffer,
+    scratch: Type1ScratchBuffers,
     count_pipeline: wgpu::ComputePipeline,
     count_layout: wgpu::BindGroupLayout,
     prefix_scan: GpuExclusiveScanU32,
@@ -161,6 +163,8 @@ impl Type1GpuPlan2d {
             usage: fine_usage,
             mapped_at_creation: false,
         });
+        let scratch =
+            Type1ScratchBuffers::new(device, "wgpu_nufft.type1_2d", count_bytes, offset_bytes);
         let fft = FftPlan::c2c(device, queue, fft_config).map_err(|source| {
             NufftError::FftShapeUnsupported {
                 stage: "type-1 2D oversampled-grid C2C plan",
@@ -217,6 +221,7 @@ impl Type1GpuPlan2d {
             amplitudes,
             fine_input,
             fine_output,
+            scratch,
             count_pipeline,
             count_layout,
             prefix_scan,
@@ -402,31 +407,10 @@ impl Type1GpuPlan2d {
             self.max_workgroups_per_dimension,
         )?;
 
-        let atomic_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let bin_counts = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wgpu_nufft.type1_2d.bin_counts"),
-            size: count_bytes,
-            usage: atomic_usage,
-            mapped_at_creation: false,
-        });
-        let bin_cursors = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wgpu_nufft.type1_2d.bin_cursors"),
-            size: count_bytes,
-            usage: atomic_usage,
-            mapped_at_creation: false,
-        });
-        let bin_offsets = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wgpu_nufft.type1_2d.bin_offsets"),
-            size: offset_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let sorted_indices = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wgpu_nufft.type1_2d.sorted_point_indices"),
-            size: index_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let bin_counts = &self.scratch.bin_counts;
+        let bin_cursors = &self.scratch.bin_cursors;
+        let bin_offsets = &self.scratch.bin_offsets;
+        let sorted_indices = self.scratch.sorted_indices(index_bytes);
 
         let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_2d.bin_count.bind_group"),
@@ -443,8 +427,8 @@ impl Type1GpuPlan2d {
             label: Some("wgpu_nufft.type1_2d.bin_terminal.bind_group"),
             layout: &self.terminal_layout,
             entries: &[
-                binding_entry(0, &bin_counts, count_bytes),
-                binding_entry(1, &bin_offsets, offset_bytes),
+                binding_entry(0, bin_counts, count_bytes),
+                binding_entry(1, bin_offsets, offset_bytes),
             ],
         });
         let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -460,10 +444,7 @@ impl Type1GpuPlan2d {
                     binding: 2,
                     resource: bin_cursors.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: sorted_indices.as_entire_binding(),
-                },
+                binding_entry(3, &sorted_indices, index_bytes),
             ],
         });
         let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -474,10 +455,7 @@ impl Type1GpuPlan2d {
                     binding: 0,
                     resource: bin_offsets.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: sorted_indices.as_entire_binding(),
-                },
+                binding_entry(1, &sorted_indices, index_bytes),
             ],
         });
         let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -490,10 +468,7 @@ impl Type1GpuPlan2d {
                     binding: 2,
                     resource: bin_offsets.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: sorted_indices.as_entire_binding(),
-                },
+                binding_entry(3, &sorted_indices, index_bytes),
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: self.fine_input.as_entire_binding(),
@@ -503,8 +478,8 @@ impl Type1GpuPlan2d {
 
         #[cfg(feature = "gpu-profiling")]
         profile.encode_type1_start_marker(encoder);
-        encoder.clear_buffer(&bin_counts, 0, None);
-        encoder.clear_buffer(&bin_cursors, 0, None);
+        encoder.clear_buffer(bin_counts, 0, None);
+        encoder.clear_buffer(bin_cursors, 0, None);
         encode_pass(
             encoder,
             "wgpu_nufft.type1_2d.bin_count.pass",
@@ -515,7 +490,7 @@ impl Type1GpuPlan2d {
             profile.timestamp_writes(None, Some(1)),
         );
         self.prefix_scan
-            .encode(device, encoder, &bin_counts, &bin_offsets)?;
+            .encode(device, encoder, bin_counts, bin_offsets)?;
         encode_pass(
             encoder,
             "wgpu_nufft.type1_2d.bin_terminal.pass",

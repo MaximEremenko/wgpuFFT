@@ -35,6 +35,7 @@ async fn run_gpu_2d_cases() {
     validate_accuracy_matrix(&context.device, &context.queue);
     validate_type2_duplicate_outputs(&context.device, &context.queue);
     validate_type1_repeat_determinism(&context.device, &context.queue);
+    validate_type1_scratch_grow_then_shrink(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
     validate_non_square_case(&context.device, &context.queue);
 
@@ -173,6 +174,69 @@ fn validate_type1_repeat_determinism(device: &wgpu::Device, queue: &wgpu::Queue)
             .collect::<Vec<_>>(),
         "2D type1 must be bitwise deterministic across repeated executions"
     );
+}
+
+fn validate_type1_scratch_grow_then_shrink(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let eps = 1.0e-6;
+    let config = NufftConfig::new([12, 10], eps)
+        .with_sign(NufftSign::Negative)
+        .with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+
+    // Cross both a point-dispatch boundary and the growable scratch capacity
+    // before reusing the same plan for a much smaller, unrelated point set.
+    let large_points = seeded_random_points(257, 0xc851_4a79);
+    let mut large_strengths = test_values(257, NufftSign::Positive, ModeOrder::Centered);
+    for value in &mut large_strengths {
+        *value *= 64.0;
+    }
+
+    let three_pi_inside = f32::from_bits(((3.0 * PI) as f32).to_bits() - 1);
+    let small_points = vec![
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        PI as f32,
+        -(PI as f32),
+        -three_pi_inside,
+        three_pi_inside,
+        0.3125,
+        -0.6875,
+        -1.75,
+        2.25,
+        2.875,
+        -2.625,
+    ];
+    let small_strengths = vec![
+        0.125, -0.25, -0.375, 0.5, 0.625, -0.75, -0.875, 1.0, 1.125, -1.25, -1.375, 1.5, 1.625,
+        -1.75,
+    ];
+    assert!(large_points.len() > small_points.len());
+
+    for (label, points, strengths) in [
+        ("large", large_points.as_slice(), large_strengths.as_slice()),
+        ("small", small_points.as_slice(), small_strengths.as_slice()),
+    ] {
+        let actual =
+            interleaved_to_complex64(&execute_type1(device, queue, &plan, points, strengths));
+        let reference = reference_type1_f64(
+            &config,
+            &points_f64(points),
+            &interleaved_to_complex64(strengths),
+        )
+        .unwrap();
+        let error = relative_l2(&actual, &reference);
+        let tolerance = FLOAT_TOLERANCE_FACTOR * eps;
+        eprintln!(
+            "NUFFT_2D_SCRATCH_REUSE phase={label} M={} relative_l2={error:.9e}",
+            points.len() / DIMENSIONS
+        );
+        assert!(
+            error <= tolerance,
+            "2D type1 scratch reuse {label} execution: relative l2 {error} exceeds {tolerance}"
+        );
+    }
 }
 
 fn validate_adjoint_consistency(device: &wgpu::Device, queue: &wgpu::Queue) {

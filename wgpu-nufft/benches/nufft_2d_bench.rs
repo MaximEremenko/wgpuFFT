@@ -27,6 +27,59 @@ struct Options {
     runs: usize,
     samples: usize,
     wait_timeout: Duration,
+    type1_gather: Type1Gather,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Type1Gather {
+    Global,
+    Tiled16,
+}
+
+impl Type1Gather {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Tiled16 => "tiled16",
+        }
+    }
+
+    fn create_plan(
+        self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> BenchResult<NufftPlan> {
+        match self {
+            Self::Global => {
+                #[cfg(feature = "type1-2d-tile-prototype")]
+                {
+                    Ok(NufftPlan::type1_gpu_with_global_2d_gather_for_testing(
+                        device, queue, config,
+                    )?)
+                }
+                #[cfg(not(feature = "type1-2d-tile-prototype"))]
+                {
+                    let _ = (device, queue, config);
+                    Err(input_error(
+                        "--type1-gather global requires feature type1-2d-tile-prototype",
+                    ))
+                }
+            }
+            Self::Tiled16 => {
+                #[cfg(feature = "type1-2d-tile-prototype")]
+                {
+                    Ok(NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(
+                        device, queue, config,
+                    )?)
+                }
+                #[cfg(not(feature = "type1-2d-tile-prototype"))]
+                {
+                    Ok(NufftPlan::type1_gpu(device, queue, config)?)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,9 +110,10 @@ impl TransformKind {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: NufftConfig,
+        type1_gather: Type1Gather,
     ) -> BenchResult<NufftPlan> {
         match self {
-            Self::Type1 => Ok(NufftPlan::type1_gpu(device, queue, config)?),
+            Self::Type1 => type1_gather.create_plan(device, queue, config),
             Self::Type2 => Ok(NufftPlan::type2_gpu(device, queue, config)?),
         }
     }
@@ -135,9 +189,10 @@ async fn run() -> BenchResult<()> {
     let options = parse_options()?;
     println!("wgpu-nufft 2D GPU benchmark");
     println!(
-        "configuration: shapes={CASE_SHAPES:?} point_count_equals_total_mode_count=true axis_zero_fastest=true point_layout=point-major-[x,y] runs={} samples_per_run={} seed={DATA_SEED:#010x} point_y_seed_mask={POINT_Y_SEED_MASK:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={} wait_timeout_secs={}",
+        "configuration: shapes={CASE_SHAPES:?} point_count_equals_total_mode_count=true axis_zero_fastest=true point_layout=point-major-[x,y] runs={} samples_per_run={} type1_gather={} seed={DATA_SEED:#010x} point_y_seed_mask={POINT_Y_SEED_MASK:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={} wait_timeout_secs={}",
         options.runs,
         options.samples,
+        options.type1_gather.name(),
         DEFAULT_EPS,
         DEFAULT_SIGMA,
         options
@@ -323,6 +378,7 @@ async fn run_cases(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_kind(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -348,7 +404,7 @@ async fn run_kind(
     for run_index in 0..options.runs {
         let plan_scopes = push_gpu_error_scopes(device);
         let plan_start = Instant::now();
-        let plan = kind.create_plan(device, queue, config.clone());
+        let plan = kind.create_plan(device, queue, config.clone(), options.type1_gather);
         let plan_creation_ms = plan_start.elapsed().as_secs_f64() * 1_000.0;
         pop_gpu_error_scopes(plan_scopes, "creating 2D NUFFT benchmark plan").await?;
         let plan = plan?;
@@ -440,8 +496,9 @@ async fn run_kind(
     let fine_shape = fine_shape.expect("at least one validated run");
     let million_points_per_second = point_count as f64 / (submit_wait_stats.mean * 1_000.0);
     println!(
-        "RESULT kind={} dimensions=2 N0={} N1={} N_total={} M={} fine_grid_shape={}x{} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback",
+        "RESULT kind={} type1_gather={} dimensions=2 N0={} N1={} N_total={} M={} fine_grid_shape={}x{} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback",
         kind.name(),
+        options.type1_gather.name(),
         shape[0],
         shape[1],
         point_count,
@@ -660,6 +717,7 @@ fn parse_options() -> BenchResult<Options> {
     let mut runs = DEFAULT_RUNS;
     let mut samples = DEFAULT_SAMPLES;
     let mut wait_timeout = DEFAULT_WAIT_TIMEOUT;
+    let mut type1_gather = Type1Gather::Tiled16;
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -680,6 +738,17 @@ fn parse_options() -> BenchResult<Options> {
                 }
                 wait_timeout = Duration::from_secs(seconds);
             }
+            "--type1-gather" => {
+                type1_gather = match next_value(&mut arguments, "--type1-gather")?.as_str() {
+                    "global" => Type1Gather::Global,
+                    "tiled16" => Type1Gather::Tiled16,
+                    value => {
+                        return Err(input_error(format!(
+                            "unknown type-1 gather {value:?}; expected global or tiled16"
+                        )));
+                    }
+                };
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -692,6 +761,7 @@ fn parse_options() -> BenchResult<Options> {
         runs,
         samples,
         wait_timeout,
+        type1_gather,
     })
 }
 
@@ -721,6 +791,7 @@ Options:
   --runs <count>              Plan recreations per case (default: 3).
   --samples <count>           Timed submissions per plan (default: 10).
   --wait-timeout-secs <secs>  Per-submission timeout (default: 120).
+  --type1-gather <route>      Select global or tiled16 (default: tiled16).
   --help                      Show this help.
 
 Fixed cases are 512x512 and 1024x1024 with M=N0*N1, f32, eps=1e-6,

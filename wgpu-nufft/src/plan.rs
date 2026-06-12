@@ -6,7 +6,7 @@ use crate::gpu_2d::Type2GpuPlan2d;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_type1::Type1GpuPlan;
-use crate::gpu_type1_2d::Type1GpuPlan2d;
+use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::Complex64;
 
@@ -211,6 +211,53 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
+        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Tiled16)
+    }
+
+    /// Benchmark-only constructor retaining the original one-cell-per-lane 2D
+    /// gather while the tiled prototype is evaluated.
+    #[doc(hidden)]
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    pub fn type1_gpu_with_global_2d_gather_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> Result<Self> {
+        if config.dimensions() != 2 {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-1 global 2D gather prototype control",
+                actual: config.dimensions(),
+                supported: 2,
+            });
+        }
+        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Global)
+    }
+
+    /// Benchmark-only constructor selecting the 16x16 shared-memory 2D gather
+    /// prototype. This surface is intentionally absent from default builds.
+    #[doc(hidden)]
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    pub fn type1_gpu_with_tiled_2d_gather_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> Result<Self> {
+        if config.dimensions() != 2 {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-1 tiled 2D gather prototype",
+                actual: config.dimensions(),
+                supported: 2,
+            });
+        }
+        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Tiled16)
+    }
+
+    fn type1_gpu_with_2d_gather(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+        gather_2d: Type1Gather2d,
+    ) -> Result<Self> {
         if config.dimensions() > 2 {
             return Err(NufftError::GpuDimensionsUnsupported {
                 kind: "type-1",
@@ -238,6 +285,7 @@ impl NufftPlan {
                     plan.centered_kernel_fourier_coefficients[0].as_slice(),
                     plan.centered_kernel_fourier_coefficients[1].as_slice(),
                 ],
+                gather_2d,
             )?),
             _ => unreachable!("validated NUFFT GPU plans have at least one dimension"),
         };

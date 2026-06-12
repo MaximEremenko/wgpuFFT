@@ -38,6 +38,13 @@ async fn run_gpu_2d_cases() {
     validate_type1_scratch_grow_then_shrink(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
     validate_non_square_case(&context.device, &context.queue);
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    {
+        validate_tiled_equivalence_and_oracle(&context.device, &context.queue);
+        validate_tiled_tolerance_sweep(&context.device, &context.queue);
+        validate_tiled_adjoint_consistency(&context.device, &context.queue);
+        validate_tiled_scratch_grow_then_shrink(&context.device, &context.queue);
+    }
 
     // Keep the native Windows teardown workaround used by the other GPU suites.
     std::mem::forget(context);
@@ -327,14 +334,14 @@ fn validate_non_square_case(device: &wgpu::Device, queue: &wgpu::Queue) {
         opposite_sign(config.sign()),
         config.mode_order(),
     );
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    let type1_plan =
+        NufftPlan::type1_gpu_with_global_2d_gather_for_testing(device, queue, config.clone())
+            .unwrap();
+    #[cfg(not(feature = "type1-2d-tile-prototype"))]
     let type1_plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
-    let actual_type1 = interleaved_to_complex64(&execute_type1(
-        device,
-        queue,
-        &type1_plan,
-        &points,
-        &strengths,
-    ));
+    let global_type1 = execute_type1(device, queue, &type1_plan, &points, &strengths);
+    let actual_type1 = interleaved_to_complex64(&global_type1);
     let reference_type1 = reference_type1_f64(
         &config,
         &points_f64(&points),
@@ -346,6 +353,289 @@ fn validate_non_square_case(device: &wgpu::Device, queue: &wgpu::Queue) {
         "NUFFT_2D_ACCURACY kind=type1 shape=256x1024 eps={eps:.0e} class=sparse relative_l2={type1_error:.9e}"
     );
     assert!(type1_error <= tolerance);
+
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    {
+        let tiled_plan =
+            NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(device, queue, config.clone())
+                .unwrap();
+        let tiled_type1 = execute_type1(device, queue, &tiled_plan, &points, &strengths);
+        assert_f32_bits_equal(
+            &tiled_type1,
+            &global_type1,
+            "non-square 256x1024 tiled/global type-1",
+        );
+        let tiled_error = relative_l2(&interleaved_to_complex64(&tiled_type1), &reference_type1);
+        eprintln!(
+            "NUFFT_2D_TILED_ACCURACY kind=type1 shape=256x1024 eps={eps:.0e} class=sparse relative_l2={tiled_error:.9e}"
+        );
+        assert!(tiled_error <= tolerance);
+    }
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn validate_tiled_equivalence_and_oracle(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mode_shape = [17, 19];
+    let eps = 1.0e-6;
+    let tolerance = FLOAT_TOLERANCE_FACTOR * eps;
+    let classes = tiled_point_classes();
+
+    for sign in [NufftSign::Positive, NufftSign::Negative] {
+        for order in [ModeOrder::Centered, ModeOrder::Fft] {
+            let config = NufftConfig::new(mode_shape, eps)
+                .with_sign(sign)
+                .with_mode_order(order);
+            let global = NufftPlan::type1_gpu_with_global_2d_gather_for_testing(
+                device,
+                queue,
+                config.clone(),
+            )
+            .unwrap();
+            let tiled = NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(
+                device,
+                queue,
+                config.clone(),
+            )
+            .unwrap();
+
+            for class in &classes {
+                let strengths = test_values(class.point_count(), opposite_sign(sign), order);
+                let global_output =
+                    execute_type1(device, queue, &global, &class.points, &strengths);
+                let tiled_output = execute_type1(device, queue, &tiled, &class.points, &strengths);
+                assert_f32_bits_equal(
+                    &tiled_output,
+                    &global_output,
+                    &format!(
+                        "17x19 tiled/global type-1 sign={sign:?} order={order:?} class={}",
+                        class.label
+                    ),
+                );
+
+                let reference = reference_type1_f64(
+                    &config,
+                    &points_f64(&class.points),
+                    &interleaved_to_complex64(&strengths),
+                )
+                .unwrap();
+                let error = relative_l2(&interleaved_to_complex64(&tiled_output), &reference);
+                eprintln!(
+                    "NUFFT_2D_TILED_ACCURACY kind=type1 shape=17x19 eps={eps:.0e} sign={sign:?} order={order:?} class={} relative_l2={error:.9e}",
+                    class.label
+                );
+                assert!(
+                    error <= tolerance,
+                    "17x19 tiled type1 sign={sign:?} order={order:?} class={}: relative l2 {error} exceeds {tolerance}",
+                    class.label
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn validate_tiled_tolerance_sweep(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let mode_shape = [17, 19];
+    let classes = adversarial_point_classes()
+        .into_iter()
+        .filter(|class| matches!(class.label, "clustered" | "boundary"))
+        .collect::<Vec<_>>();
+
+    for eps in [1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6] {
+        let tolerance = FLOAT_TOLERANCE_FACTOR * eps;
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new(mode_shape, eps)
+                .with_sign(sign)
+                .with_mode_order(ModeOrder::Centered);
+            let tiled = NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(
+                device,
+                queue,
+                config.clone(),
+            )
+            .unwrap();
+            for class in &classes {
+                let strengths = test_values(
+                    class.point_count(),
+                    opposite_sign(sign),
+                    ModeOrder::Centered,
+                );
+                let actual = interleaved_to_complex64(&execute_type1(
+                    device,
+                    queue,
+                    &tiled,
+                    &class.points,
+                    &strengths,
+                ));
+                let reference = reference_type1_f64(
+                    &config,
+                    &points_f64(&class.points),
+                    &interleaved_to_complex64(&strengths),
+                )
+                .unwrap();
+                let error = relative_l2(&actual, &reference);
+                eprintln!(
+                    "NUFFT_2D_TILED_SWEEP shape=17x19 eps={eps:.0e} sign={sign:?} class={} relative_l2={error:.9e}",
+                    class.label
+                );
+                assert!(
+                    error <= tolerance,
+                    "17x19 tiled sweep eps={eps} sign={sign:?} class={}: relative l2 {error} exceeds {tolerance}",
+                    class.label
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn validate_tiled_adjoint_consistency(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let points = seeded_random_points(13, 0x27c4_9b8d);
+    let mode_shape = [17, 19];
+    let mode_count = mode_shape.iter().product();
+    for sign in [NufftSign::Positive, NufftSign::Negative] {
+        for order in [ModeOrder::Centered, ModeOrder::Fft] {
+            let type2_config = NufftConfig::new(mode_shape, 1.0e-6)
+                .with_sign(sign)
+                .with_mode_order(order);
+            let type1_config = NufftConfig::new(mode_shape, 1.0e-6)
+                .with_sign(opposite_sign(sign))
+                .with_mode_order(order);
+            let type2_plan = NufftPlan::type2_gpu(device, queue, type2_config).unwrap();
+            let type1_plan =
+                NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(device, queue, type1_config)
+                    .unwrap();
+            let modes = test_values(mode_count, sign, order);
+            let point_values = test_values(points.len() / DIMENSIONS, opposite_sign(sign), order);
+
+            let av = interleaved_to_complex64(&execute_type2(
+                device,
+                queue,
+                &type2_plan,
+                &points,
+                &modes,
+            ));
+            let a_star_u = interleaved_to_complex64(&execute_type1(
+                device,
+                queue,
+                &type1_plan,
+                &points,
+                &point_values,
+            ));
+            let u = interleaved_to_complex64(&point_values);
+            let v = interleaved_to_complex64(&modes);
+            let left = hermitian_inner(&u, &av);
+            let right = hermitian_inner(&a_star_u, &v);
+            let residual = complex_abs(Complex64::new(left.re - right.re, left.im - right.im));
+            let scale = (l2_norm(&u) * l2_norm(&av) + l2_norm(&a_star_u) * l2_norm(&v))
+                .max(f64::MIN_POSITIVE);
+            let relative = residual / scale;
+            eprintln!(
+                "NUFFT_2D_TILED_ADJOINT shape=17x19 sign={sign:?} order={order:?} relative_residual={relative:.9e}"
+            );
+            assert!(
+                relative <= ADJOINT_TOLERANCE,
+                "17x19 tiled type2 sign={sign:?} / opposite-sign type1 order={order:?}: adjoint residual {relative} exceeds {ADJOINT_TOLERANCE}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn validate_tiled_scratch_grow_then_shrink(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let eps = 1.0e-6;
+    let config = NufftConfig::new([17, 19], eps)
+        .with_sign(NufftSign::Negative)
+        .with_mode_order(ModeOrder::Fft);
+    let global =
+        NufftPlan::type1_gpu_with_global_2d_gather_for_testing(device, queue, config.clone())
+            .unwrap();
+    let tiled =
+        NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(device, queue, config.clone())
+            .unwrap();
+
+    // All 513 points occupy one bin. This exceeds the tiled point-cache capacity
+    // and therefore forces multiple uniform cache batches before the smaller run.
+    let large_points = dense_same_bin_points(513);
+    let large_strengths = test_values(513, NufftSign::Positive, ModeOrder::Centered);
+    let small_points = vec![
+        0.0,
+        0.0,
+        PI as f32,
+        -(PI as f32),
+        -2.75,
+        2.5,
+        0.3125,
+        -0.6875,
+        -1.75,
+        2.25,
+        2.875,
+        -2.625,
+        -0.125,
+        0.75,
+    ];
+    let small_strengths = test_values(7, NufftSign::Positive, ModeOrder::Centered);
+
+    let global_large = execute_type1(device, queue, &global, &large_points, &large_strengths);
+    let global_small = execute_type1(device, queue, &global, &small_points, &small_strengths);
+
+    for (label, points, strengths, expected) in [
+        (
+            "dense-multibatch",
+            large_points.as_slice(),
+            large_strengths.as_slice(),
+            global_large.as_slice(),
+        ),
+        (
+            "small-after-grow",
+            small_points.as_slice(),
+            small_strengths.as_slice(),
+            global_small.as_slice(),
+        ),
+    ] {
+        let actual = execute_type1(device, queue, &tiled, points, strengths);
+        assert_f32_bits_equal(
+            &actual,
+            expected,
+            &format!("17x19 tiled scratch reuse {label}"),
+        );
+        let reference = reference_type1_f64(
+            &config,
+            &points_f64(points),
+            &interleaved_to_complex64(strengths),
+        )
+        .unwrap();
+        let error = relative_l2(&interleaved_to_complex64(&actual), &reference);
+        let tolerance = FLOAT_TOLERANCE_FACTOR * eps;
+        eprintln!(
+            "NUFFT_2D_TILED_SCRATCH_REUSE phase={label} M={} relative_l2={error:.9e}",
+            points.len() / DIMENSIONS
+        );
+        assert!(
+            error <= tolerance,
+            "17x19 tiled scratch reuse {label}: relative l2 {error} exceeds {tolerance}"
+        );
+    }
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn tiled_point_classes() -> Vec<PointClass> {
+    let mut classes = adversarial_point_classes();
+    classes[0] = PointClass {
+        label: "seeded",
+        points: seeded_random_points(257, 0xa67f_4d31),
+    };
+    classes.push(PointClass {
+        label: "dense-same-bin-multibatch",
+        points: dense_same_bin_points(513),
+    });
+    classes
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn dense_same_bin_points(point_count: usize) -> Vec<f32> {
+    (0..point_count)
+        .flat_map(|_| [0.25f32, -0.375f32])
+        .collect()
 }
 
 struct PointClass {
@@ -615,4 +905,16 @@ fn assert_complex_bits_equal(values: &[f32], first: usize, second: usize, contex
     let second = &values[second * 2..second * 2 + 2];
     assert_eq!(first[0].to_bits(), second[0].to_bits(), "{context} real");
     assert_eq!(first[1].to_bits(), second[1].to_bits(), "{context} imag");
+}
+
+#[cfg(feature = "type1-2d-tile-prototype")]
+fn assert_f32_bits_equal(actual: &[f32], expected: &[f32], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context} length");
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "{context} word {index}: actual={actual:?} expected={expected:?}"
+        );
+    }
 }

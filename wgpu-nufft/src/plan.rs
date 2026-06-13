@@ -8,6 +8,7 @@ use crate::gpu_3d::Type2GpuPlan3d;
 use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
+use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
 use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::Complex64;
 
@@ -19,8 +20,9 @@ pub enum NufftKind {
 }
 
 enum Type1GpuExecution {
-    OneDimensional(Type1GpuPlan),
-    TwoDimensional(Type1GpuPlan2d),
+    OneD(Type1GpuPlan),
+    TwoD(Type1GpuPlan2d),
+    ThreeD(Type1GpuPlan3d),
 }
 
 impl Type1GpuExecution {
@@ -34,10 +36,13 @@ impl Type1GpuExecution {
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneDimensional(plan) => {
+            Self::OneD(plan) => {
                 plan.encode(device, encoder, point_count, points, strengths, output)
             }
-            Self::TwoDimensional(plan) => {
+            Self::TwoD(plan) => {
+                plan.encode(device, encoder, point_count, points, strengths, output)
+            }
+            Self::ThreeD(plan) => {
                 plan.encode(device, encoder, point_count, points, strengths, output)
             }
         }
@@ -57,7 +62,7 @@ impl Type1GpuExecution {
         first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
         match self {
-            Self::OneDimensional(plan) => plan.encode_profiled(
+            Self::OneD(plan) => plan.encode_profiled(
                 device,
                 encoder,
                 point_count,
@@ -67,7 +72,17 @@ impl Type1GpuExecution {
                 query_set,
                 first_query,
             ),
-            Self::TwoDimensional(plan) => plan.encode_profiled(
+            Self::TwoD(plan) => plan.encode_profiled(
+                device,
+                encoder,
+                point_count,
+                points,
+                strengths,
+                output,
+                query_set,
+                first_query,
+            ),
+            Self::ThreeD(plan) => plan.encode_profiled(
                 device,
                 encoder,
                 point_count,
@@ -83,8 +98,9 @@ impl Type1GpuExecution {
     #[cfg(feature = "gpu-profiling")]
     fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         match self {
-            Self::OneDimensional(plan) => plan.fft_diagnostics(),
-            Self::TwoDimensional(plan) => plan.fft_diagnostics(),
+            Self::OneD(plan) => plan.fft_diagnostics(),
+            Self::TwoD(plan) => plan.fft_diagnostics(),
+            Self::ThreeD(plan) => plan.fft_diagnostics(),
         }
     }
 }
@@ -215,7 +231,7 @@ impl NufftPlan {
         Self::new(NufftKind::Type2, config)
     }
 
-    /// Builds a reusable one- or two-dimensional type-1 GPU plan.
+    /// Builds a reusable one-, two-, or three-dimensional type-1 GPU plan.
     ///
     /// Execution is entirely GPU-resident and records commands into a caller
     /// supplied encoder. The plan is device-specific and may be reused with
@@ -227,7 +243,13 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
-        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Tiled16)
+        Self::type1_gpu_with_gathers(
+            device,
+            queue,
+            config,
+            Type1Gather2d::Tiled16,
+            Type1Gather3d::Tiled8x8x4,
+        )
     }
 
     /// Benchmark-only constructor retaining the original one-cell-per-lane 2D
@@ -246,7 +268,13 @@ impl NufftPlan {
                 supported: 2,
             });
         }
-        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Global)
+        Self::type1_gpu_with_gathers(
+            device,
+            queue,
+            config,
+            Type1Gather2d::Global,
+            Type1Gather3d::Global,
+        )
     }
 
     /// Benchmark-only constructor selecting the 16x16 shared-memory 2D gather
@@ -265,25 +293,83 @@ impl NufftPlan {
                 supported: 2,
             });
         }
-        Self::type1_gpu_with_2d_gather(device, queue, config, Type1Gather2d::Tiled16)
+        Self::type1_gpu_with_gathers(
+            device,
+            queue,
+            config,
+            Type1Gather2d::Tiled16,
+            Type1Gather3d::Global,
+        )
     }
 
-    fn type1_gpu_with_2d_gather(
+    /// Benchmark-only constructor retaining the one-cell-per-lane 3D gather
+    /// as a deterministic comparison path for the tiled default.
+    #[doc(hidden)]
+    #[cfg(feature = "type1-3d-tile-prototype")]
+    pub fn type1_gpu_with_global_3d_gather_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> Result<Self> {
+        if config.dimensions() != 3 {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-1 global 3D gather prototype control",
+                actual: config.dimensions(),
+                supported: 3,
+            });
+        }
+        Self::type1_gpu_with_gathers(
+            device,
+            queue,
+            config,
+            Type1Gather2d::Tiled16,
+            Type1Gather3d::Global,
+        )
+    }
+
+    /// Benchmark-only constructor explicitly requesting the `8x8x4`
+    /// shared-memory 3D gather used by the public default. Devices without the
+    /// required limits use the global fallback.
+    #[doc(hidden)]
+    #[cfg(feature = "type1-3d-tile-prototype")]
+    pub fn type1_gpu_with_tiled_3d_gather_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: NufftConfig,
+    ) -> Result<Self> {
+        if config.dimensions() != 3 {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-1 tiled 3D gather prototype",
+                actual: config.dimensions(),
+                supported: 3,
+            });
+        }
+        Self::type1_gpu_with_gathers(
+            device,
+            queue,
+            config,
+            Type1Gather2d::Tiled16,
+            Type1Gather3d::Tiled8x8x4,
+        )
+    }
+
+    fn type1_gpu_with_gathers(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: NufftConfig,
         gather_2d: Type1Gather2d,
+        gather_3d: Type1Gather3d,
     ) -> Result<Self> {
-        if config.dimensions() > 2 {
+        if config.dimensions() > 3 {
             return Err(NufftError::GpuDimensionsUnsupported {
                 kind: "type-1",
                 actual: config.dimensions(),
-                supported: 2,
+                supported: 3,
             });
         }
         let mut plan = Self::new(NufftKind::Type1, config)?;
         let gpu = match plan.config.dimensions() {
-            1 => Type1GpuExecution::OneDimensional(Type1GpuPlan::new(
+            1 => Type1GpuExecution::OneD(Type1GpuPlan::new(
                 device,
                 queue,
                 &plan.config,
@@ -291,7 +377,7 @@ impl NufftPlan {
                 plan.fine_grid_shape[0],
                 &plan.centered_kernel_fourier_coefficients[0],
             )?),
-            2 => Type1GpuExecution::TwoDimensional(Type1GpuPlan2d::new(
+            2 => Type1GpuExecution::TwoD(Type1GpuPlan2d::new(
                 device,
                 queue,
                 &plan.config,
@@ -302,6 +388,23 @@ impl NufftPlan {
                     plan.centered_kernel_fourier_coefficients[1].as_slice(),
                 ],
                 gather_2d,
+            )?),
+            3 => Type1GpuExecution::ThreeD(Type1GpuPlan3d::new(
+                device,
+                queue,
+                &plan.config,
+                plan.kernel,
+                [
+                    plan.fine_grid_shape[0],
+                    plan.fine_grid_shape[1],
+                    plan.fine_grid_shape[2],
+                ],
+                [
+                    plan.centered_kernel_fourier_coefficients[0].as_slice(),
+                    plan.centered_kernel_fourier_coefficients[1].as_slice(),
+                    plan.centered_kernel_fourier_coefficients[2].as_slice(),
+                ],
+                gather_3d,
             )?),
             _ => unreachable!("validated NUFFT GPU plans have at least one dimension"),
         };
@@ -458,7 +561,7 @@ impl NufftPlan {
         )
     }
 
-    /// Records a one- or two-dimensional type-1 NUFFT into `encoder` without
+    /// Records a one-, two-, or three-dimensional type-1 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
     /// `points` stores point-major `f32` coordinates (one scalar per configured

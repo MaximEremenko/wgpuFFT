@@ -11,6 +11,7 @@ readme = "README.md"
 default = []
 gpu-profiling = []
 type1-2d-tile-prototype = []
+type1-3d-tile-prototype = []
 
 [lib]
 name = "wgpu_nufft"

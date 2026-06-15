@@ -32,6 +32,51 @@ pub enum NufftError {
         minimum: usize,
         maximum: usize,
     },
+    InvalidType3Interval {
+        set: &'static str,
+        axis: usize,
+        lower: f64,
+        upper: f64,
+        reason: &'static str,
+    },
+    Type3CoordinateLength {
+        set: &'static str,
+        actual: usize,
+        dimensions: usize,
+    },
+    Type3NonFiniteCoordinate {
+        set: &'static str,
+        point: usize,
+        axis: usize,
+        value: f64,
+    },
+    Type3CoordinateOutOfBounds {
+        set: &'static str,
+        point: usize,
+        axis: usize,
+        value: f64,
+        lower: f64,
+        upper: f64,
+    },
+    Type3GridSizeUnsupported {
+        axis: usize,
+        requested: f64,
+        maximum: usize,
+        reason: &'static str,
+    },
+    Type3GridVolumeUnsupported {
+        requested: u128,
+        maximum: usize,
+    },
+    Type3RescalingUnsupported {
+        axis: usize,
+        quantity: &'static str,
+        value: f64,
+        reason: &'static str,
+    },
+    InvalidType3KernelFrequency {
+        frequency: f64,
+    },
     LengthOverflow {
         context: &'static str,
     },
@@ -158,6 +203,70 @@ impl fmt::Display for NufftError {
             } => write!(
                 f,
                 "invalid ES kernel width {width}; expected {minimum}..={maximum}"
+            ),
+            Self::InvalidType3Interval {
+                set,
+                axis,
+                lower,
+                upper,
+                reason,
+            } => write!(
+                f,
+                "invalid type-3 {set} interval on axis {axis}, [{lower}, {upper}]: {reason}"
+            ),
+            Self::Type3CoordinateLength {
+                set,
+                actual,
+                dimensions,
+            } => write!(
+                f,
+                "type-3 {set} coordinate length {actual} is incompatible with dimension count {dimensions}"
+            ),
+            Self::Type3NonFiniteCoordinate {
+                set,
+                point,
+                axis,
+                value,
+            } => write!(
+                f,
+                "type-3 {set} point {point} coordinate on axis {axis} is not finite: {value}"
+            ),
+            Self::Type3CoordinateOutOfBounds {
+                set,
+                point,
+                axis,
+                value,
+                lower,
+                upper,
+            } => write!(
+                f,
+                "type-3 {set} point {point} coordinate on axis {axis} is {value}, outside the planned interval [{lower}, {upper}]"
+            ),
+            Self::Type3GridSizeUnsupported {
+                axis,
+                requested,
+                maximum,
+                reason,
+            } => write!(
+                f,
+                "type-3 outer grid length on axis {axis} would be {requested}, exceeding the supported maximum {maximum}: {reason}"
+            ),
+            Self::Type3GridVolumeUnsupported { requested, maximum } => write!(
+                f,
+                "type-3 outer grid would contain {requested} points, exceeding the supported maximum {maximum}"
+            ),
+            Self::Type3RescalingUnsupported {
+                axis,
+                quantity,
+                value,
+                reason,
+            } => write!(
+                f,
+                "type-3 {quantity} on axis {axis} is unsupported ({value}): {reason}"
+            ),
+            Self::InvalidType3KernelFrequency { frequency } => write!(
+                f,
+                "type-3 ES-kernel Fourier-transform frequency cannot produce a finite kernel phase: {frequency}"
             ),
             Self::LengthOverflow { context } => {
                 write!(f, "NUFFT length arithmetic overflow while computing {context}")

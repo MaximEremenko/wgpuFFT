@@ -773,3 +773,115 @@ fn tensor_product_es_host_type2_meets_acceptance_in_three_dimensions() {
         }
     }
 }
+
+#[test]
+fn many_vector_direct_references_are_transform_major_and_match_single_loops() {
+    let points = [0.13, -0.27, 0.71, 0.43];
+    let batched = NufftConfig::new([3, 2], 1.0e-6)
+        .with_sign(NufftSign::Negative)
+        .with_mode_order(ModeOrder::Fft)
+        .with_batch(3);
+    let single = batched.clone().with_batch(1);
+
+    let strengths = (0..6)
+        .map(|index| {
+            let x = index as f64 + 0.25;
+            Complex64::new((0.31 * x).sin(), (0.17 * x).cos())
+        })
+        .collect::<Vec<_>>();
+    let type1 = reference_type1_f64(&batched, &points, &strengths).unwrap();
+    let expected_type1 = strengths
+        .chunks_exact(2)
+        .flat_map(|vector| reference_type1_f64(&single, &points, vector).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(type1, expected_type1);
+    assert_eq!(
+        reference_type1_f64(&batched, &points, &strengths[..5]),
+        Err(NufftError::InputLength {
+            input: "type-1 strengths",
+            expected: 6,
+            actual: 5,
+        })
+    );
+
+    let coefficients = (0..18)
+        .map(|index| {
+            let x = index as f64 + 0.5;
+            Complex64::new((0.11 * x).cos(), (0.23 * x).sin())
+        })
+        .collect::<Vec<_>>();
+    let type2 = reference_type2_f64(&batched, &points, &coefficients).unwrap();
+    let expected_type2 = coefficients
+        .chunks_exact(6)
+        .flat_map(|vector| reference_type2_f64(&single, &points, vector).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(type2, expected_type2);
+    assert_eq!(
+        reference_type2_f64(&batched, &points, &coefficients[..17]),
+        Err(NufftError::InputLength {
+            input: "type-2 Fourier coefficients",
+            expected: 18,
+            actual: 17,
+        })
+    );
+}
+
+#[test]
+fn batch_aware_buffer_sizes_preserve_legacy_single_vector_helpers() {
+    let config = NufftConfig::new([3, 2], 1.0e-6).with_batch(3);
+    let type1 = NufftPlan::type1(config.clone()).unwrap();
+    let type2 = NufftPlan::type2(config).unwrap();
+
+    assert_eq!(
+        NufftPlan::required_type1_strength_buffer_size_bytes(2).unwrap(),
+        16
+    );
+    assert_eq!(
+        type1
+            .required_type1_strength_buffer_size_bytes_for_batch(2, 2)
+            .unwrap(),
+        32
+    );
+    assert_eq!(
+        type1.required_type1_output_buffer_size_bytes().unwrap(),
+        144
+    );
+    assert_eq!(
+        type1
+            .required_type1_output_buffer_size_bytes_for_batch(2)
+            .unwrap(),
+        96
+    );
+    assert_eq!(
+        type2
+            .required_type2_coefficient_buffer_size_bytes()
+            .unwrap(),
+        144
+    );
+    assert_eq!(
+        type2
+            .required_type2_coefficient_buffer_size_bytes_for_batch(2)
+            .unwrap(),
+        96
+    );
+    assert_eq!(
+        NufftPlan::required_type2_output_buffer_size_bytes(2).unwrap(),
+        16
+    );
+    assert_eq!(
+        type2
+            .required_type2_output_buffer_size_bytes_for_batch(2, 3)
+            .unwrap(),
+        48
+    );
+
+    for active_batch in [0, 4] {
+        assert_eq!(
+            type1.required_type1_output_buffer_size_bytes_for_batch(active_batch),
+            Err(NufftError::InvalidBatch {
+                actual: active_batch,
+                maximum: 3,
+            })
+        );
+    }
+}

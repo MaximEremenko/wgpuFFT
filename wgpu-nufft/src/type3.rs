@@ -91,6 +91,7 @@ pub struct NufftType3Config {
     eps: f64,
     sign: NufftSign,
     sigma: f64,
+    batch: usize,
 }
 
 impl NufftType3Config {
@@ -105,6 +106,7 @@ impl NufftType3Config {
             eps,
             sign: NufftSign::Positive,
             sigma: DEFAULT_SIGMA,
+            batch: 1,
         }
     }
 
@@ -120,6 +122,13 @@ impl NufftType3Config {
 
     pub fn with_sigma(mut self, sigma: f64) -> Self {
         self.sigma = sigma;
+        self
+    }
+
+    /// Sets the `ntransf` capacity: the maximum number of
+    /// strength vectors sharing one source and target point set.
+    pub fn with_batch(mut self, batch: usize) -> Self {
+        self.batch = batch;
         self
     }
 
@@ -151,7 +160,17 @@ impl NufftType3Config {
         self.sigma
     }
 
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if self.batch == 0 {
+            return Err(NufftError::InvalidBatch {
+                actual: 0,
+                maximum: usize::MAX,
+            });
+        }
         let dimensions = self.dimensions();
         if !(1..=3).contains(&dimensions) {
             return Err(NufftError::InvalidDimensions {
@@ -368,11 +387,39 @@ impl NufftType3Plan {
     }
 
     pub fn required_strength_buffer_size_bytes(&self, source_count: usize) -> Result<u64> {
-        complex_buffer_size_bytes("type-3 source strength buffer", source_count)
+        self.required_strength_buffer_size_bytes_for_batch(source_count, self.config.batch())
     }
 
     pub fn required_output_buffer_size_bytes(&self, target_count: usize) -> Result<u64> {
-        complex_buffer_size_bytes("type-3 output buffer", target_count)
+        self.required_output_buffer_size_bytes_for_batch(target_count, self.config.batch())
+    }
+
+    pub fn required_strength_buffer_size_bytes_for_batch(
+        &self,
+        source_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        validate_active_batch(active_batch, self.config.batch())?;
+        let values = source_count
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 batched source strength count",
+            })?;
+        complex_buffer_size_bytes("type-3 source strength buffer", values)
+    }
+
+    pub fn required_output_buffer_size_bytes_for_batch(
+        &self,
+        target_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        validate_active_batch(active_batch, self.config.batch())?;
+        let values = target_count
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 batched output count",
+            })?;
+        complex_buffer_size_bytes("type-3 output buffer", values)
     }
 
     /// Records a 1D, 2D, or 3D type-3 NUFFT into `encoder` without submission
@@ -394,6 +441,36 @@ impl NufftType3Plan {
         target_points: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_gpu_batch(
+            device,
+            encoder,
+            self.config.batch(),
+            source_count,
+            source_points,
+            strengths,
+            target_count,
+            target_points,
+            output,
+        )
+    }
+
+    /// Records `active_batch` transforms sharing the same point sets. The
+    /// active count may be smaller than the plan-time capacity but never
+    /// larger. Complex buffers are transform-major.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        source_count: usize,
+        source_points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        target_count: usize,
+        target_points: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        validate_active_batch(active_batch, self.config.batch())?;
         let gpu = self
             .gpu
             .as_ref()
@@ -401,9 +478,10 @@ impl NufftType3Plan {
                 kind: "type-3",
                 reason: "plan was created without GPU resources",
             })?;
-        gpu.encode(
+        gpu.encode_batch(
             device,
             encoder,
+            active_batch,
             source_count,
             source_points,
             strengths,
@@ -501,31 +579,58 @@ pub fn reference_type3_f64(
         target_frequencies,
         &config.target_bounds,
     )?;
-    if strengths.len() != source_count {
+    let expected_strengths =
+        source_count
+            .checked_mul(config.batch())
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 direct batched strength count",
+            })?;
+    if strengths.len() != expected_strengths {
         return Err(NufftError::InputLength {
             input: "type-3 source strengths",
-            expected: source_count,
+            expected: expected_strengths,
             actual: strengths.len(),
         });
     }
     validate_complex("type-3 source strengths", strengths)?;
 
     let mut output = Vec::new();
+    let output_count =
+        target_count
+            .checked_mul(config.batch())
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 direct batched output count",
+            })?;
     output
-        .try_reserve_exact(target_count)
+        .try_reserve_exact(output_count)
         .map_err(|_| NufftError::HostAllocationFailed {
             buffer: "type-3 direct output",
-            elements: target_count,
+            elements: output_count,
         })?;
-    for target in target_frequencies.chunks_exact(dimensions) {
-        let mut sum = Complex64::default();
-        for (source, &strength) in source_coordinates.chunks_exact(dimensions).zip(strengths) {
-            let phase = source.iter().zip(target).map(|(&x, &s)| x * s).sum::<f64>();
-            add_rotated(&mut sum, strength, config.sign.multiplier() * phase);
+    for batch in 0..config.batch() {
+        let strength_start = batch * source_count;
+        let strength_vector = &strengths[strength_start..strength_start + source_count];
+        for target in target_frequencies.chunks_exact(dimensions) {
+            let mut sum = Complex64::default();
+            for (source, &strength) in source_coordinates
+                .chunks_exact(dimensions)
+                .zip(strength_vector)
+            {
+                let phase = source.iter().zip(target).map(|(&x, &s)| x * s).sum::<f64>();
+                add_rotated(&mut sum, strength, config.sign.multiplier() * phase);
+            }
+            output.push(sum);
         }
-        output.push(sum);
     }
     Ok(output)
+}
+
+fn validate_active_batch(actual: usize, maximum: usize) -> Result<()> {
+    if actual == 0 || actual > maximum {
+        Err(NufftError::InvalidBatch { actual, maximum })
+    } else {
+        Ok(())
+    }
 }
 
 /// Continuous, unshifted Fourier transform of the one-dimensional ES kernel.
@@ -802,6 +907,47 @@ mod tests {
                 assert_complex_close(actual[0], expected, 8.0 * f64::EPSILON);
             }
         }
+    }
+
+    #[test]
+    fn direct_type3_many_vectors_are_transform_major_and_match_single_loops() {
+        let source = [-0.7, 0.2, 0.9, -0.4];
+        let target = [-1.1, 0.3, 0.8];
+        let vectors = [
+            Complex64::new(0.7, -0.2),
+            Complex64::new(-0.4, 0.8),
+            Complex64::new(0.3, 0.5),
+            Complex64::new(-0.1, -0.6),
+            Complex64::new(-0.6, 0.1),
+            Complex64::new(0.2, -0.9),
+            Complex64::new(0.4, 0.7),
+            Complex64::new(-0.3, -0.5),
+        ];
+        let single = NufftType3Config::new(
+            [NufftInterval::new(-1.0, 1.0)],
+            [NufftInterval::new(-1.5, 1.5)],
+            1.0e-9,
+        )
+        .with_isign(-1);
+        let batched = single.clone().with_batch(2);
+
+        let actual = reference_type3_f64(&batched, &source, &target, &vectors).unwrap();
+        let mut expected = Vec::new();
+        expected.extend(reference_type3_f64(&single, &source, &target, &vectors[..4]).unwrap());
+        expected.extend(reference_type3_f64(&single, &source, &target, &vectors[4..]).unwrap());
+        assert_eq!(actual, expected);
+
+        let plan = NufftType3Plan::new(batched).unwrap();
+        assert_eq!(plan.config().batch(), 2);
+        assert_eq!(plan.required_strength_buffer_size_bytes(4).unwrap(), 64);
+        assert_eq!(plan.required_output_buffer_size_bytes(3).unwrap(), 48);
+        assert!(matches!(
+            plan.required_output_buffer_size_bytes_for_batch(3, 0),
+            Err(NufftError::InvalidBatch {
+                actual: 0,
+                maximum: 2
+            })
+        ));
     }
 
     #[test]

@@ -16,11 +16,13 @@ The current implementation provides:
 - even fine-grid selection through `wgpu-fft`'s public supported-length
   factorization;
 - reusable 1D, 2D, and 3D type-2 `f32` GPU plans with caller-owned point,
-  Fourier-coefficient, and output buffers;
+  Fourier-coefficient, and output buffers, including many-vector
+  batching;
 - reusable 1D, 2D, and 3D type-1 `f32` GPU plans with caller-owned point,
-  strength, and Fourier-mode output buffers; and
+  strength, and Fourier-mode output buffers, including many-vector batching;
 - reusable 1D, 2D, and 3D type-3 `f32` GPU plans with caller-owned source
-  points, strengths, target frequencies, and output buffers.
+  points, strengths, target frequencies, and output buffers, also with
+  many-vector batching.
 
 The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
 `wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
@@ -33,6 +35,18 @@ interleaved complex `(re, im)` `f32` pairs; all require `STORAGE` buffer usage.
 Call `NufftPlan::required_point_buffer_size_bytes` when sizing a plan's
 coordinate buffer; the older transform-specific static helpers retain their 1D
 contract.
+
+`NufftConfig::with_batch(ntr)` and `NufftType3Config::with_batch(ntr)` follow
+the `ntransf` batching convention: every transform shares one point set, while
+complex inputs and outputs are transform-major (`[transform][point or mode]`).
+Type-1 binning, scan, and stable sorting run once per execution, and the spread
+and interpolation kernels reuse each computed support weight across blocks of
+up to four vectors. The oversampled-grid C2C plan uses `wgpu-fft`'s native batch
+dimension. The ordinary encode methods execute the configured count; the
+explicit `*_batch` methods may execute `1..=ntr` vectors on the same plan for
+grow/shrink workflows. The embedded FFT remains capacity-sized in that case,
+so a smaller active count is a reuse feature rather than a promise of
+proportionally lower FFT work.
 
 The 1D Vulkan accuracy matrix enforces relative L2 error at most `4*eps` over
 the complete random-plus-adversarial vector and `8*eps` for each isolated
@@ -72,11 +86,11 @@ phase range return structured planning errors. Use the dimension-aware
 source, target, strength, and output buffer. Type-3 plans likewise reuse
 grow-only internal scratch and require ordered execution on a given plan.
 
-GPU NUFFT execution is currently `f32` only and processes one transform per
-execution; NUFFT batching and `f64`/df64 arithmetic remain deferred. WASM
-packaging is also deferred. The underlying `wgpu-fft` crate already exposes the
-needed native-`f64` and portable-df64 C2C plumbing, but those precision paths
-have not yet been threaded through the NUFFT kernels and buffers.
+GPU NUFFT execution is currently `f32` only; native-`f64` and portable-df64
+NUFFT arithmetic remain deferred. WASM packaging is also deferred. The
+underlying `wgpu-fft` crate already exposes the needed precision-aware C2C
+plumbing, but those paths have not yet been threaded through the NUFFT kernels
+and buffers.
 
 ## Mathematical conventions
 

@@ -6,6 +6,10 @@ pub type Result<T> = std::result::Result<T, NufftError>;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum NufftError {
+    InvalidBatch {
+        actual: usize,
+        maximum: usize,
+    },
     InvalidDimensions {
         actual: usize,
         minimum: usize,
@@ -171,6 +175,10 @@ pub enum NufftError {
 impl fmt::Display for NufftError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBatch { actual, maximum } => write!(
+                f,
+                "invalid NUFFT batch count {actual}; expected 1..={maximum}"
+            ),
             Self::InvalidDimensions {
                 actual,
                 minimum,

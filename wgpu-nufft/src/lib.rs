@@ -2,9 +2,9 @@
 //!
 //! The crate provides reusable host-side type-1 and type-2 planning metadata,
 //! Direct `f64` reference transforms, and
-//! exponential-of-semicircle kernel tables. Reusable 1D, 2D, and 3D `f32`
-//! type-1 and type-2 plans encode spreading or interpolation around a fine-grid
-//! C2C transform entirely on the GPU using caller-owned input and output buffers.
+//! exponential-of-semicircle kernel tables. Reusable 1D, 2D, and 3D f32 or
+//! native-f64 plans encode spreading or interpolation around a fine-grid C2C
+//! transform entirely on the GPU using caller-owned input and output buffers.
 
 #![forbid(unsafe_code)]
 
@@ -38,4 +38,5 @@ pub use type3::{
     es_kernel_fourier_transform, reference_type3_f64, NufftInterval, NufftType3AxisMetadata,
     NufftType3Config, NufftType3Plan,
 };
-pub use wgpu_fft::math::Complex64;
+pub use wgpu_fft::math::{Complex64, ComplexDoubleFloat, DoubleFloat};
+pub use wgpu_fft::FftPrecision;

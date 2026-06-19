@@ -26,8 +26,11 @@ const TILED_GATHER_PADDED_SCAN_ELEMENTS: usize =
 const TILED_GATHER_STORAGE_BUDGET_BYTES: usize = 47 * 1024;
 const TILED_GATHER_CACHE_CAPACITY: usize = 300;
 const COMPLEX_F32_BYTES: u64 = 8;
+const COMPLEX_F64_BYTES: u64 = 16;
 const POINT_F32_BYTES: u64 = DIMENSIONS as u64 * 4;
+const POINT_F64_BYTES: u64 = DIMENSIONS as u64 * 8;
 const F32_BYTES: u64 = 4;
+const F64_BYTES: u64 = 8;
 const U32_BYTES: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,7 @@ pub(crate) struct Type1GpuPlan3d {
     mode_count: usize,
     fine_count: usize,
     batch_capacity: usize,
+    precision: FftPrecision,
     max_storage_binding_bytes: u64,
     max_buffer_bytes: u64,
 }
@@ -88,8 +92,20 @@ impl Type1GpuPlan3d {
                 supported: DIMENSIONS,
             });
         }
+        if config.precision() == FftPrecision::Df64 {
+            return Err(NufftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                stage: "type-1 3D GPU plan",
+                reason: "portable df64 NUFFT kernels are not implemented",
+            });
+        }
 
-        let maximum_signed_length = (1usize << f32::MANTISSA_DIGITS)
+        let precision = config.precision();
+        let exact_integer_limit = match precision {
+            FftPrecision::F32 | FftPrecision::Df64 => 1usize << f32::MANTISSA_DIGITS,
+            FftPrecision::F64 => 1usize << f64::MANTISSA_DIGITS,
+        };
+        let maximum_signed_length = exact_integer_limit
             .saturating_sub(kernel.width())
             .min(i32::MAX as usize - kernel.width());
         for &length in &fine_shape {
@@ -123,7 +139,7 @@ impl Type1GpuPlan3d {
         let fft_config = FftConfig::new_nd(fine_shape)
             .with_direction(fft_direction)
             .with_normalization(Normalization::None)
-            .with_precision(FftPrecision::F32);
+            .with_precision(precision);
         fft_config
             .validate()
             .map_err(|source| NufftError::FftShapeUnsupported {
@@ -153,9 +169,16 @@ impl Type1GpuPlan3d {
                 .ok_or(NufftError::LengthOverflow {
                     context: "batched type-1 3D fine-grid element count",
                 })?;
-        let fine_bytes = Self::complex_buffer_size_bytes("type-1 3D fine grid", total_fine_count)?;
-        let amplitude_bytes =
-            checked_buffer_size("type-1 3D deconvolution amplitudes", mode_count, F32_BYTES)?;
+        let fine_bytes = Self::complex_buffer_size_bytes_for_precision(
+            "type-1 3D fine grid",
+            total_fine_count,
+            precision,
+        )?;
+        let amplitude_bytes = checked_buffer_size(
+            "type-1 3D deconvolution amplitudes",
+            mode_count,
+            scalar_size_bytes(precision),
+        )?;
         let count_bytes = checked_buffer_size("type-1 3D bin counts", fine_count, U32_BYTES)?;
         let offset_count = fine_count
             .checked_add(1)
@@ -176,10 +199,10 @@ impl Type1GpuPlan3d {
             validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
         }
 
-        let amplitudes = mode_amplitudes(config, kernel_fourier_coefficients)?;
+        let amplitudes = mode_amplitude_bytes(config, kernel_fourier_coefficients, precision)?;
         let amplitudes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("wgpu_nufft.type1_3d.deconvolution_amplitudes"),
-            contents: bytemuck::cast_slice(&amplitudes),
+            contents: &amplitudes,
             usage: wgpu::BufferUsages::STORAGE,
         });
         let fine_usage = wgpu::BufferUsages::STORAGE
@@ -209,7 +232,7 @@ impl Type1GpuPlan3d {
         let count_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_3d.bin_count",
-            &generate_count_wgsl(fine_shape),
+            &generate_count_wgsl_for_precision(fine_shape, precision),
         );
         let count_layout = count_pipeline.get_bind_group_layout(0);
         let prefix_scan = GpuExclusiveScanU32::new(device, fine_count)?;
@@ -222,7 +245,7 @@ impl Type1GpuPlan3d {
         let scatter_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_3d.bin_scatter",
-            &generate_scatter_wgsl(fine_shape),
+            &generate_scatter_wgsl_for_precision(fine_shape, precision),
         );
         let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
         let sort_pipeline = create_compute_pipeline(
@@ -232,40 +255,50 @@ impl Type1GpuPlan3d {
         );
         let sort_layout = sort_pipeline.get_bind_group_layout(0);
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let (gather_label, gather_source, gather_workgroups_per_vector_block) = match gather {
-            Type1Gather3d::Global => (
-                "wgpu_nufft.type1_3d.spread_gather",
-                generate_gather_wgsl(kernel, fine_shape),
+        let (gather_label, gather_source, gather_workgroups_per_vector_block) = if precision
+            == FftPrecision::F64
+        {
+            (
+                "wgpu_nufft.type1_3d.spread_gather_f64",
+                generate_gather_wgsl_f64(kernel, fine_shape),
                 workgroups_for_elements(fine_count)?,
-            ),
-            Type1Gather3d::Tiled8x8x4 => {
-                let configuration =
-                    tiled_gather_halo_shape(kernel.width()).and_then(|halo_shape| {
-                        let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
-                        let storage_bytes =
-                            tiled_gather_storage_bytes(kernel.width(), cache_capacity)?;
+            )
+        } else {
+            match gather {
+                Type1Gather3d::Global => (
+                    "wgpu_nufft.type1_3d.spread_gather",
+                    generate_gather_wgsl(kernel, fine_shape),
+                    workgroups_for_elements(fine_count)?,
+                ),
+                Type1Gather3d::Tiled8x8x4 => {
+                    let configuration =
+                        tiled_gather_halo_shape(kernel.width()).and_then(|halo_shape| {
+                            let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
+                            let storage_bytes =
+                                tiled_gather_storage_bytes(kernel.width(), cache_capacity)?;
+                            Ok((halo_shape, cache_capacity, storage_bytes))
+                        });
+                    match configuration {
                         Ok((halo_shape, cache_capacity, storage_bytes))
-                    });
-                match configuration {
-                    Ok((halo_shape, cache_capacity, storage_bytes))
-                        if maximum_workgroup_size >= TILED_GATHER_WORKGROUP_SIZE
-                            && fine_shape
-                                .iter()
-                                .zip(halo_shape)
-                                .all(|(&length, halo)| length >= halo)
-                            && storage_bytes <= limits.max_compute_workgroup_storage_size =>
-                    {
-                        (
-                            "wgpu_nufft.type1_3d.spread_gather_tiled8x8x4",
-                            generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
-                            tiled_gather_workgroups(fine_shape)?,
-                        )
+                            if maximum_workgroup_size >= TILED_GATHER_WORKGROUP_SIZE
+                                && fine_shape
+                                    .iter()
+                                    .zip(halo_shape)
+                                    .all(|(&length, halo)| length >= halo)
+                                && storage_bytes <= limits.max_compute_workgroup_storage_size =>
+                        {
+                            (
+                                "wgpu_nufft.type1_3d.spread_gather_tiled8x8x4",
+                                generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
+                                tiled_gather_workgroups(fine_shape)?,
+                            )
+                        }
+                        _ => (
+                            "wgpu_nufft.type1_3d.spread_gather",
+                            generate_gather_wgsl(kernel, fine_shape),
+                            workgroups_for_elements(fine_count)?,
+                        ),
                     }
-                    _ => (
-                        "wgpu_nufft.type1_3d.spread_gather",
-                        generate_gather_wgsl(kernel, fine_shape),
-                        workgroups_for_elements(fine_count)?,
-                    ),
                 }
             }
         };
@@ -274,7 +307,7 @@ impl Type1GpuPlan3d {
         let deconvolution_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_3d.deconvolution",
-            &generate_deconvolution_wgsl(config, fine_shape),
+            &generate_deconvolution_wgsl_for_precision(config, fine_shape, precision),
         );
         let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
 
@@ -304,24 +337,40 @@ impl Type1GpuPlan3d {
             mode_count,
             fine_count,
             batch_capacity,
+            precision,
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
             max_buffer_bytes: limits.max_buffer_size,
         })
     }
 
-    pub(crate) fn point_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        checked_buffer_size("type-1 3D point buffer", point_count, POINT_F32_BYTES)
+    pub(crate) fn point_buffer_size_bytes_for_precision(
+        point_count: usize,
+        precision: FftPrecision,
+    ) -> Result<u64> {
+        let bytes = match precision {
+            FftPrecision::F32 => POINT_F32_BYTES,
+            FftPrecision::F64 | FftPrecision::Df64 => POINT_F64_BYTES,
+        };
+        checked_buffer_size("type-1 3D point buffer", point_count, bytes)
     }
 
-    pub(crate) fn strength_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Self::complex_buffer_size_bytes("type-1 3D strength buffer", point_count)
+    pub(crate) fn strength_buffer_size_bytes_for_precision(
+        point_count: usize,
+        precision: FftPrecision,
+    ) -> Result<u64> {
+        Self::complex_buffer_size_bytes_for_precision(
+            "type-1 3D strength buffer",
+            point_count,
+            precision,
+        )
     }
 
-    pub(crate) fn complex_buffer_size_bytes(
+    pub(crate) fn complex_buffer_size_bytes_for_precision(
         buffer: &'static str,
         element_count: usize,
+        precision: FftPrecision,
     ) -> Result<u64> {
-        checked_buffer_size(buffer, element_count, COMPLEX_F32_BYTES)
+        checked_buffer_size(buffer, element_count, complex_size_bytes(precision))
     }
 
     /// Records only the deterministic point spreading stages into the
@@ -470,8 +519,11 @@ impl Type1GpuPlan3d {
                 .ok_or(NufftError::LengthOverflow {
                     context: "batched type-1 3D Fourier output element count",
                 })?;
-        let output_bytes =
-            Self::complex_buffer_size_bytes("type-1 3D Fourier output buffer", output_elements)?;
+        let output_bytes = Self::complex_buffer_size_bytes_for_precision(
+            "type-1 3D Fourier output buffer",
+            output_elements,
+            self.precision,
+        )?;
         validate_external_storage_buffer(
             "type-1 3D Fourier output",
             output,
@@ -562,14 +614,15 @@ impl Type1GpuPlan3d {
                 context: "type-1 3D GPU point count",
             })?;
         validate_point_coordinate_shader_index(point_count)?;
-        let point_bytes = Self::point_buffer_size_bytes(point_count)?;
+        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
         let strength_elements =
             point_count
                 .checked_mul(active_batch)
                 .ok_or(NufftError::LengthOverflow {
                     context: "batched type-1 3D strength element count",
                 })?;
-        let strength_bytes = Self::strength_buffer_size_bytes(strength_elements)?;
+        let strength_bytes =
+            Self::strength_buffer_size_bytes_for_precision(strength_elements, self.precision)?;
         validate_external_storage_buffer(
             "type-1 3D point",
             points,
@@ -665,9 +718,10 @@ impl Type1GpuPlan3d {
                 context: "active batched type-1 3D fine-grid element count",
             },
         )?;
-        let active_fine_bytes = Self::complex_buffer_size_bytes(
+        let active_fine_bytes = Self::complex_buffer_size_bytes_for_precision(
             "active batched type-1 3D fine grid",
             active_fine_elements,
+            self.precision,
         )?;
         let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_3d.spread_gather.bind_group"),
@@ -861,6 +915,92 @@ fn mode_amplitudes(config: &NufftConfig, coefficients: [&[f64]; DIMENSIONS]) -> 
     Ok(amplitudes)
 }
 
+fn mode_amplitudes_f64(
+    config: &NufftConfig,
+    coefficients: [&[f64]; DIMENSIONS],
+) -> Result<Vec<f64>> {
+    let mode_shape = config.n_modes();
+    for axis in 0..DIMENSIONS {
+        let required = mode_shape[axis] / 2 + 1;
+        if coefficients[axis].len() < required {
+            return Err(NufftError::InputLength {
+                input: coefficient_axis_label(axis),
+                expected: required,
+                actual: coefficients[axis].len(),
+            });
+        }
+    }
+    let mode_count = config.mode_count()?;
+    let mut amplitudes = Vec::new();
+    amplitudes
+        .try_reserve_exact(mode_count)
+        .map_err(|_| NufftError::HostAllocationFailed {
+            buffer: "type-1 3D deconvolution amplitudes",
+            elements: mode_count,
+        })?;
+    for linear in 0..mode_count {
+        let storage_0 = linear % mode_shape[0];
+        let remaining = linear / mode_shape[0];
+        let storage_1 = remaining % mode_shape[1];
+        let storage_2 = remaining / mode_shape[1];
+        let modes = [
+            mode_for_storage_index(config.mode_order(), storage_0, mode_shape[0]),
+            mode_for_storage_index(config.mode_order(), storage_1, mode_shape[1]),
+            mode_for_storage_index(config.mode_order(), storage_2, mode_shape[2]),
+        ];
+        let values = [
+            coefficients[0][modes[0].unsigned_abs() as usize],
+            coefficients[1][modes[1].unsigned_abs() as usize],
+            coefficients[2][modes[2].unsigned_abs() as usize],
+        ];
+        let denominator = values[0] * values[1] * values[2];
+        let amplitude = 1.0 / denominator;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value == 0.0)
+            || !denominator.is_finite()
+            || denominator == 0.0
+            || !amplitude.is_finite()
+        {
+            return Err(NufftError::InvalidKernelFourierCoefficient {
+                mode: modes[0],
+                value: denominator,
+            });
+        }
+        amplitudes.push(amplitude);
+    }
+    Ok(amplitudes)
+}
+
+fn mode_amplitude_bytes(
+    config: &NufftConfig,
+    coefficients: [&[f64]; DIMENSIONS],
+    precision: FftPrecision,
+) -> Result<Vec<u8>> {
+    match precision {
+        FftPrecision::F64 => {
+            Ok(bytemuck::cast_slice(&mode_amplitudes_f64(config, coefficients)?).to_vec())
+        }
+        FftPrecision::F32 | FftPrecision::Df64 => {
+            Ok(bytemuck::cast_slice(&mode_amplitudes(config, coefficients)?).to_vec())
+        }
+    }
+}
+
+const fn scalar_size_bytes(precision: FftPrecision) -> u64 {
+    match precision {
+        FftPrecision::F32 => F32_BYTES,
+        FftPrecision::F64 | FftPrecision::Df64 => F64_BYTES,
+    }
+}
+
+const fn complex_size_bytes(precision: FftPrecision) -> u64 {
+    match precision {
+        FftPrecision::F32 => COMPLEX_F32_BYTES,
+        FftPrecision::F64 | FftPrecision::Df64 => COMPLEX_F64_BYTES,
+    }
+}
+
 fn coefficient_axis_label(axis: usize) -> &'static str {
     match axis {
         0 => "axis-0 centered kernel Fourier coefficients",
@@ -1026,6 +1166,106 @@ fn floor_df64_to_i32(value: Df64) -> i32 {{
     )
 }
 
+fn generate_position_wgsl_f64(fine_shape: [usize; DIMENSIONS]) -> String {
+    let scales = [
+        fine_shape[0] as f64 / std::f64::consts::TAU,
+        fine_shape[1] as f64 / std::f64::consts::TAU,
+        fine_shape[2] as f64 / std::f64::consts::TAU,
+    ];
+    format!(
+        r#"const FINE_0: u32 = {fine_0}u;
+const FINE_1: u32 = {fine_1}u;
+const FINE_2: u32 = {fine_2}u;
+const FINE_01: u32 = {fine_01}u;
+const FINE_0_I32: i32 = {fine_0}i;
+const FINE_1_I32: i32 = {fine_1}i;
+const FINE_2_I32: i32 = {fine_2}i;
+const FINE_0_F64: f64 = {fine_0_f64};
+const FINE_1_F64: f64 = {fine_1_f64};
+const FINE_2_F64: f64 = {fine_2_f64};
+const FINE_COUNT: u32 = {fine_count}u;
+const POSITION_SCALE_0: f64 = {scale_0};
+const POSITION_SCALE_1: f64 = {scale_1};
+const POSITION_SCALE_2: f64 = {scale_2};
+const GRID_ORIGIN_0: f64 = {origin_0};
+const GRID_ORIGIN_1: f64 = {origin_1};
+const GRID_ORIGIN_2: f64 = {origin_2};
+
+fn fold_position(point: f64, scale: f64, origin: f64, fine_length: f64) -> f64 {{
+    var position = point * scale + origin;
+    if (position < 0.0lf) {{ position = position + fine_length; }}
+    if (position < 0.0lf) {{ position = position + fine_length; }}
+    if (position >= fine_length) {{ position = position - fine_length; }}
+    if (position >= fine_length) {{ position = position - fine_length; }}
+    return position;
+}}
+
+fn fold_position_0(point: f64) -> f64 {{
+    return fold_position(point, POSITION_SCALE_0, GRID_ORIGIN_0, FINE_0_F64);
+}}
+fn fold_position_1(point: f64) -> f64 {{
+    return fold_position(point, POSITION_SCALE_1, GRID_ORIGIN_1, FINE_1_F64);
+}}
+fn fold_position_2(point: f64) -> f64 {{
+    return fold_position(point, POSITION_SCALE_2, GRID_ORIGIN_2, FINE_2_F64);
+}}
+"#,
+        fine_0 = fine_shape[0],
+        fine_1 = fine_shape[1],
+        fine_2 = fine_shape[2],
+        fine_01 = fine_shape[0] * fine_shape[1],
+        fine_0_f64 = format_wgsl_f64(fine_shape[0] as f64),
+        fine_1_f64 = format_wgsl_f64(fine_shape[1] as f64),
+        fine_2_f64 = format_wgsl_f64(fine_shape[2] as f64),
+        fine_count = fine_shape[0] * fine_shape[1] * fine_shape[2],
+        scale_0 = format_wgsl_f64(scales[0]),
+        scale_1 = format_wgsl_f64(scales[1]),
+        scale_2 = format_wgsl_f64(scales[2]),
+        origin_0 = format_wgsl_f64((fine_shape[0] / 2) as f64),
+        origin_1 = format_wgsl_f64((fine_shape[1] / 2) as f64),
+        origin_2 = format_wgsl_f64((fine_shape[2] / 2) as f64),
+    )
+}
+
+fn generate_count_wgsl_for_precision(
+    fine_shape: [usize; DIMENSIONS],
+    precision: FftPrecision,
+) -> String {
+    match precision {
+        FftPrecision::F64 => generate_count_wgsl_f64(fine_shape),
+        FftPrecision::F32 | FftPrecision::Df64 => generate_count_wgsl(fine_shape),
+    }
+}
+
+fn generate_count_wgsl_f64(fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl_f64(fine_shape);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+@group(0) @binding(0) var<storage, read> points: array<f64>;
+@group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points) / 3u;
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+    let point_base = point_index * 3u;
+    let bin_0 = u32(floor(fold_position_0(points[point_base])));
+    let bin_1 = u32(floor(fold_position_1(points[point_base + 1u])));
+    let bin_2 = u32(floor(fold_position_2(points[point_base + 2u])));
+    atomicAdd(&bin_counts[bin_0 + FINE_0 * (bin_1 + FINE_1 * bin_2)], 1u);
+}}
+"#,
+    );
+    format!("{position}\n{entry}")
+}
+
 fn generate_count_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
     let position = generate_position_wgsl(fine_shape);
     let entry = format!(
@@ -1111,6 +1351,49 @@ fn main(
 "#,
     );
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+fn generate_scatter_wgsl_for_precision(
+    fine_shape: [usize; DIMENSIONS],
+    precision: FftPrecision,
+) -> String {
+    match precision {
+        FftPrecision::F64 => generate_scatter_wgsl_f64(fine_shape),
+        FftPrecision::F32 | FftPrecision::Df64 => generate_scatter_wgsl(fine_shape),
+    }
+}
+
+fn generate_scatter_wgsl_f64(fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl_f64(fine_shape);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+@group(0) @binding(0) var<storage, read> points: array<f64>;
+@group(0) @binding(1) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read_write> bin_cursors: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> sorted_indices: array<u32>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points) / 3u;
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+    let point_base = point_index * 3u;
+    let bin_0 = u32(floor(fold_position_0(points[point_base])));
+    let bin_1 = u32(floor(fold_position_1(points[point_base + 1u])));
+    let bin_2 = u32(floor(fold_position_2(points[point_base + 2u])));
+    let bin = bin_0 + FINE_0 * (bin_1 + FINE_1 * bin_2);
+    let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
+    sorted_indices[slot] = point_index;
+}}
+"#,
+    );
+    format!("{position}\n{entry}")
 }
 
 fn generate_sort_wgsl() -> String {
@@ -1321,6 +1604,124 @@ fn main(
         beta = format_wgsl_f32(kernel.beta() as f32),
     );
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+fn generate_gather_wgsl_f64(kernel: EsKernel, fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl_f64(fine_shape);
+    let horner = generate_horner_wgsl_f64(kernel);
+    let width = kernel.width();
+    let bin_radius = width.div_ceil(2);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const WIDTH: u32 = {width}u;
+const WIDTH_I32: i32 = {width}i;
+const HALF_WIDTH: f64 = {half_width};
+const BIN_RADIUS: i32 = {bin_radius}i;
+const VECTOR_BLOCK_SIZE: u32 = {VECTOR_BLOCK_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<f64>;
+@group(0) @binding(1) var<storage, read> strengths: array<vec2<f64>>;
+@group(0) @binding(2) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(4) var<storage, read_write> fine_grid: array<vec2<f64>>;
+
+fn wrap_bin(index: i32, fine_length: i32) -> u32 {{
+    var wrapped = index;
+    if (wrapped < 0) {{ wrapped = wrapped + fine_length; }}
+    if (wrapped >= fine_length) {{ wrapped = wrapped - fine_length; }}
+    return u32(wrapped);
+}}
+
+fn support_cell(wrapped_cell: u32, start: i32, fine_length: i32) -> i32 {{
+    var unwrapped = i32(wrapped_cell);
+    if (unwrapped < start) {{ unwrapped = unwrapped + fine_length; }}
+    if (unwrapped >= start + WIDTH_I32) {{ unwrapped = unwrapped - fine_length; }}
+    return unwrapped;
+}}
+
+{horner}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
+    let vector_blocks = (total_vectors + VECTOR_BLOCK_SIZE - 1u) / VECTOR_BLOCK_SIZE;
+    let total_work = FINE_COUNT * vector_blocks;
+    if (wg_flat > (total_work - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let work_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (work_index >= total_work) {{ return; }}
+    let vector_block = work_index / FINE_COUNT;
+    let cell = work_index - vector_block * FINE_COUNT;
+    let first_vector = vector_block * VECTOR_BLOCK_SIZE;
+    let cell_0 = cell % FINE_0;
+    let cell_1 = (cell / FINE_0) % FINE_1;
+    let cell_2 = cell / FINE_01;
+    var sums: array<vec2<f64>, {VECTOR_BLOCK_SIZE}>;
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        sums[vector_local] = vec2<f64>(0.0lf, 0.0lf);
+    }}
+    for (var bin_offset_2 = -BIN_RADIUS; bin_offset_2 < BIN_RADIUS;
+         bin_offset_2 = bin_offset_2 + 1) {{
+        let bin_2 = wrap_bin(i32(cell_2) + bin_offset_2, FINE_2_I32);
+        for (var bin_offset_1 = -BIN_RADIUS; bin_offset_1 < BIN_RADIUS;
+             bin_offset_1 = bin_offset_1 + 1) {{
+            let bin_1 = wrap_bin(i32(cell_1) + bin_offset_1, FINE_1_I32);
+            for (var bin_offset_0 = -BIN_RADIUS; bin_offset_0 < BIN_RADIUS;
+                 bin_offset_0 = bin_offset_0 + 1) {{
+                let bin_0 = wrap_bin(i32(cell_0) + bin_offset_0, FINE_0_I32);
+                let bin = bin_0 + FINE_0 * (bin_1 + FINE_1 * bin_2);
+                for (var slot = bin_offsets[bin]; slot < bin_offsets[bin + 1u];
+                     slot = slot + 1u) {{
+                    let point_index = sorted_indices[slot];
+                    let point_base = point_index * 3u;
+                    let position_0 = fold_position_0(points[point_base]);
+                    let position_1 = fold_position_1(points[point_base + 1u]);
+                    let position_2 = fold_position_2(points[point_base + 2u]);
+                    let start_0 = i32(ceil(position_0 - HALF_WIDTH));
+                    let start_1 = i32(ceil(position_1 - HALF_WIDTH));
+                    let start_2 = i32(ceil(position_2 - HALF_WIDTH));
+                    let unwrapped_0 = support_cell(cell_0, start_0, FINE_0_I32);
+                    let unwrapped_1 = support_cell(cell_1, start_1, FINE_1_I32);
+                    let unwrapped_2 = support_cell(cell_2, start_2, FINE_2_I32);
+                    if (unwrapped_0 >= start_0 && unwrapped_0 < start_0 + WIDTH_I32 &&
+                        unwrapped_1 >= start_1 && unwrapped_1 < start_1 + WIDTH_I32 &&
+                        unwrapped_2 >= start_2 && unwrapped_2 < start_2 + WIDTH_I32) {{
+                        let weight_0 = es_weight(f64(unwrapped_0) - position_0);
+                        let weight_1 = es_weight(f64(unwrapped_1) - position_1);
+                        let weight_2 = es_weight(f64(unwrapped_2) - position_2);
+                        let weight = (weight_0 * weight_1) * weight_2;
+                        for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+                             vector_local = vector_local + 1u) {{
+                            let vector_index = first_vector + vector_local;
+                            if (vector_index < total_vectors) {{
+                                let strength_index = vector_index *
+                                    (arrayLength(&points) / 3u) + point_index;
+                                sums[vector_local] = sums[vector_local] +
+                                    strengths[strength_index] * weight;
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        let vector_index = first_vector + vector_local;
+        if (vector_index < total_vectors) {{
+            fine_grid[vector_index * FINE_COUNT + cell] = sums[vector_local];
+        }}
+    }}
+}}
+"#,
+        half_width = format_wgsl_f64(kernel.half_width()),
+    );
+    format!("{position}\n{entry}")
 }
 
 fn generate_tiled_gather_wgsl(
@@ -1752,6 +2153,48 @@ fn main(
     )
 }
 
+fn generate_deconvolution_wgsl_for_precision(
+    config: &NufftConfig,
+    fine_shape: [usize; DIMENSIONS],
+    precision: FftPrecision,
+) -> String {
+    match precision {
+        FftPrecision::F64 => generate_deconvolution_wgsl(config, fine_shape)
+            .replace("vec2<f32>", "vec2<f64>")
+            .replace("array<f32>", "array<f64>"),
+        FftPrecision::F32 | FftPrecision::Df64 => generate_deconvolution_wgsl(config, fine_shape),
+    }
+}
+
+fn generate_horner_wgsl_f64(kernel: EsKernel) -> String {
+    let table = kernel.horner_table();
+    let coefficients = table
+        .coefficients()
+        .iter()
+        .map(|&value| format_wgsl_f64(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let coefficient_total = table.coefficients().len();
+    let coefficient_count = table.coefficient_count();
+    format!(
+        r#"const HORNER_COEFFICIENT_COUNT: u32 = {coefficient_count}u;
+const HORNER_COEFFICIENTS: array<f64, {coefficient_total}> =
+    array<f64, {coefficient_total}>({coefficients});
+
+fn es_weight(distance: f64) -> f64 {{
+    if (abs(distance) >= HALF_WIDTH) {{ return 0.0lf; }}
+    let panel = u32(clamp(i32(ceil(distance + HALF_WIDTH)) - 1, 0, WIDTH_I32 - 1));
+    let local = 2.0lf * (distance - f64(panel)) + f64(WIDTH_I32 - 1);
+    var value = 0.0lf;
+    for (var coefficient = 0u; coefficient < HORNER_COEFFICIENT_COUNT;
+         coefficient = coefficient + 1u) {{
+        value = value * local + HORNER_COEFFICIENTS[coefficient * WIDTH + panel];
+    }}
+    return value;
+}}"#,
+    )
+}
+
 fn tiled_gather_halo_shape(width: usize) -> Result<[usize; DIMENSIONS]> {
     let diameter = width
         .div_ceil(2)
@@ -1878,6 +2321,16 @@ fn format_wgsl_f32(value: f32) -> String {
     if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
         formatted.push_str(".0");
     }
+    formatted
+}
+
+fn format_wgsl_f64(value: f64) -> String {
+    debug_assert!(value.is_finite());
+    let mut formatted = value.to_string();
+    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+        formatted.push_str(".0");
+    }
+    formatted.push_str("lf");
     formatted
 }
 
@@ -2012,6 +2465,24 @@ mod tests {
     }
 
     #[test]
+    fn native_f64_shaders_use_horner_without_transcendentals() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let config = NufftConfig::new([17, 19, 21], 1.0e-6).with_precision(FftPrecision::F64);
+        let source = [
+            generate_count_wgsl_for_precision([36, 40, 44], FftPrecision::F64),
+            generate_scatter_wgsl_for_precision([36, 40, 44], FftPrecision::F64),
+            generate_gather_wgsl_f64(kernel, [36, 40, 44]),
+            generate_deconvolution_wgsl_for_precision(&config, [36, 40, 44], FftPrecision::F64),
+        ]
+        .join("\n");
+        assert!(source.contains("array<vec2<f64>>"));
+        assert!(source.contains("HORNER_COEFFICIENTS"));
+        for forbidden in ["exp(", "log(", "pow(", "sin(", "cos("] {
+            assert!(!source.contains(forbidden), "found {forbidden} in f64 WGSL");
+        }
+    }
+
+    #[test]
     fn tiled_gather_width_seven_uses_the_bounded_storage_budget() {
         assert_eq!(tiled_gather_halo_shape(7).unwrap(), [15, 15, 11]);
         assert_eq!(15 * 15 * 11, 2_475);
@@ -2123,8 +2594,14 @@ mod tests {
 
     #[test]
     fn buffer_and_shader_index_arithmetic_is_checked() {
-        assert_eq!(Type1GpuPlan3d::point_buffer_size_bytes(7).unwrap(), 84);
-        assert_eq!(Type1GpuPlan3d::strength_buffer_size_bytes(7).unwrap(), 56);
+        assert_eq!(
+            Type1GpuPlan3d::point_buffer_size_bytes_for_precision(7, FftPrecision::F32).unwrap(),
+            84
+        );
+        assert_eq!(
+            Type1GpuPlan3d::strength_buffer_size_bytes_for_precision(7, FftPrecision::F32).unwrap(),
+            56
+        );
         assert!(validate_point_coordinate_shader_index(u32::MAX as usize / 3).is_ok());
         assert!(matches!(
             validate_point_coordinate_shader_index(u32::MAX as usize / 3 + 1),

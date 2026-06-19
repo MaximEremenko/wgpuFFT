@@ -36,6 +36,11 @@ pub enum NufftError {
         minimum: usize,
         maximum: usize,
     },
+    PrecisionUnsupported {
+        requested: wgpu_fft::FftPrecision,
+        stage: &'static str,
+        reason: &'static str,
+    },
     InvalidType3Interval {
         set: &'static str,
         axis: usize,
@@ -212,6 +217,15 @@ impl fmt::Display for NufftError {
                 f,
                 "invalid ES kernel width {width}; expected {minimum}..={maximum}"
             ),
+            Self::PrecisionUnsupported {
+                requested,
+                stage,
+                reason,
+            } => write!(
+                f,
+                "NUFFT precision {} is unsupported for {stage}: {reason}",
+                requested.as_str()
+            ),
             Self::InvalidType3Interval {
                 set,
                 axis,
@@ -382,14 +396,14 @@ impl fmt::Display for NufftError {
             ),
             Self::GpuFineGridIndexUnsupported { length, maximum } => write!(
                 f,
-                "GPU NUFFT fine-grid length {length} exceeds the exact f32 shader-index limit {maximum}"
+                "GPU NUFFT fine-grid length {length} exceeds the selected shader-index limit {maximum}"
             ),
             Self::FftExecutionFailed { stage, source } => {
                 write!(f, "wgpu-fft failed while encoding {stage}: {source}")
             }
             Self::InvalidKernelFourierCoefficient { mode, value } => write!(
                 f,
-                "ES kernel Fourier coefficient for mode {mode} cannot be inverted as f32: {value}"
+                "ES kernel Fourier coefficient for mode {mode} cannot be represented and inverted at the selected precision: {value}"
             ),
         }
     }

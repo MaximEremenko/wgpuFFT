@@ -38,6 +38,10 @@ name = "nufft_batch_bench"
 harness = false
 
 [[bench]]
+name = "nufft_precision_bench"
+harness = false
+
+[[bench]]
 name = "nufft_stage_profile"
 harness = false
 required-features = ["gpu-profiling"]

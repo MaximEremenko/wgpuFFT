@@ -15,14 +15,15 @@ The current implementation provides:
 - host-`f64` centered-grid kernel Fourier coefficients;
 - even fine-grid selection through `wgpu-fft`'s public supported-length
   factorization;
-- reusable 1D, 2D, and 3D type-2 `f32` and native-`f64` GPU plans with caller-owned point,
-  Fourier-coefficient, and output buffers, including many-vector
-  batching;
-- reusable 1D, 2D, and 3D type-1 `f32` and native-`f64` GPU plans with caller-owned point,
-  strength, and Fourier-mode output buffers, including many-vector batching;
-- reusable 1D, 2D, and 3D type-3 `f32` and native-`f64` GPU plans with caller-owned source
-  points, strengths, target frequencies, and output buffers, also with
-  many-vector batching.
+- reusable 1D, 2D, and 3D type-2 `f32`, native-`f64`, and portable
+  double-float GPU plans with caller-owned point, Fourier-coefficient, and
+  output buffers, including many-vector batching;
+- reusable 1D, 2D, and 3D type-1 plans in the same three precisions with
+  caller-owned point, strength, and Fourier-mode output buffers, including
+  many-vector batching;
+- reusable 1D, 2D, and 3D type-3 plans in the same three precisions with
+  caller-owned source points, strengths, target frequencies, and output
+  buffers, also with many-vector batching.
 
 The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
 `wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
@@ -94,18 +95,32 @@ is the default and preserves the original shader path. `F64` uses scalar `f64`
 coordinates and `vec2<f64>` complex values and requires a device created with
 `wgpu::Features::SHADER_F64`; this is currently a Vulkan capability in wgpu.
 Plans return a structured `PrecisionUnsupported` error before shader creation
-when that feature is absent.
+when that feature is absent. `Df64` represents every scalar as an unevaluated
+`hi + lo` pair of `f32` words and every complex value as
+`(re_hi, re_lo, im_hi, im_lo)`. It requires no optional device feature and is
+the portable high-precision route for DX12, Metal, and browser/WebGPU devices
+that do not expose native shader `f64`.
 
-The ES kernel cannot call `exp` in native-f64 SPIR-V. High-precision plans
-therefore fit piecewise-Horner tables on the host in `f64` and use
-the same polynomial for interpolation/spreading and Fourier deconvolution.
-Type-3 phase factors use a transcendental-free, range-reduced polynomial
-sine/cosine and conservatively reject planned phase magnitudes above `1e6`.
-Plan-aware byte-size helpers account for 8-byte coordinates and 16-byte complex
-values; legacy static helpers retain their documented one-dimensional f32 ABI.
+The ES kernel cannot call `exp` in native-f64 SPIR-V, and df64 deliberately
+contains no shader transcendental operations. Both high-precision routes fit
+piecewise-Horner tables on the host in `f64` and use the same
+polynomial for interpolation/spreading and Fourier deconvolution. Native-f64
+tables store `f64` coefficients; df64 tables split each coefficient into its
+high and low `f32` words. Type-3 phase factors use a transcendental-free,
+range-reduced polynomial sine/cosine. Native f64 conservatively rejects planned
+phase magnitudes above `1e6`; portable df64 uses the tighter, accuracy-driven
+bound of `1024` because its two-f32 range reduction loses absolute precision as
+the unreduced phase grows.
 
-Portable double-float NUFFT arithmetic remains deferred to the next precision
-slice. WASM packaging is also deferred.
+Df64 retains roughly 44-48 significant bits, but its exponent range remains
+that of `f32` (approximately `1e-38` through `1e38`). Its split-based Dekker
+products avoid relying on fused multiply-add contraction; exact-word arithmetic
+canaries in `wgpu-fft` define the backend support contract. Vulkan and DX12 are
+tested. Metal remains the riskiest untested backend because its
+shader compiler enables fast-math transformations by default. Plan-aware
+byte-size helpers account for 8-byte coordinates and 16-byte complex values in
+both high-precision formats; legacy static helpers retain their documented
+one-dimensional f32 ABI. WASM packaging is deferred.
 
 ## Mathematical conventions
 

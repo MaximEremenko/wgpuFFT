@@ -2,9 +2,10 @@
 //!
 //! The crate provides reusable host-side type-1 and type-2 planning metadata,
 //! Direct `f64` reference transforms, and
-//! exponential-of-semicircle kernel tables. Reusable 1D, 2D, and 3D f32 or
-//! native-f64 plans encode spreading or interpolation around a fine-grid C2C
-//! transform entirely on the GPU using caller-owned input and output buffers.
+//! exponential-of-semicircle kernel tables. Reusable 1D, 2D, and 3D f32,
+//! native-f64, or portable double-float plans encode spreading or interpolation
+//! around a fine-grid C2C transform entirely on the GPU using caller-owned input
+//! and output buffers.
 
 #![forbid(unsafe_code)]
 

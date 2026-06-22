@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in 1D/2D/3D GPU type-3 validation against the direct f64 NDFT.
 
 use std::sync::mpsc;

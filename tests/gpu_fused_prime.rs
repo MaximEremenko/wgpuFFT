@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Focused correctness and routing coverage for fused Rader and Bluestein kernels.
 
 use std::sync::mpsc;

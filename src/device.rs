@@ -1,6 +1,6 @@
 use crate::config::FftPrecision;
 
-/// Minimal native `wgpu` context helper for examples and opt-in integration tests.
+/// Minimal platform `wgpu` context helper for examples and opt-in integration tests.
 pub struct GpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -34,17 +34,32 @@ pub async fn request_default_device() -> Option<GpuContext> {
         .ok()?;
 
     let required_features = precision_features_supported_by_adapter(adapter.features());
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("wgpu_fft.device"),
-            required_features,
-            required_limits: adapter.limits(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        })
-        .await
-        .ok()?;
+    let maximum_descriptor = wgpu::DeviceDescriptor {
+        label: Some("wgpu_fft.device"),
+        required_features,
+        required_limits: adapter.limits(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
+        trace: wgpu::Trace::Off,
+    };
+    let maximum_request = adapter.request_device(&maximum_descriptor).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    let (device, queue) = maximum_request.ok()?;
+    #[cfg(target_arch = "wasm32")]
+    let (device, queue) = match maximum_request {
+        Ok(device) => device,
+        Err(_) => adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("wgpu_fft.browser_default_device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .ok()?,
+    };
 
     Some(GpuContext {
         instance,
@@ -60,12 +75,18 @@ fn precision_features_supported_by_adapter(features: wgpu::Features) -> wgpu::Fe
 
 fn default_instance_descriptor() -> wgpu::InstanceDescriptor {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = default_native_backends();
+    descriptor.backends = default_backends();
     descriptor.with_env()
 }
 
-fn default_native_backends() -> wgpu::Backends {
+#[cfg(not(target_arch = "wasm32"))]
+fn default_backends() -> wgpu::Backends {
     wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12
+}
+
+#[cfg(target_arch = "wasm32")]
+fn default_backends() -> wgpu::Backends {
+    wgpu::Backends::BROWSER_WEBGPU
 }
 
 #[cfg(test)]
@@ -73,8 +94,15 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn default_native_backends_exclude_gl() {
-        assert!(!default_native_backends().contains(wgpu::Backends::GL));
+        assert!(!default_backends().contains(wgpu::Backends::GL));
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn default_browser_backend_uses_webgpu() {
+        assert_eq!(default_backends(), wgpu::Backends::BROWSER_WEBGPU);
     }
 
     #[test]

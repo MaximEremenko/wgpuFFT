@@ -473,6 +473,7 @@ fn main(
 }
 
 #[cfg(test)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -509,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn gpu_exclusive_scan_matches_cpu_bit_exactly() {
         if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
             eprintln!("skipping GPU scan test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");

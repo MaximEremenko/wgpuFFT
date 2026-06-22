@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in portable double-float NUFFT correctness and backend coverage.
 
 use std::f64::consts::PI;

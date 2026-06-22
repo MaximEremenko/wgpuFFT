@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in GPU coverage for the public per-plan tuning surface.
 
 use std::sync::mpsc;

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! GPU correctness and routing coverage for the GPU-resident four-step C2C route.
 
 use std::sync::mpsc;

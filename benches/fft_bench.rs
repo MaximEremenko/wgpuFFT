@@ -1,3 +1,8 @@
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -218,6 +223,7 @@ struct Statistics {
     population_spread_ms: f64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     if let Err(error) = pollster::block_on(run()) {
         eprintln!("wgpuFFT benchmark failed: {error}");

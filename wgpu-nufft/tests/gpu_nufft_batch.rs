@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in GPU validation of `ntransf` batching.
 
 use std::sync::mpsc;

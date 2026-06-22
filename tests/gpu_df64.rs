@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in portable-df64 normal C2C correctness and routing coverage.
 
 use std::mem::ManuallyDrop;

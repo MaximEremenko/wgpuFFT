@@ -1,0 +1,15 @@
+{
+  "browserName": "chrome",
+  "goog:chromeOptions": {
+    "args": [
+      "--enable-unsafe-webgpu",
+      "--disable-gpu-sandbox",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-breakpad",
+      "--disable-crash-reporter"
+    ]
+  }
+}

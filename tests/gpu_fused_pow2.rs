@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Focused correctness and routing coverage for single-workgroup FFT kernels.
 
 use std::f64::consts::PI;

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::mpsc;
 
 use wgpu_fft::math::{from_interleaved_f32, reference_c2c_nd, to_interleaved_f32};

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::f64::consts::PI;
 use std::sync::mpsc;
 use std::time::Duration;

@@ -12,7 +12,13 @@ $env:CHROMEDRIVER = 'C:\path\to\chromedriver.exe'
 web\run_browser_tests.cmd
 ```
 
-The checked-in Cargo environment setting loads `wasm-webdriver.json`, which
-pins the WebGPU-related Chrome flags. The wrapper forces ChromeDriver rather
-than allowing `wasm-bindgen-test-runner` to select another WebDriver found on
-`PATH` first.
+The runner automatically loads the checked-in root `webdriver.json`, which pins
+the WebGPU-related Chrome flags. The wrapper forces ChromeDriver rather than
+allowing `wasm-bindgen-test-runner` to select another WebDriver found on `PATH`
+first.
+
+The wrapper runs the smoke test, browser-default correctness matrix, exact df64
+canaries, and the natural four-step and segmented-volume cases. The latter
+allocates roughly 1 GiB of transient GPU resources and is therefore enabled by
+the wrapper's `WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1` setting instead of ordinary
+workspace test commands.

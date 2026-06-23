@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::error::{FftError, Result};
 
 const COPY_BUFFER_ALIGNMENT: u64 = 4;
@@ -221,6 +223,31 @@ impl<'a> BufferView<'a> {
 
     pub fn is_single_segment(&self) -> bool {
         self.single_range().is_some()
+    }
+
+    /// Returns whether this logical view is made from complete physical buffers.
+    ///
+    /// The segmented full-volume executor uses this stricter shape for its
+    /// caller-owned endpoints: multiple buffers are supported, but partial
+    /// buffers and logical windows into their concatenation remain rejected.
+    pub(crate) fn covers_whole_buffers(&self) -> bool {
+        if self.logical_byte_offset != 0 {
+            return false;
+        }
+        let mut unique_buffers = HashSet::with_capacity(self.segments.len());
+        let Some(total_bytes) = self.segments.iter().try_fold(0u64, |total, segment| {
+            if segment.offset_bytes != 0
+                || segment.size_bytes != segment.buffer.size()
+                || !unique_buffers.insert(segment.buffer)
+            {
+                None
+            } else {
+                total.checked_add(segment.size_bytes)
+            }
+        }) else {
+            return false;
+        };
+        total_bytes == self.length_bytes
     }
 
     pub fn ranges(

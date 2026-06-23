@@ -1592,11 +1592,11 @@ fn add_four_step_bound_logical_io_diagnostics(
     segmented_volume: bool,
 ) -> FftDiagnostics {
     diagnostics = add_logical_io_stages(diagnostics, role, route, io);
-    if segmented_volume && io.layout_kind() != "contiguous" {
+    if segmented_volume && (!io.is_contiguous() || !io.covers_whole_buffers) {
         return diagnostics.with_blocker(
             FftBlocker::new(
                 FftBlockerKind::Unsupported,
-                "segmented full-volume execution requires a single zero-offset contiguous endpoint buffer",
+                "segmented full-volume execution requires zero-offset whole-buffer endpoints",
             )
             .with_route("large-out-of-core")
             .with_stage(format!("{role}-segmented-volume-endpoint"))

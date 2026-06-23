@@ -394,8 +394,8 @@ impl SegmentedVolumeC2cPlan {
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
-        validate_whole_contiguous_endpoint(&input)?;
-        validate_whole_contiguous_endpoint(&output)?;
+        validate_whole_buffer_endpoint(&input)?;
+        validate_whole_buffer_endpoint(&output)?;
         validate_endpoint_usage(&input, wgpu::BufferUsages::COPY_SRC, "COPY_SRC")?;
         validate_endpoint_usage(&output, wgpu::BufferUsages::COPY_DST, "COPY_DST")?;
         let input = input.prefix(self.required_bytes)?;
@@ -1231,18 +1231,13 @@ fn create_segmented_buffer(
     }))
 }
 
-fn validate_whole_contiguous_endpoint(view: &BufferView<'_>) -> Result<()> {
-    let segments = view.segments();
-    let whole = segments.len() == 1
-        && view.logical_byte_offset() == 0
-        && segments[0].offset_bytes == 0
-        && view.size() == segments[0].size_bytes;
-    if whole {
+fn validate_whole_buffer_endpoint(view: &BufferView<'_>) -> Result<()> {
+    if view.covers_whole_buffers() {
         Ok(())
     } else {
         Err(FftError::LargeRouteLayoutUnsupported {
             route_mode: "large-out-of-core",
-            layout: "segmented full-volume execution requires whole-buffer contiguous endpoints",
+            layout: "segmented full-volume execution requires zero-offset whole-buffer endpoints",
         })
     }
 }

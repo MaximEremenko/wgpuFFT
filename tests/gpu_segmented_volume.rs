@@ -374,7 +374,46 @@ fn run_cross_normalized_limit_case(context: &wgpu_fft::device::GpuContext) {
         segmented_input,
         BufferView::whole(&output),
     );
-    assert!(segmented_diagnostics
+    assert!(
+        segmented_diagnostics.blockers().is_empty(),
+        "whole physical-buffer segments are valid segmented-volume endpoints: {:?}",
+        segmented_diagnostics.blockers()
+    );
+
+    let partial_segment = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.segmented_volume.partial_segment"),
+        size: VOLUME_BYTES / 2 + 8,
+        usage: usages,
+        mapped_at_creation: false,
+    });
+    let partial_input = BufferView::from_segments(
+        &[
+            BufferSegment::new(&partial_segment, 8, VOLUME_BYTES / 2),
+            BufferSegment::new(&segment_b, 0, VOLUME_BYTES / 2),
+        ],
+        0,
+        VOLUME_BYTES,
+    )
+    .unwrap();
+    let partial_diagnostics =
+        segmented.diagnostics_for_views(&context.device, partial_input, BufferView::whole(&output));
+    assert!(partial_diagnostics
+        .blockers()
+        .iter()
+        .any(|blocker| { blocker.stage.as_deref() == Some("input-segmented-volume-endpoint") }));
+
+    let aliased_input = BufferView::from_segments(
+        &[
+            BufferSegment::new(&segment_a, 0, VOLUME_BYTES / 2),
+            BufferSegment::new(&segment_a, 0, VOLUME_BYTES / 2),
+        ],
+        0,
+        VOLUME_BYTES,
+    )
+    .unwrap();
+    let aliased_diagnostics =
+        segmented.diagnostics_for_views(&context.device, aliased_input, BufferView::whole(&output));
+    assert!(aliased_diagnostics
         .blockers()
         .iter()
         .any(|blocker| { blocker.stage.as_deref() == Some("input-segmented-volume-endpoint") }));

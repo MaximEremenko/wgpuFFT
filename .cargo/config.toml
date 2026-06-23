@@ -1,5 +1,2 @@
 [target.wasm32-unknown-unknown]
 runner = "wasm-bindgen-test-runner"
-
-[env]
-WASM_BINDGEN_TEST_WEBDRIVER_JSON = { value = "../web/wasm-webdriver.json", relative = true }

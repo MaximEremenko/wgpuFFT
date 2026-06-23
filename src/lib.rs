@@ -37,6 +37,7 @@
 
 pub mod config;
 pub mod device;
+pub mod df64_canary;
 pub mod diagnostics;
 pub mod error;
 pub mod kernels;
@@ -46,6 +47,10 @@ pub mod runtime;
 pub mod tuning;
 
 pub use config::{FftConfig, FftDirection, FftPrecision, Normalization};
+pub use df64_canary::{
+    validate_df64_invariants, Df64CanaryError, Df64CanaryReport, DF64_CANARY_CASE_COUNT,
+    DF64_CANARY_WORD_COUNT,
+};
 pub use diagnostics::{
     FftBlocker, FftBlockerKind, FftBufferRequirement, FftDeviceLimits, FftDiagnostics,
     FftRouteSummary, FftStageSummary,

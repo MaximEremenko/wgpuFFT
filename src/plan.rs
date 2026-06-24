@@ -67,9 +67,14 @@ impl GpuPlanCreationErrorScopes {
     async fn pop_error(self) -> Option<(&'static str, String)> {
         // Error scopes are a stack. Pop every scope in strict reverse order,
         // even when plan construction already returned a synchronous error.
-        let validation_error = self.validation.pop().await;
-        let internal_error = self.internal.pop().await;
-        let out_of_memory_error = self.out_of_memory.pop().await;
+        // Initiate every pop before awaiting. Yielding between pops would let
+        // another browser operation interleave scopes above the lower guards.
+        let validation_pop = self.validation.pop();
+        let internal_pop = self.internal.pop();
+        let out_of_memory_pop = self.out_of_memory.pop();
+        let validation_error = validation_pop.await;
+        let internal_error = internal_pop.await;
+        let out_of_memory_error = out_of_memory_pop.await;
         if let Some(error) = validation_error {
             Some(("validation", error.to_string()))
         } else if let Some(error) = internal_error {

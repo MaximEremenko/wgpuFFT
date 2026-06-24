@@ -1132,6 +1132,8 @@ dependencies = [
  "bytemuck",
  "futures-channel",
  "pollster",
+ "serde",
+ "serde_json",
  "wasm-bindgen-test",
  "wgpu",
 ]
@@ -1222,6 +1224,19 @@ dependencies = [
  "log",
  "raw-window-handle",
  "web-sys",
+]
+
+[[package]]
+name = "wgpu-web"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "futures-channel",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu",
+ "wgpu-fft",
 ]
 
 [[package]]

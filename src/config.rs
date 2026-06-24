@@ -38,6 +38,7 @@ impl FftPrecision {
 }
 
 /// Direction of a complex-to-complex transform.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FftDirection {
     Forward,

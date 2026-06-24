@@ -1392,9 +1392,12 @@ async fn pop_gpu_error_scopes(
     ),
     context: &str,
 ) -> BenchResult<()> {
-    let validation_error = validation.pop().await;
-    let internal_error = internal.pop().await;
-    let out_of_memory_error = out_of_memory.pop().await;
+    let validation_pop = validation.pop();
+    let internal_pop = internal.pop();
+    let out_of_memory_pop = out_of_memory.pop();
+    let validation_error = validation_pop.await;
+    let internal_error = internal_pop.await;
+    let out_of_memory_error = out_of_memory_pop.await;
     if let Some(error) = validation_error {
         return Err(contextual_error(
             format!("{context}: wgpu validation error"),

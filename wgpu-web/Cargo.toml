@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
-description = "Minimal wasm-bindgen browser surface for wgpu-fft"
+description = "Minimal wasm-bindgen browser surface for wgpu-fft and wgpu-nufft"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -17,3 +17,7 @@ wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4.70"
 wgpu = "29.0.1"
 wgpu-fft = { path = "..", features = ["serde"] }
+wgpu-nufft = { path = "../wgpu-nufft" }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.70"

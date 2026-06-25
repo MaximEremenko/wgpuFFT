@@ -215,11 +215,11 @@ pass.
   convention. Unsupported real axis subsets return structured diagnostics.
 - In-place execution, `f16`, DCT/DST, and public convolution remain out of
   scope. NUFFT types 1/2/3 live in the `wgpu-nufft` workspace member.
-- The `wgpu-web` workspace member provides a minimal `wasm-bindgen` C2C surface
-  with GPU-resident plan/buffer handles, df64 compiler canary gating, and a
-  `localStorage` cache demo. Core FFT browser tests also cover real and large
-  routes directly. Use `WGPU_BACKEND=vulkan` for Vulkan/native validation where
-  available.
+- The `wgpu-web` workspace member provides `wasm-bindgen` C2C and NUFFT type
+  1/2/3 surfaces with GPU-resident plan/buffer handles, df64 compiler-canary
+  gating, and a `localStorage` cache demo. Browser tests cover FFT real/large
+  routes and the full 1D-3D F32/Df64 NUFFT matrix at WebGPU default limits. Use
+  `WGPU_BACKEND=vulkan` for Vulkan/native validation where available.
 - The native test/example device helper requests the selected adapter's active
   limits so planner diagnostics and huge-route scheduling see the real storage
   binding and buffer-size limits exposed by that adapter.

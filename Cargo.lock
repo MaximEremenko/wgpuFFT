@@ -1207,7 +1207,9 @@ name = "wgpu-nufft"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "futures-channel",
  "pollster",
+ "wasm-bindgen-test",
  "wgpu",
  "wgpu-fft",
 ]
@@ -1235,8 +1237,10 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-bindgen-test",
  "wgpu",
  "wgpu-fft",
+ "wgpu-nufft",
 ]
 
 [[package]]

@@ -11,6 +11,7 @@ publish = false
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1.22", features = ["derive"] }
+wgpu-fft = { path = "../.." }
 
 [profile.release]
 opt-level = 3

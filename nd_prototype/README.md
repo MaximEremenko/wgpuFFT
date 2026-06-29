@@ -71,9 +71,27 @@ pure f32 accumulation error. Throughput at d=4 matches the class of the
 hand-tuned production 2D bin-tile kernel (~6.7e10 upd/s), i.e. rank-generic
 codegen costs essentially nothing. No GPU NUFFT above d=3 exists elsewhere.
 
-## Next steps
+## Stage-3 milestone 3b (2026-07-17): end-to-end d=4 on GPU
 
-3b. End-to-end d=4 type-2/type-1 on GPU (spread + FFT + deconvolve) vs the
-    numpy reference; production-style neighbor-bin reads instead of host
-    duplication.
-4.  Adoption decision for wgpu-nufft.
+Full chains on the GPU, with **wgpu-fft as the ND FFT backend via its
+public API** (rank-4 plan over the 80^4 fine grid worked first try — the
+stage-4 adoption dogfood): type-1 = GPU spread -> wgpu-fft forward FFT;
+type-2 = host deconvolved pad -> wgpu-fft FFT -> new rank-generic GPU
+interpolation kernel. 64^4 sigma=1.25 timings: type-1 79.5 ms, type-2 86.7 ms
+(spreading/interp dominate, as the cost model predicts). wgpu-fft's forward
+direction matches isign=-1.
+
+Correctness (12^4 exported case, `python check2.py`): interior modes
+(|k| <= N/4) at **3.56e-7** — clean f32; full-box rel-l2 3.76e-4/2.07e-4
+(type-1/type-2). The gap is a REAL, measured design finding: **sigma=1.25
+deconvolution conditioning** — 1/phi_hat amplifies f32 FFT rounding noise
+~50x per dim at the mode-box edge (compounding toward corners). Invisible in
+f64; material in f32. Mitigations (design-note S2 caveat): f64/df64 fine grid
+for tight eps at sigma=1.25 (wgpu-fft has both), mode-box margin trimming, or
+sigma=2 when memory allows. NOT prototyped here: production neighbor-bin reads
+(adoption reuses wgpu-nufft's cell binning) — host duplication stays a scratch
+shortcut.
+
+## Next step
+
+4. Adoption decision for wgpu-nufft (all stage-3 questions answered).

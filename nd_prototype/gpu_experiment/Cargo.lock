@@ -445,6 +445,7 @@ dependencies = [
  "bytemuck",
  "pollster",
  "wgpu",
+ "wgpu-fft",
 ]
 
 [[package]]
@@ -975,6 +976,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e592c1bbef6ad047647ae6e666ebd8cee7a32bb4544d9700ec96cbf73230257"
 dependencies = [
  "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-fft"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "wgpu",
 ]
 
 [[package]]

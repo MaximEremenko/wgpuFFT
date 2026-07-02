@@ -92,6 +92,13 @@ sigma=2 when memory allows. NOT prototyped here: production neighbor-bin reads
 (adoption reuses wgpu-nufft's cell binning) — host duplication stays a scratch
 shortcut.
 
-## Next step
+## Stage-4 decision (2026-07-17)
 
-4. Adoption decision for wgpu-nufft (all stage-3 questions answered).
+**ADOPT — hybrid strategy.** Rank-generic codegen becomes the d>=4
+implementation and the universal fallback; tuned 1D/2D/3D kernels stay as fast
+paths behind plan-time selection. Full decision record (scope, phases,
+validation gates, deferred items) in the vault note
+`03 Projects/wgpuFFT/ND NUFFT Math Design.md`, section 11. This prototype
+folder remains the reference oracle for the placement math; production
+adoption happens in wgpu-nufft proper, reusing its cell binning + scan
+(not this crate's host-duplication shortcut).

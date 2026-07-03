@@ -661,11 +661,21 @@ fn execute_type1(
 }
 
 fn validate_structured_gpu_errors(device: &wgpu::Device, queue: &wgpu::Queue) {
+    // d >= 4 type-2 is supported through the rank-generic path (F32 only);
+    // non-F32 precisions return the structured phase gate.
+    assert!(
+        NufftPlan::type2_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)).is_ok(),
+        "rank-generic d=4 type-2 plan creation must succeed"
+    );
     assert!(matches!(
-        NufftPlan::type2_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)),
-        Err(NufftError::GpuDimensionsUnsupported {
-            actual: 4,
-            supported: 3,
+        NufftPlan::type2_gpu(
+            device,
+            queue,
+            NufftConfig::new([4, 4, 4, 4], 1.0e-6)
+                .with_precision(wgpu_fft::FftPrecision::Df64),
+        ),
+        Err(NufftError::PrecisionUnsupported {
+            stage: "rank-generic type-2 GPU plan",
             ..
         })
     ));

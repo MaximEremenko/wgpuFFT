@@ -4,6 +4,7 @@ use crate::error::{NufftError, Result};
 use crate::gpu::Type2GpuPlan;
 use crate::gpu_2d::Type2GpuPlan2d;
 use crate::gpu_3d::Type2GpuPlan3d;
+use crate::gpu_nd::Type2GpuPlanNd;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_type1::Type1GpuPlan;
@@ -129,6 +130,7 @@ enum Type2GpuExecution {
     OneD(Type2GpuPlan),
     TwoD(Type2GpuPlan2d),
     ThreeD(Type2GpuPlan3d),
+    Nd(Type2GpuPlanNd),
 }
 
 impl Type2GpuExecution {
@@ -163,6 +165,15 @@ impl Type2GpuExecution {
                 output,
             ),
             Self::ThreeD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::Nd(plan) => plan.encode_batch(
                 device,
                 encoder,
                 active_batch,
@@ -218,6 +229,16 @@ impl Type2GpuExecution {
                 query_set,
                 first_query,
             ),
+            Self::Nd(plan) => plan.encode_profiled(
+                device,
+                encoder,
+                point_count,
+                points,
+                coefficients,
+                output,
+                query_set,
+                first_query,
+            ),
         }
     }
 
@@ -227,6 +248,7 @@ impl Type2GpuExecution {
             Self::OneD(plan) => plan.fft_diagnostics(),
             Self::TwoD(plan) => plan.fft_diagnostics(),
             Self::ThreeD(plan) => plan.fft_diagnostics(),
+            Self::Nd(plan) => plan.fft_diagnostics(),
         }
     }
 }
@@ -465,11 +487,11 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
-        if config.dimensions() > 3 {
-            return Err(NufftError::GpuDimensionsUnsupported {
-                kind: "type-2",
-                actual: config.dimensions(),
-                supported: 3,
+        if config.dimensions() > 3 && config.precision() != wgpu_fft::FftPrecision::F32 {
+            return Err(NufftError::PrecisionUnsupported {
+                requested: config.precision(),
+                stage: "rank-generic type-2 GPU plan",
+                reason: "dimensions above three currently support FftPrecision::F32 only",
             });
         }
         validate_device_precision(device, config.precision(), "type-2 GPU plan")?;
@@ -499,7 +521,14 @@ impl NufftPlan {
                 &plan.fine_grid_shape,
                 &plan.centered_kernel_fourier_coefficients,
             )?),
-            _ => unreachable!("validated NUFFT GPU plans have at least one dimension"),
+            _ => Type2GpuExecution::Nd(Type2GpuPlanNd::new(
+                device,
+                queue,
+                &plan.config,
+                plan.kernel,
+                &plan.fine_grid_shape,
+                &plan.centered_kernel_fourier_coefficients,
+            )?),
         };
         plan.gpu_type2 = Some(Box::new(gpu));
         Ok(plan)

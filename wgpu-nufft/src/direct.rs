@@ -168,8 +168,12 @@ fn validate_complex(input: &'static str, values: &[Complex64]) -> Result<()> {
     Ok(())
 }
 
-fn modes_from_linear(mut linear: usize, n_modes: &[usize], order: ModeOrder) -> [i64; 3] {
-    let mut modes = [0; 3];
+fn modes_from_linear(
+    mut linear: usize,
+    n_modes: &[usize],
+    order: ModeOrder,
+) -> [i64; crate::config::MAX_NUFFT_DIMENSIONS] {
+    let mut modes = [0; crate::config::MAX_NUFFT_DIMENSIONS];
     for (axis, &length) in n_modes.iter().enumerate() {
         let index = linear % length;
         linear /= length;

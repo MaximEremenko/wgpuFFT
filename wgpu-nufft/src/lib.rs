@@ -16,6 +16,7 @@ mod gpu;
 mod gpu_2d;
 mod gpu_3d;
 mod gpu_dispatch;
+mod gpu_nd;
 #[cfg(feature = "gpu-profiling")]
 mod gpu_profile;
 mod gpu_scan;
@@ -28,7 +29,9 @@ mod kernel;
 mod plan;
 mod type3;
 
-pub use config::{ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
+pub use config::{
+    ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA, MAX_NUFFT_DIMENSIONS,
+};
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};
 #[cfg(feature = "gpu-profiling")]

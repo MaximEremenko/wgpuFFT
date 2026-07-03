@@ -4,6 +4,9 @@ use wgpu_fft::FftPrecision;
 
 pub const DEFAULT_EPS: f64 = 1.0e-6;
 pub const DEFAULT_SIGMA: f64 = 2.0;
+/// Maximum supported transform dimensionality. Ranks 1-3 use hand-tuned GPU
+/// paths; higher ranks route to the rank-generic implementation.
+pub const MAX_NUFFT_DIMENSIONS: usize = 8;
 
 /// Sign in the NUFFT exponential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -179,11 +182,11 @@ impl NufftConfig {
             });
         }
         let dimensions = self.dimensions();
-        if !(1..=3).contains(&dimensions) {
+        if !(1..=MAX_NUFFT_DIMENSIONS).contains(&dimensions) {
             return Err(NufftError::InvalidDimensions {
                 actual: dimensions,
                 minimum: 1,
-                maximum: 3,
+                maximum: MAX_NUFFT_DIMENSIONS,
             });
         }
         for (axis, &length) in self.n_modes.iter().enumerate() {

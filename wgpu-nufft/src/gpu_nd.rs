@@ -488,7 +488,10 @@ impl Type2GpuPlanNd {
 
 /// Product amplitude table over the full mode box, axis-0-fast linearization:
 /// `amplitude[flat] = prod_i 1 / phi_hat_i(|k_i|)`.
-fn mode_amplitudes_nd(config: &NufftConfig, coefficients: &[Vec<f64>]) -> Result<Vec<f32>> {
+pub(crate) fn mode_amplitudes_nd(
+    config: &NufftConfig,
+    coefficients: &[Vec<f64>],
+) -> Result<Vec<f32>> {
     let n_modes = config.n_modes();
     let mode_count = config.mode_count()?;
     let mut amplitudes = Vec::new();
@@ -526,7 +529,7 @@ fn mode_amplitudes_nd(config: &NufftConfig, coefficients: &[Vec<f64>]) -> Result
     Ok(amplitudes)
 }
 
-fn create_compute_pipeline(
+pub(crate) fn create_compute_pipeline(
     device: &wgpu::Device,
     label: &str,
     source: &str,
@@ -811,7 +814,7 @@ fn generate_interpolation_wgsl(kernel: EsKernel, fine_shape: &[usize]) -> String
     format!("{}\n{source}", wgpu_fft::kernels::DF64_WGSL)
 }
 
-fn format_wgsl_f32(value: f32) -> String {
+pub(crate) fn format_wgsl_f32(value: f32) -> String {
     debug_assert!(value.is_finite());
     let mut formatted = value.to_string();
     if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
@@ -820,7 +823,7 @@ fn format_wgsl_f32(value: f32) -> String {
     formatted
 }
 
-fn checked_buffer_size(
+pub(crate) fn checked_buffer_size(
     context: &'static str,
     elements: usize,
     bytes_per_element: u64,
@@ -831,12 +834,12 @@ fn checked_buffer_size(
         .ok_or(NufftError::LengthOverflow { context })
 }
 
-fn checked_product(context: &'static str, left: usize, right: usize) -> Result<usize> {
+pub(crate) fn checked_product(context: &'static str, left: usize, right: usize) -> Result<usize> {
     left.checked_mul(right)
         .ok_or(NufftError::LengthOverflow { context })
 }
 
-fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
+pub(crate) fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
     if bytes > limit {
         Err(NufftError::GpuBufferBindingTooLarge {
             buffer,
@@ -848,7 +851,7 @@ fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Resul
     }
 }
 
-fn validate_external_storage_buffer(
+pub(crate) fn validate_external_storage_buffer(
     label: &'static str,
     buffer: &wgpu::Buffer,
     required_bytes: u64,
@@ -870,7 +873,7 @@ fn validate_external_storage_buffer(
     validate_binding_limit(label, required_bytes, max_storage_binding_bytes)
 }
 
-fn binding_entry<'a>(
+pub(crate) fn binding_entry<'a>(
     binding: u32,
     buffer: &'a wgpu::Buffer,
     size: u64,

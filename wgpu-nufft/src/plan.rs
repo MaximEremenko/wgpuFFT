@@ -444,13 +444,6 @@ impl NufftPlan {
         gather_2d: Type1Gather2d,
         gather_3d: Type1Gather3d,
     ) -> Result<Self> {
-        if config.dimensions() > 3 && config.precision() != wgpu_fft::FftPrecision::F32 {
-            return Err(NufftError::PrecisionUnsupported {
-                requested: config.precision(),
-                stage: "rank-generic type-1 GPU plan",
-                reason: "dimensions above three currently support FftPrecision::F32 only",
-            });
-        }
         validate_device_precision(device, config.precision(), "type-1 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type1, config)?;
         let gpu = match plan.config.dimensions() {
@@ -516,13 +509,6 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
-        if config.dimensions() > 3 && config.precision() != wgpu_fft::FftPrecision::F32 {
-            return Err(NufftError::PrecisionUnsupported {
-                requested: config.precision(),
-                stage: "rank-generic type-2 GPU plan",
-                reason: "dimensions above three currently support FftPrecision::F32 only",
-            });
-        }
         validate_device_precision(device, config.precision(), "type-2 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type2, config)?;
         let gpu = match plan.config.dimensions() {

@@ -1,17 +1,18 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-//! Opt-in rank-generic (d >= 4) type-2 GPU validation against the direct f64
-//! NDFT oracle. Adoption phase 1 of the ND NUFFT design: F32 precision,
-//! sigma per config, both signs and mode orders, batching, and coordinates
-//! exercising the full [-3*pi, 3*pi] folding interval.
+//! Opt-in rank-generic (d >= 4) GPU validation against the direct f64 NDFT
+//! oracle: F32/F64/Df64 precisions, sigma per config, both signs and mode
+//! orders, batching, and coordinates exercising the full
+//! [-3*pi, 3*pi] folding interval. The F64 cases run only when the adapter
+//! exposes SHADER_F64; Df64 needs no device feature.
 
 use std::f64::consts::PI;
 use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 use wgpu_nufft::{
-    reference_type1_f64, reference_type2_f64, Complex64, ModeOrder, NufftConfig, NufftPlan,
-    NufftSign,
+    reference_type1_f64, reference_type2_f64, Complex64, ComplexDoubleFloat, DoubleFloat,
+    FftPrecision, ModeOrder, NufftConfig, NufftPlan, NufftSign,
 };
 
 #[test]
@@ -115,8 +116,168 @@ async fn run_cases() {
 
     adjoint_case(&context).await;
 
+    high_precision_case(
+        &context,
+        "4d eps=1e-8 df64",
+        &[10, 9, 8, 8],
+        1.0e-8,
+        FftPrecision::Df64,
+        48.0,
+    )
+    .await;
+    if context
+        .device
+        .features()
+        .contains(wgpu::Features::SHADER_F64)
+    {
+        high_precision_case(
+            &context,
+            "4d eps=1e-8 f64",
+            &[10, 9, 8, 8],
+            1.0e-8,
+            FftPrecision::F64,
+            40.0,
+        )
+        .await;
+    } else {
+        eprintln!("skipping ND F64 case; the adapter lacks SHADER_F64");
+    }
+
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+/// Runs both transform types in a high-precision configuration against the
+/// f64 oracle. Sub-f32 relative error is the pass criterion: an f32 pipeline
+/// cannot reach these thresholds, so agreement proves the F64/Df64 shaders
+/// carry the extra precision end to end.
+async fn high_precision_case(
+    context: &wgpu_fft::device::GpuContext,
+    label: &str,
+    n_modes: &[usize],
+    eps: f64,
+    precision: FftPrecision,
+    tolerance_factor: f64,
+) {
+    let dims = n_modes.len();
+    let mode_count: usize = n_modes.iter().product();
+    let config = NufftConfig::new(n_modes.to_vec(), eps)
+        .with_sign(NufftSign::Negative)
+        .with_precision(precision);
+
+    let point_count = 37;
+    let mut state = 0x0dd5_ba11_5eed_f00du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let mut points = Vec::with_capacity(point_count * dims);
+    for point in 0..point_count {
+        for _ in 0..dims {
+            let unit = next();
+            let coordinate = if point == 0 {
+                2.5 * PI
+            } else if point == 1 {
+                -2.75 * PI
+            } else {
+                (unit * 2.0 - 1.0) * PI
+            };
+            points.push(coordinate);
+        }
+    }
+    let coefficients: Vec<Complex64> = (0..mode_count)
+        .map(|_| Complex64::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0))
+        .collect();
+    let strengths: Vec<Complex64> = (0..point_count)
+        .map(|_| Complex64::new(next() * 2.0 - 1.0, next() * 2.0 - 1.0))
+        .collect();
+
+    let (point_bytes, coefficient_bytes, strength_bytes) = match precision {
+        FftPrecision::F64 => (
+            bytemuck::cast_slice::<f64, u8>(&points).to_vec(),
+            bytemuck::cast_slice::<Complex64, u8>(&coefficients).to_vec(),
+            bytemuck::cast_slice::<Complex64, u8>(&strengths).to_vec(),
+        ),
+        FftPrecision::Df64 => {
+            let packed_points: Vec<DoubleFloat> =
+                points.iter().map(|&x| DoubleFloat::from_f64(x)).collect();
+            let packed_coefficients: Vec<ComplexDoubleFloat> = coefficients
+                .iter()
+                .map(|value| ComplexDoubleFloat::from_f64(value.re, value.im))
+                .collect();
+            let packed_strengths: Vec<ComplexDoubleFloat> = strengths
+                .iter()
+                .map(|value| ComplexDoubleFloat::from_f64(value.re, value.im))
+                .collect();
+            (
+                bytemuck::cast_slice::<DoubleFloat, u8>(&packed_points).to_vec(),
+                bytemuck::cast_slice::<ComplexDoubleFloat, u8>(&packed_coefficients).to_vec(),
+                bytemuck::cast_slice::<ComplexDoubleFloat, u8>(&packed_strengths).to_vec(),
+            )
+        }
+        FftPrecision::F32 => unreachable!("high-precision ND cases cover F64/Df64 only"),
+    };
+
+    let scope = context
+        .device
+        .push_error_scope(wgpu::ErrorFilter::Validation);
+    let plan_t2 = NufftPlan::type2_gpu(&context.device, &context.queue, config.clone())
+        .unwrap_or_else(|error| panic!("{label}: type-2 plan creation failed: {error}"));
+    let t2_bytes = execute_type2_bytes(
+        &context.device,
+        &context.queue,
+        &plan_t2,
+        point_count,
+        1,
+        &point_bytes,
+        &coefficient_bytes,
+        16,
+    );
+    let plan_t1 = NufftPlan::type1_gpu(&context.device, &context.queue, config.clone())
+        .unwrap_or_else(|error| panic!("{label}: type-1 plan creation failed: {error}"));
+    let t1_bytes = execute_type1_bytes(
+        &context.device,
+        &context.queue,
+        &plan_t1,
+        point_count,
+        1,
+        mode_count,
+        &point_bytes,
+        &strength_bytes,
+        16,
+    );
+    if let Some(error) = scope.pop().await {
+        panic!("{label}: validation error: {error}");
+    }
+
+    let unpack = |bytes: &[u8]| -> Vec<Complex64> {
+        match precision {
+            FftPrecision::F64 => bytemuck::cast_slice::<u8, Complex64>(bytes).to_vec(),
+            FftPrecision::Df64 => bytemuck::cast_slice::<u8, ComplexDoubleFloat>(bytes)
+                .iter()
+                .map(|value| Complex64::new(value.re().to_f64(), value.im().to_f64()))
+                .collect(),
+            FftPrecision::F32 => unreachable!(),
+        }
+    };
+    let t2_actual = unpack(&t2_bytes);
+    let t2_reference = reference_type2_f64(&config, &points, &coefficients).unwrap();
+    let t2_error = relative_l2(&t2_actual, &t2_reference);
+    eprintln!("NUFFT_ND_ACCURACY {label} type-2: relative_l2={t2_error:.9e}");
+    assert!(
+        t2_error <= tolerance_factor * eps,
+        "{label}: type-2 relative l2 {t2_error} exceeds {tolerance_factor} * {eps}"
+    );
+    let t1_actual = unpack(&t1_bytes);
+    let t1_reference = reference_type1_f64(&config, &points, &strengths).unwrap();
+    let t1_error = relative_l2(&t1_actual, &t1_reference);
+    eprintln!("NUFFT_ND_ACCURACY {label} type-1: relative_l2={t1_error:.9e}");
+    assert!(
+        t1_error <= tolerance_factor * eps,
+        "{label}: type-1 relative l2 {t1_error} exceeds {tolerance_factor} * {eps}"
+    );
 }
 
 /// <y, A x> == <A^H y, x>: type-2 with one sign is adjoint to type-1 with the
@@ -451,6 +612,135 @@ fn execute_type1(
     receiver.recv().unwrap().unwrap();
     let mapped = slice.get_mapped_range();
     let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+    drop(mapped);
+    readback.unmap();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_type2_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    point_count: usize,
+    batch: usize,
+    points: &[u8],
+    coefficients: &[u8],
+    complex_bytes: usize,
+) -> Vec<u8> {
+    let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_points"),
+        contents: points,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let coefficient_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_coefficients"),
+        contents: coefficients,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes = (point_count * batch * complex_bytes) as u64;
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_readback"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_encoder"),
+    });
+    plan.encode_type2_gpu_batch(
+        device,
+        &mut encoder,
+        point_count,
+        batch,
+        &point_buffer,
+        &coefficient_buffer,
+        &output,
+    )
+    .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = slice.get_mapped_range();
+    let result = mapped.to_vec();
+    drop(mapped);
+    readback.unmap();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_type1_bytes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    point_count: usize,
+    batch: usize,
+    mode_count: usize,
+    points: &[u8],
+    strengths: &[u8],
+    complex_bytes: usize,
+) -> Vec<u8> {
+    let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_t1_points"),
+        contents: points,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let strength_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_t1_strengths"),
+        contents: strengths,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes = (mode_count * batch * complex_bytes) as u64;
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_t1_output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_t1_readback"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test_nd.hp_t1_encoder"),
+    });
+    plan.encode_type1_gpu_batch(
+        device,
+        &mut encoder,
+        point_count,
+        batch,
+        &point_buffer,
+        &strength_buffer,
+        &output,
+    )
+    .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = slice.get_mapped_range();
+    let result = mapped.to_vec();
     drop(mapped);
     readback.unmap();
     result

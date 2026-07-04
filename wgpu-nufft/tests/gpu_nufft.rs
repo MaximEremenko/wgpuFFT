@@ -661,38 +661,61 @@ fn execute_type1(
 }
 
 fn validate_structured_gpu_errors(device: &wgpu::Device, queue: &wgpu::Queue) {
-    // d >= 4 type-2 is supported through the rank-generic path (F32 only);
-    // non-F32 precisions return the structured phase gate.
+    // d >= 4 runs through the rank-generic path in every precision; Df64
+    // needs no device feature, while native F64 keeps the SHADER_F64 gate.
     assert!(
         NufftPlan::type2_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)).is_ok(),
         "rank-generic d=4 type-2 plan creation must succeed"
     );
-    assert!(matches!(
+    assert!(
         NufftPlan::type2_gpu(
             device,
             queue,
             NufftConfig::new([4, 4, 4, 4], 1.0e-6).with_precision(wgpu_fft::FftPrecision::Df64),
-        ),
-        Err(NufftError::PrecisionUnsupported {
-            stage: "rank-generic type-2 GPU plan",
-            ..
-        })
-    ));
+        )
+        .is_ok(),
+        "rank-generic d=4 type-2 Df64 plan creation must succeed"
+    );
     assert!(
         NufftPlan::type1_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)).is_ok(),
         "rank-generic d=4 type-1 plan creation must succeed"
     );
-    assert!(matches!(
+    assert!(
         NufftPlan::type1_gpu(
             device,
             queue,
             NufftConfig::new([4, 4, 4, 4], 1.0e-6).with_precision(wgpu_fft::FftPrecision::Df64),
-        ),
-        Err(NufftError::PrecisionUnsupported {
-            stage: "rank-generic type-1 GPU plan",
-            ..
-        })
-    ));
+        )
+        .is_ok(),
+        "rank-generic d=4 type-1 Df64 plan creation must succeed"
+    );
+    let f64_config =
+        NufftConfig::new([4, 4, 4, 4], 1.0e-6).with_precision(wgpu_fft::FftPrecision::F64);
+    if device.features().contains(wgpu::Features::SHADER_F64) {
+        assert!(
+            NufftPlan::type2_gpu(device, queue, f64_config.clone()).is_ok(),
+            "rank-generic d=4 type-2 F64 plan creation must succeed with SHADER_F64"
+        );
+        assert!(
+            NufftPlan::type1_gpu(device, queue, f64_config).is_ok(),
+            "rank-generic d=4 type-1 F64 plan creation must succeed with SHADER_F64"
+        );
+    } else {
+        assert!(matches!(
+            NufftPlan::type2_gpu(device, queue, f64_config.clone()),
+            Err(NufftError::PrecisionUnsupported {
+                stage: "type-2 GPU plan",
+                ..
+            })
+        ));
+        assert!(matches!(
+            NufftPlan::type1_gpu(device, queue, f64_config),
+            Err(NufftError::PrecisionUnsupported {
+                stage: "type-1 GPU plan",
+                ..
+            })
+        ));
+    }
     let config = NufftConfig::new([8], 1.0e-6);
     let host_only = NufftPlan::type2(config.clone()).unwrap();
     let plan = NufftPlan::type2_gpu(device, queue, config).unwrap();

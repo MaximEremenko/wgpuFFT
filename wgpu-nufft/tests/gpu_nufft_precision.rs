@@ -111,7 +111,7 @@ async fn run_native_f64_cases() {
     ] {
         validate_type1_and_type2(&context.device, &context.queue, &shape, sign);
     }
-    for dimensions in 1..=3 {
+    for dimensions in 1..=4 {
         validate_type12_adjoint(&context.device, &context.queue, dimensions);
         for sign in [NufftSign::Positive, NufftSign::Negative] {
             validate_type3_oracle(&context.device, &context.queue, dimensions, sign);
@@ -410,6 +410,7 @@ fn validate_type12_adjoint(device: &wgpu::Device, queue: &wgpu::Queue, dimension
         1 => vec![15],
         2 => vec![5, 7],
         3 => vec![3, 4, 5],
+        4 => vec![3, 4, 3, 4],
         _ => unreachable!(),
     };
     let point_count = 9;

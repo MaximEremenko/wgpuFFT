@@ -8,6 +8,7 @@ use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
+use crate::gpu_type1_nd::Type1GpuPlanNd;
 use crate::kernel::{EsHornerTable, EsKernel};
 use crate::plan::NufftPlan;
 use crate::type3::NufftType3Plan;
@@ -130,13 +131,14 @@ impl GpuType3Plan {
                 ],
                 Type1Gather3d::Tiled8x8x4,
             )?),
-            _ => {
-                return Err(NufftError::GpuDimensionsUnsupported {
-                    kind: "type-3",
-                    actual: dimensions,
-                    supported: 3,
-                });
-            }
+            _ => RawSpreadPlan::Nd(Type1GpuPlanNd::new(
+                device,
+                queue,
+                &outer_config,
+                kernel,
+                &outer_shape,
+                &outer_coefficients,
+            )?),
         };
         if raw_spread.fine_grid_element_count() != metadata.outer_grid_count() {
             return Err(NufftError::LengthOverflow {
@@ -484,6 +486,7 @@ enum RawSpreadPlan {
     OneD(Type1GpuPlan),
     TwoD(Type1GpuPlan2d),
     ThreeD(Type1GpuPlan3d),
+    Nd(Type1GpuPlanNd),
 }
 
 impl RawSpreadPlan {
@@ -533,6 +536,14 @@ impl RawSpreadPlan {
                 points,
                 strengths,
             ),
+            Self::Nd(plan) => plan.encode_spread_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+            ),
         }
     }
 
@@ -541,6 +552,7 @@ impl RawSpreadPlan {
             Self::OneD(plan) => plan.fine_grid_buffer(),
             Self::TwoD(plan) => plan.fine_grid_buffer(),
             Self::ThreeD(plan) => plan.fine_grid_buffer(),
+            Self::Nd(plan) => plan.fine_grid_buffer(),
         }
     }
 
@@ -549,6 +561,7 @@ impl RawSpreadPlan {
             Self::OneD(plan) => plan.fine_grid_element_count(),
             Self::TwoD(plan) => plan.fine_grid_element_count(),
             Self::ThreeD(plan) => plan.fine_grid_element_count(),
+            Self::Nd(plan) => plan.fine_grid_element_count(),
         }
     }
 }
@@ -1937,7 +1950,7 @@ mod tests {
 
     #[test]
     fn generated_shaders_cover_every_axis_and_use_df64_phase_reduction() {
-        for dimensions in 1..=3 {
+        for dimensions in 1..=4 {
             let metadata = metadata(dimensions);
             let source = generate_source_wgsl(&metadata).unwrap();
             let target = generate_target_wgsl(&metadata).unwrap();
@@ -1958,7 +1971,7 @@ mod tests {
 
     #[test]
     fn native_f64_type3_shaders_are_transcendental_free() {
-        for dimensions in 1..=3 {
+        for dimensions in 1..=4 {
             let metadata = metadata_with_precision(dimensions, FftPrecision::F64);
             let source = generate_source_wgsl(&metadata).unwrap();
             let target = generate_target_wgsl(&metadata).unwrap();
@@ -1982,7 +1995,7 @@ mod tests {
 
     #[test]
     fn portable_df64_type3_shaders_use_dd_horner_without_transcendentals() {
-        for dimensions in 1..=3 {
+        for dimensions in 1..=4 {
             let metadata = metadata_with_precision(dimensions, FftPrecision::Df64);
             let source = generate_source_wgsl(&metadata).unwrap();
             let target = generate_target_wgsl(&metadata).unwrap();

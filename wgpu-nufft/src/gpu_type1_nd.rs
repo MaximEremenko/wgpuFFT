@@ -319,21 +319,17 @@ impl Type1GpuPlanNd {
             self.max_storage_binding_bytes,
         )?;
 
-        if point_count == 0 {
-            // Type-1 with no sources has a nonempty, all-zero mode output:
-            // clear the fine grid, then still run FFT + deconvolution so the
-            // external output is fully overwritten.
-            encoder.clear_buffer(&self.fine_input, 0, None);
-        } else {
-            self.encode_spread(
-                device,
-                encoder,
-                active_batch,
-                point_count,
-                points,
-                strengths,
-            )?;
-        }
+        // Type-1 with no sources has a nonempty, all-zero mode output: the
+        // spread entry clears the fine grid, then FFT + deconvolution still
+        // run so the external output is fully overwritten.
+        self.encode_spread_batch(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+        )?;
 
         self.fft
             .execute_views(
@@ -408,6 +404,49 @@ impl Type1GpuPlanNd {
     #[cfg(feature = "gpu-profiling")]
     pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         self.fft.diagnostics()
+    }
+
+    /// Encodes only the deterministic spread (bin/scan/scatter/sort/gather)
+    /// into the plan-owned fine grid — no FFT, no deconvolution. With zero
+    /// points the fine grid is cleared instead, so downstream consumers (the
+    /// batched FFT here, or type-3's inner type-2) always see defined data.
+    pub(crate) fn encode_spread_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+    ) -> Result<()> {
+        if active_batch == 0 || active_batch > self.batch_capacity {
+            return Err(NufftError::InvalidBatch {
+                actual: active_batch,
+                maximum: self.batch_capacity,
+            });
+        }
+        if point_count == 0 {
+            encoder.clear_buffer(&self.fine_input, 0, None);
+            return Ok(());
+        }
+        self.encode_spread(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+        )
+    }
+
+    /// Returns the plan-owned fine grid populated by
+    /// [`Self::encode_spread_batch`].
+    pub(crate) fn fine_grid_buffer(&self) -> &wgpu::Buffer {
+        &self.fine_input
+    }
+
+    pub(crate) const fn fine_grid_element_count(&self) -> usize {
+        self.fine_product
     }
 
     fn encode_spread(

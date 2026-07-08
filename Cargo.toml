@@ -8,8 +8,12 @@ name = "wgpu-fft"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-license = "MIT OR Apache-2.0"
-description = "Early Rust wgpu FFT library scaffold with C2C f32 support."
+license = "Apache-2.0"
+description = "GPU FFT library for Rust on wgpu/WebGPU: C2C f32, native f64, and portable double-float plus real f32 transforms over 1D/ND shapes, native and WebAssembly, with structured diagnostics and tuning."
+repository = "https://github.com/MaximEremenko/wgpuFFT"
+readme = "README.md"
+keywords = ["fft", "wgpu", "webgpu", "gpu", "dsp"]
+categories = ["mathematics", "algorithms", "wasm"]
 
 [lib]
 name = "wgpu_fft"

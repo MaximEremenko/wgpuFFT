@@ -3,8 +3,12 @@ name = "wgpu-web"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Minimal wasm-bindgen browser surface for wgpu-fft and wgpu-nufft"
+repository = "https://github.com/MaximEremenko/wgpuFFT"
+readme = "README.md"
+keywords = ["fft", "nufft", "wgpu", "webgpu", "wasm"]
+categories = ["mathematics", "algorithms", "wasm"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -16,8 +20,8 @@ js-sys = "0.3.97"
 wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4.70"
 wgpu = "29.0.1"
-wgpu-fft = { path = "..", features = ["serde"] }
-wgpu-nufft = { path = "../wgpu-nufft" }
+wgpu-fft = { path = "..", version = "0.1.0", features = ["serde"] }
+wgpu-nufft = { path = "../wgpu-nufft", version = "0.1.0" }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "=0.3.70"

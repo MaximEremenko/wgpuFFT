@@ -7,8 +7,10 @@ public API. Planning is separate from execution and plans are reusable.
 
 The current implementation provides:
 
-- Type-1, type-2, and type-3 definitions in one to three
-  dimensions;
+- Type-1, type-2, and type-3 definitions in arbitrary
+  dimension: hand-tuned 1D, 2D, and 3D paths plus a rank-generic GPU path that
+  serves every rank `d >= 4` for all three transform types in F32, native F64,
+  and portable double-float;
 - direct `f64` NDFT execution for every transform kind as the correctness oracle
   and tiny-problem fallback;
 - `sigma = 2` default exponential-of-semicircle kernel planning;
@@ -160,3 +162,8 @@ and are periodic modulo `2*pi`; type-3 source and target domains are instead
 the explicit intervals supplied at planning. With the conventional Hermitian
 inner product, type-2 with sign `s` is adjoint to type-1 with sign `-s`; a
 type-3 plan's adjoint swaps source and target sets and reverses the sign.
+
+## License
+
+Licensed under the Apache License, Version 2.0 ([LICENSE](../LICENSE) or
+<http://www.apache.org/licenses/LICENSE-2.0>).

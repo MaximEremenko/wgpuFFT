@@ -1,6 +1,24 @@
 # wgpuFFT
 
-Rust `wgpu` FFT library.
+Rust `wgpu` FFT library. The package name is `wgpu-fft`; the library target is
+imported as `wgpu_fft`. This is the Rust counterpart of the JavaScript
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) and
+[WebGPU-NUFFT](https://github.com/MaximEremenko/WebGPU-NUFFT) projects. The
+workspace also contains the [`wgpu-nufft`](wgpu-nufft/README.md) NUFFT crate
+and the [`wgpu-web`](wgpu-web/README.md) browser surface.
+
+## Installation
+
+The crates are not yet published on crates.io; depend on the library as a git
+dependency:
+
+```toml
+[dependencies]
+wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT" }
+```
+
+The optional `serde` feature adds schema-versioned JSON persistence for
+pipeline-cache snapshots. The minimum supported Rust version is 1.92.
 
 This crate exposes a native Rust API for out-of-place complex-to-complex `f32`,
 native `f64`, and portable double-float (`df64`) transforms, plus
@@ -17,7 +35,8 @@ Df64 uses four `f32` words per complex element:
 [re_hi0, re_lo0, im_hi0, im_lo0, ...]
 ```
 
-R2C/C2R use the WebGPU-FFT packed-spectrum convention. For a logical real
+R2C/C2R use the [WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT)
+packed-spectrum convention. For a logical real
 shape `[N0, ...]`, the packed complex shape is `[floor(N0 / 2) + 1, ...]`, also
 stored as interleaved complex values.
 
@@ -235,6 +254,25 @@ WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_f64 --release
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_df64 --release -- --nocapture
 ```
 
+The environment-variable prefixes above are bash syntax. On Windows PowerShell
+set the variables first, for example:
+
+```powershell
+$env:WGPU_BACKEND = 'dx12'; $env:WGPU_FFT_RUN_GPU_TESTS = '1'
+cargo test --test gpu_df64_canary --release -- --nocapture
+```
+
+Browser (wasm) tests run through the tracked runner, which needs a
+ChromeDriver matching the installed Chrome build (set `CHROMEDRIVER` or put
+`chromedriver.exe` on `PATH`):
+
+```bat
+web\run_browser_tests.cmd
+```
+
+See [wgpu-nufft/README.md](wgpu-nufft/README.md) and
+[wgpu-web/README.md](wgpu-web/README.md) for the sub-crate build commands.
+
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
 is set. The native test helper excludes the GL backend by default because EGL
 can crash on WSL/Linux systems where `/dev/dri` nodes exist but are not readable
@@ -250,3 +288,8 @@ are part of the arithmetic support contract. Metal's fast-math compilation
 makes it the riskiest backend for the error-free transforms; it is currently
 untested. Double-float also retains the `f32` exponent range, and preservation
 of subnormals is backend-dependent.
+
+## License
+
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
+<http://www.apache.org/licenses/LICENSE-2.0>).

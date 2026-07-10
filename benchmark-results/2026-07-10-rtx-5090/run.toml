@@ -1,0 +1,60 @@
+schema_version = 1
+capture_date = "2026-07-10"
+timezone = "America/New_York"
+
+[hardware]
+gpu = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "610.47"
+vram_mib = 32607
+vulkan_device_api = "1.4.341"
+
+[software]
+vkfft_tag = "v1.3.4"
+vkfft_commit = "066a17c17068c0f11c9298d848c2976c71fad1c1"
+glslang_tag = "12.3.1"
+glslang_commit = "4f3ae4b03dc3556f96f55467e139f852831199d0"
+vulkan_sdk = "1.4.350.0"
+wgpu_fft_commit = "03c2b246d4c6c859bc0d026364f2082be6ae6638"
+
+[build]
+vkfft_backend = 0
+configuration = "Release"
+generator = "Ninja"
+compiler = "MSVC"
+executable_sha256 = "148EAD53FDA227939AEBF08BD07ACC320344CE8AFBF156381B50C8218F16AD4F"
+
+[methodology]
+runs_per_case = 3
+warmup_reported = false
+timing = "wall clock around one submit and fence wait"
+iteration_rule = "min(1000, floor(3 * 4096 MiB / bufferSize))"
+normalization = "off"
+execution = "in-place"
+vkfft_std_error_field = "population standard deviation across three runs"
+
+[suites.sample0]
+command = "VkFFT_TestSuite.exe -d 0 -o vkfft_sample0_rtx5090.txt -vkfft 0"
+started_local = "2026-07-10T07:35:20-04:00"
+finished_local = "2026-07-10T07:36:08-04:00"
+elapsed_seconds = 47.7
+expected_cases = 25
+actual_cases = 25
+aggregate_score = 243422
+raw_file = "vkfft-sample-0.txt"
+raw_bytes = 3622
+raw_sha256 = "F45CB8A7A5B156E50ED639504FD5442E02EC6B073E1254E31B0E2093F3F13361"
+
+[suites.sample1000]
+command = "VkFFT_TestSuite.exe -d 0 -o vkfft_sample1000_rtx5090.txt -vkfft 1000"
+started_local = "2026-07-10T07:36:31-04:00"
+finished_local = "2026-07-10T09:44:25-04:00"
+elapsed_seconds = 7674.1
+expected_cases = 4095
+actual_cases = 4095
+aggregate_score = 305226
+raw_file = "vkfft-sample-1000.txt"
+raw_bytes = 682948
+raw_sha256 = "4470673258BC8B637129FDE41F4AAB2FDCAD846AC3C4CA854E155E9FF67B0530"

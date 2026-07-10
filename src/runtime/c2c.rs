@@ -9,6 +9,7 @@ use crate::runtime::bluestein_axis::{
     bluestein_bfft, bluestein_chirp, BluesteinAxis, BluesteinAxisConfig,
 };
 use crate::runtime::buffer_view::{BufferLayout, BufferView, FftIoView};
+use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_bridge::{plan_large_bridge, LargeBridgePlan, LargeBridgeRoute};
 use crate::runtime::large_chunk::LargeChunkPlan;
 use crate::runtime::large_graph::{
@@ -5329,7 +5330,11 @@ fn dispatch_bridge_kernel(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(work_items.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        work_items.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -5479,7 +5484,11 @@ fn dispatch_c2c_smooth_copy_pipeline(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(work_items.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        work_items.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -5539,7 +5548,11 @@ fn dispatch_c2c_smooth_twiddle_transpose(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(params.total_complex.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        params.total_complex.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -5648,7 +5661,11 @@ fn dispatch_c2c_strided_copy(
     });
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
-    pass.dispatch_workgroups(total_complex.div_ceil(WORKGROUP_SIZE), 1, 1);
+    let (x, y, z) = split_workgroups(
+        total_complex.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension(device),
+    )?;
+    pass.dispatch_workgroups(x, y, z);
     Ok(())
 }
 
@@ -5695,7 +5712,7 @@ pub(crate) fn generate_bridge_wgsl_for_key(key: &BridgeStageKey) -> String {
         }
         BridgeKernelKind::RaderSumAccumulate => {
             r#"
-  let line_local: u32 = wid.x;
+  let line_local: u32 = wgFlat;
   if (line_local >= params.line_count) { return; }
   let base: u32 = line_base(params.line_offset + line_local);
   var acc: vec2<f32> = vec2<f32>(0.0, 0.0);
@@ -5785,6 +5802,29 @@ pub(crate) fn generate_bridge_wgsl_for_key(key: &BridgeStageKey) -> String {
 "#
         }
     };
+    let index_prologue = match key.kind {
+        BridgeKernelKind::RaderSumAccumulate => format!(
+            "{}\n  if (wgFlat >= params.line_count) {{ return; }}",
+            crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX
+        ),
+        BridgeKernelKind::RaderSumInit | BridgeKernelKind::RaderWriteY0 => {
+            crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.line_count",
+                key.workgroup_size,
+            )
+        }
+        BridgeKernelKind::RaderPack
+        | BridgeKernelKind::RaderMul
+        | BridgeKernelKind::RaderPost
+        | BridgeKernelKind::BluesteinPack
+        | BridgeKernelKind::BluesteinMul
+        | BridgeKernelKind::BluesteinPost => crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.t_count",
+            key.workgroup_size,
+        ),
+    };
     let bindings = match key.kind {
         BridgeKernelKind::RaderSumInit => {
             r#"@group(0) @binding(0) var<storage, read_write> sum_all: array<vec2<f32>>;
@@ -5868,8 +5908,8 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
 var<workgroup> scratch: array<vec2<f32>, {workgroup_size}>;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  {index_prologue}
   {body}
 }}
 "#,
@@ -5880,6 +5920,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
         scale = scale,
         workgroup_size = key.workgroup_size,
         line_base_fn = line_base_fn,
+        index_prologue = index_prologue,
         body = body,
     )
 }
@@ -5915,8 +5956,10 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
 }}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total_complex / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total_complex) {{ return; }}
   let local_k1: u32 = i % params.chunk_outer;
   let local_n1: u32 = i / params.chunk_outer;
@@ -5958,8 +6001,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total_complex / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total_complex) {{ return; }}
   {assignment}
 }}
@@ -6012,8 +6057,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total_complex / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total_complex) {{ return; }}
   {body}
 }}
@@ -6048,8 +6095,10 @@ struct Params {{
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+  let wgFlat: u32 = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+  if (wgFlat > params.total_complex / {workgroup_size}u) {{ return; }}
+  let i: u32 = wgFlat * {workgroup_size}u + lid.x;
   if (i >= params.total_complex) {{ return; }}
   let batch: u32 = i / params.logical_per_batch;
   let element: u32 = i - batch * params.logical_per_batch;
@@ -6476,7 +6525,8 @@ impl DirectDftPlan {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_x, 1, 1);
+        let (x, y, z) = split_workgroups(self.workgroups_x, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 }

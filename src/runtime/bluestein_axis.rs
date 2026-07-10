@@ -6,6 +6,7 @@ use crate::math::{reference_c2c_nd, to_interleaved_f32, Complex32};
 use crate::runtime::axis_plan::{AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision};
 use crate::runtime::axis_policy::next_smooth_at_least;
 use crate::runtime::buffer_view::BufferView;
+use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
     format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
@@ -393,7 +394,9 @@ impl BluesteinAxis {
         });
         pass.set_pipeline(&self.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_work, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -418,7 +421,9 @@ impl BluesteinAxis {
         });
         pass.set_pipeline(&self.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_work, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -445,7 +450,9 @@ impl BluesteinAxis {
         });
         pass.set_pipeline(&self.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_output, 1, 1);
+        let (x, y, z) =
+            split_workgroups(self.workgroups_output, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 }
@@ -672,11 +679,8 @@ const STRIDE: u32 = {stride}u;
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.lines * M) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
 
   let lineLocal: u32 = i / M;
   let t: u32 = i - lineLocal * M;
@@ -696,6 +700,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         complex_mul = complex_mul,
         line_base_fn = line_base_fn,
         workgroup_size = WORKGROUP_SIZE,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.lines * M",
+            WORKGROUP_SIZE,
+        ),
     )
 }
 
@@ -718,11 +728,8 @@ const M: u32 = {m}u;
 {complex_mul}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.total) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
   let t: u32 = i - (i / M) * M;
   work[i] = c_mul(work[i], bfft[t]);
 }}
@@ -730,6 +737,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         m = m,
         complex_mul = complex_mul,
         workgroup_size = WORKGROUP_SIZE,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index =
+            crate::runtime::dispatch::wgsl_flat_index_stmts("i", "params.total", WORKGROUP_SIZE),
     )
 }
 
@@ -768,11 +778,8 @@ const SCALE: f32 = {scale};
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let i: u32 = gid.x;
-  if (i >= params.lines * N) {{
-    return;
-  }}
+fn main({entry_params}) {{
+  {flat_index}
 
   let lineLocal: u32 = i / N;
   let t: u32 = i - lineLocal * N;
@@ -789,6 +796,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         complex_mul = complex_mul,
         line_base_fn = line_base_fn,
         workgroup_size = WORKGROUP_SIZE,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+            "i",
+            "params.lines * N",
+            WORKGROUP_SIZE,
+        ),
     )
 }
 

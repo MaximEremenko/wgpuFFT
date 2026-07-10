@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::runtime::buffer_view::BufferView;
+use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::ElementFormat;
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, PipelineLayoutCacheKey, StockhamStageKey,
@@ -407,6 +408,7 @@ impl AxisPlan {
         }
 
         let scheduler = WindowScheduler::for_device(device);
+        let max_workgroups_per_dimension = max_workgroups_per_dimension(device);
         let mut src_slot = BufferSlot::Input;
         let mut dst_slot = if self.stages.len() % 2 == 1 {
             BufferSlot::Output
@@ -468,7 +470,8 @@ impl AxisPlan {
                 });
                 pass.set_pipeline(&stage.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
-                pass.dispatch_workgroups(self.workgroups_x, 1, 1);
+                let (x, y, z) = split_workgroups(self.workgroups_x, max_workgroups_per_dimension)?;
+                pass.dispatch_workgroups(x, y, z);
             }
 
             if stage_index + 1 < self.stages.len() {
@@ -589,8 +592,12 @@ const SIGN: f32 = {sign};
 {line_base_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
-  let idx: u32 = params.baseIndex + gid.x;
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  if (wgFlat > params.total / {workgroup_size}u) {{
+    return;
+  }}
+  let idx: u32 = params.baseIndex + wgFlat * {workgroup_size}u + lid.x;
   if (idx >= params.total) {{
     return;
   }}
@@ -634,6 +641,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         sign = sign,
         line_base_fn = line_base_fn,
         workgroup_size = config.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
         maybe_scale = maybe_scale,
     )
 }

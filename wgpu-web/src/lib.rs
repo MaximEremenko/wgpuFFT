@@ -124,14 +124,14 @@ pub struct WgpuFftBuffer {
     size: u64,
 }
 
-async fn initialize(request_adapter_maximums: bool) -> Result<WgpuFft, JsValue> {
+async fn initialize(request_adapter_maximums: bool, force_fallback: bool) -> Result<WgpuFft, JsValue> {
     let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
     let instance = wgpu::Instance::new(instance_descriptor);
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
+            force_fallback_adapter: force_fallback,
             compatible_surface: None,
         })
         .await
@@ -218,14 +218,22 @@ impl WgpuFft {
     /// remains available and the failure text is exposed for diagnostics.
     #[wasm_bindgen(js_name = init)]
     pub async fn init() -> Result<WgpuFft, JsValue> {
-        initialize(true).await
+        initialize(true, false).await
     }
 
     /// Acquires a featureless browser device at the WebGPU default limits and
     /// runs the same 96-word df64 invariant suite as [`Self::init`].
+    /// Initializes on the browser's software fallback adapter (CPU execution
+    /// of the same WGSL pipelines, e.g. SwiftShader). Useful where no hardware
+    /// WebGPU adapter is available or for deterministic CPU runs.
+    #[wasm_bindgen(js_name = initFallback)]
+    pub async fn init_fallback() -> Result<WgpuFft, JsValue> {
+        initialize(true, true).await
+    }
+
     #[wasm_bindgen(js_name = initWithDefaultLimits)]
     pub async fn init_with_default_limits() -> Result<WgpuFft, JsValue> {
-        initialize(false).await
+        initialize(false, false).await
     }
 
     /// Adapter name reported by the browser.

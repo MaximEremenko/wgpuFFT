@@ -27,17 +27,19 @@ async fn run_cases() {
     };
     eprintln!("adapter: {:?}", context.adapter.get_info());
 
-    // Stockham stages: 4_194_306 elements = 65_537 workgroups per stage,
-    // producing one padded workgroup in the balanced 32_769 x 2 grid.
-    roundtrip_c2c(&context, &[2], 2_097_153, C2cRoute::MixedRadix, 65_537);
+    // The fused N=2 kernel dispatches one workgroup per line. 65_537 lines
+    // produce one padded workgroup in the balanced 32_769 x 2 grid.
+    roundtrip_c2c(&context, &[2], 65_537, C2cRoute::MixedRadix, 65_537);
     // Rader sum dispatches one workgroup per line and exercises the same
     // padded-grid guard independently of the element-index kernels.
     roundtrip_c2c(&context, &[17], 65_537, C2cRoute::Rader, 65_537);
     // Any valid Bluestein convolution for N=34 has at least 67 elements, so
     // 62_601 lines require at least ceil(62_601 * 67 / 64) = 65_536 groups.
     roundtrip_c2c(&context, &[34], 62_601, C2cRoute::Bluestein, 65_536);
-    // Real conversion kernels share the same flat dispatch path.
-    roundtrip_real(&context, 2, 2_097_121);
+    // Real conversion kernels share the same flat dispatch path. N=256 keeps
+    // their element dispatch oversized without creating millions of mostly
+    // idle fused child-FFT workgroups.
+    roundtrip_real(&context, 256, 16_385);
 
     #[cfg(windows)]
     {

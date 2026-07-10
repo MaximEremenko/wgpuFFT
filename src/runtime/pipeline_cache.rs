@@ -287,6 +287,9 @@ impl PipelineCache {
 
     fn import_snapshot(&mut self, device: &wgpu::Device, snapshot: &PipelineCacheSnapshot) {
         for entry in &snapshot.shader_entries {
+            if !entry.key.is_supported_on_device(device) {
+                continue;
+            }
             let shader_label = format!(
                 "wgpu_fft.pipeline_cache.import.shader.{}",
                 entry.key.stable_key()
@@ -300,6 +303,9 @@ impl PipelineCache {
             .map(|entry| (entry.key.clone(), entry.code.clone()))
             .collect::<HashMap<_, _>>();
         for key in &snapshot.pipeline_entries {
+            if !key.shader.is_supported_on_device(device) {
+                continue;
+            }
             let pipeline_label = format!(
                 "wgpu_fft.pipeline_cache.import.pipeline.{}",
                 key.stable_key()
@@ -323,6 +329,7 @@ impl PipelineCache {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ShaderCacheKey {
     StockhamStage(StockhamStageKey),
+    FusedPow2Stage(FusedPow2StageKey),
     BridgeStage(BridgeStageKey),
     RaderStage(RaderStageKey),
     RealStage(RealStageKey),
@@ -335,6 +342,7 @@ impl ShaderCacheKey {
     pub(crate) fn stable_key(&self) -> String {
         match self {
             Self::StockhamStage(key) => key.stable_key(),
+            Self::FusedPow2Stage(key) => key.stable_key(),
             Self::BridgeStage(key) => key.stable_key(),
             Self::RaderStage(key) => key.stable_key(),
             Self::RealStage(key) => key.stable_key(),
@@ -347,6 +355,9 @@ impl ShaderCacheKey {
     fn fallback_source(&self) -> String {
         match self {
             Self::StockhamStage(_) => String::new(),
+            Self::FusedPow2Stage(key) => {
+                crate::runtime::axis_plan::generate_fused_pow2_stage_wgsl_for_key(key)
+            }
             Self::BridgeStage(key) => crate::runtime::c2c::generate_bridge_wgsl_for_key(key),
             Self::RaderStage(key) => crate::runtime::rader_axis::generate_rader_wgsl_for_key(key),
             Self::RealStage(key) => crate::runtime::real::generate_real_wgsl_for_key(key),
@@ -355,6 +366,20 @@ impl ShaderCacheKey {
                 crate::runtime::c2c::generate_c2c_strided_wgsl_for_key(key)
             }
             Self::DirectDftC2cF32 => crate::kernels::C2C_DFT_WGSL.to_owned(),
+        }
+    }
+
+    fn is_supported_on_device(&self, device: &wgpu::Device) -> bool {
+        match self {
+            Self::FusedPow2Stage(key) => {
+                let limits = device.limits();
+                key.is_supported_by_limits(
+                    u64::from(limits.max_compute_workgroup_storage_size),
+                    limits.max_compute_invocations_per_workgroup,
+                    limits.max_compute_workgroup_size_x,
+                )
+            }
+            _ => true,
         }
     }
 }
@@ -372,6 +397,14 @@ impl ComputePipelineCacheKey {
             layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::StockhamStage(shader),
+        }
+    }
+
+    pub(crate) fn fused_pow2_stage(shader: FusedPow2StageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::FusedPow2Stage(shader),
         }
     }
 
@@ -812,6 +845,91 @@ pub(crate) struct StockhamStageKey {
     scale_bits: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FusedPow2StageKey {
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl FusedPow2StageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        direction: FftDirection,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert!(axis_length.is_power_of_two());
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            direction,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:fused-pow2:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            direction_key(self.direction),
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+
+    fn is_supported_by_limits(
+        &self,
+        max_workgroup_storage_bytes: u64,
+        max_invocations_per_workgroup: u32,
+        max_workgroup_size_x: u32,
+    ) -> bool {
+        let Some(scratch_bytes) = self.axis_length.checked_mul(8) else {
+            return false;
+        };
+        scratch_bytes as u64 <= max_workgroup_storage_bytes
+            && self.workgroup_size <= max_invocations_per_workgroup
+            && self.workgroup_size <= max_workgroup_size_x
+    }
+}
+
 impl StockhamStageKey {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1064,6 +1182,78 @@ mod tests {
     }
 
     #[test]
+    fn fused_pow2_shader_key_is_stable_and_includes_plan_constants() {
+        let key = FusedPow2StageKey::new(
+            2,
+            1,
+            &[4, 256],
+            256,
+            4,
+            FftDirection::Inverse,
+            256,
+            true,
+            1.0 / 1024.0,
+        );
+
+        assert_eq!(key.scale_factor(), 1.0 / 1024.0);
+        assert_eq!(
+            key.stable_key(),
+            "shader:v1:fused-pow2:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000"
+        );
+        let pipeline = ComputePipelineCacheKey::fused_pow2_stage(key);
+        assert!(pipeline.stable_key().starts_with(
+            "pipeline:v1:layout=axis-plan/interleaved-f32:entry=main:shader:v1:fused-pow2:"
+        ));
+    }
+
+    #[test]
+    fn fused_pow2_shader_key_ignores_unused_scale_value() {
+        let a = FusedPow2StageKey::new(
+            1,
+            0,
+            &[4096],
+            4096,
+            1,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+        );
+        let b = FusedPow2StageKey::new(
+            1,
+            0,
+            &[4096],
+            4096,
+            1,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0 / 4096.0,
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn fused_pow2_shader_key_checks_target_device_compute_limits() {
+        let key = FusedPow2StageKey::new(
+            1,
+            0,
+            &[4096],
+            4096,
+            1,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+        );
+        assert!(key.is_supported_by_limits(32 * 1024, 256, 256));
+        assert!(!key.is_supported_by_limits(16 * 1024, 256, 256));
+        assert!(!key.is_supported_by_limits(32 * 1024, 255, 256));
+        assert!(!key.is_supported_by_limits(32 * 1024, 256, 255));
+    }
+
+    #[test]
     fn compute_pipeline_key_wraps_layout_entry_point_and_shader_key() {
         let shader = StockhamStageKey::new(
             1,
@@ -1108,6 +1298,7 @@ mod tests {
         ));
         let pipeline = ComputePipelineCacheKey::stockham_stage(match &shader {
             ShaderCacheKey::StockhamStage(key) => key.clone(),
+            ShaderCacheKey::FusedPow2Stage(_) => unreachable!(),
             ShaderCacheKey::BridgeStage(_) => unreachable!(),
             ShaderCacheKey::RaderStage(_) => unreachable!(),
             ShaderCacheKey::RealStage(_) => unreachable!(),

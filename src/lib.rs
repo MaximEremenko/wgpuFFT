@@ -28,7 +28,9 @@
 //! `execute_checked(...)` and `execute_checked_with_workspace(...)` aliases,
 //! return `FftExecutionError`, preserving the original `FftError` plus
 //! structured diagnostics for validation or binding-safety failures. Pipeline
-//! cache snapshots can be exported and imported as typed in-memory Rust values.
+//! cache snapshots can be exported and imported as typed in-memory Rust values,
+//! and long-running shape sweeps can explicitly clear thread-local per-device
+//! cache entries.
 
 pub mod config;
 pub mod device;
@@ -59,6 +61,7 @@ pub use runtime::large_policy::{
 };
 pub use runtime::logical_io::{FftEndpointFormat, FftLogicalLayout, FftLogicalView};
 pub use runtime::pipeline_cache::{
-    export_pipeline_cache_snapshot, import_pipeline_cache_snapshot, PipelineCacheSnapshot,
-    PIPELINE_CACHE_SNAPSHOT_SCHEMA, PIPELINE_CACHE_SNAPSHOT_VERSION,
+    clear_thread_local_pipeline_cache, export_pipeline_cache_snapshot,
+    import_pipeline_cache_snapshot, PipelineCacheSnapshot, PIPELINE_CACHE_SNAPSHOT_SCHEMA,
+    PIPELINE_CACHE_SNAPSHOT_VERSION,
 };

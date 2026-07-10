@@ -2,10 +2,11 @@ use std::sync::mpsc;
 
 use wgpu_fft::math::{from_interleaved_f32, reference_c2c_nd, to_interleaved_f32};
 use wgpu_fft::{
-    export_pipeline_cache_snapshot, import_pipeline_cache_snapshot, BufferLayout, BufferSegment,
-    BufferView, C2cRoute, FftBlockerKind, FftConfig, FftDeviceLimits, FftError, FftIoView,
-    FftLogicalLayout, FftLogicalView, FftPlan, LargeExecutionKind, LargePolicyLimits,
-    LargeRouteMode, Normalization, PIPELINE_CACHE_SNAPSHOT_SCHEMA, PIPELINE_CACHE_SNAPSHOT_VERSION,
+    clear_thread_local_pipeline_cache, export_pipeline_cache_snapshot,
+    import_pipeline_cache_snapshot, BufferLayout, BufferSegment, BufferView, C2cRoute,
+    FftBlockerKind, FftConfig, FftDeviceLimits, FftError, FftIoView, FftLogicalLayout,
+    FftLogicalView, FftPlan, LargeExecutionKind, LargePolicyLimits, LargeRouteMode, Normalization,
+    PIPELINE_CACHE_SNAPSHOT_SCHEMA, PIPELINE_CACHE_SNAPSHOT_VERSION,
 };
 
 fn c2c_route_name(route: C2cRoute) -> &'static str {
@@ -184,6 +185,7 @@ async fn run_gpu_case() {
 
     assert_workspace_behavior(&context);
     assert_pipeline_cache_snapshot_behavior(&context);
+    assert_pipeline_cache_clear_behavior(&context);
     assert_view_validation_behavior(&context);
     run_one_case_with_caller_workspace(
         &context,
@@ -238,6 +240,59 @@ fn assert_pipeline_cache_snapshot_behavior(context: &wgpu_fft::device::GpuContex
     assert_eq!(imported.version(), PIPELINE_CACHE_SNAPSHOT_VERSION);
     assert_eq!(imported.shader_codes(), snapshot.shader_codes());
     assert_eq!(imported.pipeline_keys(), snapshot.pipeline_keys());
+}
+
+fn assert_pipeline_cache_clear_behavior(context: &wgpu_fft::device::GpuContext) {
+    assert!(clear_thread_local_pipeline_cache(&context.device));
+    assert!(!clear_thread_local_pipeline_cache(&context.device));
+
+    let plan = FftPlan::c2c(
+        &context.device,
+        &context.queue,
+        FftConfig::new(8).with_normalization(Normalization::None),
+    )
+    .unwrap();
+    assert!(clear_thread_local_pipeline_cache(&context.device));
+
+    let required = plan.required_buffer_size_bytes();
+    let input = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.cache_clear_input"),
+        size: required,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let output = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.test.cache_clear_output"),
+        size: required,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    context.queue.write_buffer(
+        &input,
+        0,
+        bytemuck::cast_slice(&input_for_total_complex_len(8)),
+    );
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.test.cache_clear_existing_plan"),
+        });
+    plan.execute_checked(&context.device, &mut encoder, &input, &output)
+        .unwrap();
+    let submission = context.queue.submit([encoder.finish()]);
+    context
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(std::time::Duration::from_secs(30)),
+        })
+        .unwrap();
+
+    let empty_snapshot = export_pipeline_cache_snapshot(&context.device);
+    assert!(empty_snapshot.shader_codes().is_empty());
+    assert!(empty_snapshot.pipeline_keys().is_empty());
+    assert!(clear_thread_local_pipeline_cache(&context.device));
+    assert!(!clear_thread_local_pipeline_cache(&context.device));
 }
 
 fn assert_strided_pipeline_cache_snapshot_behavior(context: &wgpu_fft::device::GpuContext) {

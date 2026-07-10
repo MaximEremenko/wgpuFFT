@@ -1,0 +1,1385 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
+use std::io;
+use std::time::{Duration, Instant};
+
+use wgpu_fft::{
+    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, Normalization,
+};
+
+type BenchResult<T> = Result<T, Box<dyn Error>>;
+
+const DEFAULT_RUNS: usize = 3;
+const DEFAULT_ITER_CAP: u64 = 1000;
+const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
+const ITER_TRAFFIC_BUDGET_BYTES: u64 = 3 * 4096 * 1024 * 1024;
+const TARGET_COMPLEX_ELEMENTS: usize = 1 << 27;
+const COMPLEX_F32_BYTES: u64 = 2 * std::mem::size_of::<f32>() as u64;
+const INITIALIZATION_SEED_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Suite {
+    Smoke,
+    Sample0,
+    Sample1000,
+    Sample3,
+    Sample7,
+    All,
+    Custom,
+}
+
+impl Suite {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "smoke" => Some(Self::Smoke),
+            "sample0" | "sample_0" | "0" => Some(Self::Sample0),
+            "sample1000" | "sample_1000" | "1000" => Some(Self::Sample1000),
+            "sample3" | "sample_3" | "3" => Some(Self::Sample3),
+            "sample7" | "sample_7" | "7" => Some(Self::Sample7),
+            "all" => Some(Self::All),
+            "shape" | "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Sample0 => "sample0",
+            Self::Sample1000 => "sample1000",
+            Self::Sample3 => "sample3",
+            Self::Sample7 => "sample7",
+            Self::All => "all",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Options {
+    suite: Suite,
+    custom_shape: Option<Vec<usize>>,
+    custom_batch: usize,
+    adapter_selector: Option<String>,
+    runs: usize,
+    iter_cap: u64,
+    max_cases: Option<usize>,
+    wait_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct BenchCase {
+    suite: &'static str,
+    label: String,
+    shape: Vec<usize>,
+    batch: usize,
+    report: bool,
+}
+
+#[derive(Debug)]
+struct CaseResult {
+    route: String,
+    axis_kinds: String,
+    pass_count: u64,
+    pass_count_method: String,
+    buffer_size: u64,
+    external_io_bytes: u64,
+    initialization_seed_bytes: u64,
+    plan_workspace_requirement_bytes: u64,
+    diagnostic_helper_requirement_bytes: u64,
+    num_iter: u64,
+    run_pair_ms: Vec<f64>,
+}
+
+#[derive(Debug)]
+struct Statistics {
+    mean_ms: f64,
+    stderr_ms: Option<f64>,
+    vkfft_population_spread_ms: f64,
+}
+
+fn main() {
+    if let Err(error) = pollster::block_on(run()) {
+        eprintln!("wgpuFFT benchmark failed: {error}");
+        let mut source = error.source();
+        while let Some(cause) = source {
+            eprintln!("  caused by: {cause}");
+            source = cause.source();
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn select_vulkan_adapter(
+    instance: &wgpu::Instance,
+    selector: Option<&str>,
+) -> BenchResult<wgpu::Adapter> {
+    let mut adapters = instance
+        .enumerate_adapters(wgpu::Backends::VULKAN)
+        .await
+        .into_iter()
+        .map(|adapter| {
+            let info = adapter.get_info();
+            (adapter, info)
+        })
+        .collect::<Vec<_>>();
+    if adapters.is_empty() {
+        return Err(input_error("no Vulkan adapters were found"));
+    }
+
+    println!("enumerated Vulkan adapters:");
+    for (index, (_, info)) in adapters.iter().enumerate() {
+        println!(
+            "  index={} name={:?} vendor={:#x} device={:#x} type={:?} driver={:?}",
+            index, info.name, info.vendor, info.device, info.device_type, info.driver
+        );
+    }
+
+    let selected_position = if let Some(selector) = selector {
+        let numeric_index = selector
+            .parse::<usize>()
+            .ok()
+            .filter(|&index| index < adapters.len());
+        if let Some(index) = numeric_index {
+            index
+        } else {
+            let selector_lower = selector.to_ascii_lowercase();
+            let matches = adapters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (_, info))| {
+                    info.name
+                        .to_ascii_lowercase()
+                        .contains(&selector_lower)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [index] => *index,
+                [] => {
+                    return Err(input_error(format!(
+                        "adapter selector {selector:?} did not match any Vulkan adapter"
+                    )))
+                }
+                _ => {
+                    return Err(input_error(format!(
+                        "adapter selector {selector:?} is ambiguous; matched indices {matches:?}"
+                    )))
+                }
+            }
+        }
+    } else {
+        let hardware = adapters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, info))| is_native_hardware_adapter(info).then_some(index))
+            .collect::<Vec<_>>();
+        match hardware.as_slice() {
+            [index] => *index,
+            [] => {
+                return Err(input_error(
+                    "no native discrete or integrated Vulkan GPU was found",
+                ))
+            }
+            _ => {
+                return Err(input_error(format!(
+                    "multiple native Vulkan GPUs were found at indices {hardware:?}; select one with --adapter <index-or-name>"
+                )))
+            }
+        }
+    };
+
+    let (adapter, info) = adapters.swap_remove(selected_position);
+    if !is_native_hardware_adapter(&info) {
+        return Err(input_error(format!(
+            "refusing non-native-hardware Vulkan adapter {:?} ({:?})",
+            info.name, info.device_type
+        )));
+    }
+    println!(
+        "selected Vulkan adapter index={} name={:?} vendor={:#x} device={:#x} type={:?}",
+        selected_position, info.name, info.vendor, info.device, info.device_type
+    );
+    Ok(adapter)
+}
+
+fn is_native_hardware_adapter(info: &wgpu::AdapterInfo) -> bool {
+    matches!(
+        info.device_type,
+        wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+    )
+}
+
+async fn run() -> BenchResult<()> {
+    let options = parse_options()?;
+    let cases = build_cases(&options)?;
+    if cases.is_empty() {
+        return Err(input_error("the selected suite contains no cases"));
+    }
+
+    println!("wgpuFFT VkFFT-parity benchmark harness");
+    println!(
+        "configuration: suite={} adapter_selector={} runs={} iter_cap={} max_reported_cases_per_suite={} traffic_budget_bytes={} wait_timeout_secs={}",
+        options.suite.name(),
+        options.adapter_selector.as_deref().unwrap_or("auto-single-hardware"),
+        options.runs,
+        options.iter_cap,
+        options
+            .max_cases
+            .map_or_else(|| "unlimited".to_owned(), |value| value.to_string()),
+        ITER_TRAFFIC_BUDGET_BYTES,
+        options.wait_timeout.as_secs(),
+    );
+    println!(
+        "method: FFT+iFFT pairs, one command encoder, one submit, wall-clock submit-through-device-poll"
+    );
+    println!(
+        "comparability: wgpuFFT mode=out-of-place; VkFFT reference samples mode=in-place; both directions normalization=none"
+    );
+    println!(
+        "iteration budget note: normalized 3*4096 MiB for every suite as requested; upstream VkFFT sample3/sample7 use 4096 MiB"
+    );
+    if options.suite == Suite::Custom {
+        println!("CUSTOM SHAPE SMOKE MODE: this case is outside the upstream VkFFT grids");
+    }
+    if options.runs != DEFAULT_RUNS
+        || options.iter_cap != DEFAULT_ITER_CAP
+        || options.max_cases.is_some()
+    {
+        println!("SMOKE OVERRIDES ACTIVE: results are not the default full VkFFT-comparable run");
+    }
+
+    let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    instance_descriptor.backends = wgpu::Backends::VULKAN;
+    let instance = wgpu::Instance::new(instance_descriptor);
+    let adapter = select_vulkan_adapter(&instance, options.adapter_selector.as_deref()).await?;
+
+    let adapter_info = adapter.get_info();
+    if adapter_info.backend != wgpu::Backend::Vulkan {
+        return Err(input_error(format!(
+            "requested a Vulkan-only instance but selected backend {:?}",
+            adapter_info.backend
+        )));
+    }
+    let adapter_limits = adapter.limits();
+    println!("adapter info:\n{adapter_info:#?}");
+    println!("adapter limits:\n{adapter_limits:#?}");
+
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("wgpu_fft.bench.device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter_limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|error| contextual_error("requesting the benchmark device", error))?;
+    println!("device limits:\n{:#?}", device.limits());
+
+    let benchmark_result = run_cases(&device, &queue, &cases, &options).await;
+
+    // Keep native objects alive until all success or failure cleanup is done.
+    // The existing native GPU tests use the same Windows workaround for a
+    // backend teardown hang; the process exits immediately after `run`.
+    #[cfg(windows)]
+    std::mem::forget((queue, device, adapter, instance));
+    #[cfg(not(windows))]
+    drop((queue, device, adapter, instance));
+    benchmark_result
+}
+
+async fn run_cases(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    cases: &[BenchCase],
+    options: &Options,
+) -> BenchResult<()> {
+    let mut previous_suite = None;
+    let mut suite_scores = BTreeMap::<&'static str, Vec<f64>>::new();
+    for (case_index, case) in cases.iter().enumerate() {
+        if previous_suite != Some(case.suite) {
+            println!("\n=== suite {} ===", case.suite);
+            previous_suite = Some(case.suite);
+        }
+
+        let role = if case.report { "case" } else { "warmup" };
+        println!(
+            "\n[{}/{}] {} {}: shape={:?} batch={}",
+            case_index + 1,
+            cases.len(),
+            role,
+            case.label,
+            case.shape,
+            case.batch,
+        );
+
+        let result = run_case(device, queue, case, options).await;
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| contextual_error("polling after a benchmark case", error))?;
+        let cache_cleared = clear_thread_local_pipeline_cache(device);
+        println!("pipeline_cache_cleared_after_case={cache_cleared}");
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| contextual_error("reclaiming cleared cache resources", error))?;
+
+        let result = result.map_err(|error| {
+            contextual_boxed_error(
+                format!(
+                    "running suite {} case {} shape={:?} batch={}",
+                    case.suite, case.label, case.shape, case.batch
+                ),
+                error,
+            )
+        })?;
+
+        if case.report {
+            let score = print_case_result(case, options, &result)?;
+            suite_scores.entry(case.suite).or_default().push(score);
+        } else {
+            println!(
+                "warmup {} complete; timing intentionally excluded from reported results",
+                case.label
+            );
+        }
+    }
+
+    let default_methodology = options.runs == DEFAULT_RUNS
+        && options.iter_cap == DEFAULT_ITER_CAP
+        && options.max_cases.is_none();
+    for (suite, scores) in suite_scores {
+        let mean_score = scores.iter().sum::<f64>() / scores.len() as f64;
+        let source_exact_iteration_budget = matches!(suite, "sample0" | "sample1000");
+        let upstream_suite =
+            source_exact_iteration_budget || matches!(suite, "sample3" | "sample7");
+        let normalized_methodology = default_methodology && upstream_suite;
+        println!(
+            "SUITE_RESULT suite={} reported_cases={} benchmark_score_mean_KiB_per_ms={:.3} vkfft_integer_score={} normalized_default_methodology={} source_exact_iteration_budget={}",
+            suite,
+            scores.len(),
+            mean_score,
+            mean_score as u64,
+            normalized_methodology,
+            source_exact_iteration_budget,
+        );
+    }
+    Ok(())
+}
+
+async fn run_case(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    case: &BenchCase,
+    options: &Options,
+) -> BenchResult<CaseResult> {
+    let logical_elements = checked_case_elements(case)?;
+    let expected_buffer_size = u64::try_from(logical_elements)
+        .map_err(|_| input_error("logical element count does not fit u64"))?
+        .checked_mul(COMPLEX_F32_BYTES)
+        .ok_or_else(|| input_error("logical buffer size overflow"))?;
+    benchmark_config(case, false).validate()?;
+    benchmark_config(case, true).validate()?;
+    let max_buffer_size = device.limits().max_buffer_size;
+    if expected_buffer_size > max_buffer_size {
+        return Err(input_error(format!(
+            "logical buffer requires {expected_buffer_size} bytes but device max_buffer_size is {max_buffer_size}"
+        )));
+    }
+    let external_io_bytes = expected_buffer_size
+        .checked_mul(2)
+        .ok_or_else(|| input_error("out-of-place I/O allocation size overflow"))?;
+    let initialization_seed_bytes = expected_buffer_size.min(INITIALIZATION_SEED_BYTES);
+    let num_iter = (ITER_TRAFFIC_BUDGET_BYTES / expected_buffer_size)
+        .clamp(1, DEFAULT_ITER_CAP)
+        .min(options.iter_cap);
+
+    println!(
+        "logical_elements={} logical_buffer_bytes={} logical_buffer_MiB={:.3} external_io_bytes={} initialization_seed_bytes={} num_iter={}",
+        logical_elements,
+        expected_buffer_size,
+        expected_buffer_size as f64 / 1024_f64.powi(2),
+        external_io_bytes,
+        initialization_seed_bytes,
+        num_iter,
+    );
+
+    let usage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let error_scopes = push_gpu_error_scopes(device);
+    let buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.buffer_a"),
+        size: expected_buffer_size,
+        usage,
+        mapped_at_creation: false,
+    });
+    let buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.buffer_b"),
+        size: expected_buffer_size,
+        usage,
+        mapped_at_creation: false,
+    });
+    let initialization_seed = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.bench.initialization_seed"),
+        size: initialization_seed_bytes,
+        usage: wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+    pop_gpu_error_scopes(error_scopes, "allocating benchmark data buffers").await?;
+    fill_initialization_seed(&initialization_seed)?;
+
+    let mut route = None;
+    let mut axis_kinds = None;
+    let mut pass_count = None;
+    let mut pass_count_method = None;
+    let mut plan_workspace_requirement_bytes = None;
+    let mut diagnostic_helper_requirement_total = None;
+    let mut run_pair_ms = Vec::with_capacity(options.runs);
+
+    for run_index in 0..options.runs {
+        println!(
+            "run {}/{}: recreating forward and inverse plans",
+            run_index + 1,
+            options.runs
+        );
+        initialize_buffers(
+            device,
+            queue,
+            &initialization_seed,
+            &buffer_a,
+            &buffer_b,
+            expected_buffer_size,
+            options.wait_timeout,
+        )?;
+
+        let error_scopes = push_gpu_error_scopes(device);
+        let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
+            let forward =
+                FftPlan::c2c_with_diagnostics(device, queue, benchmark_config(case, false))?;
+            let inverse =
+                FftPlan::c2c_with_diagnostics(device, queue, benchmark_config(case, true))?;
+            Ok((forward, inverse))
+        })();
+        pop_gpu_error_scopes(error_scopes, "creating forward and inverse FFT plans").await?;
+        let (forward, inverse) = plans?;
+
+        let forward_size = forward.required_buffer_size_bytes();
+        let inverse_size = inverse.required_buffer_size_bytes();
+        if forward_size != expected_buffer_size || inverse_size != expected_buffer_size {
+            return Err(input_error(format!(
+                "plan buffer-size mismatch: expected {expected_buffer_size}, forward {forward_size}, inverse {inverse_size}"
+            )));
+        }
+
+        let forward_diagnostics = forward.diagnostics();
+        let inverse_diagnostics = inverse.diagnostics();
+        let this_plan_workspace_requirement_bytes = forward
+            .workspace_size_bytes()
+            .checked_add(inverse.workspace_size_bytes())
+            .ok_or_else(|| input_error("combined plan workspace requirement overflow"))?;
+        let this_diagnostic_helper_requirement_bytes =
+            diagnostic_helper_requirement_bytes(&forward_diagnostics)?
+                .checked_add(diagnostic_helper_requirement_bytes(&inverse_diagnostics)?)
+                .ok_or_else(|| input_error("combined plan helper requirement overflow"))?;
+        let (forward_passes, forward_pass_method) = compute_pass_count(&forward_diagnostics)?;
+        let (inverse_passes, inverse_pass_method) = compute_pass_count(&inverse_diagnostics)?;
+        if forward_passes != inverse_passes {
+            return Err(input_error(format!(
+                "forward/inverse compute-pass mismatch: {forward_passes} versus {inverse_passes}"
+            )));
+        }
+        if forward_pass_method != inverse_pass_method {
+            return Err(input_error(format!(
+                "forward/inverse pass-count method mismatch: {forward_pass_method} versus {inverse_pass_method}"
+            )));
+        }
+
+        let this_route = format!("{:?}", forward.route());
+        let inverse_route = format!("{:?}", inverse.route());
+        if this_route != inverse_route {
+            return Err(input_error(format!(
+                "forward/inverse route mismatch: {this_route} versus {inverse_route}"
+            )));
+        }
+        let this_axis_kinds = format!("{:?}", forward.axis_kinds());
+        let inverse_axis_kinds = format!("{:?}", inverse.axis_kinds());
+        if this_axis_kinds != inverse_axis_kinds {
+            return Err(input_error(format!(
+                "forward/inverse axis-kind mismatch: {this_axis_kinds} versus {inverse_axis_kinds}"
+            )));
+        }
+
+        ensure_consistent(&mut route, this_route, "route")?;
+        ensure_consistent(&mut axis_kinds, this_axis_kinds, "axis kinds")?;
+        ensure_consistent(&mut pass_count, forward_passes, "compute pass count")?;
+        ensure_consistent(
+            &mut pass_count_method,
+            forward_pass_method,
+            "compute pass-count method",
+        )?;
+        ensure_consistent(
+            &mut plan_workspace_requirement_bytes,
+            this_plan_workspace_requirement_bytes,
+            "combined plan workspace requirement bytes",
+        )?;
+        ensure_consistent(
+            &mut diagnostic_helper_requirement_total,
+            this_diagnostic_helper_requirement_bytes,
+            "combined diagnostic plan helper bytes",
+        )?;
+
+        // Plan construction queues parameter and LUT uploads. Flush and wait for
+        // them before the timed submission so setup traffic is excluded.
+        wait_for_submission(
+            device,
+            queue.submit([]),
+            "flushing plan uploads before timing",
+            options.wait_timeout,
+        )?;
+
+        let error_scopes = push_gpu_error_scopes(device);
+        let command_buffer = (|| -> BenchResult<wgpu::CommandBuffer> {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_fft.bench.pairs"),
+            });
+            for iteration in 0..num_iter {
+                forward
+                    .execute_checked(device, &mut encoder, &buffer_a, &buffer_b)
+                    .map_err(|error| {
+                        contextual_error(
+                            format!("recording forward FFT for iteration {iteration}"),
+                            error,
+                        )
+                    })?;
+                inverse
+                    .execute_checked(device, &mut encoder, &buffer_b, &buffer_a)
+                    .map_err(|error| {
+                        contextual_error(
+                            format!("recording inverse FFT for iteration {iteration}"),
+                            error,
+                        )
+                    })?;
+            }
+            Ok(encoder.finish())
+        })();
+        pop_gpu_error_scopes(error_scopes, "recording the timed FFT command buffer").await?;
+        let command_buffer = command_buffer?;
+
+        println!(
+            "run {}/{}: submitting {} FFT+iFFT pairs to {:?} via Vulkan",
+            run_index + 1,
+            options.runs,
+            num_iter,
+            forward.route(),
+        );
+        let submit_error_scopes = push_gpu_error_scopes(device);
+        let start = Instant::now();
+        let submission = queue.submit([command_buffer]);
+        let wait_result = wait_for_submission(
+            device,
+            submission,
+            "waiting for timed FFT submission",
+            options.wait_timeout,
+        );
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let submit_scope_result = pop_gpu_error_scopes(
+            submit_error_scopes,
+            "submitting and executing timed FFT work",
+        )
+        .await;
+        wait_result?;
+        submit_scope_result?;
+        let pair_ms = elapsed_ms / num_iter as f64;
+        if !pair_ms.is_finite() || pair_ms <= 0.0 {
+            return Err(input_error(format!(
+                "invalid elapsed time: total {elapsed_ms} ms, per pair {pair_ms} ms"
+            )));
+        }
+        if case.report {
+            println!(
+                "run {}/{} complete: total_ms={:.6} pair_ms={:.6}",
+                run_index + 1,
+                options.runs,
+                elapsed_ms,
+                pair_ms,
+            );
+        } else {
+            println!("warmup run {}/{} complete", run_index + 1, options.runs);
+        }
+        run_pair_ms.push(pair_ms);
+
+        drop((forward, inverse));
+        device
+            .poll(wgpu::PollType::Poll)
+            .map_err(|error| contextual_error("reclaiming plan resources between runs", error))?;
+    }
+
+    Ok(CaseResult {
+        route: route.ok_or_else(|| input_error("benchmark produced no route"))?,
+        axis_kinds: axis_kinds.ok_or_else(|| input_error("benchmark produced no axis kinds"))?,
+        pass_count: pass_count.ok_or_else(|| input_error("benchmark produced no pass count"))?,
+        pass_count_method: pass_count_method
+            .ok_or_else(|| input_error("benchmark produced no pass-count method"))?,
+        buffer_size: expected_buffer_size,
+        external_io_bytes,
+        initialization_seed_bytes,
+        plan_workspace_requirement_bytes: plan_workspace_requirement_bytes
+            .ok_or_else(|| input_error("benchmark produced no plan workspace requirement"))?,
+        diagnostic_helper_requirement_bytes: diagnostic_helper_requirement_total
+            .ok_or_else(|| input_error("benchmark produced no plan helper requirement"))?,
+        num_iter,
+        run_pair_ms,
+    })
+}
+
+fn initialize_buffers(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    initialization_seed: &wgpu::Buffer,
+    buffer_a: &wgpu::Buffer,
+    buffer_b: &wgpu::Buffer,
+    buffer_size: u64,
+    wait_timeout: Duration,
+) -> BenchResult<()> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_fft.bench.initialize"),
+    });
+    encoder.clear_buffer(buffer_b, 0, None);
+    let seed_size = initialization_seed.size();
+    let mut offset = 0u64;
+    while offset < buffer_size {
+        let copy_size = seed_size.min(buffer_size - offset);
+        encoder.copy_buffer_to_buffer(initialization_seed, 0, buffer_a, offset, copy_size);
+        offset += copy_size;
+    }
+    wait_for_submission(
+        device,
+        queue.submit([encoder.finish()]),
+        "initializing benchmark buffers with deterministic nonzero data",
+        wait_timeout,
+    )
+}
+
+fn fill_initialization_seed(seed: &wgpu::Buffer) -> BenchResult<()> {
+    let mut mapped = seed.slice(..).get_mapped_range_mut();
+    let value_count = mapped.len() / std::mem::size_of::<f32>();
+    let mut values = Vec::with_capacity(value_count);
+    values.resize(value_count, 0.0f32);
+    for (index, value) in values.iter_mut().enumerate() {
+        let numerator = ((index as u64).wrapping_mul(17) % 251 + 1) as f32;
+        let magnitude = numerator / 251.0;
+        *value = if index % 2 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+    }
+    mapped.copy_from_slice(bytemuck::cast_slice(&values));
+    drop(mapped);
+    seed.unmap();
+    Ok(())
+}
+
+fn benchmark_config(case: &BenchCase, inverse: bool) -> FftConfig {
+    let config = if inverse {
+        FftConfig::inverse_nd(case.shape.clone())
+    } else {
+        FftConfig::new_nd(case.shape.clone())
+    };
+    config
+        .with_batch(case.batch)
+        .with_normalization(Normalization::None)
+}
+
+fn diagnostic_helper_requirement_bytes(diagnostics: &FftDiagnostics) -> BenchResult<u64> {
+    diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role.starts_with("helper:"))
+        .try_fold(0u64, |total, requirement| {
+            total
+                .checked_add(requirement.required_bytes)
+                .ok_or_else(|| input_error("diagnostic helper requirement total overflow"))
+        })
+}
+
+fn push_gpu_error_scopes(
+    device: &wgpu::Device,
+) -> (
+    wgpu::ErrorScopeGuard,
+    wgpu::ErrorScopeGuard,
+    wgpu::ErrorScopeGuard,
+) {
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    (out_of_memory, internal, validation)
+}
+
+async fn pop_gpu_error_scopes(
+    (out_of_memory, internal, validation): (
+        wgpu::ErrorScopeGuard,
+        wgpu::ErrorScopeGuard,
+        wgpu::ErrorScopeGuard,
+    ),
+    context: &str,
+) -> BenchResult<()> {
+    let validation_error = validation.pop().await;
+    let internal_error = internal.pop().await;
+    let out_of_memory_error = out_of_memory.pop().await;
+    if let Some(error) = validation_error {
+        return Err(contextual_error(
+            format!("{context}: wgpu validation error"),
+            error,
+        ));
+    }
+    if let Some(error) = internal_error {
+        return Err(contextual_error(
+            format!("{context}: wgpu internal error"),
+            error,
+        ));
+    }
+    if let Some(error) = out_of_memory_error {
+        return Err(contextual_error(
+            format!("{context}: wgpu out-of-memory error"),
+            error,
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_submission(
+    device: &wgpu::Device,
+    submission_index: wgpu::SubmissionIndex,
+    context: &str,
+    timeout: Duration,
+) -> BenchResult<()> {
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: Some(timeout),
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            contextual_error(
+                format!("{context} (submission wait timeout {:?})", timeout),
+                error,
+            )
+        })
+}
+
+fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, String)> {
+    if !diagnostics.blockers().is_empty() {
+        return Err(input_error(format!(
+            "plan diagnostics contain {} blocker(s)",
+            diagnostics.blockers().len()
+        )));
+    }
+
+    let mut count = diagnostics
+        .stages()
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.kind.as_str(),
+                "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose"
+            )
+        })
+        .count();
+    if count == 0 {
+        return Err(input_error(
+            "diagnostics reported no FFT axis-pass graph stages",
+        ));
+    }
+
+    let execution_kind = diagnostics
+        .route()
+        .execution_kind
+        .as_deref()
+        .unwrap_or("unknown");
+    let method = if execution_kind == "batch-chunk" {
+        let chunk_count = diagnostics
+            .stages()
+            .iter()
+            .filter(|stage| stage.label == "large-chunk-copy-input")
+            .count();
+        if chunk_count == 0 || count % chunk_count != 0 {
+            return Err(input_error(format!(
+                "cannot collapse batch-chunk graph: {count} pass-like stages across {chunk_count} chunks"
+            )));
+        }
+        count /= chunk_count;
+        "estimated-batch-chunk-collapsed"
+    } else if execution_kind == "normal" {
+        "exact-normal-graph"
+    } else {
+        "estimated-graph"
+    };
+    let count =
+        u64::try_from(count).map_err(|_| input_error("compute pass count does not fit u64"))?;
+    Ok((count, method.to_owned()))
+}
+
+fn ensure_consistent<T>(slot: &mut Option<T>, value: T, name: &str) -> BenchResult<()>
+where
+    T: PartialEq + fmt::Display,
+{
+    if let Some(previous) = slot.as_ref() {
+        if previous != &value {
+            return Err(input_error(format!(
+                "{name} changed across recreated runs: {previous} versus {value}"
+            )));
+        }
+    } else {
+        *slot = Some(value);
+    }
+    Ok(())
+}
+
+fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -> BenchResult<f64> {
+    let statistics = statistics(&result.run_pair_ms)?;
+    let traffic_multiplier = result
+        .pass_count
+        .checked_mul(4)
+        .ok_or_else(|| input_error("traffic multiplier overflow"))?;
+    let traffic_bytes_per_pair = result.buffer_size as f64 * traffic_multiplier as f64;
+    let harness_owned_buffer_allocation_bytes = result
+        .external_io_bytes
+        .checked_add(result.initialization_seed_bytes)
+        .ok_or_else(|| input_error("harness-owned buffer allocation size overflow"))?;
+    let seconds_per_pair = statistics.mean_ms / 1000.0;
+    let score = (result.buffer_size as f64 / 1024.0) / statistics.mean_ms;
+    let bandwidth_gib_s = traffic_bytes_per_pair / seconds_per_pair / 1024_f64.powi(3);
+    let bandwidth_gb_s = traffic_bytes_per_pair / seconds_per_pair / 1_000_000_000.0;
+
+    println!(
+        "RESULT suite={} label={} shape={:?} batch={} logical_vkfft_style_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place reference_mode=VkFFT-in-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} vkfft_population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-axis-pass-stages estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
+        case.suite,
+        case.label,
+        case.shape,
+        case.batch,
+        result.buffer_size,
+        result.buffer_size as f64 / 1024_f64.powi(2),
+        result.external_io_bytes,
+        result.initialization_seed_bytes,
+        harness_owned_buffer_allocation_bytes,
+        result.plan_workspace_requirement_bytes,
+        result.diagnostic_helper_requirement_bytes,
+        options.runs,
+        result.num_iter,
+        statistics.mean_ms,
+        statistics
+            .stderr_ms
+            .map_or_else(|| "NA".to_owned(), |value| format!("{value:.6}")),
+        statistics.stderr_ms.is_some(),
+        statistics.vkfft_population_spread_ms,
+        score,
+        result.pass_count,
+        result.pass_count_method,
+        traffic_multiplier,
+        bandwidth_gib_s,
+        bandwidth_gb_s,
+        result.route,
+        result.axis_kinds,
+    );
+    Ok(score)
+}
+
+fn statistics(samples: &[f64]) -> BenchResult<Statistics> {
+    if samples.is_empty() {
+        return Err(input_error("cannot calculate statistics without samples"));
+    }
+    if samples.iter().any(|value| !value.is_finite()) {
+        return Err(input_error(
+            "cannot calculate statistics from non-finite samples",
+        ));
+    }
+    let sample_count = samples.len() as f64;
+    let mean_ms = samples.iter().sum::<f64>() / sample_count;
+    let squared_deviations = samples
+        .iter()
+        .map(|value| {
+            let deviation = value - mean_ms;
+            deviation * deviation
+        })
+        .sum::<f64>();
+    let stderr_ms = if samples.len() > 1 {
+        Some((squared_deviations / (sample_count * (sample_count - 1.0))).sqrt())
+    } else {
+        None
+    };
+    let vkfft_population_spread_ms = (squared_deviations / sample_count).sqrt();
+    Ok(Statistics {
+        mean_ms,
+        stderr_ms,
+        vkfft_population_spread_ms,
+    })
+}
+
+fn parse_options() -> BenchResult<Options> {
+    // Cargo invokes harness-free benchmark binaries with an implicit
+    // `--bench`; it is not part of this harness's CLI.
+    let mut args = std::env::args().skip(1).filter(|arg| arg != "--bench");
+    let Some(suite_arg) = args.next() else {
+        print_usage();
+        return Err(input_error("missing suite name"));
+    };
+    if matches!(suite_arg.as_str(), "-h" | "--help" | "help") {
+        print_usage();
+        std::process::exit(0);
+    }
+    let suite = Suite::parse(&suite_arg).ok_or_else(|| {
+        input_error(format!(
+            "unknown suite {suite_arg:?}; expected smoke, sample0, sample1000, sample3, sample7, all, or shape"
+        ))
+    })?;
+    let custom_shape = if suite == Suite::Custom {
+        let shape_arg = args.next().ok_or_else(|| {
+            input_error("custom shape mode requires dimensions such as 1024x1024")
+        })?;
+        if matches!(shape_arg.as_str(), "-h" | "--help" | "help") {
+            print_usage();
+            std::process::exit(0);
+        }
+        Some(parse_shape(&shape_arg)?)
+    } else {
+        None
+    };
+
+    let mut options = Options {
+        suite,
+        custom_shape,
+        custom_batch: 1,
+        adapter_selector: None,
+        runs: DEFAULT_RUNS,
+        iter_cap: DEFAULT_ITER_CAP,
+        max_cases: None,
+        wait_timeout: Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS),
+    };
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--runs" => {
+                options.runs = parse_positive::<usize>(next_value(&mut args, "--runs")?, "--runs")?;
+            }
+            "--iter-cap" => {
+                options.iter_cap =
+                    parse_positive::<u64>(next_value(&mut args, "--iter-cap")?, "--iter-cap")?;
+            }
+            "--max-cases" => {
+                options.max_cases = Some(parse_positive::<usize>(
+                    next_value(&mut args, "--max-cases")?,
+                    "--max-cases",
+                )?);
+            }
+            "--adapter" => {
+                let selector = next_value(&mut args, "--adapter")?;
+                let selector = selector.trim();
+                if selector.is_empty() {
+                    return Err(input_error("--adapter must not be empty"));
+                }
+                options.adapter_selector = Some(selector.to_owned());
+            }
+            "--wait-timeout-secs" => {
+                let seconds = parse_positive::<u64>(
+                    next_value(&mut args, "--wait-timeout-secs")?,
+                    "--wait-timeout-secs",
+                )?;
+                options.wait_timeout = Duration::from_secs(seconds);
+            }
+            "--batch" => {
+                if suite != Suite::Custom {
+                    return Err(input_error("--batch is valid only in custom shape mode"));
+                }
+                options.custom_batch =
+                    parse_positive::<usize>(next_value(&mut args, "--batch")?, "--batch")?;
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => return Err(input_error(format!("unknown argument {argument:?}"))),
+        }
+    }
+    Ok(options)
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> BenchResult<String> {
+    args.next()
+        .ok_or_else(|| input_error(format!("{option} requires a value")))
+}
+
+fn parse_positive<T>(value: String, option: &str) -> BenchResult<T>
+where
+    T: std::str::FromStr + PartialEq + Default,
+    T::Err: Error + 'static,
+{
+    let parsed = value
+        .parse::<T>()
+        .map_err(|error| contextual_error(format!("parsing {option} value {value:?}"), error))?;
+    if parsed == T::default() {
+        return Err(input_error(format!("{option} must be greater than zero")));
+    }
+    Ok(parsed)
+}
+
+fn parse_shape(value: &str) -> BenchResult<Vec<usize>> {
+    let parts = value.split(['x', 'X', ',']).collect::<Vec<_>>();
+    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
+        return Err(input_error(format!(
+            "invalid custom shape {value:?}; use dimensions such as 1024x1024"
+        )));
+    }
+    let mut shape = Vec::with_capacity(parts.len());
+    for part in parts {
+        let dimension = part.parse::<usize>().map_err(|error| {
+            contextual_error(format!("parsing shape dimension {part:?}"), error)
+        })?;
+        if dimension == 0 {
+            return Err(input_error(
+                "custom shape dimensions must be greater than zero",
+            ));
+        }
+        shape.push(dimension);
+    }
+    Ok(shape)
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage:\n  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]\n  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]\n\nDefaults:\n  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.\n  With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.\n\nExamples:\n  cargo bench --bench fft_bench -- smoke --adapter \"RTX 5090\" --runs 1 --iter-cap 2\n  cargo bench --bench fft_bench -- sample0 --adapter \"RTX 5090\"\n  cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2\n  cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter \"RTX 5090\" --runs 1 --iter-cap 1"
+    );
+}
+
+fn build_cases(options: &Options) -> BenchResult<Vec<BenchCase>> {
+    match options.suite {
+        Suite::Smoke => Ok(vec![one_dimensional_case(
+            "smoke",
+            "N=64-batch=1024".to_owned(),
+            64,
+            1024,
+            true,
+        )?]),
+        Suite::Sample0 => limited_cases(sample0_cases()?, options.max_cases),
+        Suite::Sample1000 => limited_cases(sample1000_cases()?, options.max_cases),
+        Suite::Sample3 => limited_cases(sample3_cases(), options.max_cases),
+        Suite::Sample7 => limited_cases(sample7_cases(), options.max_cases),
+        Suite::All => {
+            let mut cases = Vec::new();
+            cases.extend(limited_cases(sample0_cases()?, options.max_cases)?);
+            cases.extend(limited_cases(sample1000_cases()?, options.max_cases)?);
+            cases.extend(limited_cases(sample3_cases(), options.max_cases)?);
+            cases.extend(limited_cases(sample7_cases(), options.max_cases)?);
+            Ok(cases)
+        }
+        Suite::Custom => {
+            let shape = options
+                .custom_shape
+                .clone()
+                .ok_or_else(|| input_error("custom suite is missing its shape"))?;
+            Ok(vec![BenchCase {
+                suite: "custom",
+                label: format!("shape={}", shape_label(&shape)),
+                shape,
+                batch: options.custom_batch,
+                report: true,
+            }])
+        }
+    }
+}
+
+fn limited_cases(
+    cases: Vec<BenchCase>,
+    max_reported_cases: Option<usize>,
+) -> BenchResult<Vec<BenchCase>> {
+    let Some(max_reported_cases) = max_reported_cases else {
+        return Ok(cases);
+    };
+    let mut reported = 0usize;
+    Ok(cases
+        .into_iter()
+        .filter(|case| {
+            if !case.report {
+                true
+            } else if reported < max_reported_cases {
+                reported += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect())
+}
+
+fn sample0_cases() -> BenchResult<Vec<BenchCase>> {
+    let mut cases = Vec::with_capacity(26);
+    cases.push(one_dimensional_case(
+        "sample0",
+        "upstream-unreported-warmup-N4096".to_owned(),
+        4096,
+        TARGET_COMPLEX_ELEMENTS / 4096,
+        false,
+    )?);
+    for exponent in 1u32..=25 {
+        let n = 4usize
+            .checked_shl(exponent)
+            .ok_or_else(|| input_error(format!("sample0 size overflow at exponent {exponent}")))?;
+        let batch = (TARGET_COMPLEX_ELEMENTS / n).max(1);
+        cases.push(one_dimensional_case(
+            "sample0",
+            format!("n={exponent}-N={n}"),
+            n,
+            batch,
+            true,
+        )?);
+    }
+    Ok(cases)
+}
+
+fn sample1000_cases() -> BenchResult<Vec<BenchCase>> {
+    let mut cases = Vec::with_capacity(4096);
+    let warmup_batch = floor_power_of_two(TARGET_COMPLEX_ELEMENTS / 4096)?;
+    cases.push(one_dimensional_case(
+        "sample1000",
+        "upstream-unreported-warmup-N4096".to_owned(),
+        4096,
+        warmup_batch,
+        false,
+    )?);
+    for n in 2usize..=4096 {
+        let quotient = TARGET_COMPLEX_ELEMENTS / n;
+        let batch = floor_power_of_two(quotient)?;
+        cases.push(one_dimensional_case(
+            "sample1000",
+            format!("N={n}"),
+            n,
+            batch,
+            true,
+        )?);
+    }
+    Ok(cases)
+}
+
+fn one_dimensional_case(
+    suite: &'static str,
+    label: String,
+    n: usize,
+    batch: usize,
+    report: bool,
+) -> BenchResult<BenchCase> {
+    if n == 0 || batch == 0 {
+        return Err(input_error(format!(
+            "invalid generated case N={n}, batch={batch}"
+        )));
+    }
+    Ok(BenchCase {
+        suite,
+        label,
+        shape: vec![n],
+        batch,
+        report,
+    })
+}
+
+fn floor_power_of_two(value: usize) -> BenchResult<usize> {
+    if value == 0 {
+        return Err(input_error("cannot find a power of two at or below zero"));
+    }
+    1usize
+        .checked_shl(value.ilog2())
+        .ok_or_else(|| input_error(format!("power-of-two overflow for {value}")))
+}
+
+fn sample3_cases() -> Vec<BenchCase> {
+    SAMPLE3_DIMENSIONS
+        .iter()
+        .enumerate()
+        .map(|(index, dimensions)| BenchCase {
+            suite: "sample3",
+            label: if index == 0 {
+                "upstream-unreported-warmup-1024x1024".to_owned()
+            } else {
+                format!("system-{index}-{}", shape_label(dimensions))
+            },
+            shape: dimensions.to_vec(),
+            batch: 1,
+            report: index != 0,
+        })
+        .collect()
+}
+
+fn sample7_cases() -> Vec<BenchCase> {
+    SAMPLE7_DIMENSIONS
+        .iter()
+        .enumerate()
+        .map(|(index, dimensions)| BenchCase {
+            suite: "sample7",
+            label: if index == 0 {
+                "upstream-unreported-warmup-1024x1024".to_owned()
+            } else {
+                format!("system-{index}-{}", shape_label(dimensions))
+            },
+            shape: dimensions.to_vec(),
+            batch: 1,
+            report: index != 0,
+        })
+        .collect()
+}
+
+fn checked_case_elements(case: &BenchCase) -> BenchResult<usize> {
+    let per_transform = case.shape.iter().try_fold(1usize, |product, &dimension| {
+        product
+            .checked_mul(dimension)
+            .ok_or_else(|| input_error(format!("shape product overflow for {:?}", case.shape)))
+    })?;
+    per_transform.checked_mul(case.batch).ok_or_else(|| {
+        input_error(format!(
+            "batched element-count overflow for shape {:?}, batch {}",
+            case.shape, case.batch
+        ))
+    })
+}
+
+fn shape_label(shape: &[usize]) -> String {
+    shape
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("x")
+}
+
+fn input_error(message: impl Into<String>) -> Box<dyn Error> {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
+}
+
+fn contextual_error(context: impl Into<String>, source: impl Error + 'static) -> Box<dyn Error> {
+    Box::new(ContextError {
+        context: context.into(),
+        source: Box::new(source),
+    })
+}
+
+fn contextual_boxed_error(context: impl Into<String>, source: Box<dyn Error>) -> Box<dyn Error> {
+    Box::new(ContextError {
+        context: context.into(),
+        source,
+    })
+}
+
+#[derive(Debug)]
+struct ContextError {
+    context: String,
+    source: Box<dyn Error>,
+}
+
+impl fmt::Display for ContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.context)
+    }
+}
+
+impl Error for ContextError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+const SAMPLE3_DIMENSIONS: [&[usize]; 39] = [
+    &[1024, 1024],
+    &[720, 480],
+    &[1280, 720],
+    &[1920, 1080],
+    &[2560, 1440],
+    &[3840, 2160],
+    &[7680, 4320],
+    &[64, 64],
+    &[128, 64],
+    &[128, 128],
+    &[256, 128],
+    &[256, 256],
+    &[512, 256],
+    &[512, 512],
+    &[1024, 512],
+    &[1024, 1024],
+    &[2048, 1024],
+    &[2048, 2048],
+    &[4096, 2048],
+    &[4096, 4096],
+    &[8192, 4096],
+    &[8192, 8192],
+    &[16384, 8192],
+    &[16, 16, 16],
+    &[32, 16, 16],
+    &[32, 32, 16],
+    &[32, 32, 32],
+    &[64, 32, 32],
+    &[64, 64, 32],
+    &[64, 64, 64],
+    &[128, 64, 64],
+    &[128, 128, 64],
+    &[128, 128, 128],
+    &[256, 128, 128],
+    &[256, 256, 128],
+    &[256, 256, 256],
+    &[512, 256, 256],
+    &[512, 512, 256],
+    &[512, 512, 512],
+];
+
+const SAMPLE7_DIMENSIONS: [&[usize]; 54] = [
+    &[1024, 1024],
+    &[17, 17],
+    &[19, 19],
+    &[23, 23],
+    &[29, 29],
+    &[31, 31],
+    &[37, 37],
+    &[41, 41],
+    &[43, 43],
+    &[47, 47],
+    &[53, 53],
+    &[59, 59],
+    &[61, 61],
+    &[67, 67],
+    &[71, 71],
+    &[73, 73],
+    &[79, 79],
+    &[83, 83],
+    &[89, 89],
+    &[97, 97],
+    &[17, 17, 17],
+    &[19, 19, 19],
+    &[23, 23, 23],
+    &[29, 29, 29],
+    &[31, 31, 31],
+    &[37, 37, 37],
+    &[41, 41, 41],
+    &[43, 43, 43],
+    &[47, 47, 47],
+    &[53, 53, 53],
+    &[59, 59, 59],
+    &[61, 61, 61],
+    &[67, 67, 67],
+    &[71, 71, 71],
+    &[73, 73, 73],
+    &[79, 79, 79],
+    &[83, 83, 83],
+    &[89, 89, 89],
+    &[97, 97, 97],
+    &[179, 179],
+    &[283, 283],
+    &[419, 419],
+    &[547, 547],
+    &[661, 661],
+    &[811, 811],
+    &[947, 947],
+    &[1087, 1087],
+    &[1229, 1229],
+    &[1381, 1381],
+    &[1523, 1523],
+    &[2909, 2909],
+    &[4241, 4241],
+    &[6841, 6841],
+    &[7727, 7727],
+];

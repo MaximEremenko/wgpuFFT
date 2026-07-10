@@ -1,5 +1,3 @@
-const TAU: f32 = 6.28318530717958647692;
-
 struct Params {
     len: u32,
     inverse: u32,
@@ -16,6 +14,9 @@ var<storage, read_write> output: array<vec2<f32>>;
 @group(0) @binding(2)
 var<uniform> params: Params;
 
+@group(0) @binding(3)
+var<storage, read> twiddle_lut: array<vec2<f32>>;
+
 @compute @workgroup_size(64)
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -31,17 +32,26 @@ fn main(
         return;
     }
 
-    let sign = select(-1.0, 1.0, params.inverse != 0u);
     var sum = vec2<f32>(0.0, 0.0);
+    var twiddle_index = 0u;
 
     for (var n = 0u; n < params.len; n = n + 1u) {
-        let angle = sign * TAU * f32(k) * f32(n) / f32(params.len);
-        let twiddle = vec2<f32>(cos(angle), sin(angle));
+        let forward_twiddle = twiddle_lut[twiddle_index];
+        let twiddle = select(
+            forward_twiddle,
+            vec2<f32>(forward_twiddle.x, -forward_twiddle.y),
+            params.inverse != 0u,
+        );
         let x = input[n];
         sum = sum + vec2<f32>(
             x.x * twiddle.x - x.y * twiddle.y,
             x.x * twiddle.y + x.y * twiddle.x,
         );
+        if (twiddle_index >= params.len - k) {
+            twiddle_index = twiddle_index - (params.len - k);
+        } else {
+            twiddle_index = twiddle_index + k;
+        }
     }
 
     output[k] = sum * params.scale;

@@ -136,15 +136,16 @@ pub fn import_pipeline_cache_snapshot(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PipelineLayoutCacheKey {
-    AxisPlanInterleavedF32,
+    AxisPlanInterleavedF32Lut,
     BridgeReadWriteReadF32,
     BridgeReadWriteUniformF32,
     BridgeTwoWriteUniformF32,
     BridgeWriteReadUniformF32,
     BluesteinBridgePostF32,
     C2cSmoothBinaryF32,
+    C2cSmoothTwiddleLutF32,
     C2cStridedBinaryF32,
-    DirectDftInterleavedF32,
+    DirectDftInterleavedF32Lut,
     RealBinaryF32,
     RaderBridgePostF32,
     RaderSumInterleavedF32,
@@ -157,15 +158,16 @@ pub(crate) enum PipelineLayoutCacheKey {
 impl PipelineLayoutCacheKey {
     fn stable_key(self) -> &'static str {
         match self {
-            Self::AxisPlanInterleavedF32 => "axis-plan/interleaved-f32",
+            Self::AxisPlanInterleavedF32Lut => "axis-plan/interleaved-f32-lut",
             Self::BridgeReadWriteReadF32 => "bridge/read-write-read-f32",
             Self::BridgeReadWriteUniformF32 => "bridge/read-write-uniform-f32",
             Self::BridgeTwoWriteUniformF32 => "bridge/two-write-uniform-f32",
             Self::BridgeWriteReadUniformF32 => "bridge/write-read-uniform-f32",
             Self::BluesteinBridgePostF32 => "bridge/bluestein-post-f32",
             Self::C2cSmoothBinaryF32 => "c2c-smooth/binary-f32",
+            Self::C2cSmoothTwiddleLutF32 => "c2c-smooth/twiddle-lut-f32",
             Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
-            Self::DirectDftInterleavedF32 => "direct-dft/interleaved-f32",
+            Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
             Self::RealBinaryF32 => "real/binary-f32",
             Self::RaderBridgePostF32 => "bridge/rader-post-f32",
             Self::RaderSumInterleavedF32 => "rader/sum/interleaved-f32",
@@ -336,7 +338,7 @@ pub(crate) enum ShaderCacheKey {
     RealStage(RealStageKey),
     C2cSmoothStage(C2cSmoothStageKey),
     C2cStridedStage(C2cStridedStageKey),
-    DirectDftC2cF32,
+    DirectDftC2cF32Lut,
 }
 
 impl ShaderCacheKey {
@@ -350,7 +352,9 @@ impl ShaderCacheKey {
             Self::RealStage(key) => key.stable_key(),
             Self::C2cSmoothStage(key) => key.stable_key(),
             Self::C2cStridedStage(key) => key.stable_key(),
-            Self::DirectDftC2cF32 => String::from("shader:v1:direct-dft/c2c-f32"),
+            Self::DirectDftC2cF32Lut => {
+                String::from("shader:v2:direct-dft/c2c-f32:twiddle=host-f64-f32-v1")
+            }
         }
     }
 
@@ -370,7 +374,7 @@ impl ShaderCacheKey {
             Self::C2cStridedStage(key) => {
                 crate::runtime::c2c::generate_c2c_strided_wgsl_for_key(key)
             }
-            Self::DirectDftC2cF32 => crate::kernels::C2C_DFT_WGSL.to_owned(),
+            Self::DirectDftC2cF32Lut => crate::kernels::C2C_DFT_WGSL.to_owned(),
         }
     }
 
@@ -407,7 +411,7 @@ pub(crate) struct ComputePipelineCacheKey {
 impl ComputePipelineCacheKey {
     pub(crate) fn stockham_stage(shader: StockhamStageKey) -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::StockhamStage(shader),
         }
@@ -415,7 +419,7 @@ impl ComputePipelineCacheKey {
 
     pub(crate) fn fused_pow2_stage(shader: FusedPow2StageKey) -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedPow2Stage(shader),
         }
@@ -423,7 +427,7 @@ impl ComputePipelineCacheKey {
 
     pub(crate) fn fused_smooth_stage(shader: FusedSmoothStageKey) -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedSmoothStage(shader),
         }
@@ -431,9 +435,9 @@ impl ComputePipelineCacheKey {
 
     pub(crate) fn direct_dft_c2c_f32() -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::DirectDftInterleavedF32,
+            layout: PipelineLayoutCacheKey::DirectDftInterleavedF32Lut,
             entry_point: String::from("main"),
-            shader: ShaderCacheKey::DirectDftC2cF32,
+            shader: ShaderCacheKey::DirectDftC2cF32Lut,
         }
     }
 
@@ -454,8 +458,17 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn c2c_smooth_stage(shader: C2cSmoothStageKey) -> Self {
+        let layout = match shader.kind {
+            C2cSmoothKernelKind::TwiddleTranspose => PipelineLayoutCacheKey::C2cSmoothTwiddleLutF32,
+            C2cSmoothKernelKind::GatherAxisLine
+            | C2cSmoothKernelKind::ScatterAxisLine
+            | C2cSmoothKernelKind::GatherSmoothPhase1
+            | C2cSmoothKernelKind::ScatterSmoothPhase2 => {
+                PipelineLayoutCacheKey::C2cSmoothBinaryF32
+            }
+        };
         Self {
-            layout: PipelineLayoutCacheKey::C2cSmoothBinaryF32,
+            layout,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::C2cSmoothStage(shader),
         }
@@ -643,11 +656,18 @@ impl C2cSmoothStageKey {
     }
 
     pub(crate) fn stable_key(&self) -> String {
-        format!(
-            "shader:v1:c2c-smooth:{}:workgroup={}",
-            self.kind.as_str(),
-            self.workgroup_size
-        )
+        match self.kind {
+            C2cSmoothKernelKind::TwiddleTranspose => format!(
+                "shader:v2:c2c-smooth:{}:workgroup={}:twiddle=host-f64-two-level-f32-v1",
+                self.kind.as_str(),
+                self.workgroup_size
+            ),
+            _ => format!(
+                "shader:v1:c2c-smooth:{}:workgroup={}",
+                self.kind.as_str(),
+                self.workgroup_size
+            ),
+        }
     }
 }
 
@@ -940,7 +960,7 @@ impl FusedSmoothStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v1:fused-smooth:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            "shader:v2:fused-smooth:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1013,7 +1033,7 @@ impl FusedPow2StageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v1:fused-pow2:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            "shader:v2:fused-pow2:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1088,7 +1108,7 @@ impl StockhamStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v1:stockham:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            "shader:v2:stockham:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}:twiddle=host-f64-f32-v1",
             self.rank,
             self.axis,
             dims_key(&self.dims),
@@ -1130,10 +1150,8 @@ fn device_cache_id(device: &wgpu::Device) -> u64 {
 
 fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroupLayoutEntry> {
     match key {
-        PipelineLayoutCacheKey::AxisPlanInterleavedF32
-        | PipelineLayoutCacheKey::C2cSmoothBinaryF32
+        PipelineLayoutCacheKey::C2cSmoothBinaryF32
         | PipelineLayoutCacheKey::C2cStridedBinaryF32
-        | PipelineLayoutCacheKey::DirectDftInterleavedF32
         | PipelineLayoutCacheKey::RealBinaryF32
         | PipelineLayoutCacheKey::RaderWriteY0InterleavedF32 => {
             vec![
@@ -1142,6 +1160,20 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
                 uniform_entry(2),
             ]
         }
+        PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut
+        | PipelineLayoutCacheKey::DirectDftInterleavedF32Lut => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+            storage_entry(3, true),
+        ],
+        PipelineLayoutCacheKey::C2cSmoothTwiddleLutF32 => vec![
+            storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+            storage_entry(3, true),
+            storage_entry(4, true),
+        ],
         PipelineLayoutCacheKey::BridgeTwoWriteUniformF32 => vec![
             storage_entry(0, false),
             storage_entry(1, false),
@@ -1255,7 +1287,7 @@ mod tests {
         assert_eq!(key.scale_factor(), 1.0 / 12.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v1:stockham:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab"
+            "shader:v2:stockham:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=host-f64-f32-v1"
         );
     }
 
@@ -1309,11 +1341,11 @@ mod tests {
         assert_eq!(key.scale_factor(), 1.0 / 1024.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v1:fused-pow2:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000"
+            "shader:v2:fused-pow2:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000:twiddle=host-f64-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_pow2_stage(key);
         assert!(pipeline.stable_key().starts_with(
-            "pipeline:v1:layout=axis-plan/interleaved-f32:entry=main:shader:v1:fused-pow2:"
+            "pipeline:v1:layout=axis-plan/interleaved-f32-lut:entry=main:shader:v2:fused-pow2:"
         ));
     }
 
@@ -1382,11 +1414,11 @@ mod tests {
         assert_eq!(key.scale_factor(), 1.0 / 4096.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v1:fused-smooth:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000"
+            "shader:v2:fused-smooth:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000:twiddle=host-f64-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_smooth_stage(key);
-        assert!(pipeline.stable_key().contains("shader:v1:fused-smooth:"));
-        assert!(!pipeline.stable_key().contains("shader:v1:fused-pow2:"));
+        assert!(pipeline.stable_key().contains("shader:v2:fused-smooth:"));
+        assert!(!pipeline.stable_key().contains("shader:v2:fused-pow2:"));
     }
 
     #[test]
@@ -1442,12 +1474,12 @@ mod tests {
 
         assert!(pipeline
             .stable_key()
-            .starts_with("pipeline:v1:layout=axis-plan/interleaved-f32:entry=main:"));
+            .starts_with("pipeline:v1:layout=axis-plan/interleaved-f32-lut:entry=main:"));
         assert!(pipeline.stable_key().contains("direction=inverse"));
 
         assert_eq!(
             ComputePipelineCacheKey::direct_dft_c2c_f32().stable_key(),
-            "pipeline:v1:layout=direct-dft/interleaved-f32:entry=main:shader:v1:direct-dft/c2c-f32"
+            "pipeline:v1:layout=direct-dft/interleaved-f32-lut:entry=main:shader:v2:direct-dft/c2c-f32:twiddle=host-f64-f32-v1"
         );
     }
 
@@ -1475,7 +1507,7 @@ mod tests {
             ShaderCacheKey::RealStage(_) => unreachable!(),
             ShaderCacheKey::C2cSmoothStage(_) => unreachable!(),
             ShaderCacheKey::C2cStridedStage(_) => unreachable!(),
-            ShaderCacheKey::DirectDftC2cF32 => unreachable!(),
+            ShaderCacheKey::DirectDftC2cF32Lut => unreachable!(),
         });
         let snapshot = PipelineCacheSnapshot::from_entries(
             vec![SnapshotShaderEntry {
@@ -1578,10 +1610,13 @@ mod tests {
         let shader = C2cSmoothStageKey::new(C2cSmoothKernelKind::TwiddleTranspose, 64);
         let pipeline = ComputePipelineCacheKey::c2c_smooth_stage(shader);
 
-        assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cSmoothBinaryF32);
+        assert_eq!(
+            pipeline.layout,
+            PipelineLayoutCacheKey::C2cSmoothTwiddleLutF32
+        );
         assert_eq!(
             pipeline.stable_key(),
-            "pipeline:v1:layout=c2c-smooth/binary-f32:entry=main:shader:v1:c2c-smooth:twiddle-transpose:workgroup=64"
+            "pipeline:v1:layout=c2c-smooth/twiddle-lut-f32:entry=main:shader:v2:c2c-smooth:twiddle-transpose:workgroup=64:twiddle=host-f64-two-level-f32-v1"
         );
 
         for (kind, expected) in [

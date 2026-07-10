@@ -187,6 +187,14 @@ impl FftPlan {
         }
     }
 
+    fn twiddle_lut_storage_bytes(&self) -> u64 {
+        match &self.inner {
+            FftPlanInner::C2c(plan) => plan.twiddle_lut_storage_bytes(),
+            FftPlanInner::R2c(plan) => plan.twiddle_lut_storage_bytes(),
+            FftPlanInner::C2r(plan) => plan.twiddle_lut_storage_bytes(),
+        }
+    }
+
     pub fn required_input_buffer_size_bytes(&self) -> u64 {
         match &self.inner {
             FftPlanInner::C2c(plan) => plan.required_buffer_size_bytes(),
@@ -561,6 +569,14 @@ impl FftPlan {
             diagnostics = diagnostics.with_buffer_requirement(FftBufferRequirement::new(
                 "workspace",
                 self.workspace_size_bytes(),
+                "complex-f32",
+            ));
+        }
+        let twiddle_lut_storage_bytes = self.twiddle_lut_storage_bytes();
+        if twiddle_lut_storage_bytes > 0 {
+            diagnostics = diagnostics.with_buffer_requirement(FftBufferRequirement::new(
+                "helper:twiddle-luts-total",
+                twiddle_lut_storage_bytes,
                 "complex-f32",
             ));
         }

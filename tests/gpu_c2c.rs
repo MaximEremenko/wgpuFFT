@@ -36,6 +36,18 @@ async fn run_gpu_case() {
     };
     trace_adapter(&context);
 
+    for config in [
+        FftConfig::new(1).with_normalization(Normalization::None),
+        FftConfig::inverse(1),
+    ] {
+        run_one_case(
+            &context,
+            input_for_config(&config),
+            config,
+            C2cRoute::DirectDft,
+        );
+    }
+
     for len in [2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 21] {
         run_one_case(
             &context,
@@ -2473,6 +2485,19 @@ fn run_one_case(
         LargeRouteMode::Normal
     );
     assert_plan_diagnostics_graph(&context.device, &plan);
+    let twiddle_lut_bytes = plan
+        .diagnostics()
+        .buffer_requirements()
+        .iter()
+        .find(|requirement| requirement.role == "helper:twiddle-luts-total")
+        .unwrap()
+        .required_bytes;
+    if expected_route == C2cRoute::DirectDft {
+        assert_eq!(twiddle_lut_bytes, 8);
+    }
+    if expected_route == C2cRoute::Rader && plan.config().shape()[plan.config().axes()[0]] == 17 {
+        assert_eq!(twiddle_lut_bytes, 32 * 8);
+    }
     assert_eq!(plan.axis_factors().len(), plan.config().axes().len());
     let mut encoder = context
         .device
@@ -3447,6 +3472,11 @@ fn assert_plan_diagnostics_graph(device: &wgpu::Device, plan: &FftPlan) {
         .iter()
         .any(|stage| matches!(stage.kind.as_str(), "kernel" | "windowed-kernel" | "copy")));
     assert!(diagnostics.buffer_requirements().len() >= 2);
+    assert!(diagnostics.buffer_requirements().iter().any(|requirement| {
+        requirement.role == "helper:twiddle-luts-total"
+            && requirement.required_bytes > 0
+            && requirement.format == "complex-f32"
+    }));
     for stage in diagnostics
         .stages()
         .iter()
@@ -3480,18 +3510,24 @@ fn assert_plan_diagnostics_graph(device: &wgpu::Device, plan: &FftPlan) {
         forced_diagnostics.stages().len(),
         diagnostics.stages().len()
     );
-    assert!(
-        forced_diagnostics.blockers().iter().any(|blocker| {
-            blocker.route.is_some()
-                && blocker.stage.is_some()
-                && blocker.required_bytes.is_some()
-                && blocker.limit_bytes.is_some()
-                && matches!(
-                    blocker.kind,
-                    FftBlockerKind::DeviceLimit | FftBlockerKind::HelperBuffer
-                )
-        }),
-        "expected forced-limit graph blocker for {:?}",
+    let exceeds_forced_limits = diagnostics
+        .buffer_requirements()
+        .iter()
+        .any(|requirement| requirement.required_bytes > 8);
+    let has_forced_limit_blocker = forced_diagnostics.blockers().iter().any(|blocker| {
+        blocker.route.is_some()
+            && blocker.stage.is_some()
+            && blocker.required_bytes.is_some()
+            && blocker.limit_bytes.is_some()
+            && matches!(
+                blocker.kind,
+                FftBlockerKind::DeviceLimit | FftBlockerKind::HelperBuffer
+            )
+    });
+    assert_eq!(
+        has_forced_limit_blocker,
+        exceeds_forced_limits,
+        "unexpected forced-limit blocker state for {:?}",
         plan.config()
     );
 }

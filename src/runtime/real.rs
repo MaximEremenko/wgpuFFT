@@ -780,6 +780,15 @@ impl R2cPlan {
         0
     }
 
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        match &self.execution {
+            R2cExecution::Normal(plan) | R2cExecution::LargeDecomposition(plan) => {
+                plan.c2c.twiddle_lut_storage_bytes()
+            }
+            R2cExecution::LargeChunk(plan) => plan.child.twiddle_lut_storage_bytes(),
+        }
+    }
+
     pub fn required_input_buffer_size_bytes(&self) -> u64 {
         self.sizes.real_bytes
     }
@@ -1046,6 +1055,15 @@ impl C2rPlan {
 
     pub fn workspace_size_bytes(&self) -> u64 {
         0
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        match &self.execution {
+            C2rExecution::Normal(plan) | C2rExecution::LargeDecomposition(plan) => {
+                plan.c2c.twiddle_lut_storage_bytes()
+            }
+            C2rExecution::LargeChunk(plan) => plan.child.twiddle_lut_storage_bytes(),
+        }
     }
 
     pub fn required_input_buffer_size_bytes(&self) -> u64 {

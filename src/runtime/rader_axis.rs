@@ -2,9 +2,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd, to_interleaved_f32, Complex32};
+use crate::math::{reference_c2c_nd_f64, to_interleaved_f32, Complex32, Complex64};
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -216,7 +216,8 @@ impl RaderAxis {
             wgpu::BufferUsages::empty(),
         )?;
 
-        let work_fft_forward = AxisPlan::new(
+        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
+        let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
             device,
             queue,
             AxisPlanConfig {
@@ -229,8 +230,9 @@ impl RaderAxis {
                 layout: AxisLayout::Interleaved,
                 precision: AxisPrecision::F32,
             },
+            &mut twiddle_lut_pool,
         )?;
-        let work_fft_inverse = AxisPlan::new(
+        let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
             device,
             queue,
             AxisPlanConfig {
@@ -243,6 +245,7 @@ impl RaderAxis {
                 layout: AxisLayout::Interleaved,
                 precision: AxisPrecision::F32,
             },
+            &mut twiddle_lut_pool,
         )?;
 
         let keys = RaderPipelineKeys::new(
@@ -306,6 +309,12 @@ impl RaderAxis {
 
     pub(crate) fn workspace_size_bytes(&self) -> u64 {
         0
+    }
+
+    pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
+        let bytes = self.work_fft_forward.twiddle_lut_storage_bytes();
+        debug_assert_eq!(bytes, self.work_fft_inverse.twiddle_lut_storage_bytes());
+        bytes
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
@@ -616,19 +625,22 @@ pub(crate) fn rader_bfft(
     direction: FftDirection,
     perm: &[u32],
 ) -> Result<Vec<Complex32>> {
-    let sign = match direction {
+    let sign: f64 = match direction {
         FftDirection::Forward => 1.0,
         FftDirection::Inverse => -1.0,
     };
-    let mut values = vec![Complex32::default(); m];
+    let mut values = vec![Complex64::default(); m];
     for (k, &index) in perm.iter().enumerate() {
-        let angle = sign * (-std::f32::consts::TAU * index as f32 / n as f32);
+        let angle = sign * (-std::f64::consts::TAU * index as f64 / n as f64);
         let (sin, cos) = angle.sin_cos();
-        values[k] = Complex32::new(cos, sin);
+        values[k] = Complex64::new(cos, sin);
     }
 
     let config = crate::config::FftConfig::new(m).with_normalization(Normalization::None);
-    reference_c2c_nd(&values, &config)
+    Ok(reference_c2c_nd_f64(&values, &config)?
+        .into_iter()
+        .map(|value| Complex32::new(value.re as f32, value.im as f32))
+        .collect())
 }
 
 fn checked_mul(left: usize, right: usize) -> Result<usize> {
@@ -990,6 +1002,37 @@ mod tests {
         let mut values = rader_permutation(17).unwrap();
         values.sort_unstable();
         assert_eq!(values, (1..17).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rader_bfft_is_f64_generated_then_rounded_once() {
+        let n = 17;
+        let m = 32;
+        let perm = rader_permutation(n).unwrap();
+        for direction in [FftDirection::Forward, FftDirection::Inverse] {
+            let actual = rader_bfft(n, m, direction, &perm).unwrap();
+            let sign = if direction == FftDirection::Forward {
+                -1.0
+            } else {
+                1.0
+            };
+            let mut kernel = vec![Complex64::default(); m];
+            for (k, &index) in perm.iter().enumerate() {
+                let angle = sign * std::f64::consts::TAU * index as f64 / n as f64;
+                let (sin, cos) = angle.sin_cos();
+                kernel[k] = Complex64::new(cos, sin);
+            }
+            let expected = reference_c2c_nd_f64(
+                &kernel,
+                &crate::config::FftConfig::new(m).with_normalization(Normalization::None),
+            )
+            .unwrap();
+
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.re.to_bits(), (expected.re as f32).to_bits());
+                assert_eq!(actual.im.to_bits(), (expected.im as f32).to_bits());
+            }
+        }
     }
 
     #[test]

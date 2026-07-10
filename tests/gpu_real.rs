@@ -1053,7 +1053,9 @@ fn assert_real_segmented_strided_usage_diagnostics(
     assert!(diagnostics.stages().iter().any(|stage| {
         matches!(
             stage.label.as_str(),
-            "mixed-radix-stockham-stage" | "fused-pow2-workgroup-stage"
+            "mixed-radix-stockham-stage"
+                | "fused-pow2-workgroup-stage"
+                | "fused-smooth-workgroup-stage"
         ) && stage.route == "mixed-radix"
     }));
     assert!(diagnostics.blockers().iter().any(|blocker| {

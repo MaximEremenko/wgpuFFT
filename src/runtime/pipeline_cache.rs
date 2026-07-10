@@ -330,6 +330,7 @@ impl PipelineCache {
 pub(crate) enum ShaderCacheKey {
     StockhamStage(StockhamStageKey),
     FusedPow2Stage(FusedPow2StageKey),
+    FusedSmoothStage(FusedSmoothStageKey),
     BridgeStage(BridgeStageKey),
     RaderStage(RaderStageKey),
     RealStage(RealStageKey),
@@ -343,6 +344,7 @@ impl ShaderCacheKey {
         match self {
             Self::StockhamStage(key) => key.stable_key(),
             Self::FusedPow2Stage(key) => key.stable_key(),
+            Self::FusedSmoothStage(key) => key.stable_key(),
             Self::BridgeStage(key) => key.stable_key(),
             Self::RaderStage(key) => key.stable_key(),
             Self::RealStage(key) => key.stable_key(),
@@ -358,6 +360,9 @@ impl ShaderCacheKey {
             Self::FusedPow2Stage(key) => {
                 crate::runtime::axis_plan::generate_fused_pow2_stage_wgsl_for_key(key)
             }
+            Self::FusedSmoothStage(key) => {
+                crate::runtime::axis_plan::generate_fused_smooth_stage_wgsl_for_key(key)
+            }
             Self::BridgeStage(key) => crate::runtime::c2c::generate_bridge_wgsl_for_key(key),
             Self::RaderStage(key) => crate::runtime::rader_axis::generate_rader_wgsl_for_key(key),
             Self::RealStage(key) => crate::runtime::real::generate_real_wgsl_for_key(key),
@@ -372,6 +377,14 @@ impl ShaderCacheKey {
     fn is_supported_on_device(&self, device: &wgpu::Device) -> bool {
         match self {
             Self::FusedPow2Stage(key) => {
+                let limits = device.limits();
+                key.is_supported_by_limits(
+                    u64::from(limits.max_compute_workgroup_storage_size),
+                    limits.max_compute_invocations_per_workgroup,
+                    limits.max_compute_workgroup_size_x,
+                )
+            }
+            Self::FusedSmoothStage(key) => {
                 let limits = device.limits();
                 key.is_supported_by_limits(
                     u64::from(limits.max_compute_workgroup_storage_size),
@@ -405,6 +418,14 @@ impl ComputePipelineCacheKey {
             layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedPow2Stage(shader),
+        }
+    }
+
+    pub(crate) fn fused_smooth_stage(shader: FusedSmoothStageKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::FusedSmoothStage(shader),
         }
     }
 
@@ -858,6 +879,96 @@ pub(crate) struct FusedPow2StageKey {
     scale_bits: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FusedSmoothStageKey {
+    pub(crate) rank: usize,
+    pub(crate) axis: usize,
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axis_length: usize,
+    pub(crate) stride_complex: usize,
+    pub(crate) factors: Vec<usize>,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u32,
+}
+
+impl FusedSmoothStageKey {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        rank: usize,
+        axis: usize,
+        dims: &[usize],
+        axis_length: usize,
+        stride_complex: usize,
+        factors: &[usize],
+        direction: FftDirection,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f32,
+    ) -> Self {
+        debug_assert_eq!(rank, dims.len());
+        debug_assert!(axis < rank);
+        debug_assert_eq!(axis_length, dims[axis]);
+        debug_assert!(!axis_length.is_power_of_two());
+        debug_assert_eq!(factors.iter().product::<usize>(), axis_length);
+        debug_assert!(scale_factor.is_finite());
+
+        let scale_bits = if apply_scale {
+            scale_factor.to_bits()
+        } else {
+            1.0f32.to_bits()
+        };
+
+        Self {
+            rank,
+            axis,
+            dims: dims.to_vec(),
+            axis_length,
+            stride_complex,
+            factors: factors.to_vec(),
+            direction,
+            workgroup_size,
+            apply_scale,
+            scale_bits,
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f32 {
+        f32::from_bits(self.scale_bits)
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:fused-smooth:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits=0x{:08x}",
+            self.rank,
+            self.axis,
+            dims_key(&self.dims),
+            self.axis_length,
+            self.stride_complex,
+            dims_key(&self.factors),
+            direction_key(self.direction),
+            self.workgroup_size,
+            self.apply_scale,
+            self.scale_bits
+        )
+    }
+
+    fn is_supported_by_limits(
+        &self,
+        max_workgroup_storage_bytes: u64,
+        max_invocations_per_workgroup: u32,
+        max_workgroup_size_x: u32,
+    ) -> bool {
+        let Some(scratch_bytes) = self.axis_length.checked_mul(8) else {
+            return false;
+        };
+        scratch_bytes as u64 <= max_workgroup_storage_bytes
+            && self.workgroup_size <= max_invocations_per_workgroup
+            && self.workgroup_size <= max_workgroup_size_x
+    }
+}
+
 impl FusedPow2StageKey {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -1254,6 +1365,65 @@ mod tests {
     }
 
     #[test]
+    fn fused_smooth_shader_key_is_distinct_and_includes_factor_schedule() {
+        let key = FusedSmoothStageKey::new(
+            2,
+            1,
+            &[4, 1001],
+            1001,
+            4,
+            &[13, 11, 7],
+            FftDirection::Inverse,
+            256,
+            true,
+            1.0 / 4096.0,
+        );
+
+        assert_eq!(key.scale_factor(), 1.0 / 4096.0);
+        assert_eq!(
+            key.stable_key(),
+            "shader:v1:fused-smooth:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000"
+        );
+        let pipeline = ComputePipelineCacheKey::fused_smooth_stage(key);
+        assert!(pipeline.stable_key().contains("shader:v1:fused-smooth:"));
+        assert!(!pipeline.stable_key().contains("shader:v1:fused-pow2:"));
+    }
+
+    #[test]
+    fn fused_smooth_shader_key_canonicalizes_scale_and_checks_limits() {
+        let a = FusedSmoothStageKey::new(
+            1,
+            0,
+            &[3000],
+            3000,
+            1,
+            &[8, 5, 5, 5, 3],
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+        );
+        let b = FusedSmoothStageKey::new(
+            1,
+            0,
+            &[3000],
+            3000,
+            1,
+            &[8, 5, 5, 5, 3],
+            FftDirection::Forward,
+            256,
+            false,
+            1.0 / 3000.0,
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.scale_factor(), 1.0);
+        assert!(a.is_supported_by_limits(24_000, 256, 256));
+        assert!(!a.is_supported_by_limits(23_999, 256, 256));
+        assert!(!a.is_supported_by_limits(24_000, 255, 256));
+        assert!(!a.is_supported_by_limits(24_000, 256, 255));
+    }
+
+    #[test]
     fn compute_pipeline_key_wraps_layout_entry_point_and_shader_key() {
         let shader = StockhamStageKey::new(
             1,
@@ -1299,6 +1469,7 @@ mod tests {
         let pipeline = ComputePipelineCacheKey::stockham_stage(match &shader {
             ShaderCacheKey::StockhamStage(key) => key.clone(),
             ShaderCacheKey::FusedPow2Stage(_) => unreachable!(),
+            ShaderCacheKey::FusedSmoothStage(_) => unreachable!(),
             ShaderCacheKey::BridgeStage(_) => unreachable!(),
             ShaderCacheKey::RaderStage(_) => unreachable!(),
             ShaderCacheKey::RealStage(_) => unreachable!(),

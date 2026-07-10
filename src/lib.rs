@@ -6,11 +6,12 @@
 //! logical I/O before dispatch. Existing `FftIoView` compatibility views route
 //! through the same logical I/O path.
 //!
-//! Power-of-two axes execute in one workgroup when the complete line fits
-//! device workgroup storage; other factorable axes use mixed-radix Stockham
-//! stages. Prime axes use Rader, unsupported composite axes use Bluestein over
-//! a smooth convolution length, and mixed-algorithm ND plans compose typed
-//! stage graphs. Large routes include batch chunking, smooth and axis
+//! Power-of-two and multi-stage smooth axes execute in one workgroup when the
+//! complete line fits device workgroup storage; single-stage smooth axes and
+//! larger lines use mixed-radix Stockham stages. Other prime axes use Rader,
+//! unsupported composite axes use Bluestein over a smooth convolution length,
+//! and mixed-algorithm ND plans compose typed stage graphs. Large routes
+//! include batch chunking, smooth and axis
 //! decomposition, and Rader/Bluestein bridge execution when active `wgpu`
 //! binding limits allow them.
 //!

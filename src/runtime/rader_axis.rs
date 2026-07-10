@@ -4,7 +4,8 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd_f64, to_interleaved_f32, Complex32, Complex64};
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
+    generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
+    AxisStageKind, AxisTwiddleLutPool,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -13,15 +14,21 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
-    format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
+    format_wgsl_f32, format_wgsl_f32_roundtrip, lines_per_batch, product, stride_for_axis,
+    wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, ComputePipelineCacheKey, PipelineLayoutCacheKey, RaderKernelKind,
-    RaderStageKey, ShaderCacheKey,
+    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
+    PipelineLayoutCacheKey, RaderKernelKind, RaderStageKey, ShaderCacheKey,
 };
+use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len;
 use crate::runtime::window_scheduler::WindowScheduler;
 
 const WORKGROUP_SIZE: u32 = 64;
+const FUSED_WORKGROUP_SIZE: u32 = 256;
+// At smaller convolution lengths the 256-lane fused kernel is mostly idle and
+// the existing staged path is already inexpensive.
+const FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
 const COMPLEX_F32_BYTES: u64 = 8;
 
 #[repr(C)]
@@ -55,6 +62,25 @@ pub(crate) struct RaderAxis {
     n: usize,
     m: usize,
     lines: u32,
+    lines_params_buffer: wgpu::Buffer,
+    perm_buffer: wgpu::Buffer,
+    bfft_buffer: wgpu::Buffer,
+    execution: RaderExecution,
+}
+
+enum RaderExecution {
+    Fused(FusedRaderExecution),
+    MultiPass(Box<MultiPassRaderExecution>),
+}
+
+struct FusedRaderExecution {
+    workgroups: u32,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    twiddle_buffer: wgpu::Buffer,
+}
+
+struct MultiPassRaderExecution {
     workgroups_sum: u32,
     workgroups_lines: u32,
     workgroups_work: u32,
@@ -69,10 +95,7 @@ pub(crate) struct RaderAxis {
     write_y0_bind_group_layout: wgpu::BindGroupLayout,
     post_pipeline: wgpu::ComputePipeline,
     post_bind_group_layout: wgpu::BindGroupLayout,
-    lines_params_buffer: wgpu::Buffer,
     total_params_buffer: wgpu::Buffer,
-    perm_buffer: wgpu::Buffer,
-    bfft_buffer: wgpu::Buffer,
     sum_buffer: wgpu::Buffer,
     x0_buffer: wgpu::Buffer,
     work_buffer: wgpu::Buffer,
@@ -131,14 +154,9 @@ impl RaderAxis {
         if crate::runtime::factor_supported_length(m).is_err() {
             m = next_power_of_two_at_least(min_conv);
         }
-        crate::runtime::factor_supported_length(m)?;
+        let factors = crate::runtime::factor_supported_length(m)?;
 
         let lines = checked_mul(config.batch, lines_per_batch(&config.shape, config.axis))?;
-        let work_complex = checked_mul(lines, m)?;
-        if work_complex > u32::MAX as usize {
-            return Err(FftError::LengthTooLarge { len: work_complex });
-        }
-        let total_work_u32 = work_complex as u32;
         let lines_u32 = lines as u32;
         let stride_complex = stride_for_axis(&config.shape, config.axis);
         let scale = config.scale()?;
@@ -159,19 +177,6 @@ impl RaderAxis {
             }),
         );
 
-        let total_params_buffer =
-            uniform_buffer::<RaderTotalParams>(device, "wgpu_fft.rader.total_params");
-        queue.write_buffer(
-            &total_params_buffer,
-            0,
-            bytemuck::bytes_of(&RaderTotalParams {
-                total: total_work_u32,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            }),
-        );
-
         let perm_buffer = storage_buffer(
             device,
             "wgpu_fft.rader.perm",
@@ -189,121 +194,174 @@ impl RaderAxis {
         )?;
         queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft_values));
 
-        let line_bytes = lines as u64 * COMPLEX_F32_BYTES;
-        let work_bytes = work_complex as u64 * COMPLEX_F32_BYTES;
-        let sum_buffer = storage_buffer(
-            device,
-            "wgpu_fft.rader.sum",
-            line_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
-        let x0_buffer = storage_buffer(
-            device,
-            "wgpu_fft.rader.x0",
-            line_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
-        let work_buffer = storage_buffer(
-            device,
-            "wgpu_fft.rader.work",
-            work_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
-        let fft_buffer = storage_buffer(
-            device,
-            "wgpu_fft.rader.fft",
-            work_bytes,
-            wgpu::BufferUsages::empty(),
-        )?;
+        let execution = if fused_rader_supported(m, &device.limits()) {
+            let twiddle_buffer = create_twiddle_lut_buffer_for_len(
+                device,
+                queue,
+                "wgpu_fft.rader.fused.twiddle_lut",
+                m,
+            )?;
+            let shader_key = FusedPrimeStageKey::new(
+                FusedPrimeKind::Rader,
+                config.shape.len(),
+                config.axis,
+                &config.shape,
+                n,
+                stride_complex,
+                m,
+                &factors,
+                config.direction,
+                FUSED_WORKGROUP_SIZE,
+                apply_scale,
+                scale,
+            );
+            let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
+            let bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::FusedPrimeInterleavedF32);
+            let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
+            RaderExecution::Fused(FusedRaderExecution {
+                workgroups: lines_u32,
+                pipeline,
+                bind_group_layout,
+                twiddle_buffer,
+            })
+        } else {
+            let work_complex = checked_mul(lines, m)?;
+            if work_complex > u32::MAX as usize {
+                return Err(FftError::LengthTooLarge { len: work_complex });
+            }
+            let total_work_u32 = work_complex as u32;
+            let total_params_buffer =
+                uniform_buffer::<RaderTotalParams>(device, "wgpu_fft.rader.total_params");
+            queue.write_buffer(
+                &total_params_buffer,
+                0,
+                bytemuck::bytes_of(&RaderTotalParams {
+                    total: total_work_u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+            );
 
-        let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
-        let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
-            device,
-            queue,
-            AxisPlanConfig {
-                shape: vec![m],
-                axes: vec![0],
-                batch: lines,
-                direction: FftDirection::Forward,
-                normalization: Normalization::None,
-                scale_override_bits: None,
-                layout: AxisLayout::Interleaved,
-                precision: AxisPrecision::F32,
-            },
-            &mut twiddle_lut_pool,
-        )?;
-        let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
-            device,
-            queue,
-            AxisPlanConfig {
-                shape: vec![m],
-                axes: vec![0],
-                batch: lines,
-                direction: FftDirection::Inverse,
-                normalization: Normalization::Inverse,
-                scale_override_bits: None,
-                layout: AxisLayout::Interleaved,
-                precision: AxisPrecision::F32,
-            },
-            &mut twiddle_lut_pool,
-        )?;
+            let line_bytes = lines as u64 * COMPLEX_F32_BYTES;
+            let work_bytes = work_complex as u64 * COMPLEX_F32_BYTES;
+            let sum_buffer = storage_buffer(
+                device,
+                "wgpu_fft.rader.sum",
+                line_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
+            let x0_buffer = storage_buffer(
+                device,
+                "wgpu_fft.rader.x0",
+                line_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
+            let work_buffer = storage_buffer(
+                device,
+                "wgpu_fft.rader.work",
+                work_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
+            let fft_buffer = storage_buffer(
+                device,
+                "wgpu_fft.rader.fft",
+                work_bytes,
+                wgpu::BufferUsages::empty(),
+            )?;
 
-        let keys = RaderPipelineKeys::new(
-            config.shape.len(),
-            config.axis,
-            &config.shape,
-            n,
-            stride_complex,
-            m,
-            apply_scale,
-            scale,
-        );
+            let mut twiddle_lut_pool = AxisTwiddleLutPool::default();
+            let work_fft_forward = AxisPlan::new_with_twiddle_lut_pool(
+                device,
+                queue,
+                AxisPlanConfig {
+                    shape: vec![m],
+                    axes: vec![0],
+                    batch: lines,
+                    direction: FftDirection::Forward,
+                    normalization: Normalization::None,
+                    scale_override_bits: None,
+                    layout: AxisLayout::Interleaved,
+                    precision: AxisPrecision::F32,
+                },
+                &mut twiddle_lut_pool,
+            )?;
+            let work_fft_inverse = AxisPlan::new_with_twiddle_lut_pool(
+                device,
+                queue,
+                AxisPlanConfig {
+                    shape: vec![m],
+                    axes: vec![0],
+                    batch: lines,
+                    direction: FftDirection::Inverse,
+                    normalization: Normalization::Inverse,
+                    scale_override_bits: None,
+                    layout: AxisLayout::Interleaved,
+                    precision: AxisPrecision::F32,
+                },
+                &mut twiddle_lut_pool,
+            )?;
 
-        let sum_bind_group_layout =
-            cached_layout(device, PipelineLayoutCacheKey::RaderSumInterleavedF32);
-        let pack_bind_group_layout =
-            cached_layout(device, PipelineLayoutCacheKey::RaderPackInterleavedF32);
-        let mul_bind_group_layout =
-            cached_layout(device, PipelineLayoutCacheKey::RaderMulInterleavedF32);
-        let write_y0_bind_group_layout =
-            cached_layout(device, PipelineLayoutCacheKey::RaderWriteY0InterleavedF32);
-        let post_bind_group_layout =
-            cached_layout(device, PipelineLayoutCacheKey::RaderPostInterleavedF32);
+            let keys = RaderPipelineKeys::new(
+                config.shape.len(),
+                config.axis,
+                &config.shape,
+                n,
+                stride_complex,
+                m,
+                apply_scale,
+                scale,
+            );
+            let sum_bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::RaderSumInterleavedF32);
+            let pack_bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::RaderPackInterleavedF32);
+            let mul_bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::RaderMulInterleavedF32);
+            let write_y0_bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::RaderWriteY0InterleavedF32);
+            let post_bind_group_layout =
+                cached_layout(device, PipelineLayoutCacheKey::RaderPostInterleavedF32);
+            let sum_pipeline = cached_pipeline(device, &keys.sum)?;
+            let pack_pipeline = cached_pipeline(device, &keys.pack)?;
+            let mul_pipeline = cached_pipeline(device, &keys.mul)?;
+            let write_y0_pipeline = cached_pipeline(device, &keys.write_y0)?;
+            let post_pipeline = cached_pipeline(device, &keys.post)?;
 
-        let sum_pipeline = cached_pipeline(device, &keys.sum)?;
-        let pack_pipeline = cached_pipeline(device, &keys.pack)?;
-        let mul_pipeline = cached_pipeline(device, &keys.mul)?;
-        let write_y0_pipeline = cached_pipeline(device, &keys.write_y0)?;
-        let post_pipeline = cached_pipeline(device, &keys.post)?;
+            RaderExecution::MultiPass(Box::new(MultiPassRaderExecution {
+                workgroups_sum: lines_u32,
+                workgroups_lines: lines_u32.div_ceil(WORKGROUP_SIZE),
+                workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
+                workgroups_tail: (lines_u32 * l as u32).div_ceil(WORKGROUP_SIZE),
+                sum_pipeline,
+                sum_bind_group_layout,
+                pack_pipeline,
+                pack_bind_group_layout,
+                mul_pipeline,
+                mul_bind_group_layout,
+                write_y0_pipeline,
+                write_y0_bind_group_layout,
+                post_pipeline,
+                post_bind_group_layout,
+                total_params_buffer,
+                sum_buffer,
+                x0_buffer,
+                work_buffer,
+                fft_buffer,
+                work_fft_forward,
+                work_fft_inverse,
+            }))
+        };
 
         Ok(Self {
             n,
             m,
             lines: lines_u32,
-            workgroups_sum: lines_u32,
-            workgroups_lines: lines_u32.div_ceil(WORKGROUP_SIZE),
-            workgroups_work: total_work_u32.div_ceil(WORKGROUP_SIZE),
-            workgroups_tail: (lines_u32 * l as u32).div_ceil(WORKGROUP_SIZE),
-            sum_pipeline,
-            sum_bind_group_layout,
-            pack_pipeline,
-            pack_bind_group_layout,
-            mul_pipeline,
-            mul_bind_group_layout,
-            write_y0_pipeline,
-            write_y0_bind_group_layout,
-            post_pipeline,
-            post_bind_group_layout,
             lines_params_buffer,
-            total_params_buffer,
             perm_buffer,
             bfft_buffer,
-            sum_buffer,
-            x0_buffer,
-            work_buffer,
-            fft_buffer,
-            work_fft_forward,
-            work_fft_inverse,
+            execution,
         })
     }
 
@@ -312,29 +370,57 @@ impl RaderAxis {
     }
 
     pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
-        let bytes = self.work_fft_forward.twiddle_lut_storage_bytes();
-        debug_assert_eq!(bytes, self.work_fft_inverse.twiddle_lut_storage_bytes());
-        bytes
+        match &self.execution {
+            RaderExecution::Fused(execution) => execution.twiddle_buffer.size(),
+            RaderExecution::MultiPass(execution) => {
+                let bytes = execution.work_fft_forward.twiddle_lut_storage_bytes();
+                debug_assert_eq!(
+                    bytes,
+                    execution.work_fft_inverse.twiddle_lut_storage_bytes()
+                );
+                bytes
+            }
+        }
+    }
+
+    pub(crate) fn graph_is_fused(&self) -> bool {
+        matches!(self.execution, RaderExecution::Fused(_))
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
-        self.work_fft_forward.graph_stage_kinds()
+        match &self.execution {
+            RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::MultiPass(execution) => execution.work_fft_forward.graph_stage_kinds(),
+        }
     }
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
-        self.work_fft_forward.workspace_size_bytes()
+        match &self.execution {
+            RaderExecution::Fused(_) => 0,
+            RaderExecution::MultiPass(execution) => {
+                execution.work_fft_forward.workspace_size_bytes()
+            }
+        }
     }
 
     pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
-        self.work_fft_inverse.graph_stage_kinds()
+        match &self.execution {
+            RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::MultiPass(execution) => execution.work_fft_inverse.graph_stage_kinds(),
+        }
     }
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {
-        self.work_fft_inverse.workspace_size_bytes()
+        match &self.execution {
+            RaderExecution::Fused(_) => 0,
+            RaderExecution::MultiPass(execution) => {
+                execution.work_fft_inverse.workspace_size_bytes()
+            }
+        }
     }
 
-    pub(crate) fn graph_helper_buffers(&self) -> [HelperBufferRange; 6] {
-        [
+    pub(crate) fn graph_helper_buffers(&self) -> Vec<HelperBufferRange> {
+        let mut helpers = vec![
             HelperBufferRange {
                 label: "rader-permutation-helper",
                 index: 0,
@@ -347,31 +433,36 @@ impl RaderAxis {
                 size_bytes: self.bfft_buffer.size(),
                 format: ElementFormat::ComplexF32,
             },
-            HelperBufferRange {
-                label: "rader-sum-helper",
-                index: 2,
-                size_bytes: self.sum_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-            HelperBufferRange {
-                label: "rader-x0-helper",
-                index: 3,
-                size_bytes: self.x0_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-            HelperBufferRange {
-                label: "rader-work-helper",
-                index: 4,
-                size_bytes: self.work_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-            HelperBufferRange {
-                label: "rader-fft-helper",
-                index: 5,
-                size_bytes: self.fft_buffer.size(),
-                format: ElementFormat::ComplexF32,
-            },
-        ]
+        ];
+        if let RaderExecution::MultiPass(execution) = &self.execution {
+            helpers.extend([
+                HelperBufferRange {
+                    label: "rader-sum-helper",
+                    index: 2,
+                    size_bytes: execution.sum_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+                HelperBufferRange {
+                    label: "rader-x0-helper",
+                    index: 3,
+                    size_bytes: execution.x0_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+                HelperBufferRange {
+                    label: "rader-work-helper",
+                    index: 4,
+                    size_bytes: execution.work_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+                HelperBufferRange {
+                    label: "rader-fft-helper",
+                    index: 5,
+                    size_bytes: execution.fft_buffer.size(),
+                    format: ElementFormat::ComplexF32,
+                },
+            ]);
+        }
+        helpers
     }
 
     pub(crate) fn execute_views(
@@ -385,15 +476,68 @@ impl RaderAxis {
         debug_assert!(self.m >= 2 * (self.n - 1) - 1);
         debug_assert!(self.lines > 0);
 
-        self.dispatch_sum(device, encoder, input.clone())?;
-        self.dispatch_pack(device, encoder, input)?;
-        self.work_fft_forward
-            .execute(device, encoder, &self.work_buffer, &self.fft_buffer)?;
-        self.dispatch_mul(device, encoder)?;
-        self.work_fft_inverse
-            .execute(device, encoder, &self.fft_buffer, &self.work_buffer)?;
-        self.dispatch_write_y0(device, encoder, output.clone())?;
-        self.dispatch_post(device, encoder, output)?;
+        match &self.execution {
+            RaderExecution::Fused(execution) => {
+                self.dispatch_fused(device, encoder, input, output, execution)?;
+            }
+            RaderExecution::MultiPass(execution) => {
+                self.dispatch_sum(device, encoder, input.clone(), execution)?;
+                self.dispatch_pack(device, encoder, input, execution)?;
+                execution.work_fft_forward.execute(
+                    device,
+                    encoder,
+                    &execution.work_buffer,
+                    &execution.fft_buffer,
+                )?;
+                self.dispatch_mul(device, encoder, execution)?;
+                execution.work_fft_inverse.execute(
+                    device,
+                    encoder,
+                    &execution.fft_buffer,
+                    &execution.work_buffer,
+                )?;
+                self.dispatch_write_y0(device, encoder, output.clone(), execution)?;
+                self.dispatch_post(device, encoder, output, execution)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_fused(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+        execution: &FusedRaderExecution,
+    ) -> Result<()> {
+        let scheduler = WindowScheduler::for_device(device);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_fft.rader.fused.bind_group"),
+            layout: &execution.bind_group_layout,
+            entries: &[
+                bind_view_entry(&scheduler, 0, input)?,
+                bind_view_entry(&scheduler, 1, output)?,
+                bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
+                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    4,
+                    &execution.twiddle_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
+                bind_uniform_entry(5, &self.lines_params_buffer),
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("wgpu_fft.rader.fused.pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&execution.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let (x, y, z) =
+            split_workgroups(execution.workgroups, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
 
@@ -402,15 +546,26 @@ impl RaderAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input: BufferView<'_>,
+        execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.sum.bind_group"),
-            layout: &self.sum_bind_group_layout,
+            layout: &execution.sum_bind_group_layout,
             entries: &[
                 bind_view_entry(&scheduler, 0, input)?,
-                bind_storage_entry(&scheduler, 1, &self.sum_buffer, ElementFormat::ComplexF32)?,
-                bind_storage_entry(&scheduler, 2, &self.x0_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    1,
+                    &execution.sum_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
+                bind_storage_entry(
+                    &scheduler,
+                    2,
+                    &execution.x0_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
@@ -418,10 +573,12 @@ impl RaderAxis {
             label: Some("wgpu_fft.rader.sum.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.sum_pipeline);
+        pass.set_pipeline(&execution.sum_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_sum, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_sum,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -431,14 +588,20 @@ impl RaderAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         input: BufferView<'_>,
+        execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.pack.bind_group"),
-            layout: &self.pack_bind_group_layout,
+            layout: &execution.pack_bind_group_layout,
             entries: &[
                 bind_view_entry(&scheduler, 0, input)?,
-                bind_storage_entry(&scheduler, 1, &self.work_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    1,
+                    &execution.work_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
@@ -447,10 +610,12 @@ impl RaderAxis {
             label: Some("wgpu_fft.rader.pack.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.pack_pipeline);
+        pass.set_pipeline(&execution.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_work,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -459,25 +624,33 @@ impl RaderAxis {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.mul.bind_group"),
-            layout: &self.mul_bind_group_layout,
+            layout: &execution.mul_bind_group_layout,
             entries: &[
-                bind_storage_entry(&scheduler, 0, &self.fft_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    0,
+                    &execution.fft_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 1, &self.bfft_buffer, ElementFormat::ComplexF32)?,
-                bind_uniform_entry(2, &self.total_params_buffer),
+                bind_uniform_entry(2, &execution.total_params_buffer),
             ],
         });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("wgpu_fft.rader.mul.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.mul_pipeline);
+        pass.set_pipeline(&execution.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_work, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_work,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -487,13 +660,19 @@ impl RaderAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         output: BufferView<'_>,
+        execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.write_y0.bind_group"),
-            layout: &self.write_y0_bind_group_layout,
+            layout: &execution.write_y0_bind_group_layout,
             entries: &[
-                bind_storage_entry(&scheduler, 0, &self.sum_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    0,
+                    &execution.sum_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_view_entry(&scheduler, 1, output)?,
                 bind_uniform_entry(2, &self.lines_params_buffer),
             ],
@@ -502,10 +681,12 @@ impl RaderAxis {
             label: Some("wgpu_fft.rader.write_y0.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.write_y0_pipeline);
+        pass.set_pipeline(&execution.write_y0_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_lines, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_lines,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -515,14 +696,25 @@ impl RaderAxis {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         output: BufferView<'_>,
+        execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.post.bind_group"),
-            layout: &self.post_bind_group_layout,
+            layout: &execution.post_bind_group_layout,
             entries: &[
-                bind_storage_entry(&scheduler, 0, &self.work_buffer, ElementFormat::ComplexF32)?,
-                bind_storage_entry(&scheduler, 1, &self.x0_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(
+                    &scheduler,
+                    0,
+                    &execution.work_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
+                bind_storage_entry(
+                    &scheduler,
+                    1,
+                    &execution.x0_buffer,
+                    ElementFormat::ComplexF32,
+                )?,
                 bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
                 bind_view_entry(&scheduler, 3, output)?,
                 bind_uniform_entry(4, &self.lines_params_buffer),
@@ -532,10 +724,12 @@ impl RaderAxis {
             label: Some("wgpu_fft.rader.post.pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.post_pipeline);
+        pass.set_pipeline(&execution.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let (x, y, z) =
-            split_workgroups(self.workgroups_tail, max_workgroups_per_dimension(device))?;
+        let (x, y, z) = split_workgroups(
+            execution.workgroups_tail,
+            max_workgroups_per_dimension(device),
+        )?;
         pass.dispatch_workgroups(x, y, z);
         Ok(())
     }
@@ -612,6 +806,50 @@ fn cached_pipeline(
             generate_rader_wgsl_for_key(stage_key)
         })
     }))
+}
+
+fn cached_fused_pipeline(
+    device: &wgpu::Device,
+    key: &ComputePipelineCacheKey,
+    shader_key: &FusedPrimeStageKey,
+) -> wgpu::ComputePipeline {
+    let stable_key = key.stable_key();
+    let pipeline_label = format!("wgpu_fft.rader.fused.pipeline.{stable_key}");
+    let shader_label = format!("wgpu_fft.rader.fused.shader.{stable_key}");
+    with_device_pipeline_cache(device, |cache| {
+        cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
+            generate_fused_rader_wgsl_for_key(shader_key)
+        })
+    })
+}
+
+fn fused_rader_supported(m: usize, limits: &wgpu::Limits) -> bool {
+    fused_rader_supported_by_limits(
+        m,
+        u64::from(limits.max_compute_workgroup_storage_size),
+        limits.max_compute_invocations_per_workgroup,
+        limits.max_compute_workgroup_size_x,
+    )
+}
+
+fn fused_rader_supported_by_limits(
+    m: usize,
+    max_workgroup_storage_bytes: u64,
+    max_invocations_per_workgroup: u32,
+    max_workgroup_size_x: u32,
+) -> bool {
+    if m < FUSED_MIN_CONVOLUTION_LENGTH {
+        return false;
+    }
+    let Some(scratch_bytes) = m.checked_mul(COMPLEX_F32_BYTES as usize) else {
+        return false;
+    };
+    let Some(workgroup_bytes) = scratch_bytes.checked_add(COMPLEX_F32_BYTES as usize) else {
+        return false;
+    };
+    workgroup_bytes as u64 <= max_workgroup_storage_bytes
+        && FUSED_WORKGROUP_SIZE <= max_invocations_per_workgroup
+        && FUSED_WORKGROUP_SIZE <= max_workgroup_size_x
 }
 
 pub(crate) fn rader_permutation(n: usize) -> Result<Vec<u32>> {
@@ -722,6 +960,174 @@ fn bind_view_entry<'a>(
         binding,
         resource: scheduler.storage_binding_resource(&view, ElementFormat::ComplexF32)?,
     })
+}
+
+pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
+    debug_assert_eq!(key.kind, FusedPrimeKind::Rader);
+    let n = key.axis_length;
+    let l = n - 1;
+    let m = key.convolution_length;
+    let m_slot_count = m.div_ceil(key.workgroup_size as usize);
+    let l_slot_count = l.div_ceil(key.workgroup_size as usize);
+    let reduction_capacity = (m - l).min(key.workgroup_size as usize);
+    let reduction_size = 1usize << reduction_capacity.ilog2();
+    let sum_slot_count = l.div_ceil(reduction_size);
+    let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
+    let scale = format_wgsl_f32_roundtrip(key.scale_factor());
+    let inverse_m = format_wgsl_f32_roundtrip(1.0 / m as f32);
+    let forward_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Forward,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_forward",
+    );
+    let inverse_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Inverse,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_inverse",
+    );
+
+    format!(
+        r#"struct Params {{
+  lines: u32,
+  lineOffset: u32,
+  pad0: u32,
+  pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> perm: array<u32>;
+@group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a + b;
+}}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a - b;
+}}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}}
+
+fn twiddle_forward(index: u32) -> vec2<f32> {{
+  return axisTwiddles[index];
+}}
+
+fn twiddle_inverse(index: u32) -> vec2<f32> {{
+  let value: vec2<f32> = axisTwiddles[index];
+  return vec2<f32>(value.x, -value.y);
+}}
+
+const N: u32 = {n}u;
+const L: u32 = {l}u;
+const M: u32 = {m}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const M_SLOT_COUNT: u32 = {m_slot_count}u;
+const L_SLOT_COUNT: u32 = {l_slot_count}u;
+const REDUCTION_SIZE: u32 = {reduction_size}u;
+const SUM_SLOT_COUNT: u32 = {sum_slot_count}u;
+const INVERSE_M: f32 = {inverse_m};
+const SCALE: f32 = {scale};
+
+var<workgroup> scratch: array<vec2<f32>, {m}>;
+var<workgroup> x0Shared: vec2<f32>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let lineLocal: u32 = wgFlat;
+  if (lineLocal >= params.lines) {{
+    return;
+  }}
+
+  let base: u32 = line_base(params.lineOffset + lineLocal);
+  var lineSum: vec2<f32> = vec2<f32>(0.0, 0.0);
+  if (lid.x == 0u) {{
+    x0Shared = input[base];
+    lineSum = x0Shared;
+  }}
+  for (var slot: u32 = 0u; slot < SUM_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * REDUCTION_SIZE;
+    if (lid.x < REDUCTION_SIZE && t < L) {{
+      let value: vec2<f32> = input[base + perm[(L - 1u) - t] * STRIDE];
+      scratch[t] = value;
+      lineSum = lineSum + value;
+    }}
+  }}
+  if (lid.x < REDUCTION_SIZE) {{
+    scratch[L + lid.x] = lineSum;
+  }}
+  workgroupBarrier();
+
+  var reductionStride: u32 = REDUCTION_SIZE / 2u;
+  loop {{
+    if (reductionStride == 0u) {{
+      break;
+    }}
+    if (lid.x < reductionStride) {{
+      scratch[L + lid.x] = scratch[L + lid.x] + scratch[L + lid.x + reductionStride];
+    }}
+    workgroupBarrier();
+    reductionStride = reductionStride / 2u;
+  }}
+  if (lid.x == 0u) {{
+    output[base] = scratch[L] * vec2<f32>(SCALE, SCALE);
+  }}
+  workgroupBarrier();
+
+  for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t >= L && t < M) {{
+      scratch[t] = vec2<f32>(0.0, 0.0);
+    }}
+  }}
+  workgroupBarrier();
+
+{forward_stages}
+  for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t < M) {{
+      scratch[t] = c_mul(scratch[t], bfft[t]);
+    }}
+  }}
+  workgroupBarrier();
+
+{inverse_stages}
+  for (var slot: u32 = 0u; slot < L_SLOT_COUNT; slot = slot + 1u) {{
+    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (t < L) {{
+      var convolution: vec2<f32> = scratch[t] * vec2<f32>(INVERSE_M, INVERSE_M);
+      let wrap: u32 = t + L;
+      if (wrap < M) {{
+        convolution = convolution + scratch[wrap] * vec2<f32>(INVERSE_M, INVERSE_M);
+      }}
+      let value: vec2<f32> = x0Shared + convolution;
+      output[base + perm[t] * STRIDE] = value * vec2<f32>(SCALE, SCALE);
+    }}
+  }}
+}}
+"#,
+        stride = key.stride_complex,
+        workgroup_size = key.workgroup_size,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+    )
 }
 
 pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {
@@ -996,6 +1402,47 @@ fn main({entry_params}) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fused_rader_gate_accounts_for_x0_and_tiny_line_floor() {
+        assert!(fused_rader_supported_by_limits(6000, 48 * 1024, 256, 256));
+        assert!(!fused_rader_supported_by_limits(6000, 16 * 1024, 256, 256));
+        assert!(fused_rader_supported_by_limits(2016, 16 * 1024, 256, 256));
+        assert!(!fused_rader_supported_by_limits(32, 48 * 1024, 256, 256));
+        assert!(!fused_rader_supported_by_limits(6000, 48_007, 256, 256));
+        assert!(!fused_rader_supported_by_limits(6000, 48 * 1024, 255, 256));
+    }
+
+    #[test]
+    fn fused_rader_wgsl_inlines_both_ffts_and_preserves_permutation_contract() {
+        let factors = crate::runtime::factor_supported_length(200).unwrap();
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            2,
+            1,
+            &[3, 101],
+            101,
+            3,
+            200,
+            &factors,
+            FftDirection::Forward,
+            FUSED_WORKGROUP_SIZE,
+            false,
+            1.0,
+        );
+        let wgsl = generate_fused_rader_wgsl_for_key(&key);
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 200>"));
+        assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f32>"));
+        assert!(wgsl.contains("perm[(L - 1u) - t]"));
+        assert!(wgsl.contains("output[base + perm[t] * STRIDE]"));
+        assert!(wgsl.contains("let wrap: u32 = t + L"));
+        assert!(wgsl.contains("fn twiddle_forward"));
+        assert!(wgsl.contains("fn twiddle_inverse"));
+        assert!(wgsl.contains("const INVERSE_M: f32"));
+        assert!(wgsl.contains("let wgFlat: u32"));
+        assert!(!wgsl.contains("sin("));
+        assert!(!wgsl.contains("cos("));
+    }
 
     #[test]
     fn rader_permutation_covers_nonzero_prime_indices() {

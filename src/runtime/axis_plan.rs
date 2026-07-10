@@ -1171,12 +1171,74 @@ fn main({entry_params}) {{
     )
 }
 
+/// Generates an in-place mixed-radix FFT fragment over an existing
+/// `var<workgroup>` array. The caller must declare `N`, `WORKGROUP_SIZE`, the
+/// scratch array, the complex helpers, and the named twiddle lookup function.
+/// Every radix stage writes its results back to scratch and places uniform
+/// workgroup barriers around that writeback.
+pub(crate) fn generate_fused_scratch_fft_stages_wgsl(
+    axis_length: usize,
+    factors: &[usize],
+    direction: FftDirection,
+    workgroup_size: u32,
+    scratch_name: &str,
+    twiddle_fn_name: &str,
+) -> String {
+    debug_assert!(axis_length >= 2);
+    debug_assert!(!factors.is_empty());
+    debug_assert!(factors
+        .iter()
+        .all(|radix| crate::runtime::SUPPORTED_RADICES.contains(radix)));
+    debug_assert_eq!(factors.iter().product::<usize>(), axis_length);
+    debug_assert!(workgroup_size > 0);
+    debug_assert!(!scratch_name.is_empty());
+    debug_assert!(!twiddle_fn_name.is_empty());
+
+    let mut ns = 1usize;
+    let mut stages = String::new();
+    for &radix in factors {
+        ns *= radix;
+        stages.push_str(&generate_in_place_smooth_fft_stage_wgsl(
+            axis_length,
+            radix,
+            ns,
+            direction,
+            workgroup_size,
+            scratch_name,
+            twiddle_fn_name,
+        ));
+    }
+    debug_assert_eq!(ns, axis_length);
+    stages
+}
+
 fn generate_fused_smooth_intermediate_stage_wgsl(
     axis_length: usize,
     radix: usize,
     ns: usize,
     direction: FftDirection,
     workgroup_size: u32,
+) -> String {
+    generate_in_place_smooth_fft_stage_wgsl(
+        axis_length,
+        radix,
+        ns,
+        direction,
+        workgroup_size,
+        "scratch",
+        "twiddle",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_in_place_smooth_fft_stage_wgsl(
+    axis_length: usize,
+    radix: usize,
+    ns: usize,
+    direction: FftDirection,
+    workgroup_size: u32,
+    scratch_name: &str,
+    twiddle_fn_name: &str,
 ) -> String {
     debug_assert_eq!(ns % radix, 0);
     debug_assert_eq!(axis_length % radix, 0);
@@ -1196,7 +1258,14 @@ fn generate_fused_smooth_intermediate_stage_wgsl(
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
-            radix, ns_div_r, n_div_r, n_div_ns, direction, slot,
+            radix,
+            ns_div_r,
+            n_div_r,
+            n_div_ns,
+            direction,
+            slot,
+            scratch_name,
+            twiddle_fn_name,
         );
         computes.push_str(&format!(
             r#"    let unit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
@@ -1210,7 +1279,7 @@ fn generate_fused_smooth_intermediate_stage_wgsl(
         let mut slot_writes = String::new();
         for output in 0..radix {
             slot_writes.push_str(&format!(
-                "      scratch[block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot}] = stageOut_{slot}_{output};\n"
+                "      {scratch_name}[block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot}] = stageOut_{slot}_{output};\n"
             ));
         }
         writes.push_str(&format!(
@@ -1256,7 +1325,7 @@ fn generate_fused_smooth_final_stage_wgsl(
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
-            radix, ns_div_r, n_div_r, n_div_ns, direction, slot,
+            radix, ns_div_r, n_div_r, n_div_ns, direction, slot, "scratch", "twiddle",
         );
         let mut stores = String::new();
         for output in 0..radix {
@@ -1284,6 +1353,7 @@ fn generate_fused_smooth_final_stage_wgsl(
     format!("  {{ // fused smooth radix-{radix} butterflies\n{slots}\n  }}\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_fused_smooth_butterfly_math_wgsl(
     radix: usize,
     ns_div_r: usize,
@@ -1291,21 +1361,23 @@ fn generate_fused_smooth_butterfly_math_wgsl(
     n_div_ns: usize,
     direction: FftDirection,
     slot: usize,
+    scratch_name: &str,
+    twiddle_fn_name: &str,
 ) -> String {
     // Workgroup-scratch form of the same unit-centric Stockham factorization
     // used by the multi-pass generator.
     let mut shader = String::new();
     shader.push_str(&format!(
-        "      let x_{slot}_0: vec2<f32> = scratch[base_{slot}];\n"
+        "      let x_{slot}_0: vec2<f32> = {scratch_name}[base_{slot}];\n"
     ));
     for q in 1..radix {
         if ns_div_r == 1 {
             shader.push_str(&format!(
-                "      let x_{slot}_{q}: vec2<f32> = scratch[base_{slot} + {q}u * {n_div_r}u];\n"
+                "      let x_{slot}_{q}: vec2<f32> = {scratch_name}[base_{slot} + {q}u * {n_div_r}u];\n"
             ));
         } else {
             shader.push_str(&format!(
-                "      let x_{slot}_{q}: vec2<f32> = c_mul(twiddle(j_{slot} * {}u), scratch[base_{slot} + {q}u * {n_div_r}u]);\n",
+                "      let x_{slot}_{q}: vec2<f32> = c_mul({twiddle_fn_name}(j_{slot} * {}u), {scratch_name}[base_{slot} + {q}u * {n_div_r}u]);\n",
                 q * n_div_ns,
             ));
         }
@@ -2016,6 +2088,45 @@ mod tests {
             generate_fused_pow2_stage_wgsl_for_key(&key),
             generate_fused_pow2_stage_wgsl(&config)
         );
+    }
+
+    #[test]
+    fn reusable_in_place_smooth_fft_uses_named_scratch_and_twiddles_for_pow2_schedule() {
+        let factors = [8, 8];
+        let wgsl = generate_fused_scratch_fft_stages_wgsl(
+            64,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_SMOOTH_WORKGROUP_SIZE,
+            "sharedData",
+            "lookupInverseRoot",
+        );
+
+        assert_eq!(wgsl.matches("fused smooth radix-8 butterflies").count(), 2);
+        assert_eq!(wgsl.matches("workgroupBarrier();").count(), 4);
+        assert!(wgsl.contains("sharedData[base_0 + 7u * 8u]"));
+        assert!(wgsl.contains("sharedData[block_0 * 64u + 7u * 8u + j_0]"));
+        assert!(wgsl.contains("lookupInverseRoot(j_0 * 7u)"));
+        assert!(!wgsl.contains("scratch["));
+        assert!(!wgsl.contains("twiddle("));
+    }
+
+    #[test]
+    fn reusable_in_place_smooth_fft_accepts_every_supported_radix() {
+        for &radix in crate::runtime::SUPPORTED_RADICES {
+            let factors = [radix, 2];
+            let wgsl = generate_fused_scratch_fft_stages_wgsl(
+                radix * 2,
+                &factors,
+                FftDirection::Forward,
+                32,
+                "values",
+                "root",
+            );
+
+            assert!(wgsl.contains(&format!("fused smooth radix-{radix} butterflies")));
+            assert_eq!(wgsl.matches("workgroupBarrier();").count(), 4);
+        }
     }
 
     #[test]

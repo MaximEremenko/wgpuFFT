@@ -387,6 +387,10 @@ fn remap_child_stage(
             label,
             range: remap_child_range(range, child_input, child_output, stage_index_base)?,
         },
+        LargeStage::WindowedHelper { label, range } => LargeStage::WindowedHelper {
+            label,
+            range: remap_child_range(range, child_input, child_output, stage_index_base)?,
+        },
         LargeStage::Kernel {
             label,
             input,
@@ -418,6 +422,26 @@ fn remap_child_stage(
             label,
             input: remap_child_range(input, child_input, child_output, stage_index_base)?,
             output: remap_child_range(output, child_input, child_output, stage_index_base)?,
+            work_items,
+        },
+        LargeStage::StripeTranspose {
+            label,
+            input,
+            output,
+            work_items,
+        } => LargeStage::StripeTranspose {
+            label,
+            input: remap_child_range(input, child_input, child_output, stage_index_base)?,
+            output: remap_child_range(output, child_input, child_output, stage_index_base)?,
+            work_items,
+        },
+        LargeStage::Scale {
+            label,
+            range,
+            work_items,
+        } => LargeStage::Scale {
+            label,
+            range: remap_child_range(range, child_input, child_output, stage_index_base)?,
             work_items,
         },
         LargeStage::HostWindow { label, range } => LargeStage::HostWindow {
@@ -463,12 +487,14 @@ fn max_stage_range_bytes(stage: &LargeStage) -> u64 {
 
 fn stage_scratch_bytes(stage: &LargeStage) -> u64 {
     match stage {
-        LargeStage::HelperWindow { range, .. } | LargeStage::HostWindow { range, .. } => {
-            range.size_bytes
-        }
+        LargeStage::HelperWindow { range, .. }
+        | LargeStage::WindowedHelper { range, .. }
+        | LargeStage::Scale { range, .. }
+        | LargeStage::HostWindow { range, .. } => range.size_bytes,
         LargeStage::Kernel { input, output, .. }
         | LargeStage::WindowedKernel { input, output, .. }
-        | LargeStage::TwiddleTranspose { input, output, .. } => {
+        | LargeStage::TwiddleTranspose { input, output, .. }
+        | LargeStage::StripeTranspose { input, output, .. } => {
             input.size_bytes.max(output.size_bytes)
         }
         LargeStage::Copy { src, dst, .. } | LargeStage::GatherScatter { src, dst, .. } => {

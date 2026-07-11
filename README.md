@@ -81,6 +81,9 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   offset, segmented, strided, and segmented+strided logical I/O.
 - Segmented input buffers need `COPY_SRC`; segmented output buffers need
   `COPY_DST`; direct storage windows need `STORAGE`.
+- Rank-2 four-step C2C endpoints currently require input `COPY_SRC` and output
+  `COPY_SRC | COPY_DST`; `STORAGE` enables direct bind windows but is optional
+  because unaligned and segmented windows use GPU-copy staging.
 - Public `FftIoView`/`BufferLayout` compatibility views for strided logical I/O.
 - Fallible `FftPlan::*_with_diagnostics` constructors, `execute_checked`,
   `execute_views`, `execute_io_views`, `execute_logical_views`,
@@ -90,12 +93,16 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
 - Large-route policy classifies normal, large-chunk, and large-out-of-core
   plans, with execution metadata for normal, batch chunk, smooth 1D
   decomposition, axis decomposition, Rader/Bluestein bridge routes, and
-  unsupported out-of-core routes. C2C and real transforms can execute batch
+  GPU-resident rank-2 four-step C2C routes. C2C and real transforms can execute batch
   `LargeChunk` when each chunk fits active binding limits. C2C and real routes
   can also execute binding-safe large decomposition through staged C2C child
   graphs when the required full-temp/helper buffers fit active limits.
-- True host/disk out-of-core execution is not implemented; routes that require
-  it return structured diagnostics with attempted out-of-core metadata.
+- In this API, out-of-core means outside one storage-binding window: data stays
+  GPU-resident. Rank-2 mixed-radix C2C volumes that exceed one binding but fit
+  `maxBufferSize` execute through windowed axis FFTs and stripe transposes.
+  Rank>2 permutation, non-mixed window executors, and segmented full-volume
+  datasets above `maxBufferSize` remain follow-up routes with structured
+  diagnostics where applicable; no host/disk staging is used.
 - Internal shader/module/pipeline cache keyed by generated fused power-of-two,
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.

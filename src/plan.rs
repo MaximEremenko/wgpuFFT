@@ -9,7 +9,9 @@ use crate::runtime::axis_policy::AxisKind;
 use crate::runtime::buffer_view::{BufferView, FftIoView};
 use crate::runtime::c2c::{C2cPlan, C2cRoute};
 use crate::runtime::large_graph::{ElementFormat, LargeExecutionGraph};
-use crate::runtime::large_policy::{LargePolicyLimits, LargeRouteMode, LargeRoutingPolicy};
+use crate::runtime::large_policy::{
+    LargeExecutionKind, LargePolicyLimits, LargeRouteMode, LargeRoutingPolicy,
+};
 use crate::runtime::logical_io::{
     BoundLogicalIo, FftEndpointFormat, FftLogicalLayout, FftLogicalView,
 };
@@ -799,10 +801,21 @@ impl FftPlan {
             )
         });
 
+        let four_step =
+            self.large_routing_policy().execution_kind() == LargeExecutionKind::OutOfCoreFourStep;
         match input_bound {
             Ok(input) => {
-                diagnostics =
-                    add_bound_logical_io_diagnostics(diagnostics, "input", &route, &input, limits);
+                diagnostics = if four_step {
+                    add_four_step_bound_logical_io_diagnostics(
+                        diagnostics,
+                        "input",
+                        &route,
+                        &input,
+                        limits,
+                    )
+                } else {
+                    add_bound_logical_io_diagnostics(diagnostics, "input", &route, &input, limits)
+                };
             }
             Err(error) => {
                 diagnostics = add_logical_io_bind_error_blockers(
@@ -820,13 +833,17 @@ impl FftPlan {
         }
         match output_bound {
             Ok(output) => {
-                diagnostics = add_bound_logical_io_diagnostics(
-                    diagnostics,
-                    "output",
-                    &route,
-                    &output,
-                    limits,
-                );
+                diagnostics = if four_step {
+                    add_four_step_bound_logical_io_diagnostics(
+                        diagnostics,
+                        "output",
+                        &route,
+                        &output,
+                        limits,
+                    )
+                } else {
+                    add_bound_logical_io_diagnostics(diagnostics, "output", &route, &output, limits)
+                };
             }
             Err(error) => {
                 diagnostics = add_logical_io_bind_error_blockers(
@@ -1316,6 +1333,91 @@ fn add_bound_logical_io_diagnostics(
     diagnostics = add_logical_io_alignment_blockers(diagnostics, role, route, io, limits);
     diagnostics = add_logical_io_usage_blockers(diagnostics, role, route, io);
     add_logical_io_limit_blockers(diagnostics, role, route, io, limits)
+}
+
+fn add_four_step_bound_logical_io_diagnostics(
+    mut diagnostics: FftDiagnostics,
+    role: &'static str,
+    route: &str,
+    io: &BoundLogicalIo<'_>,
+    limits: FftDeviceLimits,
+) -> FftDiagnostics {
+    diagnostics = add_logical_io_stages(diagnostics, role, route, io);
+    if !io.is_contiguous() {
+        return diagnostics.with_blocker(
+            FftBlocker::new(
+                FftBlockerKind::Unsupported,
+                "phase-A four-step execution does not yet support strided logical I/O",
+            )
+            .with_route("large-out-of-core")
+            .with_stage(if role == "input" {
+                "input-strided-pack"
+            } else {
+                "output-strided-unpack"
+            })
+            .with_layout(io.layout_kind()),
+        );
+    }
+
+    let required_usage = if role == "input" {
+        wgpu::BufferUsages::COPY_SRC
+    } else {
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
+    };
+    let usage_label = if role == "input" {
+        "COPY_SRC"
+    } else {
+        "COPY_SRC|COPY_DST"
+    };
+    for range in &io.physical_ranges {
+        if range.offset_bytes % 4 != 0 || range.size_bytes % 4 != 0 {
+            diagnostics = diagnostics.with_blocker(
+                FftBlocker::new(
+                    FftBlockerKind::Alignment,
+                    format!(
+                        "{role} four-step copy window is not 4-byte aligned at offset {} with size {}",
+                        range.offset_bytes, range.size_bytes
+                    ),
+                )
+                .with_route("large-out-of-core")
+                .with_stage(format!("{role}-four-step-copy-window"))
+                .with_layout(io.layout_kind())
+                .with_required_bytes(4)
+                .with_actual_bytes(range.offset_bytes.saturating_add(range.size_bytes)),
+            );
+        }
+        if !range.buffer.usage().contains(required_usage) {
+            diagnostics = diagnostics.with_blocker(
+                FftBlocker::new(
+                    FftBlockerKind::BufferUsage,
+                    logical_io_usage_reason(
+                        role,
+                        usage_label,
+                        range.offset_bytes,
+                        range.size_bytes,
+                    ),
+                )
+                .with_route("large-out-of-core")
+                .with_stage(format!("{role}-four-step-copy-window"))
+                .with_layout(io.layout_kind())
+                .with_actual_bytes(range.size_bytes),
+            );
+        }
+        if range.size_bytes > limits.max_buffer_size {
+            diagnostics = diagnostics.with_blocker(
+                FftBlocker::new(
+                    FftBlockerKind::DeviceLimit,
+                    format!("{role} four-step physical range exceeds maxBufferSize"),
+                )
+                .with_route("large-out-of-core")
+                .with_stage(format!("{role}-four-step-copy-window"))
+                .with_layout(io.layout_kind())
+                .with_required_bytes(range.size_bytes)
+                .with_limit_bytes(limits.max_buffer_size),
+            );
+        }
+    }
+    diagnostics
 }
 
 fn add_logical_io_stages(

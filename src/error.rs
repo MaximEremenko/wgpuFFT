@@ -830,8 +830,8 @@ fn out_of_core_diagnostics(reason: &'static str) -> FftDiagnostics {
     let blocker = FftBlocker::new(FftBlockerKind::Route, reason)
         .with_route("large-out-of-core")
         .with_stage("out-of-core-execution")
-        .with_layout("host/disk streaming")
-        .with_helper_buffer("out-of-core-staging");
+        .with_layout("segmented full-volume GPU execution")
+        .with_helper_buffer("segmented-full-volume");
     FftDiagnostics::new(FftRouteSummary {
         transform: "unknown",
         route: "large-out-of-core".to_owned(),
@@ -1805,7 +1805,7 @@ mod tests {
     #[test]
     fn diagnostics_describe_raw_out_of_core_execution_blocker() {
         let diagnostics = FftError::OutOfCoreExecutionUnsupported {
-            reason: "host streaming out-of-core execution is not implemented",
+            reason: "segmented full-volume GPU execution is not implemented",
         }
         .diagnostics();
 
@@ -1826,10 +1826,13 @@ mod tests {
         assert_eq!(blocker.kind, FftBlockerKind::Route);
         assert_eq!(blocker.route.as_deref(), Some("large-out-of-core"));
         assert_eq!(blocker.stage.as_deref(), Some("out-of-core-execution"));
-        assert_eq!(blocker.layout.as_deref(), Some("host/disk streaming"));
+        assert_eq!(
+            blocker.layout.as_deref(),
+            Some("segmented full-volume GPU execution")
+        );
         assert_eq!(
             blocker.helper_buffer.as_deref(),
-            Some("out-of-core-staging")
+            Some("segmented-full-volume")
         );
     }
 

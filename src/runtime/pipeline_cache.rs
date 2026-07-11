@@ -147,6 +147,7 @@ pub(crate) enum PipelineLayoutCacheKey {
     C2cStridedBinaryF32,
     DirectDftInterleavedF32Lut,
     FusedPrimeInterleavedF32,
+    FourStepUnaryF32,
     RealBinaryF32,
     RaderBridgePostF32,
     RaderSumInterleavedF32,
@@ -170,6 +171,7 @@ impl PipelineLayoutCacheKey {
             Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
             Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
             Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
+            Self::FourStepUnaryF32 => "four-step/unary-f32",
             Self::RealBinaryF32 => "real/binary-f32",
             Self::RaderBridgePostF32 => "bridge/rader-post-f32",
             Self::RaderSumInterleavedF32 => "rader/sum/interleaved-f32",
@@ -336,6 +338,7 @@ pub(crate) enum ShaderCacheKey {
     FusedPow2Stage(FusedPow2StageKey),
     FusedSmoothStage(FusedSmoothStageKey),
     FusedPrimeStage(FusedPrimeStageKey),
+    FourStepStage(FourStepStageKey),
     BridgeStage(BridgeStageKey),
     RaderStage(RaderStageKey),
     RealStage(RealStageKey),
@@ -351,6 +354,7 @@ impl ShaderCacheKey {
             Self::FusedPow2Stage(key) => key.stable_key(),
             Self::FusedSmoothStage(key) => key.stable_key(),
             Self::FusedPrimeStage(key) => key.stable_key(),
+            Self::FourStepStage(key) => key.stable_key(),
             Self::BridgeStage(key) => key.stable_key(),
             Self::RaderStage(key) => key.stable_key(),
             Self::RealStage(key) => key.stable_key(),
@@ -379,6 +383,9 @@ impl ShaderCacheKey {
                     crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
                 }
             },
+            Self::FourStepStage(key) => {
+                crate::runtime::four_step::generate_four_step_wgsl_for_key(key)
+            }
             Self::BridgeStage(key) => crate::runtime::c2c::generate_bridge_wgsl_for_key(key),
             Self::RaderStage(key) => crate::runtime::rader_axis::generate_rader_wgsl_for_key(key),
             Self::RealStage(key) => crate::runtime::real::generate_real_wgsl_for_key(key),
@@ -458,6 +465,18 @@ impl ComputePipelineCacheKey {
             layout: PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
             entry_point: String::from("main"),
             shader: ShaderCacheKey::FusedPrimeStage(shader),
+        }
+    }
+
+    pub(crate) fn four_step_stage(shader: FourStepStageKey) -> Self {
+        let layout = match shader.kind {
+            FourStepKernelKind::StripeTranspose => PipelineLayoutCacheKey::C2cSmoothBinaryF32,
+            FourStepKernelKind::Scale => PipelineLayoutCacheKey::FourStepUnaryF32,
+        };
+        Self {
+            layout,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::FourStepStage(shader),
         }
     }
 
@@ -561,6 +580,21 @@ pub(crate) enum RaderKernelKind {
 pub(crate) enum FusedPrimeKind {
     Rader,
     Bluestein,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FourStepKernelKind {
+    StripeTranspose,
+    Scale,
+}
+
+impl FourStepKernelKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StripeTranspose => "stripe-transpose",
+            Self::Scale => "scale",
+        }
+    }
 }
 
 impl FusedPrimeKind {
@@ -688,6 +722,29 @@ impl C2cSmoothKernelKind {
 pub(crate) struct C2cSmoothStageKey {
     pub(crate) kind: C2cSmoothKernelKind,
     pub(crate) workgroup_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FourStepStageKey {
+    pub(crate) kind: FourStepKernelKind,
+    pub(crate) workgroup_size: u32,
+}
+
+impl FourStepStageKey {
+    pub(crate) const fn new(kind: FourStepKernelKind, workgroup_size: u32) -> Self {
+        Self {
+            kind,
+            workgroup_size,
+        }
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        format!(
+            "shader:v1:four-step:{}:workgroup={}",
+            self.kind.as_str(),
+            self.workgroup_size
+        )
+    }
 }
 
 impl C2cSmoothStageKey {
@@ -1329,6 +1386,9 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
             storage_entry(4, true),
             uniform_entry(5),
         ],
+        PipelineLayoutCacheKey::FourStepUnaryF32 => {
+            vec![storage_entry(0, false), uniform_entry(1)]
+        }
         PipelineLayoutCacheKey::BridgeTwoWriteUniformF32 => vec![
             storage_entry(0, false),
             storage_entry(1, false),
@@ -1725,6 +1785,7 @@ mod tests {
             ShaderCacheKey::FusedPow2Stage(_) => unreachable!(),
             ShaderCacheKey::FusedSmoothStage(_) => unreachable!(),
             ShaderCacheKey::FusedPrimeStage(_) => unreachable!(),
+            ShaderCacheKey::FourStepStage(_) => unreachable!(),
             ShaderCacheKey::BridgeStage(_) => unreachable!(),
             ShaderCacheKey::RaderStage(_) => unreachable!(),
             ShaderCacheKey::RealStage(_) => unreachable!(),
@@ -1859,6 +1920,52 @@ mod tests {
             assert_eq!(pipeline.layout, PipelineLayoutCacheKey::C2cSmoothBinaryF32);
             assert!(pipeline.stable_key().contains(expected));
         }
+    }
+
+    #[test]
+    fn four_step_pipeline_keys_are_stable_and_use_typed_layouts() {
+        let transpose = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
+            FourStepKernelKind::StripeTranspose,
+            256,
+        ));
+        assert_eq!(transpose.layout, PipelineLayoutCacheKey::C2cSmoothBinaryF32);
+        assert_eq!(
+            transpose.stable_key(),
+            "pipeline:v1:layout=c2c-smooth/binary-f32:entry=main:shader:v1:four-step:stripe-transpose:workgroup=256"
+        );
+
+        let scale = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
+            FourStepKernelKind::Scale,
+            64,
+        ));
+        assert_eq!(scale.layout, PipelineLayoutCacheKey::FourStepUnaryF32);
+        assert_eq!(
+            scale.stable_key(),
+            "pipeline:v1:layout=four-step/unary-f32:entry=main:shader:v1:four-step:scale:workgroup=64"
+        );
+    }
+
+    #[test]
+    fn four_step_unary_layout_is_read_write_storage_plus_uniform() {
+        let entries = bind_group_layout_entries(PipelineLayoutCacheKey::FourStepUnaryF32);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].binding, 0);
+        assert!(matches!(
+            &entries[0].ty,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                ..
+            }
+        ));
+        assert_eq!(entries[1].binding, 1);
+        assert!(matches!(
+            &entries[1].ty,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                ..
+            }
+        ));
     }
 
     #[test]

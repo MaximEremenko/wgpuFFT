@@ -132,3 +132,74 @@ FFT+iFFT pair. The raw pair samples were 143.4882 ms and 143.9863 ms. Combined
 forward and inverse diagnostics reported 21,474,889,728 bytes of plan-owned
 helper allocations; as in Phase A, this is an allocation inventory rather than
 simultaneous traffic or caller workspace.
+
+## Phase C: windowed Rader and Bluestein axes
+
+Phase C starts from `e08a9d4` and admits Rader and Bluestein axes into the
+rank>=2 four-step route. A fitting prime window reuses the normal rank-1 C2C
+plan. When either the logical line or its smooth convolution line exceeds one
+binding, a `WindowedPrimeBridge` runs the existing pack, convolution FFT,
+pointwise multiply, inverse FFT, and postprocess stages over bounded windows.
+An oversized Rader logical line deliberately selects a Bluestein fallback.
+Planning and encoding both use the componentwise minimum of stored test limits
+and the active device limits.
+
+```powershell
+$env:WGPU_FFT_RUN_GPU_TESTS='1'
+$env:WGPU_BACKEND='vulkan'
+cargo test --release --test gpu_c2c --test gpu_real --test gpu_dispatch_split --test gpu_fused_pow2 --test gpu_accuracy --test gpu_fused_prime --test gpu_four_step -- --nocapture
+
+cargo bench --bench fft_bench -- shape 1009x266112 --batch 1 --adapter "RTX 5090" --runs 2 --iter-cap 1 --wait-timeout-secs 240
+```
+
+### Correctness and routing
+
+Forced-limit equivalence covers Rader `[5, 17, 7]`, batch 3, at a 256-byte
+binding limit; Bluestein `[5, 7, 34]`, batch 2, at 1024 bytes; and the explicit
+oversized-Rader-to-Bluestein fallback `[2, 101, 3]` at 512 bytes. Forward with
+no normalization and inverse with default normalization match both the normal
+route and the `Complex64` oracle. The prime axes are deliberately non-front
+axes, so the tests also verify their exact to-front/from-front permutations.
+Fallback diagnostics retain distinct chirp, bfft, work, FFT, and child-plan
+helpers rather than collapsing equal-sized allocations.
+
+The actual adapter-sized case is `[1009, 266112]`, batch 1. Its
+2,148,056,064-byte volume is 572,420 bytes above the RTX 5090's
+2,147,483,644-byte storage-binding limit and below `maxBufferSize`. It selected
+`large-out-of-core` / `out-of-core-four-step`; axis 0 remained Rader and used
+the fused prime child. Two complex impulses were transformed, and every `k0`
+on output lines `k1 = 0, 1, 266111` matched the analytic `Complex64` result
+within `1e-3` absolute complex error.
+
+All 227 unit tests and the `gpu_c2c`, `gpu_real`, `gpu_dispatch_split`,
+`gpu_fused_pow2`, `gpu_accuracy`, `gpu_fused_prime`, and `gpu_four_step`
+release Vulkan suites passed on the RTX 5090. The accuracy suites remained in
+the established approximately `1e-7` to `2.15e-7` RMS-relative range.
+
+### Performance
+
+| Shape | Batch | Buffer | Runs / pairs per run | Pair time | Graph stages / FFT | Traffic-equivalent passes / FFT | Effective GiB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1009 x 266112 | 1 | 2048.546 MiB | 2 / 1 | **160.07885 +/- 0.05825 ms** | 11 | 15 | 749.830 |
+
+The graph has one fused Rader axis pass, eight smooth-axis Stockham passes,
+and two logical stripe transposes. Each transpose is weighted as gather +
+transpose + scatter, giving `1 + 8 + 2*3 = 15` traffic-equivalent passes and
+`4 * 15 * bufferBytes` per timed FFT+iFFT pair. The raw samples were
+160.1371 ms and 160.0206 ms. Combined forward and inverse diagnostics reported
+25,770,267,680 bytes of partial helper requirements; these are an inventory,
+not simultaneous traffic or caller workspace.
+
+This exact traffic model applies to the measured fused-prime case. A bridge or
+nonfused prime child operates over convolution length `M > N`; the harness now
+labels its integer stage-equivalent bandwidth estimate explicitly instead of
+calling it exact.
+
+### Deferred
+
+- A full logical volume above `maxBufferSize` still needs segmented full-volume
+  execution and returns structured unsupported diagnostics today.
+- Four-step strided logical endpoints and caller-provided workspace reuse remain
+  deferred; the current endpoint copy-usage contract from Phase A is unchanged.
+- Grouped/burst window tuning and a public tuning surface remain follow-up work.
+- No host or disk staging is used by the implemented GPU-resident route.

@@ -856,7 +856,14 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
     } else if execution_kind == "normal" {
         "exact-normal-graph"
     } else if execution_kind == "out-of-core-four-step" {
-        "exact-four-step-traffic-equivalent"
+        if has_expanded_prime_window_stages(diagnostics) {
+            // A non-fused prime window expands its Rader/Bluestein child graph
+            // over convolution length M, so counting each child stage as one
+            // logical N-volume pass is an estimate rather than exact traffic.
+            "estimated-four-step-prime-stage-equivalent"
+        } else {
+            "exact-four-step-traffic-equivalent"
+        }
     } else {
         "estimated-graph"
     };
@@ -865,6 +872,21 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
     let traffic_count = u64::try_from(traffic_count)
         .map_err(|_| input_error("traffic-equivalent pass count does not fit u64"))?;
     Ok((graph_count, traffic_count, method.to_owned()))
+}
+
+fn has_expanded_prime_window_stages(diagnostics: &FftDiagnostics) -> bool {
+    diagnostics.stages().iter().any(|stage| {
+        let prime_window = stage.label.starts_with("four-step-axis")
+            && (stage.label.contains("-windowed-rader")
+                || stage.label.contains("-windowed-bluestein"));
+        prime_window
+            && diagnostics
+                .stages()
+                .iter()
+                .filter(|candidate| candidate.label == stage.label)
+                .count()
+                > 1
+    })
 }
 
 fn ensure_consistent<T>(slot: &mut Option<T>, value: T, name: &str) -> BenchResult<()>

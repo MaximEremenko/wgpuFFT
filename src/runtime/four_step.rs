@@ -7,11 +7,14 @@ use crate::error::{FftError, Result};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
 };
+use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::buffer_view::BufferView;
+use crate::runtime::c2c::{C2cPlan, WindowedPrimeBridge};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
+use crate::runtime::large_bridge::{plan_large_bridge, LargeBridgeRoute};
 use crate::runtime::large_graph::{
-    ElementFormat, LargeExecutionGraph, LargeExecutionPlan, LargeStage, LogicalBufferId,
-    LogicalRange, StageRequirements,
+    ElementFormat, LargeExecutionGraph, LargeExecutionPlan, LargeStage, LargeStageKind,
+    LogicalBufferId, LogicalRange, StageRequirements,
 };
 use crate::runtime::large_policy::{
     plan_out_of_core_windows, LargeFactorSplit, LargePolicyLimits, OutOfCoreAxisWindowPolicyInput,
@@ -75,10 +78,26 @@ struct FourStepAxisStep {
 
 struct AxisWindowPlan {
     windows: Vec<AxisWindowDispatch>,
-    plans: Vec<AxisPlan>,
-    graph_stage_kinds: Vec<AxisStageKind>,
+    plans: Vec<AxisWindowExecutor>,
+    graph_stages: Vec<AxisWindowGraphStage>,
     max_window_bytes: u64,
-    workspace_bytes: Vec<u64>,
+    helper_bytes: Vec<u64>,
+    factor_splits: Vec<LargeFactorSplit>,
+    twiddle_lut_storage_bytes: u64,
+}
+
+enum AxisWindowExecutor {
+    Mixed(AxisPlan),
+    Prime(Box<C2cPlan>),
+    Bridge(Box<WindowedPrimeBridge>),
+}
+
+#[derive(Clone, Copy)]
+enum AxisWindowGraphStage {
+    Mixed(AxisStageKind),
+    Rader,
+    Bluestein,
+    BluesteinFallback,
 }
 
 struct AxisWindowDispatch {
@@ -99,8 +118,8 @@ struct TiledTransposePlan {
 #[derive(Clone, Copy)]
 struct FourStepGraphAxis<'a> {
     axis: usize,
-    stages: &'a [AxisStageKind],
-    workspace_bytes: &'a [u64],
+    stages: &'a [AxisWindowGraphStage],
+    helper_bytes: &'a [u64],
 }
 
 struct ScaleWindowPlan {
@@ -151,10 +170,10 @@ impl FourStepC2cPlan {
                 .checked_mul(dim)
                 .ok_or(FftError::LengthTooLarge { len: usize::MAX })
         })?;
+        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
         let mut axes = Vec::with_capacity(config.axes().len());
-        for &axis in config.axes() {
+        for (&axis, &axis_kind) in config.axes().iter().zip(&axis_kinds) {
             let axis_len = config.shape()[axis];
-            crate::runtime::factor_supported_length(axis_len)?;
             let lines_total = per_batch_complex
                 .checked_div(axis_len)
                 .and_then(|lines| lines.checked_mul(config.batch()))
@@ -164,6 +183,8 @@ impl FourStepC2cPlan {
                 queue,
                 axis_len,
                 lines_total,
+                axis,
+                axis_kind,
                 config,
                 planning_limits,
                 storage_alignment,
@@ -350,8 +371,8 @@ impl FourStepC2cPlan {
             .iter()
             .map(|step| FourStepGraphAxis {
                 axis: step.axis,
-                stages: &step.fft.graph_stage_kinds,
-                workspace_bytes: &step.fft.workspace_bytes,
+                stages: &step.fft.graph_stages,
+                helper_bytes: &step.fft.helper_bytes,
             })
             .collect::<Vec<_>>();
         let graph_plan = build_four_step_graph(
@@ -374,22 +395,15 @@ impl FourStepC2cPlan {
             staging_bytes.extend([bytes, bytes]);
         }
         for step in &axes {
-            staging_bytes.extend(step.fft.workspace_bytes.iter().copied());
+            staging_bytes.extend(step.fft.helper_bytes.iter().copied());
         }
         let factor_splits = axes
             .iter()
-            .map(|step| {
-                let len = config.shape()[step.axis];
-                Ok(LargeFactorSplit {
-                    axis: Some(step.axis),
-                    len: len as u64,
-                    factors: crate::runtime::factor_supported_length(len)?
-                        .into_iter()
-                        .map(|factor| factor as u64)
-                        .collect(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .flat_map(|step| step.fft.factor_splits.iter().cloned())
+            .collect::<Vec<_>>();
+        let child_twiddle_lut_storage_bytes = axes.iter().fold(0u64, |bytes, step| {
+            bytes.saturating_add(step.fft.twiddle_lut_storage_bytes)
+        });
 
         Ok(Self {
             required_buffer_size_bytes,
@@ -408,7 +422,9 @@ impl FourStepC2cPlan {
             graph_plan,
             staging_bytes,
             factor_splits,
-            twiddle_lut_storage_bytes: twiddle_lut_pool.storage_bytes(),
+            twiddle_lut_storage_bytes: twiddle_lut_pool
+                .storage_bytes()
+                .saturating_add(child_twiddle_lut_storage_bytes),
         })
     }
 
@@ -582,6 +598,8 @@ impl AxisWindowPlan {
         queue: &wgpu::Queue,
         axis_len: usize,
         lines_total: usize,
+        axis: usize,
+        axis_kind: AxisKind,
         config: &FftConfig,
         limits: LargePolicyLimits,
         storage_alignment: u64,
@@ -590,20 +608,59 @@ impl AxisWindowPlan {
         let line_bytes = (axis_len as u64)
             .checked_mul(COMPLEX_F32_BYTES)
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-        if line_bytes > limits.max_storage_buffer_binding_size {
-            return Err(FftError::WindowScheduleUnsupported {
-                reason: "four-step axis line exceeds the binding limit",
+        if line_bytes > limits.max_buffer_size {
+            return Err(FftError::HelperBufferTooLarge {
+                helper_buffer: "four-step-axis-line-stage",
                 requested_bytes: line_bytes,
-                max_bind_bytes: limits.max_storage_buffer_binding_size,
+                max_buffer_size: limits.max_buffer_size,
             });
         }
+
+        let line_config = FftConfig::new(axis_len)
+            .with_direction(config.direction())
+            .with_normalization(Normalization::None);
+        let (bridge_route, bridge_plan, use_bridge, window_max_bind) = match axis_kind {
+            AxisKind::Mixed => (None, None, false, limits.max_storage_buffer_binding_size),
+            AxisKind::Rader | AxisKind::Bluestein => {
+                let route = match axis_kind {
+                    AxisKind::Rader if line_bytes > limits.max_storage_buffer_binding_size => {
+                        LargeBridgeRoute::Bluestein
+                    }
+                    AxisKind::Rader => LargeBridgeRoute::Rader,
+                    AxisKind::Bluestein => LargeBridgeRoute::Bluestein,
+                    AxisKind::Mixed => unreachable!(),
+                };
+                let plan = plan_large_bridge(&line_config, route, limits)?;
+                let convolution_line_bytes = plan
+                    .convolution_len()
+                    .checked_mul(COMPLEX_F32_BYTES)
+                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                let bridge = line_bytes > limits.max_storage_buffer_binding_size
+                    || convolution_line_bytes > limits.max_storage_buffer_binding_size;
+                let max_bind = if bridge {
+                    if line_bytes <= limits.max_storage_buffer_binding_size {
+                        line_bytes
+                    } else {
+                        limits.max_storage_buffer_binding_size
+                    }
+                } else {
+                    let max_lines = (limits.max_storage_buffer_binding_size / line_bytes)
+                        .min(limits.max_storage_buffer_binding_size / convolution_line_bytes)
+                        .max(1);
+                    line_bytes
+                        .checked_mul(max_lines)
+                        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?
+                };
+                (Some(route), Some(plan), bridge, max_bind)
+            }
+        };
         let window_plan = plan_out_of_core_windows(OutOfCorePlanInput {
             axis_window: OutOfCoreAxisWindowPolicyInput {
                 axis_len,
                 line_bytes,
                 lines_total,
-                max_bind_bytes: limits.max_storage_buffer_binding_size,
-                axis_kind: crate::runtime::axis_policy::AxisKind::Mixed,
+                max_bind_bytes: window_max_bind,
+                axis_kind,
                 storage_align: storage_alignment,
                 swap_to_2_stage_4_step: 0,
                 swap_to_3_stage_4_step: 0,
@@ -616,53 +673,108 @@ impl AxisWindowPlan {
         let mut plans = Vec::new();
         let mut plan_indices = HashMap::<usize, usize>::new();
         let mut windows = Vec::with_capacity(window_plan.upload_windows.len());
+        let mut graph_stages = Vec::new();
+        let mut helper_bytes = Vec::new();
+        let mut twiddle_lut_storage_bytes = 0u64;
+        let mut executor_factor_splits = None;
         for window in window_plan.upload_windows {
             let plan_index = if let Some(&index) = plan_indices.get(&window.line_count) {
                 index
             } else {
                 let index = plans.len();
-                let plan = AxisPlan::new_with_twiddle_lut_pool(
-                    device,
-                    queue,
-                    AxisPlanConfig {
-                        shape: vec![axis_len],
-                        axes: vec![0],
-                        batch: window.line_count,
-                        direction: config.direction(),
-                        normalization: Normalization::None,
-                        scale_override_bits: Some(1.0f32.to_bits()),
-                        layout: AxisLayout::Interleaved,
-                        precision: AxisPrecision::F32,
-                    },
-                    twiddle_lut_pool,
-                )?;
+                let plan = match axis_kind {
+                    AxisKind::Mixed => {
+                        AxisWindowExecutor::Mixed(AxisPlan::new_with_twiddle_lut_pool(
+                            device,
+                            queue,
+                            AxisPlanConfig {
+                                shape: vec![axis_len],
+                                axes: vec![0],
+                                batch: window.line_count,
+                                direction: config.direction(),
+                                normalization: Normalization::None,
+                                scale_override_bits: Some(1.0f32.to_bits()),
+                                layout: AxisLayout::Interleaved,
+                                precision: AxisPrecision::F32,
+                            },
+                            twiddle_lut_pool,
+                        )?)
+                    }
+                    AxisKind::Rader | AxisKind::Bluestein if use_bridge => {
+                        debug_assert_eq!(window.line_count, 1);
+                        AxisWindowExecutor::Bridge(Box::new(WindowedPrimeBridge::new(
+                            device,
+                            queue,
+                            &line_config,
+                            bridge_route.expect("a prime bridge has a route"),
+                            limits,
+                        )?))
+                    }
+                    AxisKind::Rader | AxisKind::Bluestein => {
+                        let child_config = line_config.clone().with_batch(window.line_count);
+                        AxisWindowExecutor::Prime(Box::new(C2cPlan::new_with_large_policy_limits(
+                            device,
+                            queue,
+                            child_config,
+                            Some(limits),
+                        )?))
+                    }
+                };
+                let metadata = axis_window_executor_metadata(&plan, bridge_route, axis_kind)?;
+                if let AxisWindowExecutor::Bridge(plan) = &plan {
+                    executor_factor_splits = Some(plan.factor_splits().to_vec());
+                }
+                if graph_stages.is_empty() {
+                    graph_stages = metadata.graph_stages;
+                }
+                helper_bytes.extend(metadata.helper_bytes);
+                twiddle_lut_storage_bytes =
+                    twiddle_lut_storage_bytes.saturating_add(metadata.twiddle_lut_storage_bytes);
                 plans.push(plan);
                 plan_indices.insert(window.line_count, index);
                 index
             };
             windows.push(AxisWindowDispatch { window, plan_index });
         }
-        let graph_stage_kinds = plans
-            .first()
-            .map(AxisPlan::graph_stage_kinds)
-            .unwrap_or_default();
-        let workspace_bytes = plans
-            .iter()
-            .map(AxisPlan::workspace_size_bytes)
-            .filter(|&bytes| bytes > 0)
-            .collect();
         let max_window_bytes = windows
             .iter()
             .map(|dispatch| dispatch.window.byte_size)
             .max()
             .ok_or(FftError::ZeroLength)?;
 
+        let factor_splits = match axis_kind {
+            AxisKind::Mixed => vec![LargeFactorSplit {
+                axis: Some(axis),
+                len: axis_len as u64,
+                factors: crate::runtime::factor_supported_length(axis_len)?
+                    .into_iter()
+                    .map(|factor| factor as u64)
+                    .collect(),
+            }],
+            AxisKind::Rader | AxisKind::Bluestein => executor_factor_splits
+                .unwrap_or_else(|| {
+                    bridge_plan
+                        .expect("a non-mixed axis has bridge metadata")
+                        .factor_splits()
+                })
+                .into_iter()
+                .map(|mut split| {
+                    if split.axis.is_some() {
+                        split.axis = Some(axis);
+                    }
+                    split
+                })
+                .collect(),
+        };
+
         Ok(Self {
             windows,
             plans,
-            graph_stage_kinds,
+            graph_stages,
             max_window_bytes,
-            workspace_bytes,
+            helper_bytes,
+            factor_splits,
+            twiddle_lut_storage_bytes,
         })
     }
 
@@ -727,6 +839,136 @@ impl AxisWindowPlan {
         }
         Ok(())
     }
+}
+
+struct AxisWindowExecutorMetadata {
+    graph_stages: Vec<AxisWindowGraphStage>,
+    helper_bytes: Vec<u64>,
+    twiddle_lut_storage_bytes: u64,
+}
+
+impl AxisWindowExecutor {
+    fn execute_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
+        match self {
+            Self::Mixed(plan) => plan.execute_views(device, encoder, input, output),
+            Self::Prime(plan) => plan.execute_views(device, encoder, input, output),
+            Self::Bridge(plan) => plan.execute_views(device, encoder, input, output),
+        }
+    }
+}
+
+fn axis_window_executor_metadata(
+    plan: &AxisWindowExecutor,
+    bridge_route: Option<LargeBridgeRoute>,
+    axis_kind: AxisKind,
+) -> Result<AxisWindowExecutorMetadata> {
+    match plan {
+        AxisWindowExecutor::Mixed(plan) => Ok(AxisWindowExecutorMetadata {
+            graph_stages: plan
+                .graph_stage_kinds()
+                .into_iter()
+                .map(AxisWindowGraphStage::Mixed)
+                .collect(),
+            helper_bytes: [plan.workspace_size_bytes()]
+                .into_iter()
+                .filter(|&bytes| bytes > 0)
+                .collect(),
+            twiddle_lut_storage_bytes: 0,
+        }),
+        AxisWindowExecutor::Prime(plan) => {
+            let graph = plan.execution_graph()?;
+            Ok(AxisWindowExecutorMetadata {
+                graph_stages: prime_graph_stages(
+                    operational_stage_count(&graph),
+                    bridge_route,
+                    axis_kind,
+                )?,
+                helper_bytes: owned_graph_helper_bytes(&graph),
+                twiddle_lut_storage_bytes: plan.twiddle_lut_storage_bytes(),
+            })
+        }
+        AxisWindowExecutor::Bridge(plan) => Ok(AxisWindowExecutorMetadata {
+            graph_stages: prime_graph_stages(
+                operational_stage_count(plan.execution_graph()),
+                bridge_route,
+                axis_kind,
+            )?,
+            helper_bytes: owned_graph_helper_bytes(plan.execution_graph()),
+            twiddle_lut_storage_bytes: plan.twiddle_lut_storage_bytes(),
+        }),
+    }
+}
+
+fn operational_stage_count(graph: &LargeExecutionGraph) -> usize {
+    graph
+        .stages()
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.kind(),
+                LargeStageKind::Copy
+                    | LargeStageKind::GatherScatter
+                    | LargeStageKind::Kernel
+                    | LargeStageKind::WindowedKernel
+                    | LargeStageKind::TwiddleTranspose
+                    | LargeStageKind::StripeTranspose
+                    | LargeStageKind::Permutation
+                    | LargeStageKind::Scale
+            )
+        })
+        .count()
+}
+
+fn owned_graph_helper_bytes(graph: &LargeExecutionGraph) -> Vec<u64> {
+    graph
+        .stages()
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.kind(),
+                LargeStageKind::HelperWindow | LargeStageKind::WindowedHelper
+            )
+        })
+        .flat_map(LargeStage::ranges)
+        .map(|range| range.size_bytes)
+        .collect()
+}
+
+fn prime_graph_stages(
+    count: usize,
+    bridge_route: Option<LargeBridgeRoute>,
+    axis_kind: AxisKind,
+) -> Result<Vec<AxisWindowGraphStage>> {
+    if count == 0 {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage: "four-step-prime-window",
+            reason: "prime window child graph contains no executable stages",
+        });
+    }
+    let stage = match bridge_route {
+        Some(LargeBridgeRoute::Rader) => AxisWindowGraphStage::Rader,
+        Some(LargeBridgeRoute::Bluestein) if axis_kind == AxisKind::Rader => {
+            AxisWindowGraphStage::BluesteinFallback
+        }
+        Some(LargeBridgeRoute::Bluestein) => AxisWindowGraphStage::Bluestein,
+        None => match axis_kind {
+            AxisKind::Rader => AxisWindowGraphStage::Rader,
+            AxisKind::Bluestein => AxisWindowGraphStage::Bluestein,
+            AxisKind::Mixed => {
+                return Err(FftError::LargeGraphStageUnsupported {
+                    stage: "four-step-prime-window",
+                    reason: "mixed-radix window is missing its stage metadata",
+                });
+            }
+        },
+    };
+    Ok(vec![stage; count])
 }
 
 impl TiledTransposePlan {
@@ -1233,18 +1475,18 @@ fn build_four_step_graph(
     }
     let mut workspace_stage_index = 4u32;
     for graph_axis in axes {
-        for (index, &workspace_bytes) in graph_axis.workspace_bytes.iter().enumerate() {
+        for (index, &helper_bytes) in graph_axis.helper_bytes.iter().enumerate() {
             graph.push_stage(
                 LargeStage::WindowedHelper {
                     label: four_step_axis_workspace_label(graph_axis.axis, index),
                     range: LogicalRange::new(
                         LogicalBufferId::Stage(workspace_stage_index),
                         0,
-                        workspace_bytes,
+                        helper_bytes,
                         ElementFormat::ComplexF32,
                     )?,
                 },
-                requirements(workspace_bytes)?,
+                requirements(helper_bytes)?,
             )?;
             workspace_stage_index = workspace_stage_index
                 .checked_add(1)
@@ -1410,20 +1652,64 @@ fn push_four_step_permutation_stage(
     }
 }
 
-fn four_step_axis_stage_label(axis: usize, kind: AxisStageKind) -> &'static str {
+fn four_step_axis_stage_label(axis: usize, kind: AxisWindowGraphStage) -> &'static str {
     match (axis, kind) {
-        (0, AxisStageKind::Stockham { .. }) => "four-step-axis0-windowed-stockham-stage",
-        (0, AxisStageKind::FusedPow2 { .. }) => "four-step-axis0-windowed-fused-pow2",
-        (0, AxisStageKind::FusedSmooth { .. }) => "four-step-axis0-windowed-fused-smooth",
-        (1, AxisStageKind::Stockham { .. }) => "four-step-axis1-windowed-stockham-stage",
-        (1, AxisStageKind::FusedPow2 { .. }) => "four-step-axis1-windowed-fused-pow2",
-        (1, AxisStageKind::FusedSmooth { .. }) => "four-step-axis1-windowed-fused-smooth",
-        (2, AxisStageKind::Stockham { .. }) => "four-step-axis2-windowed-stockham-stage",
-        (2, AxisStageKind::FusedPow2 { .. }) => "four-step-axis2-windowed-fused-pow2",
-        (2, AxisStageKind::FusedSmooth { .. }) => "four-step-axis2-windowed-fused-smooth",
-        (3, AxisStageKind::Stockham { .. }) => "four-step-axis3-windowed-stockham-stage",
-        (3, AxisStageKind::FusedPow2 { .. }) => "four-step-axis3-windowed-fused-pow2",
-        (3, AxisStageKind::FusedSmooth { .. }) => "four-step-axis3-windowed-fused-smooth",
+        (0, AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { .. })) => {
+            "four-step-axis0-windowed-stockham-stage"
+        }
+        (0, AxisWindowGraphStage::Mixed(AxisStageKind::FusedPow2 { .. })) => {
+            "four-step-axis0-windowed-fused-pow2"
+        }
+        (0, AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth { .. })) => {
+            "four-step-axis0-windowed-fused-smooth"
+        }
+        (1, AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { .. })) => {
+            "four-step-axis1-windowed-stockham-stage"
+        }
+        (1, AxisWindowGraphStage::Mixed(AxisStageKind::FusedPow2 { .. })) => {
+            "four-step-axis1-windowed-fused-pow2"
+        }
+        (1, AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth { .. })) => {
+            "four-step-axis1-windowed-fused-smooth"
+        }
+        (2, AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { .. })) => {
+            "four-step-axis2-windowed-stockham-stage"
+        }
+        (2, AxisWindowGraphStage::Mixed(AxisStageKind::FusedPow2 { .. })) => {
+            "four-step-axis2-windowed-fused-pow2"
+        }
+        (2, AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth { .. })) => {
+            "four-step-axis2-windowed-fused-smooth"
+        }
+        (3, AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { .. })) => {
+            "four-step-axis3-windowed-stockham-stage"
+        }
+        (3, AxisWindowGraphStage::Mixed(AxisStageKind::FusedPow2 { .. })) => {
+            "four-step-axis3-windowed-fused-pow2"
+        }
+        (3, AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth { .. })) => {
+            "four-step-axis3-windowed-fused-smooth"
+        }
+        (0, AxisWindowGraphStage::Rader) => "four-step-axis0-windowed-rader",
+        (1, AxisWindowGraphStage::Rader) => "four-step-axis1-windowed-rader",
+        (2, AxisWindowGraphStage::Rader) => "four-step-axis2-windowed-rader",
+        (3, AxisWindowGraphStage::Rader) => "four-step-axis3-windowed-rader",
+        (0, AxisWindowGraphStage::Bluestein) => "four-step-axis0-windowed-bluestein",
+        (1, AxisWindowGraphStage::Bluestein) => "four-step-axis1-windowed-bluestein",
+        (2, AxisWindowGraphStage::Bluestein) => "four-step-axis2-windowed-bluestein",
+        (3, AxisWindowGraphStage::Bluestein) => "four-step-axis3-windowed-bluestein",
+        (0, AxisWindowGraphStage::BluesteinFallback) => {
+            "four-step-axis0-windowed-bluestein-fallback"
+        }
+        (1, AxisWindowGraphStage::BluesteinFallback) => {
+            "four-step-axis1-windowed-bluestein-fallback"
+        }
+        (2, AxisWindowGraphStage::BluesteinFallback) => {
+            "four-step-axis2-windowed-bluestein-fallback"
+        }
+        (3, AxisWindowGraphStage::BluesteinFallback) => {
+            "four-step-axis3-windowed-bluestein-fallback"
+        }
         _ => "four-step-axis-windowed-stage",
     }
 }
@@ -1575,21 +1861,23 @@ mod tests {
 
     #[test]
     fn graph_reports_logical_passes_and_every_owned_workspace() {
-        let axis0_stages = [AxisStageKind::FusedSmooth { axis_length: 15 }];
+        let axis0_stages = [AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth {
+            axis_length: 15,
+        })];
         let axis1_stages = [
-            AxisStageKind::Stockham { radix: 8, ns: 8 },
-            AxisStageKind::Stockham { radix: 2, ns: 16 },
+            AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { radix: 8, ns: 8 }),
+            AxisWindowGraphStage::Mixed(AxisStageKind::Stockham { radix: 2, ns: 16 }),
         ];
         let axes = [
             FourStepGraphAxis {
                 axis: 0,
                 stages: &axis0_stages,
-                workspace_bytes: &[128],
+                helper_bytes: &[128],
             },
             FourStepGraphAxis {
                 axis: 1,
                 stages: &axis1_stages,
-                workspace_bytes: &[1024, 64],
+                helper_bytes: &[1024, 64],
             },
         ];
         let graph = build_four_step_graph(
@@ -1653,22 +1941,24 @@ mod tests {
 
     #[test]
     fn rank3_graph_reports_permutations_and_final_copy() {
-        let stages = [AxisStageKind::FusedSmooth { axis_length: 9 }];
+        let stages = [AxisWindowGraphStage::Mixed(AxisStageKind::FusedSmooth {
+            axis_length: 9,
+        })];
         let axes = [
             FourStepGraphAxis {
                 axis: 0,
                 stages: &stages,
-                workspace_bytes: &[],
+                helper_bytes: &[],
             },
             FourStepGraphAxis {
                 axis: 1,
                 stages: &stages,
-                workspace_bytes: &[],
+                helper_bytes: &[],
             },
             FourStepGraphAxis {
                 axis: 2,
                 stages: &stages,
-                workspace_bytes: &[],
+                helper_bytes: &[],
             },
         ];
         let graph = build_four_step_graph(

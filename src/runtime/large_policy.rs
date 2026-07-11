@@ -1,5 +1,5 @@
 use crate::error::{FftError, Result};
-use crate::runtime::axis_policy::AxisKind;
+use crate::runtime::axis_policy::{next_power_of_two_at_least, next_smooth_at_least, AxisKind};
 
 const COMPLEX_F32_BYTES: u64 = 8;
 
@@ -319,6 +319,13 @@ pub fn resolve_large_routing_policy(
         .is_some_and(|supported| supported.iter().any(|value| !*value))
     {
         push_unique(&mut reason_codes, "axis-line-unsupported");
+        if input.allow_non_mixed_bounded_slicing
+            && input.axis_kinds.is_some_and(|kinds| {
+                supported_non_mixed_axis_failed(kinds, axis_supported.as_deref())
+            })
+        {
+            push_unique(&mut reason_codes, "axis-window-resources-unsupported");
+        }
     }
 
     let out_of_core_eligible = input.allow_out_of_core
@@ -613,7 +620,13 @@ fn evaluate_axis_support(
                 AxisKind::Rader | AxisKind::Bluestein => {
                     let line_bytes = line_bytes_for_axis_len(len).unwrap_or(u64::MAX);
                     if allow_non_mixed_bounded_slicing {
-                        line_bytes <= max_buffer_size
+                        non_mixed_axis_window_supported(
+                            kind,
+                            len,
+                            line_bytes,
+                            max_bind_bytes,
+                            max_buffer_size,
+                        )
                     } else {
                         line_bytes <= max_bind_bytes
                     }
@@ -621,6 +634,63 @@ fn evaluate_axis_support(
             })
             .collect(),
     )
+}
+
+fn supported_non_mixed_axis_failed(
+    axis_kinds: &[AxisKind],
+    axis_supported: Option<&[bool]>,
+) -> bool {
+    let Some(axis_supported) = axis_supported else {
+        return false;
+    };
+    axis_kinds
+        .iter()
+        .zip(axis_supported)
+        .any(|(&kind, &supported)| kind != AxisKind::Mixed && !supported)
+}
+
+fn non_mixed_axis_window_supported(
+    kind: AxisKind,
+    axis_len: usize,
+    line_bytes: u64,
+    max_bind_bytes: u64,
+    max_buffer_size: u64,
+) -> bool {
+    if line_bytes > max_buffer_size {
+        return false;
+    }
+
+    // The bounded bridge can slice the logical line itself. An oversized Rader
+    // line deliberately uses Bluestein, matching the reference executor, so no
+    // Rader kernel ever needs a full-line binding. The convolution remains a
+    // smooth child FFT; its bridge chooses either direct bindings or the
+    // existing smooth decomposition. Every full helper must fit maxBuffer.
+    let effective_kind = if kind == AxisKind::Rader && line_bytes > max_bind_bytes {
+        AxisKind::Bluestein
+    } else {
+        kind
+    };
+    let Some(convolution_len) = non_mixed_convolution_len(effective_kind, axis_len) else {
+        return false;
+    };
+    let Ok(convolution_bytes) = line_bytes_for_axis_len(convolution_len) else {
+        return false;
+    };
+    convolution_bytes <= max_buffer_size
+}
+
+fn non_mixed_convolution_len(kind: AxisKind, axis_len: usize) -> Option<usize> {
+    let minimum = match kind {
+        AxisKind::Rader => axis_len.checked_sub(1)?.checked_mul(2)?.checked_sub(1)?,
+        AxisKind::Bluestein => axis_len.checked_mul(2)?.checked_sub(1)?,
+        AxisKind::Mixed => return None,
+    };
+    let smooth = next_smooth_at_least(minimum);
+    if kind == AxisKind::Rader && crate::runtime::factor_supported_length(smooth).is_err() {
+        Some(next_power_of_two_at_least(minimum))
+    } else {
+        Some(smooth)
+    }
 }
 
 fn can_axis_len_fit_or_two_step(
@@ -631,11 +701,11 @@ fn can_axis_len_fit_or_two_step(
     let Ok(line_bytes) = line_bytes_for_axis_len(axis_len) else {
         return false;
     };
-    if line_bytes <= max_bind_bytes {
-        return true;
-    }
     if line_bytes > max_buffer_size {
         return false;
+    }
+    if line_bytes <= max_bind_bytes {
+        return true;
     }
 
     let max_axis_elems = (max_bind_bytes / COMPLEX_F32_BYTES) as usize;
@@ -853,6 +923,95 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn out_of_core_accepts_fitting_windowed_rader_axis_resources() {
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 256,
+            max_buffer_size: 1024,
+        };
+        let policy = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits,
+            required_binding_bytes: &[4096],
+            line_bytes: &[136, 40],
+            axis_kinds: Some(&[AxisKind::Rader, AxisKind::Mixed]),
+            axis_lengths: Some(&[17, 5]),
+            allow_non_mixed_bounded_slicing: true,
+            allow_out_of_core: true,
+            rank: 2,
+            bytes_per_batch: Some(680),
+            ..LargeRoutingPolicyInput::new(limits, &[])
+        })
+        .unwrap();
+
+        assert_eq!(policy.axis_supported.as_deref(), Some(&[true, true][..]));
+        assert!(policy.out_of_core_eligible);
+        assert_eq!(policy.route_mode, LargeRouteMode::LargeOutOfCore);
+    }
+
+    #[test]
+    fn out_of_core_accepts_bluestein_line_and_decomposed_convolution_windows() {
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 256,
+            max_buffer_size: 1024,
+        };
+        let policy = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits,
+            required_binding_bytes: &[4096],
+            line_bytes: &[272, 40],
+            axis_kinds: Some(&[AxisKind::Bluestein, AxisKind::Mixed]),
+            axis_lengths: Some(&[34, 5]),
+            allow_non_mixed_bounded_slicing: true,
+            allow_out_of_core: true,
+            rank: 2,
+            bytes_per_batch: Some(1360),
+            ..LargeRoutingPolicyInput::new(limits, &[])
+        })
+        .unwrap();
+
+        // N=34 needs 272 bytes and its M=70 convolution needs 560 bytes.
+        // Both exceed one binding, but the line bridge plus a 5x14 smooth child
+        // keep every binding bounded while each full helper fits maxBuffer.
+        assert!(policy.oversized_line_mode);
+        assert_eq!(policy.axis_supported.as_deref(), Some(&[true, true][..]));
+        assert!(policy.out_of_core_eligible);
+        assert_eq!(policy.route_mode, LargeRouteMode::LargeOutOfCore);
+    }
+
+    #[test]
+    fn out_of_core_rejects_non_mixed_helpers_above_max_buffer_structurally() {
+        let limits = LargePolicyLimits {
+            max_storage_buffer_binding_size: 128,
+            max_buffer_size: 260,
+        };
+        let error = resolve_large_routing_policy(LargeRoutingPolicyInput {
+            limits,
+            required_binding_bytes: &[4096],
+            line_bytes: &[136, 40],
+            axis_kinds: Some(&[AxisKind::Rader, AxisKind::Mixed]),
+            axis_lengths: Some(&[17, 5]),
+            allow_non_mixed_bounded_slicing: true,
+            allow_out_of_core: true,
+            rank: 2,
+            bytes_per_batch: Some(680),
+            ..LargeRoutingPolicyInput::new(limits, &[])
+        })
+        .unwrap_err();
+
+        // The oversized Rader line deliberately falls back to Bluestein. Its
+        // M=33 convolution helper is 264 bytes, just above maxBuffer=260.
+        let FftError::LargeRouteUnsupported {
+            route_mode,
+            reason_codes,
+        } = error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(route_mode, "large-out-of-core");
+        assert!(reason_codes.contains(&"axis-line-unsupported"));
+        assert!(reason_codes.contains(&"axis-window-resources-unsupported"));
+        assert!(reason_codes.contains(&"out-of-core-ineligible"));
     }
 
     #[test]

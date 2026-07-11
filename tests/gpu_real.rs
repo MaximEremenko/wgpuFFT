@@ -204,10 +204,10 @@ async fn run_gpu_case() {
         ViewMode::Direct,
     );
     for config in [
-        FftConfig::new_nd([17, 4])
+        FftConfig::new_nd([17, 64])
             .with_batch(2)
             .with_normalization(Normalization::None),
-        FftConfig::new_nd([34, 4])
+        FftConfig::new_nd([34, 64])
             .with_batch(2)
             .with_normalization(Normalization::None),
     ] {
@@ -224,7 +224,7 @@ async fn run_gpu_case() {
             ViewMode::Direct,
         );
     }
-    let segmented_strided_large_config = FftConfig::new_nd([17, 4])
+    let segmented_strided_large_config = FftConfig::new_nd([17, 64])
         .with_batch(2)
         .with_normalization(Normalization::None);
     run_r2c_segmented_strided_logical_case(

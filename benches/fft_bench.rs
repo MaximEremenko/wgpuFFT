@@ -812,19 +812,19 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
                     | "permutation"
                     | "stripe-transpose"
                     | "scale"
-            )
+            ) || (stage.kind == "copy" && stage.label == "four-step-final-copy")
         })
         .count();
     let mut traffic_count: usize = diagnostics
         .stages()
         .iter()
         .map(|stage| match stage.kind.as_str() {
-            // The rank-2 stripe route gathers into compact storage, runs the
-            // transpose kernel, then scatters back: three full-volume
-            // read/write traffic passes per logical transpose.
-            "stripe-transpose" => 3usize,
-            "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose"
-            | "permutation" | "scale" => 1,
+            // Windowed transposes and generic axis permutations gather into
+            // compact storage, run one kernel, then scatter back: three
+            // full-volume read/write traffic passes per logical graph stage.
+            "stripe-transpose" | "permutation" => 3usize,
+            "copy" if stage.label == "four-step-final-copy" => 1,
+            "kernel" | "windowed-kernel" | "gather-scatter" | "twiddle-transpose" | "scale" => 1,
             _ => 0,
         })
         .sum();

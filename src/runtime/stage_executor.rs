@@ -264,6 +264,7 @@ fn stage_range_layout(stage: &LargeStage) -> &'static str {
         | LargeStage::WindowedKernel { .. }
         | LargeStage::TwiddleTranspose { .. }
         | LargeStage::StripeTranspose { .. }
+        | LargeStage::Permutation { .. }
         | LargeStage::Scale { .. } => "logical range",
     }
 }
@@ -405,6 +406,34 @@ mod tests {
         );
         assert_eq!(blocker.required_bytes, Some(128));
         assert_eq!(blocker.limit_bytes, Some(64));
+    }
+
+    #[test]
+    fn permutation_ranges_are_windowed_below_max_buffer() {
+        let build_requirements = requirements(256);
+        let scheduler = scheduler(64);
+        let executor = StageExecutor::new(&scheduler);
+        let mut graph = LargeExecutionGraph::new("permutation-window");
+        let input =
+            LogicalRange::new(LogicalBufferId::Input, 0, 128, ElementFormat::ComplexF32).unwrap();
+        let output =
+            LogicalRange::new(LogicalBufferId::Output, 0, 128, ElementFormat::ComplexF32).unwrap();
+        graph
+            .push_stage(
+                LargeStage::Permutation {
+                    label: "four-step-permute-axis-to-front",
+                    input,
+                    output,
+                    work_items: 16,
+                },
+                build_requirements,
+            )
+            .unwrap();
+
+        executor.validate_graph(&graph).unwrap();
+        assert!(executor
+            .graph_blockers("large-out-of-core", &graph)
+            .is_empty());
     }
 
     #[test]

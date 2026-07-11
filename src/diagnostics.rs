@@ -1,4 +1,6 @@
-use crate::runtime::large_graph::{ElementFormat, LargeExecutionGraph, LargeStage, LargeStageKind};
+use crate::runtime::large_graph::{
+    ElementFormat, LargeExecutionGraph, LargeStage, LargeStageKind, LogicalBufferId,
+};
 use crate::runtime::large_policy::{LargeExecutionKind, LargeRouteMode, LargeRoutingPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,7 +449,7 @@ pub(crate) fn stage_summaries_from_graph(
 pub(crate) fn helper_buffer_requirements_from_graph(
     graph: &LargeExecutionGraph,
 ) -> Vec<FftBufferRequirement> {
-    let mut requirements: Vec<FftBufferRequirement> = Vec::new();
+    let mut requirements: Vec<(LogicalBufferId, FftBufferRequirement)> = Vec::new();
     for stage in graph.stages() {
         let (label, range) = match stage {
             LargeStage::HelperWindow { label, range }
@@ -456,16 +458,21 @@ pub(crate) fn helper_buffer_requirements_from_graph(
         };
         let role = format!("helper:{label}");
         let format = element_format_label(range.format);
-        if let Some(existing) = requirements
-            .iter_mut()
-            .find(|requirement| requirement.role == role && requirement.format == format)
-        {
-            existing.required_bytes = existing.required_bytes.max(range.size_bytes);
+        if let Some(existing) = requirements.iter_mut().find(|(buffer, requirement)| {
+            *buffer == range.buffer && requirement.role == role && requirement.format == format
+        }) {
+            existing.1.required_bytes = existing.1.required_bytes.max(range.size_bytes);
         } else {
-            requirements.push(FftBufferRequirement::new(role, range.size_bytes, format));
+            requirements.push((
+                range.buffer,
+                FftBufferRequirement::new(role, range.size_bytes, format),
+            ));
         }
     }
     requirements
+        .into_iter()
+        .map(|(_, requirement)| requirement)
+        .collect()
 }
 
 pub(crate) fn stage_route_for_label(label: &str, default_route: &str) -> String {
@@ -521,6 +528,7 @@ fn stage_kind_label(kind: LargeStageKind) -> &'static str {
         LargeStageKind::WindowedKernel => "windowed-kernel",
         LargeStageKind::TwiddleTranspose => "twiddle-transpose",
         LargeStageKind::StripeTranspose => "stripe-transpose",
+        LargeStageKind::Permutation => "permutation",
         LargeStageKind::Scale => "scale",
         LargeStageKind::HostWindow => "host-window",
     }
@@ -553,6 +561,12 @@ fn stage_required_bytes(stage: &LargeStage) -> Option<u64> {
             ..
         }
         | LargeStage::StripeTranspose {
+            input,
+            output,
+            work_items,
+            ..
+        }
+        | LargeStage::Permutation {
             input,
             output,
             work_items,
@@ -672,6 +686,42 @@ mod tests {
     }
 
     #[test]
+    fn helper_requirements_keep_distinct_buffers_with_generic_labels() {
+        let mut graph = LargeExecutionGraph::new("generic-axis-workspaces");
+        for (index, size) in [(4u32, 128u64), (5, 64)] {
+            graph
+                .push_stage(
+                    LargeStage::WindowedHelper {
+                        label: "four-step-axis-child-workspace",
+                        range: LogicalRange::new(
+                            LogicalBufferId::Stage(index),
+                            0,
+                            size,
+                            ElementFormat::ComplexF32,
+                        )
+                        .unwrap(),
+                    },
+                    StageRequirements::new(64, 128, 1, 4, size).unwrap(),
+                )
+                .unwrap();
+        }
+
+        let requirements = helper_buffer_requirements_from_graph(&graph);
+        let generic = requirements
+            .iter()
+            .filter(|requirement| requirement.role == "helper:four-step-axis-child-workspace")
+            .collect::<Vec<_>>();
+        assert_eq!(generic.len(), 2);
+        assert_eq!(
+            generic
+                .iter()
+                .map(|requirement| requirement.required_bytes)
+                .sum::<u64>(),
+            192
+        );
+    }
+
+    #[test]
     fn generic_fused_stages_are_attributed_to_mixed_radix() {
         assert_eq!(
             stage_route_for_label("fused-pow2-workgroup-stage", "r2c"),
@@ -681,5 +731,31 @@ mod tests {
             stage_route_for_label("fused-smooth-workgroup-stage", "r2c"),
             "mixed-radix"
         );
+    }
+
+    #[test]
+    fn permutation_summary_preserves_logical_volume() {
+        let mut graph = LargeExecutionGraph::new("permutation");
+        let input =
+            LogicalRange::new(LogicalBufferId::Input, 0, 1024, ElementFormat::ComplexF32).unwrap();
+        let output =
+            LogicalRange::new(LogicalBufferId::Output, 0, 1024, ElementFormat::ComplexF32).unwrap();
+        graph
+            .push_stage(
+                LargeStage::Permutation {
+                    label: "four-step-permute-axis-to-front",
+                    input,
+                    output,
+                    work_items: 128,
+                },
+                StageRequirements::new(256, 1024, 256, 4, 256).unwrap(),
+            )
+            .unwrap();
+
+        let summaries = stage_summaries_from_graph("axis-sequence", &graph);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].kind, "permutation");
+        assert_eq!(summaries[0].route, "large-out-of-core");
+        assert_eq!(summaries[0].required_bytes, Some(1024));
     }
 }

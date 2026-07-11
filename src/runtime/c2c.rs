@@ -1053,7 +1053,7 @@ impl C2cPlan {
         if matches!(&self.execution, C2cExecution::FourStep(_)) {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "four-step-logical-io",
-                reason: "phase-A four-step execution does not yet support strided logical I/O",
+                reason: "four-step execution does not yet support strided logical I/O",
             });
         }
         let required = self.required_buffer_size_bytes();
@@ -4711,6 +4711,29 @@ fn remap_child_c2c_stage(
             )?,
             work_items,
         },
+        LargeStage::Permutation {
+            label,
+            input,
+            output,
+            work_items,
+        } => LargeStage::Permutation {
+            label,
+            input: remap_child_c2c_range(
+                input,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+            output: remap_child_c2c_range(
+                output,
+                child_input,
+                child_output,
+                temp_index_base,
+                stage_index_base,
+            )?,
+            work_items,
+        },
         LargeStage::Scale {
             label,
             range,
@@ -4790,9 +4813,8 @@ fn stage_scratch_bytes(stage: &LargeStage) -> u64 {
         LargeStage::Kernel { input, output, .. }
         | LargeStage::WindowedKernel { input, output, .. }
         | LargeStage::TwiddleTranspose { input, output, .. }
-        | LargeStage::StripeTranspose { input, output, .. } => {
-            input.size_bytes.max(output.size_bytes)
-        }
+        | LargeStage::StripeTranspose { input, output, .. }
+        | LargeStage::Permutation { input, output, .. } => input.size_bytes.max(output.size_bytes),
         LargeStage::Copy { src, dst, .. } | LargeStage::GatherScatter { src, dst, .. } => {
             src.size_bytes.max(dst.size_bytes)
         }
@@ -5095,8 +5117,8 @@ fn resolve_c2c_large_routing_policy(
         .collect::<Result<Vec<_>>>()?;
     let bytes_per_batch = bytes_per_batch(config)?;
     let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
-    let four_step_phase_a_supported = config.shape().len() == 2
-        && config.axes() == [0, 1]
+    let four_step_mixed_supported = config.shape().len() >= 2
+        && config.axes().len() >= 2
         && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
         && line_bytes
             .iter()
@@ -5108,7 +5130,7 @@ fn resolve_c2c_large_routing_policy(
         line_bytes: &line_bytes,
         axis_kinds: Some(axis_kinds),
         axis_lengths: Some(&axis_lengths),
-        allow_out_of_core: four_step_phase_a_supported,
+        allow_out_of_core: four_step_mixed_supported,
         rank: config.shape().len(),
         bytes_per_batch: Some(bytes_per_batch),
         ..LargeRoutingPolicyInput::new(limits, &[])

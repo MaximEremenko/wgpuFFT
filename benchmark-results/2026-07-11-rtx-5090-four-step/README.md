@@ -67,3 +67,68 @@ The two raw pair samples were 374.0896 ms and 365.2265 ms. Combined forward
 and inverse diagnostics reported 25,770,655,744 bytes of plan-owned helper
 allocations; this is an allocation inventory, not simultaneously transferred
 traffic or caller workspace.
+
+## Phase B: rank-N mixed-radix
+
+Phase B starts from `bfdeedd` and extends the same GPU-resident route to
+rank>=2 transforms with at least two selected smooth-radix axes. A non-front
+axis is moved to the contiguous front position by transposing the flattened
+prefix block against that axis, transformed through the existing bind-window
+axis executor, and transposed back. Tiles are compactly gathered, processed by
+the 16x16 shared-memory transpose, and scattered; tile orientation minimizes
+the number of encoded copy commands.
+
+This direct adjacent-block permutation implements the required
+axis-to-front/from-front mapping in two passes per nonzero axis. It deliberately
+does not copy the JS fallback's sequence of adjacent-dimension swaps: that
+fallback treats dimension-0-fast prefix coordinates as contiguous outer blocks
+for axes beyond 1, which gives inconsistent offsets. The direct block mapping
+is both exact for the library's layout and lower traffic.
+
+```powershell
+$env:WGPU_FFT_RUN_GPU_TESTS='1'
+$env:WGPU_BACKEND='vulkan'
+cargo test --test gpu_four_step --release -- --nocapture
+
+cargo bench --bench fft_bench -- shape 4096x256x256 --batch 1 --adapter "RTX 5090" --runs 2 --iter-cap 1 --wait-timeout-secs 240
+```
+
+### Correctness and routing
+
+Forced-limit equivalence covers `[5, 7, 9]`, batch 3, with a 256-byte binding
+cap in forward/no-normalization and inverse/default-normalization directions.
+Both offset and segmented views match the normal route and `Complex64` oracle.
+Rank-4 `[3, 5, 7, 11]` with selected axes `[3, 1]`, batch 2, passes in both
+directions and verifies axis-specific permutation and FFT diagnostics. The
+existing rank-2 forced and real cases remain green.
+
+The actual oversized rank-3 case is `[4096, 256, 256]`, batch 1: exactly 2 GiB
+and four bytes above `maxStorageBufferBindingSize`. It selected
+`large-out-of-core` / `out-of-core-four-step`, exposed four typed permutation
+stages plus three windowed FFT stages and a final full-volume copy, and matched
+the analytic two-impulse f64 DFT for every `k0` on output lines `(k1, k2) =
+(0, 0), (1, 2), (255, 255)` within `7.5e-4` absolute complex error.
+
+All 223 unit tests and the `gpu_c2c`, `gpu_real`, `gpu_dispatch_split`,
+`gpu_fused_pow2`, `gpu_accuracy`, `gpu_fused_prime`, and `gpu_four_step`
+release Vulkan suites passed on the RTX 5090. One-axis internal bridge child
+plans remain on their established executors; four-step selection requires at
+least two transformed axes, preventing an endpoint-usage mismatch with
+STORAGE-only bridge helpers.
+The real suite also forces R2C and C2R `[15, 14]` plans through an embedded
+four-step C2C child while keeping public endpoints STORAGE-only, covering the
+internal COPY-usage and diagnostics boundary.
+
+### Performance
+
+| Shape | Batch | Buffer | Runs / pairs per run | Pair time | Graph stages / FFT | Traffic-equivalent passes / FFT | Effective GiB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 4096 x 256 x 256 | 1 | 2 GiB | 2 / 1 | **143.737 +/- 0.249 ms** | 8 | 16 | 890.514 |
+
+The graph has three fused axis FFTs, four logical permutations, and one final
+copy. Each staged permutation is weighted as gather + transpose + scatter, so
+the physical model is `4 * (3 + 4*3 + 1) * bufferBytes = 128 GiB` per timed
+FFT+iFFT pair. The raw pair samples were 143.4882 ms and 143.9863 ms. Combined
+forward and inverse diagnostics reported 21,474,889,728 bytes of plan-owned
+helper allocations; as in Phase A, this is an allocation inventory rather than
+simultaneous traffic or caller workspace.

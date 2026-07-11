@@ -81,7 +81,7 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   offset, segmented, strided, and segmented+strided logical I/O.
 - Segmented input buffers need `COPY_SRC`; segmented output buffers need
   `COPY_DST`; direct storage windows need `STORAGE`.
-- Rank-2 four-step C2C endpoints currently require input `COPY_SRC` and output
+- Four-step C2C endpoints currently require input `COPY_SRC` and output
   `COPY_SRC | COPY_DST`; `STORAGE` enables direct bind windows but is optional
   because unaligned and segmented windows use GPU-copy staging.
 - Public `FftIoView`/`BufferLayout` compatibility views for strided logical I/O.
@@ -93,16 +93,18 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
 - Large-route policy classifies normal, large-chunk, and large-out-of-core
   plans, with execution metadata for normal, batch chunk, smooth 1D
   decomposition, axis decomposition, Rader/Bluestein bridge routes, and
-  GPU-resident rank-2 four-step C2C routes. C2C and real transforms can execute batch
+  GPU-resident rank>=2 four-step C2C routes. C2C and real transforms can execute batch
   `LargeChunk` when each chunk fits active binding limits. C2C and real routes
   can also execute binding-safe large decomposition through staged C2C child
   graphs when the required full-temp/helper buffers fit active limits.
 - In this API, out-of-core means outside one storage-binding window: data stays
-  GPU-resident. Rank-2 mixed-radix C2C volumes that exceed one binding but fit
-  `maxBufferSize` execute through windowed axis FFTs and stripe transposes.
-  Rank>2 permutation, non-mixed window executors, and segmented full-volume
-  datasets above `maxBufferSize` remain follow-up routes with structured
-  diagnostics where applicable; no host/disk staging is used.
+  GPU-resident. Rank>=2 mixed-radix C2C volumes with at least two selected axes
+  that exceed one binding but fit `maxBufferSize` execute through windowed axis
+  FFTs. Rank 2 uses stripe transposes; higher ranks move each non-front axis
+  through a tiled prefix-by-axis block permutation and restore canonical layout
+  afterward. Non-mixed window executors and segmented full-volume datasets above
+  `maxBufferSize` remain follow-up routes with structured diagnostics where
+  applicable; no host/disk staging is used.
 - Internal shader/module/pipeline cache keyed by generated fused power-of-two,
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.

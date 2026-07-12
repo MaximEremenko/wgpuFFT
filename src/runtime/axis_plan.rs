@@ -68,17 +68,31 @@ impl AxisPrecision {
         self.as_fft_precision().as_str()
     }
 
-    fn wgsl_complex_type(self) -> &'static str {
+    pub(crate) fn wgsl_scalar_type(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    pub(crate) fn wgsl_complex_type(self) -> &'static str {
         match self {
             Self::F32 => "vec2<f32>",
             Self::F64 => "vec2<f64>",
         }
     }
 
-    fn format_wgsl_scalar(self, value: f64) -> String {
+    pub(crate) fn format_wgsl_scalar(self, value: f64) -> String {
         match self {
             Self::F32 => format_wgsl_f32(value as f32),
             Self::F64 => format_wgsl_f64(value),
+        }
+    }
+
+    pub(crate) fn specialize_wgsl(self, source: String) -> String {
+        match self {
+            Self::F32 => source,
+            Self::F64 => source.replace("vec2<f32>", "vec2<f64>"),
         }
     }
 }
@@ -1766,10 +1780,7 @@ fn radix_root_wgsl(
 }
 
 fn specialize_complex_wgsl(source: String, precision: AxisPrecision) -> String {
-    match precision {
-        AxisPrecision::F32 => source,
-        AxisPrecision::F64 => source.replace("vec2<f32>", "vec2<f64>"),
-    }
+    precision.specialize_wgsl(source)
 }
 
 fn wgsl_line_base_fn(rank: usize, axis: usize, dims: &[usize]) -> String {
@@ -1845,13 +1856,7 @@ fn product(values: &[usize]) -> usize {
 }
 
 fn format_wgsl_f32(value: f32) -> String {
-    assert!(value.is_finite(), "WGSL f32 constants must be finite");
-
-    let mut formatted = value.to_string();
-    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
-        formatted.push_str(".0");
-    }
-    formatted
+    crate::runtime::nd_wgsl::format_wgsl_f32_roundtrip(value)
 }
 
 fn format_wgsl_f64(value: f64) -> String {

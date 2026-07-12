@@ -80,15 +80,6 @@ pub(crate) fn create_twiddle_lut_buffer(
     Ok(buffer)
 }
 
-pub(crate) fn create_twiddle_lut_buffer_for_len(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &'static str,
-    len: usize,
-) -> Result<wgpu::Buffer> {
-    create_twiddle_lut_buffer_for_len_with_precision(device, queue, label, len, FftPrecision::F32)
-}
-
 pub(crate) fn create_twiddle_lut_buffer_for_len_with_precision(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

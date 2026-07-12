@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd_f64, to_interleaved_f32, Complex32, Complex64};
+use crate::math::{reference_c2c_nd_f64, Complex32, Complex64};
 use crate::runtime::axis_plan::{
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
     AxisStageKind, AxisTwiddleLutPool,
@@ -14,14 +14,13 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
-    format_wgsl_f32, format_wgsl_f32_roundtrip, lines_per_batch, product, stride_for_axis,
-    wgsl_line_base_fn,
+    format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
     PipelineLayoutCacheKey, RaderKernelKind, RaderStageKey, ShaderCacheKey,
 };
-use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len;
+use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -29,7 +28,6 @@ const FUSED_WORKGROUP_SIZE: u32 = 256;
 // At smaller convolution lengths the 256-lane fused kernel is mostly idle and
 // the existing staged path is already inexpensive.
 const FUSED_MIN_CONVOLUTION_LENGTH: usize = 128;
-const COMPLEX_F32_BYTES: u64 = 8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -56,12 +54,14 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) batch: usize,
     pub(crate) direction: FftDirection,
     pub(crate) normalization: Normalization,
+    pub(crate) precision: AxisPrecision,
 }
 
 pub(crate) struct RaderAxis {
     n: usize,
     m: usize,
     lines: u32,
+    precision: AxisPrecision,
     lines_params_buffer: wgpu::Buffer,
     perm_buffer: wgpu::Buffer,
     bfft_buffer: wgpu::Buffer,
@@ -126,16 +126,29 @@ impl RaderAxisConfig {
         Ok(())
     }
 
-    fn scale(&self) -> Result<f32> {
-        let total = product(&self.shape) as f32;
-        let scale = match (self.direction, self.normalization) {
-            (_, Normalization::None) => 1.0,
-            (FftDirection::Forward, Normalization::Forward) => 1.0 / total,
-            (FftDirection::Inverse, Normalization::Inverse) => 1.0 / total,
-            (_, Normalization::Orthogonal) => 1.0 / total.sqrt(),
-            _ => 1.0,
-        };
-        Ok(scale)
+    fn scale(&self) -> Result<f64> {
+        Ok(match self.precision {
+            AxisPrecision::F32 => {
+                let total = product(&self.shape) as f32;
+                f64::from(match (self.direction, self.normalization) {
+                    (_, Normalization::None) => 1.0,
+                    (FftDirection::Forward, Normalization::Forward) => 1.0 / total,
+                    (FftDirection::Inverse, Normalization::Inverse) => 1.0 / total,
+                    (_, Normalization::Orthogonal) => 1.0 / total.sqrt(),
+                    _ => 1.0,
+                })
+            }
+            AxisPrecision::F64 => {
+                let total = product(&self.shape) as f64;
+                match (self.direction, self.normalization) {
+                    (_, Normalization::None) => 1.0,
+                    (FftDirection::Forward, Normalization::Forward) => 1.0 / total,
+                    (FftDirection::Inverse, Normalization::Inverse) => 1.0 / total,
+                    (_, Normalization::Orthogonal) => 1.0 / total.sqrt(),
+                    _ => 1.0,
+                }
+            }
+        })
     }
 }
 
@@ -149,20 +162,17 @@ impl RaderAxis {
 
         let n = config.shape[config.axis];
         let l = n - 1;
-        let min_conv = 2 * l - 1;
-        let mut m = next_smooth_at_least(min_conv);
-        if crate::runtime::factor_supported_length(m).is_err() {
-            m = next_power_of_two_at_least(min_conv);
-        }
+        let m = rader_convolution_length(n)?;
         let factors = crate::runtime::factor_supported_length(m)?;
 
         let lines = checked_mul(config.batch, lines_per_batch(&config.shape, config.axis))?;
         let lines_u32 = lines as u32;
         let stride_complex = stride_for_axis(&config.shape, config.axis);
         let scale = config.scale()?;
-        let apply_scale = (scale - 1.0).abs() > f32::EPSILON;
+        let apply_scale = scale != 1.0;
         let perm = rader_permutation(n)?;
-        let bfft = rader_bfft(n, m, config.direction, &perm)?;
+        let bfft = rader_bfft_f64(n, m, config.direction, &perm)?;
+        let complex_bytes = config.precision.complex_size_bytes();
 
         let lines_params_buffer =
             uniform_buffer::<RaderLinesParams>(device, "wgpu_fft.rader.lines_params");
@@ -185,21 +195,33 @@ impl RaderAxis {
         )?;
         queue.write_buffer(&perm_buffer, 0, bytemuck::cast_slice(&perm));
 
-        let bfft_values = to_interleaved_f32(&bfft);
         let bfft_buffer = storage_buffer(
             device,
             "wgpu_fft.rader.bfft",
-            m as u64 * COMPLEX_F32_BYTES,
+            m as u64 * complex_bytes,
             wgpu::BufferUsages::COPY_DST,
         )?;
-        queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft_values));
+        match config.precision {
+            AxisPrecision::F32 => {
+                let values = bfft
+                    .iter()
+                    .copied()
+                    .map(round_complex64)
+                    .collect::<Vec<_>>();
+                queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&values));
+            }
+            AxisPrecision::F64 => {
+                queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft));
+            }
+        }
 
-        let execution = if fused_rader_supported(m, &device.limits()) {
-            let twiddle_buffer = create_twiddle_lut_buffer_for_len(
+        let execution = if fused_rader_supported(m, config.precision, &device.limits()) {
+            let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
                 device,
                 queue,
                 "wgpu_fft.rader.fused.twiddle_lut",
                 m,
+                config.precision.as_fft_precision(),
             )?;
             let shader_key = FusedPrimeStageKey::new(
                 FusedPrimeKind::Rader,
@@ -214,10 +236,10 @@ impl RaderAxis {
                 FUSED_WORKGROUP_SIZE,
                 apply_scale,
                 scale,
+                config.precision,
             );
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
-            let bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::FusedPrimeInterleavedF32);
+            let bind_group_layout = cached_layout(device, pipeline_key.layout);
             let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
             RaderExecution::Fused(FusedRaderExecution {
                 workgroups: lines_u32,
@@ -244,8 +266,8 @@ impl RaderAxis {
                 }),
             );
 
-            let line_bytes = lines as u64 * COMPLEX_F32_BYTES;
-            let work_bytes = work_complex as u64 * COMPLEX_F32_BYTES;
+            let line_bytes = lines as u64 * complex_bytes;
+            let work_bytes = work_complex as u64 * complex_bytes;
             let sum_buffer = storage_buffer(
                 device,
                 "wgpu_fft.rader.sum",
@@ -283,7 +305,7 @@ impl RaderAxis {
                     normalization: Normalization::None,
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
-                    precision: AxisPrecision::F32,
+                    precision: config.precision,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -298,7 +320,7 @@ impl RaderAxis {
                     normalization: Normalization::Inverse,
                     scale_override_bits: None,
                     layout: AxisLayout::Interleaved,
-                    precision: AxisPrecision::F32,
+                    precision: config.precision,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -312,17 +334,13 @@ impl RaderAxis {
                 m,
                 apply_scale,
                 scale,
+                config.precision,
             );
-            let sum_bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::RaderSumInterleavedF32);
-            let pack_bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::RaderPackInterleavedF32);
-            let mul_bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::RaderMulInterleavedF32);
-            let write_y0_bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::RaderWriteY0InterleavedF32);
-            let post_bind_group_layout =
-                cached_layout(device, PipelineLayoutCacheKey::RaderPostInterleavedF32);
+            let sum_bind_group_layout = cached_layout(device, keys.sum.layout);
+            let pack_bind_group_layout = cached_layout(device, keys.pack.layout);
+            let mul_bind_group_layout = cached_layout(device, keys.mul.layout);
+            let write_y0_bind_group_layout = cached_layout(device, keys.write_y0.layout);
+            let post_bind_group_layout = cached_layout(device, keys.post.layout);
             let sum_pipeline = cached_pipeline(device, &keys.sum)?;
             let pack_pipeline = cached_pipeline(device, &keys.pack)?;
             let mul_pipeline = cached_pipeline(device, &keys.mul)?;
@@ -358,6 +376,7 @@ impl RaderAxis {
             n,
             m,
             lines: lines_u32,
+            precision: config.precision,
             lines_params_buffer,
             perm_buffer,
             bfft_buffer,
@@ -420,6 +439,7 @@ impl RaderAxis {
     }
 
     pub(crate) fn graph_helper_buffers(&self) -> Vec<HelperBufferRange> {
+        let element_format = self.precision.element_format();
         let mut helpers = vec![
             HelperBufferRange {
                 label: "rader-permutation-helper",
@@ -431,7 +451,7 @@ impl RaderAxis {
                 label: "rader-bfft-helper",
                 index: 1,
                 size_bytes: self.bfft_buffer.size(),
-                format: ElementFormat::ComplexF32,
+                format: element_format,
             },
         ];
         if let RaderExecution::MultiPass(execution) = &self.execution {
@@ -440,25 +460,25 @@ impl RaderAxis {
                     label: "rader-sum-helper",
                     index: 2,
                     size_bytes: execution.sum_buffer.size(),
-                    format: ElementFormat::ComplexF32,
+                    format: element_format,
                 },
                 HelperBufferRange {
                     label: "rader-x0-helper",
                     index: 3,
                     size_bytes: execution.x0_buffer.size(),
-                    format: ElementFormat::ComplexF32,
+                    format: element_format,
                 },
                 HelperBufferRange {
                     label: "rader-work-helper",
                     index: 4,
                     size_bytes: execution.work_buffer.size(),
-                    format: ElementFormat::ComplexF32,
+                    format: element_format,
                 },
                 HelperBufferRange {
                     label: "rader-fft-helper",
                     index: 5,
                     size_bytes: execution.fft_buffer.size(),
-                    format: ElementFormat::ComplexF32,
+                    format: element_format,
                 },
             ]);
         }
@@ -512,20 +532,16 @@ impl RaderAxis {
         execution: &FusedRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.fused.bind_group"),
             layout: &execution.bind_group_layout,
             entries: &[
-                bind_view_entry(&scheduler, 0, input)?,
-                bind_view_entry(&scheduler, 1, output)?,
+                bind_view_entry(&scheduler, 0, input, element_format)?,
+                bind_view_entry(&scheduler, 1, output, element_format)?,
                 bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
-                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, ElementFormat::ComplexF32)?,
-                bind_storage_entry(
-                    &scheduler,
-                    4,
-                    &execution.twiddle_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
+                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, element_format)?,
+                bind_storage_entry(&scheduler, 4, &execution.twiddle_buffer, element_format)?,
                 bind_uniform_entry(5, &self.lines_params_buffer),
             ],
         });
@@ -549,23 +565,14 @@ impl RaderAxis {
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.sum.bind_group"),
             layout: &execution.sum_bind_group_layout,
             entries: &[
-                bind_view_entry(&scheduler, 0, input)?,
-                bind_storage_entry(
-                    &scheduler,
-                    1,
-                    &execution.sum_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
-                bind_storage_entry(
-                    &scheduler,
-                    2,
-                    &execution.x0_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
+                bind_view_entry(&scheduler, 0, input, element_format)?,
+                bind_storage_entry(&scheduler, 1, &execution.sum_buffer, element_format)?,
+                bind_storage_entry(&scheduler, 2, &execution.x0_buffer, element_format)?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
@@ -591,17 +598,13 @@ impl RaderAxis {
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.pack.bind_group"),
             layout: &execution.pack_bind_group_layout,
             entries: &[
-                bind_view_entry(&scheduler, 0, input)?,
-                bind_storage_entry(
-                    &scheduler,
-                    1,
-                    &execution.work_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
+                bind_view_entry(&scheduler, 0, input, element_format)?,
+                bind_storage_entry(&scheduler, 1, &execution.work_buffer, element_format)?,
                 bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
@@ -627,17 +630,13 @@ impl RaderAxis {
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.mul.bind_group"),
             layout: &execution.mul_bind_group_layout,
             entries: &[
-                bind_storage_entry(
-                    &scheduler,
-                    0,
-                    &execution.fft_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
-                bind_storage_entry(&scheduler, 1, &self.bfft_buffer, ElementFormat::ComplexF32)?,
+                bind_storage_entry(&scheduler, 0, &execution.fft_buffer, element_format)?,
+                bind_storage_entry(&scheduler, 1, &self.bfft_buffer, element_format)?,
                 bind_uniform_entry(2, &execution.total_params_buffer),
             ],
         });
@@ -663,17 +662,13 @@ impl RaderAxis {
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.write_y0.bind_group"),
             layout: &execution.write_y0_bind_group_layout,
             entries: &[
-                bind_storage_entry(
-                    &scheduler,
-                    0,
-                    &execution.sum_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
-                bind_view_entry(&scheduler, 1, output)?,
+                bind_storage_entry(&scheduler, 0, &execution.sum_buffer, element_format)?,
+                bind_view_entry(&scheduler, 1, output, element_format)?,
                 bind_uniform_entry(2, &self.lines_params_buffer),
             ],
         });
@@ -699,24 +694,15 @@ impl RaderAxis {
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
+        let element_format = self.precision.element_format();
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.post.bind_group"),
             layout: &execution.post_bind_group_layout,
             entries: &[
-                bind_storage_entry(
-                    &scheduler,
-                    0,
-                    &execution.work_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
-                bind_storage_entry(
-                    &scheduler,
-                    1,
-                    &execution.x0_buffer,
-                    ElementFormat::ComplexF32,
-                )?,
+                bind_storage_entry(&scheduler, 0, &execution.work_buffer, element_format)?,
+                bind_storage_entry(&scheduler, 1, &execution.x0_buffer, element_format)?,
                 bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
-                bind_view_entry(&scheduler, 3, output)?,
+                bind_view_entry(&scheduler, 3, output, element_format)?,
                 bind_uniform_entry(4, &self.lines_params_buffer),
             ],
         });
@@ -753,7 +739,8 @@ impl RaderPipelineKeys {
         stride_complex: usize,
         m: usize,
         apply_scale: bool,
-        scale: f32,
+        scale: f64,
+        precision: AxisPrecision,
     ) -> Self {
         let key = |kind| {
             RaderStageKey::new(
@@ -767,6 +754,7 @@ impl RaderPipelineKeys {
                 WORKGROUP_SIZE,
                 apply_scale,
                 scale,
+                precision,
             )
         };
         Self {
@@ -823,17 +811,19 @@ fn cached_fused_pipeline(
     })
 }
 
-fn fused_rader_supported(m: usize, limits: &wgpu::Limits) -> bool {
+fn fused_rader_supported(m: usize, precision: AxisPrecision, limits: &wgpu::Limits) -> bool {
     fused_rader_supported_by_limits(
         m,
+        precision,
         u64::from(limits.max_compute_workgroup_storage_size),
         limits.max_compute_invocations_per_workgroup,
         limits.max_compute_workgroup_size_x,
     )
 }
 
-fn fused_rader_supported_by_limits(
+pub(crate) fn fused_rader_supported_by_limits(
     m: usize,
+    precision: AxisPrecision,
     max_workgroup_storage_bytes: u64,
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
@@ -841,15 +831,31 @@ fn fused_rader_supported_by_limits(
     if m < FUSED_MIN_CONVOLUTION_LENGTH {
         return false;
     }
-    let Some(scratch_bytes) = m.checked_mul(COMPLEX_F32_BYTES as usize) else {
+    let complex_bytes = precision.complex_size_bytes() as usize;
+    let Some(scratch_bytes) = m.checked_mul(complex_bytes) else {
         return false;
     };
-    let Some(workgroup_bytes) = scratch_bytes.checked_add(COMPLEX_F32_BYTES as usize) else {
+    let Some(workgroup_bytes) = scratch_bytes.checked_add(complex_bytes) else {
         return false;
     };
     workgroup_bytes as u64 <= max_workgroup_storage_bytes
         && FUSED_WORKGROUP_SIZE <= max_invocations_per_workgroup
         && FUSED_WORKGROUP_SIZE <= max_workgroup_size_x
+}
+
+pub(crate) fn rader_convolution_length(n: usize) -> Result<usize> {
+    let l = n
+        .checked_sub(1)
+        .ok_or(FftError::UnsupportedLength { len: n })?;
+    let min_conv = l
+        .checked_mul(2)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(FftError::LengthTooLarge { len: n })?;
+    let mut m = next_smooth_at_least(min_conv);
+    if crate::runtime::factor_supported_length(m).is_err() {
+        m = next_power_of_two_at_least(min_conv);
+    }
+    Ok(m)
 }
 
 pub(crate) fn rader_permutation(n: usize) -> Result<Vec<u32>> {
@@ -863,6 +869,18 @@ pub(crate) fn rader_bfft(
     direction: FftDirection,
     perm: &[u32],
 ) -> Result<Vec<Complex32>> {
+    Ok(rader_bfft_f64(n, m, direction, perm)?
+        .into_iter()
+        .map(round_complex64)
+        .collect())
+}
+
+pub(crate) fn rader_bfft_f64(
+    n: usize,
+    m: usize,
+    direction: FftDirection,
+    perm: &[u32],
+) -> Result<Vec<Complex64>> {
     let sign: f64 = match direction {
         FftDirection::Forward => 1.0,
         FftDirection::Inverse => -1.0,
@@ -875,10 +893,11 @@ pub(crate) fn rader_bfft(
     }
 
     let config = crate::config::FftConfig::new(m).with_normalization(Normalization::None);
-    Ok(reference_c2c_nd_f64(&values, &config)?
-        .into_iter()
-        .map(|value| Complex32::new(value.re as f32, value.im as f32))
-        .collect())
+    reference_c2c_nd_f64(&values, &config)
+}
+
+fn round_complex64(value: Complex64) -> Complex32 {
+    Complex32::new(value.re as f32, value.im as f32)
 }
 
 fn checked_mul(left: usize, right: usize) -> Result<usize> {
@@ -955,10 +974,11 @@ fn bind_view_entry<'a>(
     scheduler: &WindowScheduler,
     binding: u32,
     view: BufferView<'a>,
+    format: ElementFormat,
 ) -> Result<wgpu::BindGroupEntry<'a>> {
     Ok(wgpu::BindGroupEntry {
         binding,
-        resource: scheduler.storage_binding_resource(&view, ElementFormat::ComplexF32)?,
+        resource: scheduler.storage_binding_resource(&view, format)?,
     })
 }
 
@@ -973,8 +993,13 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     let reduction_size = 1usize << reduction_capacity.ilog2();
     let sum_slot_count = l.div_ceil(reduction_size);
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    let scale = format_wgsl_f32_roundtrip(key.scale_factor());
-    let inverse_m = format_wgsl_f32_roundtrip(1.0 / m as f32);
+    let scale = key.precision.format_wgsl_scalar(key.scale_factor());
+    let inverse_m = match key.precision {
+        AxisPrecision::F32 => key
+            .precision
+            .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
+        AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
+    };
     let forward_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
         &key.factors,
@@ -982,7 +1007,7 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         key.workgroup_size,
         "scratch",
         "twiddle_forward",
-        AxisPrecision::F32,
+        key.precision,
     );
     let inverse_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -991,10 +1016,10 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         key.workgroup_size,
         "scratch",
         "twiddle_inverse",
-        AxisPrecision::F32,
+        key.precision,
     );
 
-    format!(
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   lines: u32,
   lineOffset: u32,
@@ -1042,8 +1067,8 @@ const M_SLOT_COUNT: u32 = {m_slot_count}u;
 const L_SLOT_COUNT: u32 = {l_slot_count}u;
 const REDUCTION_SIZE: u32 = {reduction_size}u;
 const SUM_SLOT_COUNT: u32 = {sum_slot_count}u;
-const INVERSE_M: f32 = {inverse_m};
-const SCALE: f32 = {scale};
+const INVERSE_M: {scalar} = {inverse_m};
+const SCALE: {scalar} = {scale};
 
 var<workgroup> scratch: array<vec2<f32>, {m}>;
 var<workgroup> x0Shared: vec2<f32>;
@@ -1129,7 +1154,8 @@ fn main({entry_params}) {{
         workgroup_size = key.workgroup_size,
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
-    )
+        scalar = key.precision.wgsl_scalar_type(),
+    ))
 }
 
 pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {
@@ -1144,7 +1170,7 @@ pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {
 
 fn generate_rader_sum_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    format!(
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   lines: u32,
   lineOffset: u32,
@@ -1207,12 +1233,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
         stride = key.stride_complex,
         workgroup_size = key.workgroup_size,
         line_base_fn = line_base_fn,
-    )
+    ))
 }
 
 fn generate_rader_pack_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    format!(
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   lines: u32,
   lineOffset: u32,
@@ -1261,11 +1287,11 @@ fn main({entry_params}) {{
             key.workgroup_size,
         ),
         line_base_fn = line_base_fn,
-    )
+    ))
 }
 
 fn generate_rader_mul_wgsl(key: &RaderStageKey) -> String {
-    format!(
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   total: u32,
   pad0: u32,
@@ -1301,13 +1327,13 @@ fn main({entry_params}) {{
             "params.total",
             key.workgroup_size
         ),
-    )
+    ))
 }
 
 fn generate_rader_write_y0_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    let scale = format_wgsl_f32(key.scale_factor());
-    format!(
+    let scale = format_staged_scalar(key.precision, key.scale_factor());
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   lines: u32,
   lineOffset: u32,
@@ -1319,7 +1345,7 @@ fn generate_rader_write_y0_wgsl(key: &RaderStageKey) -> String {
 @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-const SCALE: f32 = {scale};
+const SCALE: {scalar} = {scale};
 
 {line_base_fn}
 
@@ -1340,13 +1366,14 @@ fn main({entry_params}) {{
             "params.lines",
             key.workgroup_size,
         ),
-    )
+        scalar = key.precision.wgsl_scalar_type(),
+    ))
 }
 
 fn generate_rader_post_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    let scale = format_wgsl_f32(key.scale_factor());
-    format!(
+    let scale = format_staged_scalar(key.precision, key.scale_factor());
+    key.precision.specialize_wgsl(format!(
         r#"struct Params {{
   lines: u32,
   lineOffset: u32,
@@ -1363,7 +1390,7 @@ fn generate_rader_post_wgsl(key: &RaderStageKey) -> String {
 const L: u32 = {l}u;
 const M: u32 = {m}u;
 const STRIDE: u32 = {stride}u;
-const SCALE: f32 = {scale};
+const SCALE: {scalar} = {scale};
 
 {line_base_fn}
 
@@ -1398,7 +1425,15 @@ fn main({entry_params}) {{
             key.workgroup_size,
         ),
         line_base_fn = line_base_fn,
-    )
+        scalar = key.precision.wgsl_scalar_type(),
+    ))
+}
+
+fn format_staged_scalar(precision: AxisPrecision, value: f64) -> String {
+    match precision {
+        AxisPrecision::F32 => format_wgsl_f32(value as f32),
+        AxisPrecision::F64 => precision.format_wgsl_scalar(value),
+    }
 }
 
 #[cfg(test)]
@@ -1407,12 +1442,62 @@ mod tests {
 
     #[test]
     fn fused_rader_gate_accounts_for_x0_and_tiny_line_floor() {
-        assert!(fused_rader_supported_by_limits(6000, 48 * 1024, 256, 256));
-        assert!(!fused_rader_supported_by_limits(6000, 16 * 1024, 256, 256));
-        assert!(fused_rader_supported_by_limits(2016, 16 * 1024, 256, 256));
-        assert!(!fused_rader_supported_by_limits(32, 48 * 1024, 256, 256));
-        assert!(!fused_rader_supported_by_limits(6000, 48_007, 256, 256));
-        assert!(!fused_rader_supported_by_limits(6000, 48 * 1024, 255, 256));
+        assert!(fused_rader_supported_by_limits(
+            6000,
+            AxisPrecision::F32,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            6000,
+            AxisPrecision::F32,
+            16 * 1024,
+            256,
+            256
+        ));
+        assert!(fused_rader_supported_by_limits(
+            2016,
+            AxisPrecision::F32,
+            16 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            32,
+            AxisPrecision::F32,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            6000,
+            AxisPrecision::F32,
+            48_007,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            6000,
+            AxisPrecision::F32,
+            48 * 1024,
+            255,
+            256
+        ));
+        assert!(fused_rader_supported_by_limits(
+            3071,
+            AxisPrecision::F64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            3072,
+            AxisPrecision::F64,
+            48 * 1024,
+            256,
+            256
+        ));
     }
 
     #[test]
@@ -1431,6 +1516,7 @@ mod tests {
             FUSED_WORKGROUP_SIZE,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let wgsl = generate_fused_rader_wgsl_for_key(&key);
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 200>"));
@@ -1444,6 +1530,31 @@ mod tests {
         assert!(wgsl.contains("let wgFlat: u32"));
         assert!(!wgsl.contains("sin("));
         assert!(!wgsl.contains("cos("));
+    }
+
+    #[test]
+    fn fused_rader_wgsl_specializes_storage_and_scalars_to_f64() {
+        let factors = crate::runtime::factor_supported_length(200).unwrap();
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            1,
+            0,
+            &[101],
+            101,
+            1,
+            200,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 101.0,
+            AxisPrecision::F64,
+        );
+        let wgsl = generate_fused_rader_wgsl_for_key(&key);
+        assert!(wgsl.contains("array<vec2<f64>, 200>"));
+        assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f64>"));
+        assert!(wgsl.contains("const INVERSE_M: f64 = 0.005lf;"));
+        assert!(!wgsl.contains("vec2<f32>"));
     }
 
     #[test]
@@ -1508,6 +1619,7 @@ mod tests {
             WORKGROUP_SIZE,
             false,
             1.0,
+            AxisPrecision::F32,
         );
         let wgsl = generate_rader_wgsl_for_key(&key);
         assert!(wgsl.contains("const N: u32 = 17u;"));

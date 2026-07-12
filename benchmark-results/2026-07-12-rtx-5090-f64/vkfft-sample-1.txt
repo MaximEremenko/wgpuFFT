@@ -1,0 +1,26 @@
+1 - VkFFT FFT + iFFT C2C benchmark 1D batched in double precision LUT
+VkFFT System: 3 8x8388608 Buffer: 1024 MB avg_time_per_step: 3.189 ms std_error: 0.160 num_iter: 4 benchmark: 164422 bandwidth: 1254.4
+VkFFT System: 4 16x4194304 Buffer: 1024 MB avg_time_per_step: 3.373 ms std_error: 0.097 num_iter: 4 benchmark: 155417 bandwidth: 1185.7
+VkFFT System: 5 32x2097152 Buffer: 1024 MB avg_time_per_step: 3.445 ms std_error: 0.331 num_iter: 4 benchmark: 152169 bandwidth: 1161.0
+VkFFT System: 6 64x1048576 Buffer: 1024 MB avg_time_per_step: 4.153 ms std_error: 0.321 num_iter: 4 benchmark: 126243 bandwidth: 963.2
+VkFFT System: 7 128x524288 Buffer: 1024 MB avg_time_per_step: 4.648 ms std_error: 0.256 num_iter: 4 benchmark: 112800 bandwidth: 860.6
+VkFFT System: 8 256x262144 Buffer: 1024 MB avg_time_per_step: 5.525 ms std_error: 0.268 num_iter: 4 benchmark: 94900 bandwidth: 724.0
+VkFFT System: 9 512x131072 Buffer: 1024 MB avg_time_per_step: 6.287 ms std_error: 0.281 num_iter: 4 benchmark: 83389 bandwidth: 636.2
+VkFFT System: 10 1024x65536 Buffer: 1024 MB avg_time_per_step: 7.593 ms std_error: 0.540 num_iter: 4 benchmark: 69045 bandwidth: 526.8
+VkFFT System: 11 2048x32768 Buffer: 1024 MB avg_time_per_step: 7.543 ms std_error: 0.211 num_iter: 4 benchmark: 69505 bandwidth: 530.3
+VkFFT System: 12 4096x16384 Buffer: 1024 MB avg_time_per_step: 8.678 ms std_error: 0.540 num_iter: 4 benchmark: 60417 bandwidth: 460.9
+VkFFT System: 13 8192x8192 Buffer: 1024 MB avg_time_per_step: 9.928 ms std_error: 0.192 num_iter: 4 benchmark: 52811 bandwidth: 402.9
+VkFFT System: 14 16384x4096 Buffer: 1024 MB avg_time_per_step: 12.441 ms std_error: 0.164 num_iter: 4 benchmark: 42140 bandwidth: 643.0
+VkFFT System: 15 32768x2048 Buffer: 1024 MB avg_time_per_step: 13.642 ms std_error: 0.270 num_iter: 4 benchmark: 38432 bandwidth: 586.4
+VkFFT System: 16 65536x1024 Buffer: 1024 MB avg_time_per_step: 15.458 ms std_error: 0.674 num_iter: 4 benchmark: 33918 bandwidth: 517.5
+VkFFT System: 17 131072x512 Buffer: 1024 MB avg_time_per_step: 15.065 ms std_error: 0.232 num_iter: 4 benchmark: 34802 bandwidth: 531.0
+VkFFT System: 18 262144x256 Buffer: 1024 MB avg_time_per_step: 16.408 ms std_error: 0.771 num_iter: 4 benchmark: 31953 bandwidth: 487.6
+VkFFT System: 19 524288x128 Buffer: 1024 MB avg_time_per_step: 17.309 ms std_error: 1.014 num_iter: 4 benchmark: 30289 bandwidth: 462.2
+VkFFT System: 20 1048576x64 Buffer: 1024 MB avg_time_per_step: 17.132 ms std_error: 0.272 num_iter: 4 benchmark: 30602 bandwidth: 467.0
+VkFFT System: 21 2097152x32 Buffer: 1024 MB avg_time_per_step: 18.175 ms std_error: 0.407 num_iter: 4 benchmark: 28846 bandwidth: 660.2
+VkFFT System: 22 4194304x16 Buffer: 1024 MB avg_time_per_step: 19.553 ms std_error: 0.103 num_iter: 4 benchmark: 26813 bandwidth: 613.7
+VkFFT System: 23 8388608x8 Buffer: 1024 MB avg_time_per_step: 21.314 ms std_error: 0.084 num_iter: 4 benchmark: 24598 bandwidth: 563.0
+VkFFT System: 24 16777216x4 Buffer: 1024 MB avg_time_per_step: 20.510 ms std_error: 0.149 num_iter: 4 benchmark: 25562 bandwidth: 585.1
+VkFFT System: 25 33554432x2 Buffer: 1024 MB avg_time_per_step: 21.064 ms std_error: 0.431 num_iter: 4 benchmark: 24889 bandwidth: 569.7
+Benchmark score VkFFT: 65824
+Device name: NVIDIA GeForce RTX 5090 API:1.4.341

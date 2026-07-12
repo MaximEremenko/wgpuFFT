@@ -9,7 +9,8 @@ use crate::runtime::axis_plan::{
 };
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
 use crate::runtime::bluestein_axis::{
-    bluestein_bfft, bluestein_chirp, BluesteinAxis, BluesteinAxisConfig,
+    bluestein_bfft, bluestein_chirp, bluestein_convolution_length,
+    fused_bluestein_supported_by_limits, BluesteinAxis, BluesteinAxisConfig,
 };
 use crate::runtime::buffer_view::{BufferLayout, BufferView, FftIoView};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -32,7 +33,10 @@ use crate::runtime::pipeline_cache::{
     C2cSmoothStageKey, C2cStridedKernelKind, C2cStridedStageKey, ComputePipelineCacheKey,
     PipelineLayoutCacheKey, ShaderCacheKey,
 };
-use crate::runtime::rader_axis::{rader_bfft, rader_permutation, RaderAxis, RaderAxisConfig};
+use crate::runtime::rader_axis::{
+    fused_rader_supported_by_limits, rader_bfft, rader_convolution_length, rader_permutation,
+    RaderAxis, RaderAxisConfig,
+};
 use crate::runtime::segmented_volume::{
     validate_segmented_burst_depth, SegmentedVolumeC2cPlan, DEFAULT_SEGMENTED_BURST_DEPTH,
 };
@@ -68,25 +72,27 @@ fn phase_a_f64_route_error(
     config: &FftConfig,
     axis_kinds: &[AxisKind],
     limits: LargePolicyLimits,
-    route: C2cRoute,
+    _route: C2cRoute,
+    compute_limits: &wgpu::Limits,
 ) -> Result<()> {
     if config.precision() != FftPrecision::F64 {
         return Ok(());
     }
     let required_bytes = config.required_buffer_size_bytes()?;
     let bytes_per_batch = bytes_per_batch(config)?;
-    let needs_large_mode = required_bytes > limits.max_storage_buffer_binding_size;
+    let prime_helper_bytes = f64_prime_max_binding_bytes(config, axis_kinds, compute_limits)?;
+    let normal_binding_bytes = required_bytes.max(prime_helper_bytes);
+    let needs_large_mode = normal_binding_bytes > limits.max_storage_buffer_binding_size
+        || normal_binding_bytes > limits.max_buffer_size;
     let needs_out_of_core = needs_large_mode
         && config.shape().len() >= 2
         && bytes_per_batch > limits.max_storage_buffer_binding_size;
     let four_step_eligible =
         needs_out_of_core && lightweight_four_step_eligible(config, axis_kinds, limits)?;
-    if !needs_large_mode && matches!(route, C2cRoute::DirectDft | C2cRoute::MixedRadix) {
+    if !needs_large_mode {
         return Ok(());
     }
-    let (route, reason) = if !needs_large_mode {
-        (route.as_str(), "native-f64-prime-kernels-not-implemented")
-    } else if !four_step_eligible {
+    let (route, reason) = if !four_step_eligible {
         ("large-chunk", "large-chunk-f64-not-implemented")
     } else if required_bytes > limits.max_buffer_size
         && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
@@ -105,6 +111,60 @@ fn phase_a_f64_route_error(
         route,
         reason,
     })
+}
+
+fn f64_prime_max_binding_bytes(
+    config: &FftConfig,
+    axis_kinds: &[AxisKind],
+    compute_limits: &wgpu::Limits,
+) -> Result<u64> {
+    let total_complex = config.total_complex_len_u32()? as usize;
+    let complex_bytes = FftPrecision::F64.complex_size_bytes();
+    config
+        .axes()
+        .iter()
+        .copied()
+        .zip(axis_kinds.iter().copied())
+        .try_fold(0u64, |maximum, (axis, kind)| {
+            let n = config.shape()[axis];
+            let m = match kind {
+                AxisKind::Mixed => return Ok(maximum),
+                AxisKind::Rader => rader_convolution_length(n)?,
+                AxisKind::Bluestein => bluestein_convolution_length(n)?,
+            };
+            let fused = match kind {
+                AxisKind::Mixed => false,
+                AxisKind::Rader => fused_rader_supported_by_limits(
+                    m,
+                    AxisPrecision::F64,
+                    u64::from(compute_limits.max_compute_workgroup_storage_size),
+                    compute_limits.max_compute_invocations_per_workgroup,
+                    compute_limits.max_compute_workgroup_size_x,
+                ),
+                AxisKind::Bluestein => fused_bluestein_supported_by_limits(
+                    m,
+                    AxisPrecision::F64,
+                    u64::from(compute_limits.max_compute_workgroup_storage_size),
+                    compute_limits.max_compute_invocations_per_workgroup,
+                    compute_limits.max_compute_workgroup_size_x,
+                ),
+            };
+            let helper_complex = if fused {
+                m
+            } else {
+                total_complex
+                    .checked_div(n)
+                    .and_then(|lines| lines.checked_mul(m))
+                    .ok_or(FftError::LengthTooLarge { len: total_complex })?
+            };
+            let helper_bytes = u64::try_from(helper_complex)
+                .ok()
+                .and_then(|value| value.checked_mul(complex_bytes))
+                .ok_or(FftError::LengthTooLarge {
+                    len: helper_complex,
+                })?;
+            Ok(maximum.max(helper_bytes))
+        })
 }
 
 fn lightweight_four_step_eligible(
@@ -658,7 +718,13 @@ impl C2cPlan {
         let len = config.total_complex_len_u32()?;
         let route = select_route(&config);
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
-        phase_a_f64_route_error(&config, &axis_kinds, effective_policy_limits, route)?;
+        phase_a_f64_route_error(
+            &config,
+            &axis_kinds,
+            effective_policy_limits,
+            route,
+            &device.limits(),
+        )?;
         let mut large_routing_policy =
             resolve_c2c_large_routing_policy(device, &config, &axis_kinds, policy_limits)?;
 
@@ -3643,17 +3709,23 @@ fn build_normal_c2c_graph_for_impl(
             plan.graph_helper_buffers(),
             ConvolutionGraphFfts::rader(plan),
             required_bytes,
+            element_format,
             limits,
         ),
         C2cRouteImpl::Bluestein(plan) => build_normal_bluestein_c2c_graph(
             plan.graph_helper_buffers(),
             ConvolutionGraphFfts::bluestein(plan),
             required_bytes,
+            element_format,
             limits,
         ),
-        C2cRouteImpl::AxisSequence(plan) => {
-            build_axis_sequence_c2c_graph(plan, required_bytes, workspace_bytes, limits)
-        }
+        C2cRouteImpl::AxisSequence(plan) => build_axis_sequence_c2c_graph(
+            plan,
+            required_bytes,
+            workspace_bytes,
+            element_format,
+            limits,
+        ),
     }
 }
 
@@ -3688,12 +3760,20 @@ fn helper_range_from_info_with_base(
 }
 
 fn stage_range(slot: SequenceBufferSlot, size_bytes: u64) -> Result<LogicalRange> {
+    stage_range_with_format(slot, size_bytes, ElementFormat::ComplexF32)
+}
+
+fn stage_range_with_format(
+    slot: SequenceBufferSlot,
+    size_bytes: u64,
+    format: ElementFormat,
+) -> Result<LogicalRange> {
     let buffer = match slot {
         SequenceBufferSlot::Input => LogicalBufferId::Input,
         SequenceBufferSlot::Output => LogicalBufferId::Output,
         SequenceBufferSlot::Temp => LogicalBufferId::Temp(0),
     };
-    c2c_range(buffer, 0, size_bytes)
+    c2c_range_with_format(buffer, 0, size_bytes, format)
 }
 
 fn stage_range_with_temp(
@@ -4089,27 +4169,33 @@ fn build_normal_rader_c2c_graph(
     helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     required_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     let mut graph = LargeExecutionGraph::new("c2c-rader-normal");
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
-            range: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
     push_helper_windows(&mut graph, helpers.iter().copied(), limits)?;
 
-    let input = c2c_range(LogicalBufferId::Input, 0, required_bytes)?;
-    let output = c2c_range(LogicalBufferId::Output, 0, required_bytes)?;
+    let input = c2c_range_with_format(LogicalBufferId::Input, 0, required_bytes, element_format)?;
+    let output = c2c_range_with_format(LogicalBufferId::Output, 0, required_bytes, element_format)?;
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
                 label: "rader-fused-workgroup-stage",
                 input,
                 output,
-                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+                work_items: work_items_for_bytes(required_bytes, element_format),
             },
             graph_requirements_covering(limits, 1, required_bytes, 0)?,
         )?;
@@ -4138,7 +4224,7 @@ fn build_normal_rader_c2c_graph(
             label: "rader-sum",
             input,
             output: helper_range_from_info(sum)?,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4152,7 +4238,7 @@ fn build_normal_rader_c2c_graph(
             label: "rader-pack",
             input,
             output: work_range,
-            work_items: work_items_for_bytes(work.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(work.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4179,7 +4265,7 @@ fn build_normal_rader_c2c_graph(
             label: "rader-mul",
             input: fft_range,
             output: fft_range,
-            work_items: work_items_for_bytes(fft.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(fft.size_bytes, element_format),
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
@@ -4201,7 +4287,7 @@ fn build_normal_rader_c2c_graph(
             label: "rader-write-y0",
             input: helper_range_from_info(sum)?,
             output,
-            work_items: work_items_for_bytes(sum.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(sum.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4215,7 +4301,7 @@ fn build_normal_rader_c2c_graph(
             label: "rader-post",
             input: work_range,
             output,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4238,27 +4324,33 @@ fn build_normal_bluestein_c2c_graph(
     helpers: Vec<HelperBufferRange>,
     convolution: ConvolutionGraphFfts,
     required_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     let mut graph = LargeExecutionGraph::new("c2c-bluestein-normal");
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
-            range: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
     push_helper_windows(&mut graph, helpers.iter().copied(), limits)?;
 
-    let input = c2c_range(LogicalBufferId::Input, 0, required_bytes)?;
-    let output = c2c_range(LogicalBufferId::Output, 0, required_bytes)?;
+    let input = c2c_range_with_format(LogicalBufferId::Input, 0, required_bytes, element_format)?;
+    let output = c2c_range_with_format(LogicalBufferId::Output, 0, required_bytes, element_format)?;
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
                 label: "bluestein-fused-workgroup-stage",
                 input,
                 output,
-                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+                work_items: work_items_for_bytes(required_bytes, element_format),
             },
             graph_requirements_covering(limits, 1, required_bytes, 0)?,
         )?;
@@ -4287,7 +4379,7 @@ fn build_normal_bluestein_c2c_graph(
             label: "bluestein-pack",
             input,
             output: work_range,
-            work_items: work_items_for_bytes(work.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(work.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4314,7 +4406,7 @@ fn build_normal_bluestein_c2c_graph(
             label: "bluestein-mul",
             input: fft_range,
             output: fft_range,
-            work_items: work_items_for_bytes(fft.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(fft.size_bytes, element_format),
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
@@ -4336,7 +4428,7 @@ fn build_normal_bluestein_c2c_graph(
             label: "bluestein-post",
             input: work_range,
             output,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4359,12 +4451,14 @@ fn build_axis_sequence_c2c_graph(
     plan: &AxisSequencePlan,
     required_bytes: u64,
     workspace_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     build_axis_sequence_c2c_graph_from_steps(
         &plan.graph_steps(),
         required_bytes,
         workspace_bytes,
+        element_format,
         limits,
     )
 }
@@ -4373,13 +4467,19 @@ fn build_axis_sequence_c2c_graph_from_steps(
     steps: &[AxisSequenceGraphStep],
     required_bytes: u64,
     workspace_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     let mut graph = LargeExecutionGraph::new("c2c-axis-sequence-normal");
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
-            range: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
@@ -4387,7 +4487,12 @@ fn build_axis_sequence_c2c_graph_from_steps(
         graph.push_stage(
             LargeStage::HelperWindow {
                 label: "axis-sequence-workspace",
-                range: c2c_range(LogicalBufferId::Temp(0), 0, workspace_bytes)?,
+                range: c2c_range_with_format(
+                    LogicalBufferId::Temp(0),
+                    0,
+                    workspace_bytes,
+                    element_format,
+                )?,
             },
             graph_requirements_covering(limits, 1, workspace_bytes, workspace_bytes)?,
         )?;
@@ -4400,8 +4505,8 @@ fn build_axis_sequence_c2c_graph_from_steps(
         SequenceBufferSlot::Temp
     };
     for (step_index, step) in steps.iter().cloned().enumerate() {
-        let input = stage_range(src_slot, required_bytes)?;
-        let output = stage_range(dst_slot, required_bytes)?;
+        let input = stage_range_with_format(src_slot, required_bytes, element_format)?;
+        let output = stage_range_with_format(dst_slot, required_bytes, element_format)?;
         let helper_base = 16 + step_index as u32 * 16;
         match step {
             AxisSequenceGraphStep::Mixed {
@@ -4461,7 +4566,12 @@ fn build_axis_sequence_c2c_graph_from_steps(
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-output",
-            range: c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Output,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
@@ -4479,6 +4589,7 @@ fn add_rader_c2c_stages(
     limits: LargePolicyLimits,
 ) -> Result<()> {
     push_helper_windows_with_base(graph, helpers.iter().copied(), helper_index_base, limits)?;
+    let element_format = input.format;
 
     if convolution.fused {
         graph.push_stage(
@@ -4486,7 +4597,7 @@ fn add_rader_c2c_stages(
                 label: "rader-fused-workgroup-stage",
                 input,
                 output,
-                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+                work_items: work_items_for_bytes(required_bytes, element_format),
             },
             graph_requirements_covering(limits, 1, required_bytes, 0)?,
         )?;
@@ -4508,7 +4619,7 @@ fn add_rader_c2c_stages(
             label: "rader-sum",
             input,
             output: helper_range_from_info_with_base(sum, helper_index_base)?,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4522,7 +4633,7 @@ fn add_rader_c2c_stages(
             label: "rader-pack",
             input,
             output: work_range,
-            work_items: work_items_for_bytes(work.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(work.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4549,7 +4660,7 @@ fn add_rader_c2c_stages(
             label: "rader-mul",
             input: fft_range,
             output: fft_range,
-            work_items: work_items_for_bytes(fft.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(fft.size_bytes, element_format),
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
@@ -4571,7 +4682,7 @@ fn add_rader_c2c_stages(
             label: "rader-write-y0",
             input: helper_range_from_info_with_base(sum, helper_index_base)?,
             output,
-            work_items: work_items_for_bytes(sum.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(sum.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4585,7 +4696,7 @@ fn add_rader_c2c_stages(
             label: "rader-post",
             input: work_range,
             output,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4608,6 +4719,7 @@ fn add_bluestein_c2c_stages(
     limits: LargePolicyLimits,
 ) -> Result<()> {
     push_helper_windows_with_base(graph, helpers.iter().copied(), helper_index_base, limits)?;
+    let element_format = input.format;
 
     if convolution.fused {
         graph.push_stage(
@@ -4615,7 +4727,7 @@ fn add_bluestein_c2c_stages(
                 label: "bluestein-fused-workgroup-stage",
                 input,
                 output,
-                work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+                work_items: work_items_for_bytes(required_bytes, element_format),
             },
             graph_requirements_covering(limits, 1, required_bytes, 0)?,
         )?;
@@ -4637,7 +4749,7 @@ fn add_bluestein_c2c_stages(
             label: "bluestein-pack",
             input,
             output: work_range,
-            work_items: work_items_for_bytes(work.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(work.size_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -4664,7 +4776,7 @@ fn add_bluestein_c2c_stages(
             label: "bluestein-mul",
             input: fft_range,
             output: fft_range,
-            work_items: work_items_for_bytes(fft.size_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(fft.size_bytes, element_format),
         },
         graph_requirements_covering(limits, 1, fft.size_bytes, fft.size_bytes)?,
     )?;
@@ -4686,7 +4798,7 @@ fn add_bluestein_c2c_stages(
             label: "bluestein-post",
             input: work_range,
             output,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(
             limits,
@@ -6980,7 +7092,7 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
         },
         scale_override_bits: None,
         layout: crate::runtime::axis_plan::AxisLayout::Interleaved,
-        precision: crate::runtime::axis_plan::AxisPrecision::F32,
+        precision: config.precision().into(),
     }
 }
 
@@ -6995,6 +7107,7 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
         } else {
             Normalization::None
         },
+        precision: config.precision().into(),
     }
 }
 
@@ -7013,6 +7126,7 @@ fn bluestein_config_for_axis(
         } else {
             Normalization::None
         },
+        precision: config.precision().into(),
     }
 }
 
@@ -7423,7 +7537,8 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_f64_boundary_allows_normal_mixed_and_gates_deferred_routes() {
+    fn phase_c_f64_boundary_allows_normal_routes_and_gates_deferred_resources() {
+        let compute_limits = wgpu::Limits::default();
         let normal = FftConfig::new(8).with_precision(FftPrecision::F64);
         let normal_kinds = resolve_axis_kinds_for_axes(normal.shape(), normal.axes()).unwrap();
         assert_eq!(
@@ -7435,6 +7550,7 @@ mod tests {
                     max_buffer_size: 4096,
                 },
                 select_route(&normal),
+                &compute_limits,
             ),
             Ok(())
         );
@@ -7450,13 +7566,14 @@ mod tests {
                     max_buffer_size,
                 },
                 route,
+                &compute_limits,
             )
             .unwrap_err()
         };
 
         let prime = FftConfig::new(17).with_precision(FftPrecision::F64);
         let prime_kinds = resolve_axis_kinds_for_axes(prime.shape(), prime.axes()).unwrap();
-        assert!(matches!(
+        assert_eq!(
             phase_a_f64_route_error(
                 &prime,
                 &prime_kinds,
@@ -7465,13 +7582,70 @@ mod tests {
                     max_buffer_size: 4096,
                 },
                 select_route(&prime),
+                &compute_limits,
             ),
-            Err(FftError::PrecisionUnsupported {
-                route: "rader",
-                reason: "native-f64-prime-kernels-not-implemented",
-                ..
-            })
-        ));
+            Ok(())
+        );
+        for normal_prime in [
+            FftConfig::new(34).with_precision(FftPrecision::F64),
+            FftConfig::new_nd([2, 17]).with_precision(FftPrecision::F64),
+        ] {
+            let kinds =
+                resolve_axis_kinds_for_axes(normal_prime.shape(), normal_prime.axes()).unwrap();
+            assert_eq!(
+                phase_a_f64_route_error(
+                    &normal_prime,
+                    &kinds,
+                    LargePolicyLimits {
+                        max_storage_buffer_binding_size: 4096,
+                        max_buffer_size: 4096,
+                    },
+                    select_route(&normal_prime),
+                    &compute_limits,
+                ),
+                Ok(())
+            );
+        }
+
+        for (helper_limited, binding_limit) in [
+            (
+                FftConfig::new(17)
+                    .with_batch(9)
+                    .with_precision(FftPrecision::F64),
+                4096,
+            ),
+            (
+                FftConfig::new(34)
+                    .with_batch(4)
+                    .with_precision(FftPrecision::F64),
+                4096,
+            ),
+            (
+                FftConfig::new_nd([2, 17]).with_precision(FftPrecision::F64),
+                800,
+            ),
+        ] {
+            let route = select_route(&helper_limited);
+            let kinds =
+                resolve_axis_kinds_for_axes(helper_limited.shape(), helper_limited.axes()).unwrap();
+            assert!(matches!(
+                phase_a_f64_route_error(
+                    &helper_limited,
+                    &kinds,
+                    LargePolicyLimits {
+                        max_storage_buffer_binding_size: binding_limit,
+                        max_buffer_size: 16 * 1024,
+                    },
+                    route,
+                    &compute_limits,
+                ),
+                Err(FftError::PrecisionUnsupported {
+                    route: "large-chunk",
+                    reason: "large-chunk-f64-not-implemented",
+                    ..
+                })
+            ));
+        }
         assert!(matches!(
             error_for(
                 FftConfig::new(8)
@@ -7980,6 +8154,7 @@ mod tests {
             ],
             128,
             128,
+            ElementFormat::ComplexF32,
             limits,
         )
         .unwrap();
@@ -8483,9 +8658,14 @@ mod tests {
             helper("rader-work-helper", 4, 128, ElementFormat::ComplexF32),
             helper("rader-fft-helper", 5, 128, ElementFormat::ComplexF32),
         ];
-        let graph =
-            build_normal_rader_c2c_graph(helpers.to_vec(), test_convolution_ffts(), 128, limits)
-                .unwrap();
+        let graph = build_normal_rader_c2c_graph(
+            helpers.to_vec(),
+            test_convolution_ffts(),
+            128,
+            ElementFormat::ComplexF32,
+            limits,
+        )
+        .unwrap();
 
         assert_eq!(graph.stages().len(), 19);
         for label in [
@@ -8540,6 +8720,7 @@ mod tests {
             ],
             test_fused_convolution(),
             128,
+            ElementFormat::ComplexF32,
             limits,
         )
         .unwrap();
@@ -8550,6 +8731,7 @@ mod tests {
             ],
             test_fused_convolution(),
             128,
+            ElementFormat::ComplexF32,
             limits,
         )
         .unwrap();
@@ -8595,6 +8777,7 @@ mod tests {
             helpers.to_vec(),
             test_convolution_ffts(),
             128,
+            ElementFormat::ComplexF32,
             limits,
         )
         .unwrap();

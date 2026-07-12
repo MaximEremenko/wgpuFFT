@@ -1,0 +1,9 @@
+command: cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision both --adapter "RTX 5090" --runs 2 --iter-cap 200
+RESULT precision=f32 shape=[4096] batch=16384 buffer_bytes=536870912 num_iter=24 raw_pair_ms=[1.632725,1.637738] avg_pair_ms=1.635231 stderr_ms=0.002506 passes_per_fft=1 bandwidth_GiB_s=1223.069 score_KiB_per_ms=320620.096
+RESULT precision=f64 shape=[4096] batch=16384 buffer_bytes=1073741824 num_iter=12 raw_pair_ms=[22.631408,21.270383] avg_pair_ms=21.950896 stderr_ms=0.680513 passes_per_fft=4 bandwidth_GiB_s=728.900 score_KiB_per_ms=47769.167
+PRECISION_COMPARE shape=[4096] batch=16384 f64_over_f32_avg_pair_time_ratio=13.423725747 same_process=true same_adapter=true same_device=true precision_order=f32-then-f64
+
+command: cargo bench --bench fft_bench -- shape 2048 --batch 32768 --precision both --adapter "RTX 5090" --runs 2 --iter-cap 200
+RESULT precision=f32 shape=[2048] batch=32768 buffer_bytes=536870912 num_iter=24 raw_pair_ms=[1.736817,1.707258] avg_pair_ms=1.722038 stderr_ms=0.014779 passes_per_fft=1 bandwidth_GiB_s=1161.415 score_KiB_per_ms=304457.946
+RESULT precision=f64 shape=[2048] batch=32768 buffer_bytes=1073741824 num_iter=12 raw_pair_ms=[9.329167,9.323492] avg_pair_ms=9.326329 stderr_ms=0.002837 passes_per_fft=1 bandwidth_GiB_s=428.893 score_KiB_per_ms=112431.803
+PRECISION_COMPARE shape=[2048] batch=32768 f64_over_f32_avg_pair_time_ratio=5.415868799 same_process=true same_adapter=true same_device=true precision_order=f32-then-f64

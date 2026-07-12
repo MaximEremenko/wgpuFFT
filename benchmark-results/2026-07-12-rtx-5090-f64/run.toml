@@ -1,0 +1,55 @@
+schema_version = 1
+capture_date = "2026-07-12"
+timezone = "America/New_York"
+
+[hardware]
+gpu = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "610.47"
+vulkan_device_api = "1.4.341"
+max_workgroup_storage_bytes = 49152
+
+[software]
+wgpu_fft_phase_b_commit = "1240ca462697a33a7fe128436ed33c16c93d8f9a"
+wgpu_fft_phase_c = "commit containing this archive"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+wgpu = "29.0.3"
+vkfft_tag = "v1.3.4"
+vkfft_commit = "066a17c17068c0f11c9298d848c2976c71fad1c1"
+glslang_tag = "12.3.1"
+glslang_commit = "4f3ae4b03dc3556f96f55467e139f852831199d0"
+vulkan_sdk = "1.4.350.0"
+
+[vkfft_build]
+backend = 0
+configuration = "Release"
+generator = "Visual Studio 17 2022"
+compiler = "MSVC"
+cmake = "3.29.3"
+executable_sha256 = "B47C142653090C6B357ED357A259972A14C5CD6C458FEBFCCD225A484E43287B"
+cmakelists_sha256 = "9AFF01E8AC694B6EFAA3472FF45C6616899A9C34BFC049FE40E5E7F302674934"
+test_suite_source_sha256 = "AFE0ED44D754C7F927A56F80CE604A62E02E5A45E9162999969E52612D8FF0EA"
+
+[vkfft_sample1]
+command = "VkFFT_TestSuite.exe -d 0 -o vkfft_sample1_rtx5090.txt -vkfft 1"
+started_local = "2026-07-12T16:30:10-04:00"
+finished_local = "2026-07-12T16:30:57-04:00"
+elapsed_seconds = 48.0
+expected_cases = 23
+actual_cases = 23
+aggregate_score = 65824
+raw_file = "vkfft-sample-1.txt"
+raw_bytes = 3289
+raw_sha256 = "A9152C7BC3A9182B32D003517AA290C5426F1B415B31D130FE26F046F7331BCD"
+
+[wgpu_fft_benchmark]
+runs_per_precision = 2
+iteration_rule = "min(200, floor(3 * 4096 MiB / precision-sized bufferSize))"
+timing = "wall clock around one submit and device wait"
+execution = "out-of-place"
+precision_order = "f32-then-f64 in one process on one adapter/device"
+summary_file = "wgpu-fft-bench-summary.txt"
+summary_bytes = 1494
+summary_sha256 = "86762EE896BF6DED0860BA8830E87FFF261002148A9206CDF0589D541C9377B5"

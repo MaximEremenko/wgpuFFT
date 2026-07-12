@@ -5,8 +5,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use wgpu_fft::{
-    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, LargePolicyLimits,
-    Normalization,
+    clear_thread_local_pipeline_cache, FftConfig, FftDiagnostics, FftPlan, FftPrecision,
+    LargePolicyLimits, Normalization,
 };
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
@@ -16,9 +16,54 @@ const DEFAULT_ITER_CAP: u64 = 1000;
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
 const ITER_TRAFFIC_BUDGET_BYTES: u64 = 3 * 4096 * 1024 * 1024;
 const TARGET_COMPLEX_ELEMENTS: usize = 1 << 27;
-const COMPLEX_F32_BYTES: u64 = 2 * std::mem::size_of::<f32>() as u64;
 const INITIALIZATION_SEED_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_SEGMENTED_BURST_DEPTH: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrecisionMode {
+    F32,
+    F64,
+    Both,
+}
+
+impl PrecisionMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "f32" => Some(Self::F32),
+            "f64" => Some(Self::F64),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::Both => "both",
+        }
+    }
+
+    fn precisions(self) -> Vec<FftPrecision> {
+        match self {
+            Self::F32 => vec![FftPrecision::F32],
+            Self::F64 => vec![FftPrecision::F64],
+            Self::Both => vec![FftPrecision::F32, FftPrecision::F64],
+        }
+    }
+
+    fn needs_f64(self) -> bool {
+        matches!(self, Self::F64 | Self::Both)
+    }
+
+    fn single_precision(self) -> Option<FftPrecision> {
+        match self {
+            Self::F32 => Some(FftPrecision::F32),
+            Self::F64 => Some(FftPrecision::F64),
+            Self::Both => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Suite {
@@ -61,6 +106,7 @@ impl Suite {
 #[derive(Debug)]
 struct Options {
     suite: Suite,
+    precision: PrecisionMode,
     custom_shape: Option<Vec<usize>>,
     custom_batch: usize,
     adapter_selector: Option<String>,
@@ -90,6 +136,7 @@ struct BenchCase {
 
 #[derive(Debug)]
 struct CaseResult {
+    precision: FftPrecision,
     route: String,
     execution_kind: String,
     axis_kinds: String,
@@ -282,8 +329,9 @@ async fn run() -> BenchResult<()> {
 
     println!("wgpuFFT VkFFT-parity benchmark harness");
     println!(
-        "configuration: suite={} adapter_selector={} runs={} iter_cap={} max_reported_cases_per_suite={} traffic_budget_bytes={} wait_timeout_secs={}",
+        "configuration: suite={} precision={} adapter_selector={} runs={} iter_cap={} max_reported_cases_per_suite={} traffic_budget_bytes={} wait_timeout_secs={}",
         options.suite.name(),
+        options.precision.name(),
         options.adapter_selector.as_deref().unwrap_or("auto-single-hardware"),
         options.runs,
         options.iter_cap,
@@ -340,13 +388,33 @@ async fn run() -> BenchResult<()> {
         )));
     }
     let adapter_limits = adapter.limits();
+    let adapter_features = adapter.features();
     println!("adapter info:\n{adapter_info:#?}");
     println!("adapter limits:\n{adapter_limits:#?}");
+
+    let required_features = if options.precision.needs_f64() {
+        if !adapter_features.contains(wgpu::Features::SHADER_F64) {
+            return Err(input_error(format!(
+                "precision {} requires wgpu SHADER_F64, but Vulkan adapter {:?} does not expose it",
+                options.precision.name(),
+                adapter_info.name,
+            )));
+        }
+        wgpu::Features::SHADER_F64
+    } else {
+        wgpu::Features::empty()
+    };
+    println!(
+        "precision feature selection: mode={} adapter_shader_f64={} requested_shader_f64={}",
+        options.precision.name(),
+        adapter_features.contains(wgpu::Features::SHADER_F64),
+        required_features.contains(wgpu::Features::SHADER_F64),
+    );
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("wgpu_fft.bench.device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: adapter_limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -375,7 +443,7 @@ async fn run_cases(
     options: &Options,
 ) -> BenchResult<()> {
     let mut previous_suite = None;
-    let mut suite_scores = BTreeMap::<&'static str, Vec<f64>>::new();
+    let mut suite_scores = BTreeMap::<(&'static str, &'static str), Vec<f64>>::new();
     for (case_index, case) in cases.iter().enumerate() {
         if previous_suite != Some(case.suite) {
             println!("\n=== suite {} ===", case.suite);
@@ -394,7 +462,10 @@ async fn run_cases(
         );
 
         if options.compare_max_buffer_bytes.is_some() {
-            let result = run_compare_case(device, queue, case, options).await;
+            let precision = options.precision.single_precision().ok_or_else(|| {
+                input_error("precision=both is unavailable for segment-cap comparison mode")
+            })?;
+            let result = run_compare_case(device, queue, case, options, precision).await;
             device
                 .poll(wgpu::PollType::Poll)
                 .map_err(|error| contextual_error("polling after a comparison case", error))?;
@@ -416,33 +487,77 @@ async fn run_cases(
             continue;
         }
 
-        let result = run_case(device, queue, case, options).await;
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| contextual_error("polling after a benchmark case", error))?;
-        let cache_cleared = clear_thread_local_pipeline_cache(device);
-        println!("pipeline_cache_cleared_after_case={cache_cleared}");
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| contextual_error("reclaiming cleared cache resources", error))?;
-
-        let result = result.map_err(|error| {
-            contextual_boxed_error(
-                format!(
-                    "running suite {} case {} shape={:?} batch={}",
-                    case.suite, case.label, case.shape, case.batch
-                ),
-                error,
-            )
-        })?;
-
-        if case.report {
-            let score = print_case_result(case, options, &result)?;
-            suite_scores.entry(case.suite).or_default().push(score);
-        } else {
+        let mut completed_results = Vec::new();
+        for precision in options.precision.precisions() {
+            println!("precision={} starting case", precision.as_str());
+            let result = run_case(device, queue, case, options, precision).await;
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| contextual_error("polling after a benchmark case", error))?;
+            let cache_cleared = clear_thread_local_pipeline_cache(device);
             println!(
-                "warmup {} complete; timing intentionally excluded from reported results",
-                case.label
+                "precision={} pipeline_cache_cleared_after_case={cache_cleared}",
+                precision.as_str()
+            );
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|error| contextual_error("reclaiming cleared cache resources", error))?;
+
+            let result = result.map_err(|error| {
+                contextual_boxed_error(
+                    format!(
+                        "running suite {} case {} precision={} shape={:?} batch={}",
+                        case.suite,
+                        case.label,
+                        precision.as_str(),
+                        case.shape,
+                        case.batch
+                    ),
+                    error,
+                )
+            })?;
+
+            if case.report {
+                let score = print_case_result(case, options, &result)?;
+                suite_scores
+                    .entry((case.suite, precision.as_str()))
+                    .or_default()
+                    .push(score);
+            } else {
+                println!(
+                    "warmup {} precision={} complete; timing intentionally excluded from reported results",
+                    case.label,
+                    precision.as_str(),
+                );
+            }
+            completed_results.push(result);
+        }
+
+        if case.report && options.precision == PrecisionMode::Both {
+            let f32_result = completed_results
+                .iter()
+                .find(|result| result.precision == FftPrecision::F32)
+                .ok_or_else(|| input_error("precision comparison produced no f32 result"))?;
+            let f64_result = completed_results
+                .iter()
+                .find(|result| result.precision == FftPrecision::F64)
+                .ok_or_else(|| input_error("precision comparison produced no f64 result"))?;
+            let f32_statistics = statistics(&f32_result.run_pair_ms)?;
+            let f64_statistics = statistics(&f64_result.run_pair_ms)?;
+            let ratio = f64_statistics.mean_ms / f32_statistics.mean_ms;
+            println!(
+                "PRECISION_COMPARE suite={} label={} shape={:?} batch={} f32_logical_buffer_bytes={} f64_logical_buffer_bytes={} f32_num_iter={} f64_num_iter={} f32_avg_pair_ms={:.9} f64_avg_pair_ms={:.9} f64_over_f32_avg_pair_time_ratio={:.9} precision_order=f32-then-f64 same_process=true same_adapter=true same_device=true",
+                case.suite,
+                case.label,
+                case.shape,
+                case.batch,
+                f32_result.buffer_size,
+                f64_result.buffer_size,
+                f32_result.num_iter,
+                f64_result.num_iter,
+                f32_statistics.mean_ms,
+                f64_statistics.mean_ms,
+                ratio,
             );
         }
     }
@@ -450,15 +565,16 @@ async fn run_cases(
     let default_methodology = options.runs == DEFAULT_RUNS
         && options.iter_cap == DEFAULT_ITER_CAP
         && options.max_cases.is_none();
-    for (suite, scores) in suite_scores {
+    for ((suite, precision), scores) in suite_scores {
         let mean_score = scores.iter().sum::<f64>() / scores.len() as f64;
         let source_exact_iteration_budget = matches!(suite, "sample0" | "sample1000");
         let upstream_suite =
             source_exact_iteration_budget || matches!(suite, "sample3" | "sample7");
         let normalized_methodology = default_methodology && upstream_suite;
         println!(
-            "SUITE_RESULT suite={} reported_cases={} benchmark_score_mean_KiB_per_ms={:.3} vkfft_integer_score={} normalized_default_methodology={} source_exact_iteration_budget={}",
+            "SUITE_RESULT suite={} precision={} reported_cases={} benchmark_score_mean_KiB_per_ms={:.3} vkfft_integer_score={} normalized_default_methodology={} source_exact_iteration_budget={}",
             suite,
+            precision,
             scores.len(),
             mean_score,
             mean_score as u64,
@@ -474,14 +590,15 @@ async fn run_case(
     queue: &wgpu::Queue,
     case: &BenchCase,
     options: &Options,
+    precision: FftPrecision,
 ) -> BenchResult<CaseResult> {
     let logical_elements = checked_case_elements(case)?;
     let expected_buffer_size = u64::try_from(logical_elements)
         .map_err(|_| input_error("logical element count does not fit u64"))?
-        .checked_mul(COMPLEX_F32_BYTES)
+        .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false).validate()?;
-    benchmark_config(case, true).validate()?;
+    benchmark_config(case, false, precision).validate()?;
+    benchmark_config(case, true, precision).validate()?;
     let max_buffer_size = device.limits().max_buffer_size;
     if expected_buffer_size > max_buffer_size {
         return Err(input_error(format!(
@@ -497,7 +614,9 @@ async fn run_case(
         .min(options.iter_cap);
 
     println!(
-        "logical_elements={} logical_buffer_bytes={} logical_buffer_MiB={:.3} external_io_bytes={} initialization_seed_bytes={} num_iter={}",
+        "precision={} complex_element_bytes={} logical_elements={} logical_buffer_bytes={} logical_buffer_MiB={:.3} external_io_bytes={} initialization_seed_bytes={} num_iter={}",
+        precision.as_str(),
+        precision.complex_size_bytes(),
         logical_elements,
         expected_buffer_size,
         expected_buffer_size as f64 / 1024_f64.powi(2),
@@ -528,7 +647,7 @@ async fn run_case(
         mapped_at_creation: true,
     });
     pop_gpu_error_scopes(error_scopes, "allocating benchmark data buffers").await?;
-    fill_initialization_seed(&initialization_seed)?;
+    fill_initialization_seed(&initialization_seed, precision)?;
 
     let mut route = None;
     let mut execution_kind = None;
@@ -561,10 +680,16 @@ async fn run_case(
 
         let error_scopes = push_gpu_error_scopes(device);
         let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
-            let forward =
-                FftPlan::c2c_with_diagnostics(device, queue, benchmark_config(case, false))?;
-            let inverse =
-                FftPlan::c2c_with_diagnostics(device, queue, benchmark_config(case, true))?;
+            let forward = FftPlan::c2c_with_diagnostics(
+                device,
+                queue,
+                benchmark_config(case, false, precision),
+            )?;
+            let inverse = FftPlan::c2c_with_diagnostics(
+                device,
+                queue,
+                benchmark_config(case, true, precision),
+            )?;
             Ok((forward, inverse))
         })();
         pop_gpu_error_scopes(error_scopes, "creating forward and inverse FFT plans").await?;
@@ -732,10 +857,11 @@ async fn run_case(
         let command_buffer = command_buffer?;
 
         println!(
-            "run {}/{}: submitting {} FFT+iFFT pairs to {:?} via Vulkan",
+            "run {}/{}: submitting {} precision={} FFT+iFFT pairs to {:?} via Vulkan",
             run_index + 1,
             options.runs,
             num_iter,
+            precision.as_str(),
             forward.route(),
         );
         let submit_error_scopes = push_gpu_error_scopes(device);
@@ -781,6 +907,7 @@ async fn run_case(
     }
 
     Ok(CaseResult {
+        precision,
         route: route.ok_or_else(|| input_error("benchmark produced no route"))?,
         execution_kind: execution_kind
             .ok_or_else(|| input_error("benchmark produced no execution kind"))?,
@@ -864,12 +991,14 @@ impl VariantAccumulator {
 
     fn finish(
         self,
+        precision: FftPrecision,
         buffer_size: u64,
         external_io_bytes: u64,
         initialization_seed_bytes: u64,
         num_iter: u64,
     ) -> BenchResult<CaseResult> {
         Ok(CaseResult {
+            precision,
             route: self
                 .route
                 .ok_or_else(|| input_error("comparison variant produced no route"))?,
@@ -917,6 +1046,7 @@ async fn run_compare_case(
     queue: &wgpu::Queue,
     case: &BenchCase,
     options: &Options,
+    precision: FftPrecision,
 ) -> BenchResult<CompareCaseResult> {
     let requested_max_bind_bytes = options
         .plan_max_bind_bytes
@@ -927,10 +1057,10 @@ async fn run_compare_case(
     let logical_elements = checked_case_elements(case)?;
     let expected_buffer_size = u64::try_from(logical_elements)
         .map_err(|_| input_error("logical element count does not fit u64"))?
-        .checked_mul(COMPLEX_F32_BYTES)
+        .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false).validate()?;
-    benchmark_config(case, true).validate()?;
+    benchmark_config(case, false, precision).validate()?;
+    benchmark_config(case, true, precision).validate()?;
 
     let device_limits = device.limits();
     let real_max_buffer_size = device_limits.max_buffer_size;
@@ -977,7 +1107,9 @@ async fn run_compare_case(
         .clamp(1, DEFAULT_ITER_CAP)
         .min(options.iter_cap);
     println!(
-        "SEGMENT_CAP_VARIANTS logical_elements={} logical_buffer_bytes={} real_device_max_buffer_bytes={} requested_plan_max_bind_bytes={} unsharded_effective_max_bind_bytes={} sharded_effective_max_bind_bytes={} unsharded_requested_max_buffer_bytes={} unsharded_effective_max_buffer_bytes={} sharded_requested_max_buffer_bytes={} sharded_effective_max_buffer_bytes={} num_iter={}",
+        "SEGMENT_CAP_VARIANTS precision={} complex_element_bytes={} logical_elements={} logical_buffer_bytes={} real_device_max_buffer_bytes={} requested_plan_max_bind_bytes={} unsharded_effective_max_bind_bytes={} sharded_effective_max_bind_bytes={} unsharded_requested_max_buffer_bytes={} unsharded_effective_max_buffer_bytes={} sharded_requested_max_buffer_bytes={} sharded_effective_max_buffer_bytes={} num_iter={}",
+        precision.as_str(),
+        precision.complex_size_bytes(),
         logical_elements,
         expected_buffer_size,
         real_max_buffer_size,
@@ -1013,7 +1145,7 @@ async fn run_compare_case(
         mapped_at_creation: true,
     });
     pop_gpu_error_scopes(error_scopes, "allocating comparison data buffers").await?;
-    fill_initialization_seed(&initialization_seed)?;
+    fill_initialization_seed(&initialization_seed, precision)?;
 
     let mut unsharded = VariantAccumulator::default();
     let mut sharded = VariantAccumulator::default();
@@ -1047,7 +1179,7 @@ async fn run_compare_case(
             let error_scopes = push_gpu_error_scopes(device);
             let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
                 let create = |inverse| {
-                    let config = benchmark_config(case, inverse);
+                    let config = benchmark_config(case, inverse, precision);
                     if variant_label == "sharded" {
                         FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
                             device,
@@ -1173,6 +1305,7 @@ async fn run_compare_case(
             effective_max_bind_bytes: effective_unsharded_bind,
             effective_max_buffer_bytes: effective_unsharded_cap,
             result: unsharded.finish(
+                precision,
                 expected_buffer_size,
                 external_io_bytes,
                 initialization_seed_bytes,
@@ -1185,6 +1318,7 @@ async fn run_compare_case(
             effective_max_bind_bytes: effective_sharded_bind,
             effective_max_buffer_bytes: effective_sharded_cap,
             result: sharded.finish(
+                precision,
                 expected_buffer_size,
                 external_io_bytes,
                 initialization_seed_bytes,
@@ -1362,9 +1496,10 @@ fn print_compare_result(
         let traffic_bytes_per_pair = variant.result.buffer_size as f64 * traffic_multiplier as f64;
         let bandwidth_gib_s = traffic_bytes_per_pair / seconds_per_pair / 1024_f64.powi(3);
         println!(
-            "COMPARE_VARIANT suite={} label={} variant={} shape={:?} batch={} segmented_burst_depth={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
+            "COMPARE_VARIANT suite={} label={} precision={} variant={} shape={:?} batch={} segmented_burst_depth={} effective_max_bind_bytes={} requested_max_buffer_bytes={} effective_max_buffer_bytes={} logical_buffer_bytes={} runs={} num_iter={} raw_pair_ms={:?} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} route={} execution_kind={} graph_stages_per_fft={} traffic_equivalent_passes_per_fft={} pass_count_method={} traffic_multiplier_per_pair={} effective_traffic_bandwidth_GiB_s={:.3} plan_workspace_requirement_bytes={} combined_diagnostic_helper_requirement_bytes={} helper_requirements={} arena_segment_count={} arena_segment_bytes={:?}",
             case.suite,
             case.label,
+            variant.result.precision.as_str(),
             variant.label,
             case.shape,
             case.batch,
@@ -1399,9 +1534,10 @@ fn print_compare_result(
     let sharded_statistics = statistics(&result.sharded.result.run_pair_ms)?;
     let sharded_over_unsharded = sharded_statistics.mean_ms / unsharded_statistics.mean_ms;
     println!(
-        "COMPARE_RESULT suite={} label={} shape={:?} batch={} segmented_burst_depth={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
+        "COMPARE_RESULT suite={} label={} precision={} shape={:?} batch={} segmented_burst_depth={} unsharded_avg_pair_ms={:.6} sharded_avg_pair_ms={:.6} sharded_over_unsharded_ratio={:.6} sharding_overhead_percent={:.3} variant_order=alternated-by-run",
         case.suite,
         case.label,
+        result.unsharded.result.precision.as_str(),
         case.shape,
         case.batch,
         result.sharded.result.segmented_burst_depth,
@@ -1441,27 +1577,44 @@ fn initialize_buffers(
     )
 }
 
-fn fill_initialization_seed(seed: &wgpu::Buffer) -> BenchResult<()> {
+fn fill_initialization_seed(seed: &wgpu::Buffer, precision: FftPrecision) -> BenchResult<()> {
     let mut mapped = seed.slice(..).get_mapped_range_mut();
-    let value_count = mapped.len() / std::mem::size_of::<f32>();
-    let mut values = Vec::with_capacity(value_count);
-    values.resize(value_count, 0.0f32);
-    for (index, value) in values.iter_mut().enumerate() {
-        let numerator = ((index as u64).wrapping_mul(17) % 251 + 1) as f32;
-        let magnitude = numerator / 251.0;
-        *value = if index % 2 == 0 {
-            magnitude
-        } else {
-            -magnitude
-        };
+    match precision {
+        FftPrecision::F32 => {
+            let value_count = mapped.len() / std::mem::size_of::<f32>();
+            let mut values = vec![0.0f32; value_count];
+            for (index, value) in values.iter_mut().enumerate() {
+                let numerator = ((index as u64).wrapping_mul(17) % 251 + 1) as f32;
+                let magnitude = numerator / 251.0;
+                *value = if index % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                };
+            }
+            mapped.copy_from_slice(bytemuck::cast_slice(&values));
+        }
+        FftPrecision::F64 => {
+            let value_count = mapped.len() / std::mem::size_of::<f64>();
+            let mut values = vec![0.0f64; value_count];
+            for (index, value) in values.iter_mut().enumerate() {
+                let numerator = ((index as u64).wrapping_mul(17) % 251 + 1) as f64;
+                let magnitude = numerator / 251.0;
+                *value = if index % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                };
+            }
+            mapped.copy_from_slice(bytemuck::cast_slice(&values));
+        }
     }
-    mapped.copy_from_slice(bytemuck::cast_slice(&values));
     drop(mapped);
     seed.unmap();
     Ok(())
 }
 
-fn benchmark_config(case: &BenchCase, inverse: bool) -> FftConfig {
+fn benchmark_config(case: &BenchCase, inverse: bool, precision: FftPrecision) -> FftConfig {
     let config = if inverse {
         FftConfig::inverse_nd(case.shape.clone())
     } else {
@@ -1470,6 +1623,7 @@ fn benchmark_config(case: &BenchCase, inverse: bool) -> FftConfig {
     config
         .with_batch(case.batch)
         .with_normalization(Normalization::None)
+        .with_precision(precision)
 }
 
 fn diagnostic_helper_requirement_bytes(diagnostics: &FftDiagnostics) -> BenchResult<u64> {
@@ -1761,9 +1915,11 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
     let bandwidth_gb_s = traffic_bytes_per_pair / seconds_per_pair / 1_000_000_000.0;
 
     println!(
-        "RESULT suite={} label={} shape={:?} batch={} logical_vkfft_style_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place reference_mode=VkFFT-in-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} vkfft_population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
+        "RESULT suite={} label={} precision={} complex_element_bytes={} shape={:?} batch={} logical_vkfft_style_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place reference_mode=VkFFT-in-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} vkfft_population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
         case.suite,
         case.label,
+        result.precision.as_str(),
+        result.precision.complex_size_bytes(),
         case.shape,
         case.batch,
         result.buffer_size,
@@ -1857,6 +2013,7 @@ fn parse_options() -> BenchResult<Options> {
 
     let mut options = Options {
         suite,
+        precision: PrecisionMode::F32,
         custom_shape,
         custom_batch: 1,
         adapter_selector: None,
@@ -1871,6 +2028,14 @@ fn parse_options() -> BenchResult<Options> {
     let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--precision" => {
+                let value = next_value(&mut args, "--precision")?;
+                options.precision = PrecisionMode::parse(&value).ok_or_else(|| {
+                    input_error(format!(
+                        "unknown --precision value {value:?}; expected f32, f64, or both"
+                    ))
+                })?;
+            }
             "--runs" => {
                 options.runs = parse_positive::<usize>(next_value(&mut args, "--runs")?, "--runs")?;
             }
@@ -1961,6 +2126,11 @@ fn parse_options() -> BenchResult<Options> {
             "--segmented-burst-depth requires the segment-cap comparison flags",
         ));
     }
+    if options.precision == PrecisionMode::Both && options.compare_max_buffer_bytes.is_some() {
+        return Err(input_error(
+            "--precision both is not supported with the segment-cap comparison flags; run separate f32 and f64 comparisons",
+        ));
+    }
     Ok(options)
 }
 
@@ -2042,21 +2212,23 @@ fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBuffer
 fn print_usage() {
     eprintln!(
         r#"Usage:
-  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|both] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|both] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
 
 Defaults:
-  runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.
+  precision=f32, runs=3, iter-cap=1000, submission-wait-timeout=120 seconds.
   With one hardware Vulkan GPU it is selected automatically; multiple GPUs require --adapter.
+  Precision f64/both requires adapter SHADER_F64 support; both reports an f64/f32 pair-time ratio.
   Segment-cap comparison recreates both variants per run and alternates their order.
-  Segmented burst depth defaults to 2 and is valid only in comparison mode.
+  Segmented burst depth defaults to 2 and is valid only in comparison mode; precision=both is rejected there.
 
 Examples:
   cargo bench --bench fft_bench -- smoke --adapter "RTX 5090" --runs 1 --iter-cap 2
   cargo bench --bench fft_bench -- sample0 --adapter "RTX 5090"
   cargo bench --bench fft_bench -- sample1000 --adapter 0 --runs 1 --iter-cap 1 --max-cases 2
   cargo bench --bench fft_bench -- shape 1024x1024 --batch 2 --adapter "RTX 5090" --runs 1 --iter-cap 1
+  cargo bench --bench fft_bench -- shape 4096 --batch 16384 --precision both --adapter "RTX 5090" --runs 2 --iter-cap 200
   cargo bench --bench fft_bench -- shape 320x320x320 --plan-max-bind-bytes 16777216 --compare-max-buffer-bytes 1073741824,67108864 --segmented-burst-depth 2 --adapter "RTX 5090" --runs 2 --iter-cap 1"#
     );
 }

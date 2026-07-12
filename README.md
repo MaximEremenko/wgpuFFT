@@ -2,9 +2,10 @@
 
 Rust `wgpu` FFT library.
 
-This crate exposes a native Rust API for out-of-place complex-to-complex and
-real/packed-complex `f32` transforms over 1D/ND shapes and batches. C2C buffers
-are interleaved complex:
+This crate exposes a native Rust API for out-of-place complex-to-complex `f32`
+and native `f64` transforms, plus real/packed-complex `f32` transforms, over
+1D/ND shapes and batches. C2C buffers are interleaved complex values in the
+configured scalar precision:
 
 ```text
 [re0, im0, re1, im1, ...]
@@ -15,8 +16,9 @@ shape `[N0, ...]`, the packed complex shape is `[floor(N0 / 2) + 1, ...]`, also
 stored as interleaved complex values.
 
 Power-of-two axes and multi-stage smooth axes use a single-workgroup fused
-kernel when the complete line fits device workgroup storage (8 bytes per
-complex element) and 256 invocations are supported. This covers mixed-radix
+kernel when the complete line fits device workgroup storage (8 bytes per `f32`
+complex element or 16 bytes per `f64` complex element) and 256 invocations are
+supported. This covers mixed-radix
 lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`; single-stage smooth axes and
 larger lines use generated Stockham stages. Other prime axes route through
 Rader, unsupported composite axes route through Bluestein convolution over a
@@ -55,15 +57,20 @@ power-of-two, fused smooth-radix, and Stockham kernels, Rader/Bluestein helpers,
 real helpers, C2C/real layout helpers, smooth/strided helpers, and direct DFT
 pipelines. Typed in-memory cache snapshots can be exported and imported through
 `export_pipeline_cache_snapshot` and `import_pipeline_cache_snapshot`;
-entries that exceed the target device's fused-kernel compute limits are skipped.
+entries that exceed the target device's fused-kernel compute limits or require
+an unavailable shader feature are skipped.
 
 ## Current Scope
 
-- C2C over 1D/ND shapes.
+- C2C `f32` over 1D/ND shapes on native `wgpu` backends.
+- Native C2C `f64` over normal 1D/ND mixed-radix, Rader, Bluestein, and
+  mixed-algorithm axis-sequence routes. Select it with
+  `FftConfig::with_precision(FftPrecision::F64)`. It requires a Vulkan adapter
+  and device exposing `wgpu::Features::SHADER_F64`; unsupported devices return
+  structured `FftError::PrecisionUnsupported` errors.
 - R2C/C2R `f32` over full-shape axes only.
 - C2C axis subsets through `FftConfig::with_axes(...)`.
 - Batch count through `FftConfig::with_batch(...)`.
-- `f32` only.
 - Out-of-place execution only.
 - Caller-owned `wgpu::Buffer` input and output.
 - `FftPlan::r2c(...)`, `FftPlan::c2r(...)`, `create_r2c_plan(...)`, and
@@ -122,6 +129,10 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   internal/tuning cap is below the real endpoint limit. Prime axes inside a
   segmented volume, segmented/strided caller views, and caller-workspace reuse
   remain structured-unsupported.
+- Large-chunk, GPU-resident four-step, and segmented full-volume execution are
+  currently `f32` routes. Native-`f64` plans that require one of those routes,
+  and all real `f64` transforms, return structured `PrecisionUnsupported`
+  diagnostics rather than silently changing precision.
 - Internal shader/module/pipeline cache keyed by generated fused power-of-two,
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.
@@ -132,8 +143,8 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
 - R2C requires forward direction; C2R requires inverse direction. Real
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
-- In-place execution, f16/f64, DCT/DST, public convolution, NUFFT, and WASM
-  wrapper work are out of scope.
+- In-place execution, `f16`, portable `df64` emulation, DCT/DST, public
+  convolution, NUFFT, and the WASM wrapper are out of scope.
 - No serde/JSON cache snapshot persistence yet.
 - Native `wgpu` first; WASM is planned later. `wgpuFFT` stays `wgpu`-only; use
   `WGPU_BACKEND=vulkan` for Vulkan/native validation where available.
@@ -148,6 +159,7 @@ cargo fmt --check
 cargo test
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_c2c -- --nocapture
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_real -- --nocapture
+WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_f64 --release -- --nocapture
 ```
 
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`

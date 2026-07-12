@@ -43,7 +43,8 @@ use crate::runtime::stage_executor::StageExecutor;
 #[cfg(test)]
 use crate::runtime::twiddle::twiddle_lut_f32;
 use crate::runtime::twiddle::{
-    create_twiddle_lut_buffer, create_twiddle_lut_buffer_for_len, two_level_twiddle_lut_f32,
+    create_twiddle_lut_buffer, create_twiddle_lut_buffer_for_len_with_precision,
+    two_level_twiddle_lut_f32,
 };
 use crate::runtime::window_scheduler::{strided_span_elements, WindowScheduler};
 
@@ -80,8 +81,11 @@ fn phase_a_f64_route_error(
         && bytes_per_batch > limits.max_storage_buffer_binding_size;
     let four_step_eligible =
         needs_out_of_core && lightweight_four_step_eligible(config, axis_kinds, limits)?;
+    if !needs_large_mode && matches!(route, C2cRoute::DirectDft | C2cRoute::MixedRadix) {
+        return Ok(());
+    }
     let (route, reason) = if !needs_large_mode {
-        (route.as_str(), "native-f64-c2c-kernels-not-implemented")
+        (route.as_str(), "native-f64-prime-kernels-not-implemented")
     } else if !four_step_eligible {
         ("large-chunk", "large-chunk-f64-not-implemented")
     } else if required_bytes > limits.max_buffer_size
@@ -149,6 +153,15 @@ struct DirectParams {
     inverse: u32,
     scale: f32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct DirectParamsF64 {
+    len: u32,
+    inverse: u32,
+    scale: f64,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -501,6 +514,7 @@ struct SmoothChunkCopyRequest {
 }
 
 struct DirectDftPlan {
+    precision: AxisPrecision,
     pipeline_key: ComputePipelineCacheKey,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -962,6 +976,7 @@ impl C2cPlan {
                 route_impl,
                 self.required_buffer_size_bytes(),
                 self.workspace_size_bytes(),
+                self.complex_element_format(),
                 policy_limits(&self.large_routing_policy),
             ),
             C2cExecution::LargeChunk(plan) => Ok(plan.graph_plan.graph().clone()),
@@ -1083,18 +1098,10 @@ impl C2cPlan {
         let logical_per_batch = self.config.logical_complex_len()? as u64;
         let batch = self.config.batch() as u64;
         let scheduler = WindowScheduler::for_device(device);
-        let input = scheduler.bind_logical_io(
-            input,
-            FftEndpointFormat::ComplexF32,
-            logical_per_batch,
-            batch,
-        )?;
-        let output = scheduler.bind_logical_io(
-            output,
-            FftEndpointFormat::ComplexF32,
-            logical_per_batch,
-            batch,
-        )?;
+        let endpoint_format = self.complex_endpoint_format();
+        let input = scheduler.bind_logical_io(input, endpoint_format, logical_per_batch, batch)?;
+        let output =
+            scheduler.bind_logical_io(output, endpoint_format, logical_per_batch, batch)?;
         self.execute_io_views(
             device,
             encoder,
@@ -1114,18 +1121,10 @@ impl C2cPlan {
         let logical_per_batch = self.config.logical_complex_len()? as u64;
         let batch = self.config.batch() as u64;
         let scheduler = WindowScheduler::for_device(device);
-        let input = scheduler.bind_logical_io(
-            input,
-            FftEndpointFormat::ComplexF32,
-            logical_per_batch,
-            batch,
-        )?;
-        let output = scheduler.bind_logical_io(
-            output,
-            FftEndpointFormat::ComplexF32,
-            logical_per_batch,
-            batch,
-        )?;
+        let endpoint_format = self.complex_endpoint_format();
+        let input = scheduler.bind_logical_io(input, endpoint_format, logical_per_batch, batch)?;
+        let output =
+            scheduler.bind_logical_io(output, endpoint_format, logical_per_batch, batch)?;
         self.execute_io_views_with_workspace(
             device,
             encoder,
@@ -1209,8 +1208,9 @@ impl C2cPlan {
             output.clone()
         };
 
-        validate_exact_storage_view(device, &exec_input, ElementFormat::ComplexF32)?;
-        validate_exact_storage_view(device, &exec_output, ElementFormat::ComplexF32)?;
+        let element_format = self.complex_element_format();
+        validate_exact_storage_view(device, &exec_input, element_format)?;
+        validate_exact_storage_view(device, &exec_output, element_format)?;
         self.execute_route_views(device, encoder, exec_input, exec_output, workspace)?;
 
         if let Some(buffer) = output_stage.as_ref() {
@@ -1294,6 +1294,7 @@ impl C2cPlan {
                 input.layout,
                 self.logical_complex_len_u32()?,
                 self.config.batch() as u32,
+                self.config.precision().into(),
             )?;
             Some(buffer)
         };
@@ -1339,8 +1340,9 @@ impl C2cPlan {
             output.view.clone()
         };
 
-        validate_exact_storage_view(device, &exec_input, ElementFormat::ComplexF32)?;
-        validate_exact_storage_view(device, &exec_output, ElementFormat::ComplexF32)?;
+        let element_format = self.complex_element_format();
+        validate_exact_storage_view(device, &exec_input, element_format)?;
+        validate_exact_storage_view(device, &exec_output, element_format)?;
         self.execute_views_impl(device, encoder, exec_input, exec_output, workspace)?;
 
         if let Some(buffer) = output_stage.as_ref() {
@@ -1363,6 +1365,7 @@ impl C2cPlan {
                     output.layout,
                     self.logical_complex_len_u32()?,
                     self.config.batch() as u32,
+                    self.config.precision().into(),
                 )?;
                 if let Some(physical_stage) = output_physical_stage.as_ref() {
                     copy_buffer_to_view(
@@ -1440,7 +1443,7 @@ impl C2cPlan {
         let batch = self.config.batch() as u64;
         let span_complex = layout.required_complex_span(logical_per_batch, batch)?;
         let span_bytes = span_complex
-            .checked_mul(COMPLEX_F32_BYTES)
+            .checked_mul(self.config.precision().complex_size_bytes())
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
         if span_bytes > view.size() {
             return Err(FftError::BufferLayoutOutOfBounds {
@@ -1455,7 +1458,7 @@ impl C2cPlan {
             span_bytes
         })?;
         if !contiguous && view.is_single_segment() {
-            validate_exact_storage_view(device, &view, ElementFormat::ComplexF32)?;
+            validate_exact_storage_view(device, &view, self.complex_element_format())?;
         }
         Ok(C2cIoLayout {
             view,
@@ -1504,7 +1507,7 @@ impl C2cPlan {
         }
         let view = view.prefix(required)?;
         if required > 0 {
-            validate_exact_storage_view(device, &view, ElementFormat::ComplexF32)?;
+            validate_exact_storage_view(device, &view, self.complex_element_format())?;
         }
         Ok(view)
     }
@@ -1513,6 +1516,20 @@ impl C2cPlan {
         let graph = self.execution_graph()?;
         let scheduler = WindowScheduler::for_device(device);
         StageExecutor::new(&scheduler).validate_graph(&graph)
+    }
+
+    fn complex_element_format(&self) -> ElementFormat {
+        match self.config.precision() {
+            FftPrecision::F32 => ElementFormat::ComplexF32,
+            FftPrecision::F64 => ElementFormat::ComplexF64,
+        }
+    }
+
+    fn complex_endpoint_format(&self) -> FftEndpointFormat {
+        match self.config.precision() {
+            FftPrecision::F32 => FftEndpointFormat::ComplexF32,
+            FftPrecision::F64 => FftEndpointFormat::ComplexF64,
+        }
     }
 }
 
@@ -3590,14 +3607,26 @@ fn c2c_range(buffer: LogicalBufferId, offset_bytes: u64, size_bytes: u64) -> Res
     LogicalRange::new(buffer, offset_bytes, size_bytes, ElementFormat::ComplexF32)
 }
 
+fn c2c_range_with_format(
+    buffer: LogicalBufferId,
+    offset_bytes: u64,
+    size_bytes: u64,
+    format: ElementFormat,
+) -> Result<LogicalRange> {
+    LogicalRange::new(buffer, offset_bytes, size_bytes, format)
+}
+
 fn build_normal_c2c_graph_for_impl(
     route_impl: &C2cRouteImpl,
     required_bytes: u64,
     workspace_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     match route_impl {
-        C2cRouteImpl::DirectDft(_) => build_direct_dft_c2c_graph(required_bytes, limits),
+        C2cRouteImpl::DirectDft(_) => {
+            build_direct_dft_c2c_graph_with_format(required_bytes, element_format, limits)
+        }
         C2cRouteImpl::MixedRadix(plan) => build_axis_plan_c2c_graph_with_kinds(
             "c2c-mixed-radix-normal",
             "mixed-radix-stockham-stage",
@@ -3607,6 +3636,7 @@ fn build_normal_c2c_graph_for_impl(
             &plan.graph_stage_kinds(),
             required_bytes,
             workspace_bytes,
+            element_format,
             limits,
         ),
         C2cRouteImpl::Rader(plan) => build_normal_rader_c2c_graph(
@@ -3778,31 +3808,60 @@ enum AxisSequenceGraphStep {
     },
 }
 
+#[cfg(test)]
 fn build_direct_dft_c2c_graph(
     required_bytes: u64,
+    limits: LargePolicyLimits,
+) -> Result<LargeExecutionGraph> {
+    build_direct_dft_c2c_graph_with_format(required_bytes, ElementFormat::ComplexF32, limits)
+}
+
+fn build_direct_dft_c2c_graph_with_format(
+    required_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     let mut graph = LargeExecutionGraph::new("c2c-direct-dft-normal");
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
-            range: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
     graph.push_stage(
         LargeStage::Kernel {
             label: C2cRoute::DirectDft.graph_label(),
-            input: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
-            output: c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
-            work_items: work_items_for_bytes(required_bytes, ElementFormat::ComplexF32),
+            input: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
+            output: c2c_range_with_format(
+                LogicalBufferId::Output,
+                0,
+                required_bytes,
+                element_format,
+            )?,
+            work_items: work_items_for_bytes(required_bytes, element_format),
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-output",
-            range: c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Output,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
@@ -3840,6 +3899,7 @@ fn build_axis_plan_c2c_graph_with_kinds(
     stage_kinds: &[AxisStageKind],
     required_bytes: u64,
     workspace_bytes: u64,
+    element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
     let stage_labels = stage_kinds
@@ -3850,16 +3910,18 @@ fn build_axis_plan_c2c_graph_with_kinds(
             AxisStageKind::FusedSmooth { .. } => fused_smooth_label,
         })
         .collect::<Vec<_>>();
-    build_axis_plan_c2c_graph_with_labels(
+    build_axis_plan_c2c_graph_with_labels_and_format(
         graph_label,
         &stage_labels,
         workspace_label,
         required_bytes,
         workspace_bytes,
+        element_format,
         limits,
     )
 }
 
+#[cfg(test)]
 fn build_axis_plan_c2c_graph_with_labels(
     graph_label: &'static str,
     stage_labels: &[&'static str],
@@ -3868,11 +3930,36 @@ fn build_axis_plan_c2c_graph_with_labels(
     workspace_bytes: u64,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
+    build_axis_plan_c2c_graph_with_labels_and_format(
+        graph_label,
+        stage_labels,
+        workspace_label,
+        required_bytes,
+        workspace_bytes,
+        ElementFormat::ComplexF32,
+        limits,
+    )
+}
+
+fn build_axis_plan_c2c_graph_with_labels_and_format(
+    graph_label: &'static str,
+    stage_labels: &[&'static str],
+    workspace_label: &'static str,
+    required_bytes: u64,
+    workspace_bytes: u64,
+    element_format: ElementFormat,
+    limits: LargePolicyLimits,
+) -> Result<LargeExecutionGraph> {
     let mut graph = LargeExecutionGraph::new(graph_label);
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
-            range: c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Input,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
@@ -3880,8 +3967,8 @@ fn build_axis_plan_c2c_graph_with_labels(
         &mut graph,
         stage_labels,
         workspace_label,
-        c2c_range(LogicalBufferId::Input, 0, required_bytes)?,
-        c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
+        c2c_range_with_format(LogicalBufferId::Input, 0, required_bytes, element_format)?,
+        c2c_range_with_format(LogicalBufferId::Output, 0, required_bytes, element_format)?,
         0,
         workspace_bytes,
         limits,
@@ -3890,7 +3977,12 @@ fn build_axis_plan_c2c_graph_with_labels(
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-output",
-            range: c2c_range(LogicalBufferId::Output, 0, required_bytes)?,
+            range: c2c_range_with_format(
+                LogicalBufferId::Output,
+                0,
+                required_bytes,
+                element_format,
+            )?,
         },
         graph_requirements_covering(limits, 1, required_bytes, 0)?,
     )?;
@@ -3942,12 +4034,23 @@ fn add_axis_plan_kernel_stages_with_labels(
     workspace_bytes: u64,
     limits: LargePolicyLimits,
 ) -> Result<()> {
-    let temp = c2c_range(LogicalBufferId::Temp(temp_index), 0, workspace_bytes.max(8))?;
+    let element_format = input.format;
+    let temp = c2c_range_with_format(
+        LogicalBufferId::Temp(temp_index),
+        0,
+        workspace_bytes.max(element_format.bytes_per_element()),
+        element_format,
+    )?;
     if workspace_bytes > 0 {
         graph.push_stage(
             LargeStage::HelperWindow {
                 label: workspace_label,
-                range: c2c_range(LogicalBufferId::Temp(temp_index), 0, workspace_bytes)?,
+                range: c2c_range_with_format(
+                    LogicalBufferId::Temp(temp_index),
+                    0,
+                    workspace_bytes,
+                    element_format,
+                )?,
             },
             graph_requirements_covering(limits, 1, workspace_bytes, workspace_bytes)?,
         )?;
@@ -3966,7 +4069,7 @@ fn add_axis_plan_kernel_stages_with_labels(
                 label: stage_label,
                 input: stage_range_with_temp(src_slot, input, output, temp),
                 output: stage_range_with_temp(dst_slot, input, output, temp),
-                work_items: work_items_for_bytes(input.size_bytes, ElementFormat::ComplexF32),
+                work_items: work_items_for_bytes(input.size_bytes, element_format),
             },
             graph_requirements_covering(limits, 1, input.size_bytes.max(output.size_bytes), 0)?,
         )?;
@@ -6314,15 +6417,17 @@ fn dispatch_c2c_strided_copy(
     layout: BufferLayout,
     logical_per_batch: u32,
     batch: u32,
+    precision: AxisPrecision,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
-    let input_resource = scheduler.storage_binding_resource(input, ElementFormat::ComplexF32)?;
-    let output_resource = scheduler.storage_binding_resource(output, ElementFormat::ComplexF32)?;
+    let element_format = precision.element_format();
+    let input_resource = scheduler.storage_binding_resource(input, element_format)?;
+    let output_resource = scheduler.storage_binding_resource(output, element_format)?;
 
-    let shader_key = C2cStridedStageKey::new(kind, WORKGROUP_SIZE);
+    let shader_key = C2cStridedStageKey::new(kind, WORKGROUP_SIZE, precision);
     let pipeline_key = ComputePipelineCacheKey::c2c_strided_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
-        cache.get_bind_group_layout(device, PipelineLayoutCacheKey::C2cStridedBinaryF32)
+        cache.get_bind_group_layout(device, pipeline_key.layout)
     });
     let pipeline = with_device_pipeline_cache(device, |cache| {
         cache.get_compute_pipeline(
@@ -6804,7 +6909,7 @@ pub(crate) fn generate_c2c_strided_wgsl_for_key(key: &C2cStridedStageKey) -> Str
         C2cStridedKernelKind::Pack => "output[i] = input[physical_index];",
         C2cStridedKernelKind::Unpack => "output[physical_index] = input[i];",
     };
-    format!(
+    let source = format!(
         r#"
 struct Params {{
   total_complex: u32,
@@ -6834,7 +6939,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 }}
 "#,
         workgroup_size = key.workgroup_size,
-    )
+    );
+    match key.precision {
+        AxisPrecision::F32 => source,
+        AxisPrecision::F64 => source.replace("vec2<f32>", "vec2<f64>"),
+    }
 }
 
 pub fn select_route(config: &FftConfig) -> C2cRoute {
@@ -7136,6 +7245,16 @@ impl AxisStep {
     }
 }
 
+pub(crate) fn generate_direct_dft_wgsl(precision: AxisPrecision) -> String {
+    let source = crate::kernels::C2C_DFT_WGSL.to_owned();
+    match precision {
+        AxisPrecision::F32 => source,
+        AxisPrecision::F64 => source
+            .replace("scale: f32", "scale: f64")
+            .replace("vec2<f32>", "vec2<f64>"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceBufferSlot {
     Input,
@@ -7172,12 +7291,24 @@ impl DirectDftPlan {
         config: &FftConfig,
         len: u32,
     ) -> Result<Self> {
-        let pipeline_key = ComputePipelineCacheKey::direct_dft_c2c_f32();
-        let params = DirectParams {
-            len,
-            inverse: u32::from(config.direction() == FftDirection::Inverse),
-            scale: config.scale()?,
-            _pad: 0,
+        let precision: AxisPrecision = config.precision().into();
+        let pipeline_key = ComputePipelineCacheKey::direct_dft_c2c(precision);
+        let inverse = u32::from(config.direction() == FftDirection::Inverse);
+        let params_bytes = match precision {
+            AxisPrecision::F32 => bytemuck::bytes_of(&DirectParams {
+                len,
+                inverse,
+                scale: config.scale()?,
+                _pad: 0,
+            })
+            .to_vec(),
+            AxisPrecision::F64 => bytemuck::bytes_of(&DirectParamsF64 {
+                len,
+                inverse,
+                scale: config.scale_f64()?,
+                _pad: [0; 2],
+            })
+            .to_vec(),
         };
 
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
@@ -7189,27 +7320,29 @@ impl DirectDftPlan {
                 &pipeline_key,
                 "wgpu_fft.c2c_dft.pipeline",
                 "wgpu_fft.c2c_dft.shader",
-                || crate::kernels::C2C_DFT_WGSL.to_owned(),
+                || generate_direct_dft_wgsl(precision),
             )
         });
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wgpu_fft.c2c_dft.params"),
-            size: std::mem::size_of::<DirectParams>() as u64,
+            size: params_bytes.len() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
-        let twiddle_buffer = create_twiddle_lut_buffer_for_len(
+        queue.write_buffer(&params_buffer, 0, &params_bytes);
+        let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
             device,
             queue,
             "wgpu_fft.c2c_dft.twiddle_lut",
             len as usize,
+            config.precision(),
         )?;
 
         let workgroups_x = len.div_ceil(WORKGROUP_SIZE);
 
         Ok(Self {
+            precision,
             pipeline_key,
             pipeline,
             bind_group_layout,
@@ -7231,13 +7364,11 @@ impl DirectDftPlan {
         output: BufferView<'_>,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
-        let input_resource =
-            scheduler.storage_binding_resource(&input, ElementFormat::ComplexF32)?;
-        let output_resource =
-            scheduler.storage_binding_resource(&output, ElementFormat::ComplexF32)?;
+        let element_format = self.precision.element_format();
+        let input_resource = scheduler.storage_binding_resource(&input, element_format)?;
+        let output_resource = scheduler.storage_binding_resource(&output, element_format)?;
         let twiddle_view = BufferView::whole(&self.twiddle_buffer);
-        let twiddle_resource =
-            scheduler.storage_binding_resource(&twiddle_view, ElementFormat::ComplexF32)?;
+        let twiddle_resource = scheduler.storage_binding_resource(&twiddle_view, element_format)?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.c2c_dft.bind_group"),
             layout: &self.bind_group_layout,
@@ -7292,7 +7423,22 @@ mod tests {
     }
 
     #[test]
-    fn phase_a_f64_boundary_preclassifies_deferred_large_routes() {
+    fn phase_b_f64_boundary_allows_normal_mixed_and_gates_deferred_routes() {
+        let normal = FftConfig::new(8).with_precision(FftPrecision::F64);
+        let normal_kinds = resolve_axis_kinds_for_axes(normal.shape(), normal.axes()).unwrap();
+        assert_eq!(
+            phase_a_f64_route_error(
+                &normal,
+                &normal_kinds,
+                LargePolicyLimits {
+                    max_storage_buffer_binding_size: 128,
+                    max_buffer_size: 4096,
+                },
+                select_route(&normal),
+            ),
+            Ok(())
+        );
+
         let error_for = |config: FftConfig, max_buffer_size| {
             let route = select_route(&config);
             let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
@@ -7308,13 +7454,23 @@ mod tests {
             .unwrap_err()
         };
 
+        let prime = FftConfig::new(17).with_precision(FftPrecision::F64);
+        let prime_kinds = resolve_axis_kinds_for_axes(prime.shape(), prime.axes()).unwrap();
         assert!(matches!(
-            error_for(FftConfig::new(8).with_precision(FftPrecision::F64), 4096),
-            FftError::PrecisionUnsupported {
-                route: "mixed-radix",
-                reason: "native-f64-c2c-kernels-not-implemented",
+            phase_a_f64_route_error(
+                &prime,
+                &prime_kinds,
+                LargePolicyLimits {
+                    max_storage_buffer_binding_size: 4096,
+                    max_buffer_size: 4096,
+                },
+                select_route(&prime),
+            ),
+            Err(FftError::PrecisionUnsupported {
+                route: "rader",
+                reason: "native-f64-prime-kernels-not-implemented",
                 ..
-            }
+            })
         ));
         assert!(matches!(
             error_for(
@@ -7472,6 +7628,27 @@ mod tests {
         assert!(smooth.contains("exponent >> params.lut_shift"));
         assert!(!smooth.contains("sin("));
         assert!(!smooth.contains("cos("));
+    }
+
+    #[test]
+    fn direct_dft_and_strided_copy_sources_follow_precision() {
+        let direct_f32 = generate_direct_dft_wgsl(AxisPrecision::F32);
+        let direct_f64 = generate_direct_dft_wgsl(AxisPrecision::F64);
+        assert_eq!(direct_f32, crate::kernels::C2C_DFT_WGSL);
+        assert!(direct_f64.contains("scale: f64"));
+        assert!(direct_f64.contains("array<vec2<f64>>"));
+        assert!(!direct_f64.contains("vec2<f32>"));
+        assert_eq!(std::mem::size_of::<DirectParams>(), 16);
+        assert_eq!(std::mem::size_of::<DirectParamsF64>(), 24);
+
+        let f64_key = C2cStridedStageKey::new(
+            C2cStridedKernelKind::Pack,
+            WORKGROUP_SIZE,
+            AxisPrecision::F64,
+        );
+        let strided_f64 = generate_c2c_strided_wgsl_for_key(&f64_key);
+        assert!(strided_f64.contains("array<vec2<f64>>"));
+        assert!(!strided_f64.contains("vec2<f32>"));
     }
 
     #[test]

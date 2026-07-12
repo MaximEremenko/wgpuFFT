@@ -1,5 +1,6 @@
+use crate::config::FftPrecision;
 use crate::error::{FftError, Result};
-use crate::math::Complex32;
+use crate::math::{Complex32, Complex64};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TwoLevelTwiddleLutF32 {
@@ -15,6 +16,14 @@ pub(crate) fn twiddle_lut_f32(len: usize) -> Vec<Complex32> {
     assert!(len > 0, "a twiddle table requires a non-zero length");
     (0..len)
         .map(|index| canonical_twiddle_f32(len, index))
+        .collect()
+}
+
+/// Builds the canonical forward roots `exp(-2*pi*i*k/len)` directly in f64.
+pub(crate) fn twiddle_lut_f64(len: usize) -> Vec<Complex64> {
+    assert!(len > 0, "a twiddle table requires a non-zero length");
+    (0..len)
+        .map(|index| canonical_twiddle_f64(len, index))
         .collect()
 }
 
@@ -77,17 +86,58 @@ pub(crate) fn create_twiddle_lut_buffer_for_len(
     label: &'static str,
     len: usize,
 ) -> Result<wgpu::Buffer> {
-    validate_twiddle_lut_len(device, label, len)?;
+    create_twiddle_lut_buffer_for_len_with_precision(device, queue, label, len, FftPrecision::F32)
+}
+
+pub(crate) fn create_twiddle_lut_buffer_for_len_with_precision(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    len: usize,
+    precision: FftPrecision,
+) -> Result<wgpu::Buffer> {
+    validate_twiddle_lut_len_with_precision(device, label, len, precision)?;
+    if precision == FftPrecision::F64 {
+        let values = twiddle_lut_f64(len);
+        return create_twiddle_lut_buffer_f64(device, queue, label, &values);
+    }
     let values = twiddle_lut_f32(len);
     create_twiddle_lut_buffer(device, queue, label, &values)
 }
 
+fn create_twiddle_lut_buffer_f64(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    values: &[Complex64],
+) -> Result<wgpu::Buffer> {
+    let requested_bytes =
+        validate_twiddle_lut_len_with_precision(device, label, values.len(), FftPrecision::F64)?;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: requested_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(values));
+    Ok(buffer)
+}
+
 fn validate_twiddle_lut_len(device: &wgpu::Device, label: &'static str, len: usize) -> Result<u64> {
+    validate_twiddle_lut_len_with_precision(device, label, len, FftPrecision::F32)
+}
+
+fn validate_twiddle_lut_len_with_precision(
+    device: &wgpu::Device,
+    label: &'static str,
+    len: usize,
+    precision: FftPrecision,
+) -> Result<u64> {
     if len == 0 {
         return Err(FftError::ZeroLength);
     }
     let requested_bytes = (len as u64)
-        .checked_mul(8)
+        .checked_mul(precision.complex_size_bytes())
         .ok_or(FftError::LengthTooLarge { len })?;
     let limits = device.limits();
     if requested_bytes > limits.max_buffer_size {
@@ -127,6 +177,14 @@ fn canonical_twiddle_f32(len: usize, index: usize) -> Complex32 {
     Complex32::new(cos as f32, sin as f32)
 }
 
+fn canonical_twiddle_f64(len: usize, index: usize) -> Complex64 {
+    debug_assert!(len > 0);
+    debug_assert!(index < len);
+    let angle = -std::f64::consts::TAU * index as f64 / len as f64;
+    let (sin, cos) = angle.sin_cos();
+    Complex64::new(cos, sin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +201,18 @@ mod tests {
             let angle = -std::f64::consts::TAU * index as f64 / len as f64;
             let (sin, cos) = angle.sin_cos();
             assert_eq!(lut[index], Complex32::new(cos as f32, sin as f32));
+        }
+    }
+
+    #[test]
+    fn f64_lut_preserves_host_sin_cos_bits() {
+        let len = 4096;
+        let lut = twiddle_lut_f64(len);
+        for index in [0, 1, 17, 1023, 2048, 4095] {
+            let angle = -std::f64::consts::TAU * index as f64 / len as f64;
+            let (sin, cos) = angle.sin_cos();
+            assert_eq!(lut[index].re.to_bits(), cos.to_bits());
+            assert_eq!(lut[index].im.to_bits(), sin.to_bits());
         }
     }
 

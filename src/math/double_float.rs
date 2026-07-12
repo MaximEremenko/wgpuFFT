@@ -135,34 +135,15 @@ pub fn two_prod_f32(a: f32, b: f32) -> (f32, f32) {
     (product, error)
 }
 
-/// Dekker split with exact power-of-two scaling that keeps `4097 * value`
-/// finite across the normal `f32` exponent range.
+/// Exact mantissa-bit form of Dekker's binary32 split.
 ///
-/// Subnormal preservation remains backend-dependent because WebGPU backends may
-/// flush subnormal `f32` values to zero.
+/// The high word retains 12 significant bits and the low word is the exact
+/// residual. Clearing fraction bits avoids the splitter-multiply overflow at
+/// finite values adjacent to `f32::MAX`. Subnormal preservation on the GPU
+/// remains backend-dependent because WebGPU backends may flush subnormals.
 pub fn split_f32(value: f32) -> (f32, f32) {
-    const SPLITTER: f32 = 4097.0;
-    const UPPER: f32 = f32::from_bits(0x7180_0000); // 2^100
-    const LOWER: f32 = f32::from_bits(0x0d80_0000); // 2^-100
-    const SCALE_UP: f32 = f32::from_bits(0x4d80_0000); // 2^28
-    const SCALE_DOWN: f32 = f32::from_bits(0x3180_0000); // 2^-28
-
-    fn raw_split(value: f32, splitter: f32) -> (f32, f32) {
-        let split = splitter * value;
-        let hi = split - (split - value);
-        (hi, value - hi)
-    }
-
-    let magnitude = value.abs();
-    if magnitude > UPPER {
-        let (hi, lo) = raw_split(value * SCALE_DOWN, SPLITTER);
-        (hi * SCALE_UP, lo * SCALE_UP)
-    } else if magnitude != 0.0 && magnitude < LOWER {
-        let (hi, lo) = raw_split(value * SCALE_UP, SPLITTER);
-        (hi * SCALE_DOWN, lo * SCALE_DOWN)
-    } else {
-        raw_split(value, SPLITTER)
-    }
+    let hi = f32::from_bits(value.to_bits() & 0xffff_f000);
+    (hi, value - hi)
 }
 
 #[cfg(test)]
@@ -199,19 +180,23 @@ mod tests {
     }
 
     #[test]
-    fn split_two_prod_handles_large_times_tiny_without_splitter_overflow() {
-        let a = 1.0e36f32;
-        let b = 1.0e-30f32;
-        let (a_hi, a_lo) = split_f32(a);
-        let (b_hi, b_lo) = split_f32(b);
-        assert!(a_hi.is_finite() && a_lo.is_finite());
-        assert!(b_hi.is_finite() && b_lo.is_finite());
-        assert_eq!(f64::from(a_hi) + f64::from(a_lo), f64::from(a));
-        assert_eq!(f64::from(b_hi) + f64::from(b_lo), f64::from(b));
+    fn mantissa_bit_split_is_exact_at_both_finite_extremes() {
+        for value in [f32::MAX, -f32::MAX] {
+            let (hi, lo) = split_f32(value);
+            assert!(hi.is_finite() && lo.is_finite());
+            assert_eq!(f64::from(hi) + f64::from(lo), f64::from(value));
+            assert_eq!(hi.to_bits() & 0x0000_0fff, 0);
+        }
+    }
 
-        let (hi, lo) = two_prod_f32(a, b);
+    #[test]
+    fn two_prod_handles_max_times_min_normal_without_splitter_overflow() {
+        let (hi, lo) = two_prod_f32(f32::MAX, f32::MIN_POSITIVE);
         assert!(hi.is_finite() && lo.is_finite());
-        assert_eq!(f64::from(hi) + f64::from(lo), f64::from(a) * f64::from(b));
+        assert_eq!(
+            f64::from(hi) + f64::from(lo),
+            f64::from(f32::MAX) * f64::from(f32::MIN_POSITIVE)
+        );
     }
 
     #[test]

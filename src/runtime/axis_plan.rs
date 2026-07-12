@@ -40,13 +40,14 @@ pub(crate) enum AxisLayout {
 pub(crate) enum AxisPrecision {
     F32,
     F64,
+    Df64,
 }
 
 impl AxisPrecision {
     pub(crate) const fn complex_size_bytes(self) -> u64 {
         match self {
             Self::F32 => 8,
-            Self::F64 => 16,
+            Self::F64 | Self::Df64 => 16,
         }
     }
 
@@ -54,6 +55,7 @@ impl AxisPrecision {
         match self {
             Self::F32 => ElementFormat::ComplexF32,
             Self::F64 => ElementFormat::ComplexF64,
+            Self::Df64 => ElementFormat::ComplexDf64,
         }
     }
 
@@ -61,6 +63,7 @@ impl AxisPrecision {
         match self {
             Self::F32 => FftPrecision::F32,
             Self::F64 => FftPrecision::F64,
+            Self::Df64 => FftPrecision::Df64,
         }
     }
 
@@ -70,7 +73,7 @@ impl AxisPrecision {
 
     pub(crate) fn wgsl_scalar_type(self) -> &'static str {
         match self {
-            Self::F32 => "f32",
+            Self::F32 | Self::Df64 => "f32",
             Self::F64 => "f64",
         }
     }
@@ -79,6 +82,7 @@ impl AxisPrecision {
         match self {
             Self::F32 => "vec2<f32>",
             Self::F64 => "vec2<f64>",
+            Self::Df64 => "vec4<f32>",
         }
     }
 
@@ -86,6 +90,7 @@ impl AxisPrecision {
         match self {
             Self::F32 => format_wgsl_f32(value as f32),
             Self::F64 => format_wgsl_f64(value),
+            Self::Df64 => panic!("df64 scalars require an explicit hi/lo pair"),
         }
     }
 
@@ -93,6 +98,29 @@ impl AxisPrecision {
         match self {
             Self::F32 => source,
             Self::F64 => source.replace("vec2<f32>", "vec2<f64>"),
+            Self::Df64 => source.replace("vec2<f32>", "vec4<f32>"),
+        }
+    }
+
+    pub(crate) fn format_wgsl_complex(self, re: f64, im: f64) -> String {
+        match self {
+            Self::F32 | Self::F64 => format!(
+                "{}({}, {})",
+                self.wgsl_complex_type(),
+                self.format_wgsl_scalar(re),
+                self.format_wgsl_scalar(im)
+            ),
+            Self::Df64 => {
+                let re = crate::math::DoubleFloat::from_f64(re);
+                let im = crate::math::DoubleFloat::from_f64(im);
+                format!(
+                    "vec4<f32>({}, {}, {}, {})",
+                    format_wgsl_f32(re.hi),
+                    format_wgsl_f32(re.lo),
+                    format_wgsl_f32(im.hi),
+                    format_wgsl_f32(im.lo)
+                )
+            }
         }
     }
 }
@@ -102,6 +130,7 @@ impl From<FftPrecision> for AxisPrecision {
         match precision {
             FftPrecision::F32 => Self::F32,
             FftPrecision::F64 => Self::F64,
+            FftPrecision::Df64 => Self::Df64,
         }
     }
 }
@@ -281,7 +310,10 @@ impl AxisPlanConfig {
         }
 
         match (self.layout, self.precision) {
-            (AxisLayout::Interleaved, AxisPrecision::F32 | AxisPrecision::F64) => {}
+            (
+                AxisLayout::Interleaved,
+                AxisPrecision::F32 | AxisPrecision::F64 | AxisPrecision::Df64,
+            ) => {}
         }
 
         let rank = self.shape.len();
@@ -344,7 +376,7 @@ impl AxisPlanConfig {
                 };
                 Ok(f64::from(scale))
             }
-            AxisPrecision::F64 => {
+            AxisPrecision::F64 | AxisPrecision::Df64 => {
                 let total = total as f64;
                 let scale = match (self.direction, self.normalization) {
                     (_, Normalization::None) => 1.0,
@@ -415,6 +447,7 @@ impl AxisPlan {
                 match config.precision {
                     AxisPrecision::F32 => PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
                     AxisPrecision::F64 => PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut,
+                    AxisPrecision::Df64 => PipelineLayoutCacheKey::AxisPlanInterleavedDf64Lut,
                 },
             )
         });
@@ -954,8 +987,8 @@ pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'
     debug_assert_eq!(config.workgroup_size, FUSED_POW2_WORKGROUP_SIZE);
 
     let maybe_scale = if config.apply_scale {
-        let scale = config.precision.format_wgsl_scalar(config.scale_factor);
-        format!("    value = value * vec2<f32>({scale}, {scale});\n")
+        let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
+        format!("    value = {value};\n")
     } else {
         String::new()
     };
@@ -1051,7 +1084,7 @@ fn main({entry_params}) {{
             log_n = config.axis_length.ilog2(),
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -1204,12 +1237,7 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
     debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
     debug_assert_eq!(config.workgroup_size, FUSED_SMOOTH_WORKGROUP_SIZE);
 
-    let maybe_scale = if config.apply_scale {
-        let scale = config.precision.format_wgsl_scalar(config.scale_factor);
-        format!(" * vec2<f32>({scale}, {scale})")
-    } else {
-        String::new()
-    };
+    let scale_factor = config.apply_scale.then_some(config.scale_factor);
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
     let line_slot_count = config.axis_length.div_ceil(config.workgroup_size as usize);
 
@@ -1224,7 +1252,7 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
                 config.stride_complex,
                 radix,
                 ns,
-                &maybe_scale,
+                scale_factor,
                 config.direction,
                 config.workgroup_size,
                 config.precision,
@@ -1302,7 +1330,7 @@ fn main({entry_params}) {{
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
             line_slot_count = line_slot_count,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -1399,8 +1427,13 @@ fn generate_in_place_smooth_fft_stage_wgsl(
     for slot in 0..unit_slot_count {
         let mut stage_outputs = String::new();
         for output in 0..radix {
+            let zero = if precision == AxisPrecision::Df64 {
+                "vec4<f32>(0.0, 0.0, 0.0, 0.0)"
+            } else {
+                "vec2<f32>(0.0, 0.0)"
+            };
             stage_outputs.push_str(&format!(
-                "    var stageOut_{slot}_{output}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
+                "    var stageOut_{slot}_{output}: vec2<f32> = {zero};\n"
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
@@ -1454,7 +1487,7 @@ fn generate_fused_smooth_final_stage_wgsl(
     stride_complex: usize,
     radix: usize,
     ns: usize,
-    maybe_scale: &str,
+    scale_factor: Option<f64>,
     direction: FftDirection,
     workgroup_size: u32,
     precision: AxisPrecision,
@@ -1471,8 +1504,13 @@ fn generate_fused_smooth_final_stage_wgsl(
     for slot in 0..unit_slot_count {
         let mut stage_outputs = String::new();
         for output in 0..radix {
+            let zero = if precision == AxisPrecision::Df64 {
+                "vec4<f32>(0.0, 0.0, 0.0, 0.0)"
+            } else {
+                "vec2<f32>(0.0, 0.0)"
+            };
             stage_outputs.push_str(&format!(
-                "      var stageOut_{slot}_{output}: vec2<f32> = vec2<f32>(0.0, 0.0);\n"
+                "      var stageOut_{slot}_{output}: vec2<f32> = {zero};\n"
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
@@ -1480,8 +1518,10 @@ fn generate_fused_smooth_final_stage_wgsl(
         );
         let mut stores = String::new();
         for output in 0..radix {
+            let value = format!("stageOut_{slot}_{output}");
+            let value = scaled_complex_expr(&value, scale_factor, precision);
             stores.push_str(&format!(
-                r#"      let value_{slot}_{output}: vec2<f32> = stageOut_{slot}_{output}{maybe_scale};
+                r#"      let value_{slot}_{output}: vec2<f32> = {value};
       let p_{slot}_{output}: u32 = block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot};
       let dstIdxGlobal_{slot}_{output}: u32 = baseLineGlobal + p_{slot}_{output} * {stride}u;
       let dstIdx_{slot}_{output}: u32 = dstIdxGlobal_{slot}_{output} - params.elementBase;
@@ -1584,12 +1624,7 @@ pub(crate) fn generate_stockham_radix_stage_wgsl(config: &StockhamStageWgslConfi
     debug_assert_eq!(config.ns % config.radix, 0);
     debug_assert_eq!(config.axis_length % config.radix, 0);
 
-    let scale_suffix = if config.apply_scale {
-        let scale = config.precision.format_wgsl_scalar(config.scale_factor);
-        format!(" * vec2<f32>({scale}, {scale})")
-    } else {
-        String::new()
-    };
+    let scale_factor = config.apply_scale.then_some(config.scale_factor);
     let complex_wgsl = complex_wgsl();
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
     let ns_div_r = config.ns / config.radix;
@@ -1629,8 +1664,9 @@ pub(crate) fn generate_stockham_radix_stage_wgsl(config: &StockhamStageWgslConfi
                 ));
             }
         }
+        let value = scaled_complex_expr(&format!("out_{output}"), scale_factor, config.precision);
         outputs.push_str(&format!(
-            "  let value_{output}: vec2<f32> = out_{output}{scale_suffix};\n  let p_{output}: u32 = block * NS + {output}u * NS_DIV_R + j;\n  let dstIdxGlobal_{output}: u32 = baseLineGlobal + p_{output} * STRIDE;\n  let dstIdx_{output}: u32 = dstIdxGlobal_{output} - params.elementBase;\n  dst[dstIdx_{output}] = value_{output};\n"
+            "  let value_{output}: vec2<f32> = {value};\n  let p_{output}: u32 = block * NS + {output}u * NS_DIV_R + j;\n  let dstIdxGlobal_{output}: u32 = baseLineGlobal + p_{output} * STRIDE;\n  let dstIdx_{output}: u32 = dstIdxGlobal_{output} - params.elementBase;\n  dst[dstIdx_{output}] = value_{output};\n"
         ));
     }
 
@@ -1695,7 +1731,7 @@ fn main({entry_params}) {{
             n_div_r = n_div_r,
             n_div_ns = n_div_ns,
             stride = config.stride_complex,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction),
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
             line_base_fn = line_base_fn,
             workgroup_size = config.workgroup_size,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
@@ -1741,19 +1777,31 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 }"#
 }
 
-fn twiddle_lookup_wgsl(direction: FftDirection) -> &'static str {
-    match direction {
-        FftDirection::Forward => {
-            r#"fn twiddle(index: u32) -> vec2<f32> {
+fn twiddle_lookup_wgsl(direction: FftDirection, precision: AxisPrecision) -> String {
+    if precision == AxisPrecision::Df64 {
+        return match direction {
+            FftDirection::Forward => r#"fn twiddle(index: u32) -> vec4<f32> {
   return axisTwiddles[index];
 }"#
-        }
-        FftDirection::Inverse => {
-            r#"fn twiddle(index: u32) -> vec2<f32> {
+            .to_owned(),
+            FftDirection::Inverse => r#"fn twiddle(index: u32) -> vec4<f32> {
+  let value: vec4<f32> = axisTwiddles[index];
+  return vec4<f32>(value.x, value.y, -value.z, -value.w);
+}"#
+            .to_owned(),
+        };
+    }
+
+    match direction {
+        FftDirection::Forward => r#"fn twiddle(index: u32) -> vec2<f32> {
+  return axisTwiddles[index];
+}"#
+        .to_owned(),
+        FftDirection::Inverse => r#"fn twiddle(index: u32) -> vec2<f32> {
   let value: vec2<f32> = axisTwiddles[index];
   return vec2<f32>(value.x, -value.y);
 }"#
-        }
+        .to_owned(),
     }
 }
 
@@ -1771,16 +1819,57 @@ fn radix_root_wgsl(
     };
     let angle = sign * std::f64::consts::TAU * power as f64 / radix as f64;
     let (sin, cos) = angle.sin_cos();
-    format!(
-        "{}({}, {})",
-        precision.wgsl_complex_type(),
-        precision.format_wgsl_scalar(cos),
-        precision.format_wgsl_scalar(sin)
-    )
+    precision.format_wgsl_complex(cos, sin)
 }
 
 fn specialize_complex_wgsl(source: String, precision: AxisPrecision) -> String {
-    precision.specialize_wgsl(source)
+    if precision != AxisPrecision::Df64 {
+        return precision.specialize_wgsl(source);
+    }
+
+    let is_full_shader = source.contains(complex_wgsl());
+    let source = source
+        .replace(complex_wgsl(), df64_complex_aliases_wgsl())
+        .replace("vec2<f32>", "vec4<f32>");
+    if is_full_shader {
+        format!("{}\n{source}", crate::kernels::DF64_WGSL)
+    } else {
+        source
+    }
+}
+
+fn df64_complex_aliases_wgsl() -> &'static str {
+    r#"fn c_add(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_add(a, b);
+}
+
+fn c_sub(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_sub(a, b);
+}
+
+fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_mul(a, b);
+}"#
+}
+
+fn scaled_complex_expr(value: &str, scale_factor: Option<f64>, precision: AxisPrecision) -> String {
+    let Some(scale_factor) = scale_factor else {
+        return value.to_owned();
+    };
+    match precision {
+        AxisPrecision::F32 | AxisPrecision::F64 => {
+            let scale = precision.format_wgsl_scalar(scale_factor);
+            format!("{value} * vec2<f32>({scale}, {scale})")
+        }
+        AxisPrecision::Df64 => {
+            let scale = crate::math::DoubleFloat::from_f64(scale_factor);
+            format!(
+                "df64_complex_scale({value}, Df64({}, {}))",
+                format_wgsl_f32(scale.hi),
+                format_wgsl_f32(scale.lo)
+            )
+        }
+    }
 }
 
 fn wgsl_line_base_fn(rank: usize, axis: usize, dims: &[usize]) -> String {
@@ -2126,6 +2215,90 @@ mod tests {
     }
 
     #[test]
+    fn df64_axis_generators_use_split_luts_and_pure_f32_arithmetic() {
+        let sources = [
+            wgsl_for_precision(13, 143, 13, AxisPrecision::Df64),
+            fused_wgsl_for_precision(2048, FftDirection::Forward, AxisPrecision::Df64),
+            fused_smooth_wgsl_for_precision(3000, FftDirection::Inverse, AxisPrecision::Df64),
+        ];
+        for wgsl in sources {
+            assert!(wgsl.starts_with(crate::kernels::DF64_WGSL));
+            assert!(wgsl.contains("array<vec4<f32>>"));
+            assert!(wgsl.contains("fn c_mul(a: vec4<f32>"));
+            assert!(wgsl.contains("df64_complex_mul(a, b)"));
+            assert!(!wgsl.contains("vec2<f64>"));
+            assert!(!wgsl.contains("enable f64"));
+            assert!(!wgsl.contains("lf"));
+            assert!(!wgsl.contains("sin("));
+            assert!(!wgsl.contains("cos("));
+        }
+    }
+
+    #[test]
+    fn df64_radix_constants_and_scale_preserve_host_f64_low_words() {
+        let angle = -std::f64::consts::TAU / 13.0;
+        let (sin, cos) = angle.sin_cos();
+        let re = crate::math::DoubleFloat::from_f64(cos);
+        let im = crate::math::DoubleFloat::from_f64(sin);
+        let expected_root = format!(
+            "vec4<f32>({}, {}, {}, {})",
+            format_wgsl_f32(re.hi),
+            format_wgsl_f32(re.lo),
+            format_wgsl_f32(im.hi),
+            format_wgsl_f32(im.lo)
+        );
+        assert_eq!(
+            radix_root_wgsl(13, 1, FftDirection::Forward, AxisPrecision::Df64),
+            expected_root
+        );
+        assert_ne!(re.lo, 0.0);
+        assert_ne!(im.lo, 0.0);
+
+        let dims = [3];
+        let scale = 1.0f64 / 3.0;
+        let split_scale = crate::math::DoubleFloat::from_f64(scale);
+        let wgsl = generate_stockham_radix_stage_wgsl(&StockhamStageWgslConfig {
+            rank: 1,
+            axis: 0,
+            dims: &dims,
+            axis_length: 3,
+            stride_complex: 1,
+            radix: 3,
+            ns: 3,
+            direction: FftDirection::Inverse,
+            workgroup_size: WORKGROUP_SIZE,
+            apply_scale: true,
+            scale_factor: scale,
+            precision: AxisPrecision::Df64,
+        });
+        assert!(wgsl.contains(&format!(
+            "df64_complex_scale(out_0, Df64({}, {}))",
+            format_wgsl_f32(split_scale.hi),
+            format_wgsl_f32(split_scale.lo)
+        )));
+        assert_ne!(split_scale.lo, 0.0);
+    }
+
+    #[test]
+    fn df64_reusable_scratch_stages_are_fragments_with_vec4_values() {
+        let wgsl = generate_fused_scratch_fft_stages_wgsl(
+            40,
+            &[8, 5],
+            FftDirection::Inverse,
+            32,
+            "sharedData",
+            "lookupInverseRoot",
+            AxisPrecision::Df64,
+        );
+        assert!(wgsl.contains("var stageOut_0_0: vec4<f32>"));
+        assert!(wgsl.contains("vec4<f32>(0.0, 0.0, 0.0, 0.0)"));
+        assert!(wgsl.contains("lookupInverseRoot(j_0 *"));
+        assert!(!wgsl.contains("struct Df64"));
+        assert!(!wgsl.contains("vec2<f32>"));
+        assert!(!wgsl.contains("vec2<f64>"));
+    }
+
+    #[test]
     fn native_f64_radix_constants_and_scale_are_not_rounded_through_f32() {
         let root = radix_root_wgsl(13, 1, FftDirection::Forward, AxisPrecision::F64);
         let angle = -std::f64::consts::TAU / 13.0;
@@ -2214,6 +2387,106 @@ mod tests {
     }
 
     #[test]
+    fn df64_axis_wgsl_can_be_recreated_from_typed_cache_keys() {
+        let stockham_dims = [4, 3];
+        let stockham = StockhamStageWgslConfig {
+            rank: 2,
+            axis: 1,
+            dims: &stockham_dims,
+            axis_length: 3,
+            stride_complex: 4,
+            radix: 3,
+            ns: 3,
+            direction: FftDirection::Inverse,
+            workgroup_size: WORKGROUP_SIZE,
+            apply_scale: true,
+            scale_factor: 1.0 / 12.0,
+            precision: AxisPrecision::Df64,
+        };
+        let stockham_key = StockhamStageKey::new(
+            stockham.rank,
+            stockham.axis,
+            stockham.dims,
+            stockham.axis_length,
+            stockham.stride_complex,
+            stockham.radix,
+            stockham.ns,
+            stockham.direction,
+            stockham.workgroup_size,
+            stockham.apply_scale,
+            stockham.scale_factor,
+            stockham.precision,
+        );
+        assert_eq!(
+            generate_stockham_radix_stage_wgsl_for_key(&stockham_key),
+            generate_stockham_radix_stage_wgsl(&stockham)
+        );
+
+        let fused_dims = [3, 256, 5];
+        let fused = FusedPow2StageWgslConfig {
+            rank: 3,
+            axis: 1,
+            dims: &fused_dims,
+            axis_length: 256,
+            stride_complex: 3,
+            direction: FftDirection::Inverse,
+            workgroup_size: FUSED_POW2_WORKGROUP_SIZE,
+            apply_scale: true,
+            scale_factor: 1.0 / 3840.0,
+            precision: AxisPrecision::Df64,
+        };
+        let fused_key = FusedPow2StageKey::new(
+            fused.rank,
+            fused.axis,
+            fused.dims,
+            fused.axis_length,
+            fused.stride_complex,
+            fused.direction,
+            fused.workgroup_size,
+            fused.apply_scale,
+            fused.scale_factor,
+            fused.precision,
+        );
+        assert_eq!(
+            generate_fused_pow2_stage_wgsl_for_key(&fused_key),
+            generate_fused_pow2_stage_wgsl(&fused)
+        );
+
+        let smooth_dims = [4, 1001, 3];
+        let smooth_factors = crate::runtime::factor_supported_length(1001).unwrap();
+        let smooth = FusedSmoothStageWgslConfig {
+            rank: 3,
+            axis: 1,
+            dims: &smooth_dims,
+            axis_length: 1001,
+            stride_complex: 4,
+            factors: &smooth_factors,
+            direction: FftDirection::Inverse,
+            workgroup_size: FUSED_SMOOTH_WORKGROUP_SIZE,
+            apply_scale: true,
+            scale_factor: 1.0 / 12012.0,
+            precision: AxisPrecision::Df64,
+        };
+        let smooth_key = FusedSmoothStageKey::new(
+            smooth.rank,
+            smooth.axis,
+            smooth.dims,
+            smooth.axis_length,
+            smooth.stride_complex,
+            smooth.factors,
+            smooth.direction,
+            smooth.workgroup_size,
+            smooth.apply_scale,
+            smooth.scale_factor,
+            smooth.precision,
+        );
+        assert_eq!(
+            generate_fused_smooth_stage_wgsl_for_key(&smooth_key),
+            generate_fused_smooth_stage_wgsl(&smooth)
+        );
+    }
+
+    #[test]
     fn fused_pow2_gate_matches_storage_and_workgroup_boundaries() {
         for length in [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
             assert!(fused_pow2_supported_by_limits(
@@ -2254,6 +2527,20 @@ mod tests {
         assert!(!fused_pow2_supported_by_limits(
             4096,
             AxisPrecision::F64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(fused_pow2_supported_by_limits(
+            2048,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_pow2_supported_by_limits(
+            4096,
+            AxisPrecision::Df64,
             48 * 1024,
             256,
             256
@@ -2343,6 +2630,22 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F64,
+            47_999,
+            256,
+            256
+        ));
+        assert!(fused_smooth_supported_by_limits(
+            3000,
+            &factors_3000,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_smooth_supported_by_limits(
+            3000,
+            &factors_3000,
+            AxisPrecision::Df64,
             47_999,
             256,
             256

@@ -8,7 +8,7 @@ use wgpu_fft::math::{
     quick_two_sum_f32, split_f32, two_prod_f32, two_sum_f32, ComplexDoubleFloat, DoubleFloat,
 };
 
-const WORDS_PER_CASE: usize = 20;
+const WORDS_PER_CASE: usize = 22;
 
 #[test]
 fn gpu_df64_error_free_transform_canaries() {
@@ -182,6 +182,7 @@ fn expected_words(input: [[f32; 4]; 2]) -> [u32; WORDS_PER_CASE] {
     let b_complex = ComplexDoubleFloat::new(b_dd, DoubleFloat::new(b[2], b[3]));
     let complex_add = a_complex.add_df(b_complex);
     let complex_mul = a_complex.mul_df(b_complex);
+    let (edge_prod_hi, edge_prod_lo) = two_prod_f32(f32::MAX, f32::MIN_POSITIVE);
     [
         sum_hi.to_bits(),
         sum_lo.to_bits(),
@@ -203,6 +204,8 @@ fn expected_words(input: [[f32; 4]; 2]) -> [u32; WORDS_PER_CASE] {
         complex_mul.re_lo.to_bits(),
         complex_mul.im_hi.to_bits(),
         complex_mul.im_lo.to_bits(),
+        edge_prod_hi.to_bits(),
+        edge_prod_lo.to_bits(),
     ]
 }
 
@@ -222,6 +225,13 @@ fn assert_canaries_are_adversarial(expected: &[u32]) {
             .all(|words| words[7] != 0.0f32.to_bits()),
         "each two_prod canary must require a nonzero error word"
     );
+    let edge = two_prod_f32(f32::MAX, f32::MIN_POSITIVE);
+    for words in expected.chunks_exact(WORDS_PER_CASE) {
+        assert_eq!(words[20], edge.0.to_bits());
+        assert_eq!(words[21], edge.1.to_bits());
+        assert!(f32::from_bits(words[20]).is_finite());
+        assert!(f32::from_bits(words[21]).is_finite());
+    }
 }
 
 fn read_u32(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<u32> {
@@ -265,7 +275,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let case_index = gid.x;
     let a = inputs[case_index * 2u];
     let b = inputs[case_index * 2u + 1u];
-    let base = case_index * 20u;
+    let base = case_index * 22u;
     store_df64(base, df64_two_sum(a.x, b.x));
     store_df64(base + 2u, df64_quick_two_sum(a.z, b.z));
     store_df64(base + 4u, df64_split(a.w));
@@ -276,5 +286,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     store_df64(base + 10u, df64_mul(a_dd, b_dd));
     store_complex(base + 12u, df64_complex_add(a, b));
     store_complex(base + 16u, df64_complex_mul(a, b));
+    store_df64(base + 20u, df64_two_prod(
+        bitcast<f32>(0x7f7fffffu),
+        bitcast<f32>(0x00800000u),
+    ));
 }
 "#;

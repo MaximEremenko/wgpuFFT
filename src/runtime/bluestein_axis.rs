@@ -139,6 +139,9 @@ impl BluesteinAxisConfig {
                     _ => 1.0,
                 }
             }
+            AxisPrecision::Df64 => {
+                unreachable!("df64 Bluestein plans are rejected before scale generation")
+            }
         })
     }
 }
@@ -150,6 +153,13 @@ impl BluesteinAxis {
         config: BluesteinAxisConfig,
     ) -> Result<Self> {
         config.validate()?;
+        if config.precision == AxisPrecision::Df64 {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::Df64,
+                route: "bluestein",
+                reason: "bluestein-df64-not-implemented",
+            });
+        }
 
         let n = config.shape[config.axis];
         let m = bluestein_convolution_length(n)?;
@@ -196,6 +206,9 @@ impl BluesteinAxis {
             AxisPrecision::F64 => {
                 queue.write_buffer(&chirp_buffer, 0, bytemuck::cast_slice(&chirp));
             }
+            AxisPrecision::Df64 => {
+                unreachable!("df64 Bluestein plans are rejected before chirp upload")
+            }
         }
 
         let bfft_buffer = storage_buffer(
@@ -215,6 +228,9 @@ impl BluesteinAxis {
             }
             AxisPrecision::F64 => {
                 queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft));
+            }
+            AxisPrecision::Df64 => {
+                unreachable!("df64 Bluestein plans are rejected before bfft upload")
             }
         }
 
@@ -890,6 +906,9 @@ pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) ->
             .precision
             .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
         AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
+        AxisPrecision::Df64 => {
+            unreachable!("df64 fused Bluestein shaders are not implemented in Phase B")
+        }
     };
     let forward_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -1167,6 +1186,9 @@ fn format_staged_scalar(precision: AxisPrecision, value: f64) -> String {
     match precision {
         AxisPrecision::F32 => format_wgsl_f32(value as f32),
         AxisPrecision::F64 => precision.format_wgsl_scalar(value),
+        AxisPrecision::Df64 => {
+            unreachable!("df64 Bluestein shader constants are not implemented in Phase B")
+        }
     }
 }
 

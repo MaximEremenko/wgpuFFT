@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::config::FftDirection;
+use crate::math::DoubleFloat;
 use crate::runtime::axis_plan::AxisPrecision;
 
 pub const PIPELINE_CACHE_SNAPSHOT_SCHEMA: &str = "wgpu-fft.pipeline-cache";
@@ -139,6 +140,7 @@ pub fn import_pipeline_cache_snapshot(
 pub(crate) enum PipelineLayoutCacheKey {
     AxisPlanInterleavedF32Lut,
     AxisPlanInterleavedF64Lut,
+    AxisPlanInterleavedDf64Lut,
     BridgeReadWriteReadF32,
     BridgeReadWriteUniformF32,
     BridgeTwoWriteUniformF32,
@@ -156,6 +158,7 @@ pub(crate) enum PipelineLayoutCacheKey {
     C2cStridedBinaryF64,
     DirectDftInterleavedF32Lut,
     DirectDftInterleavedF64Lut,
+    DirectDftInterleavedDf64Lut,
     FusedPrimeInterleavedF32,
     FusedPrimeInterleavedF64,
     FourStepUnaryF32,
@@ -178,6 +181,7 @@ impl PipelineLayoutCacheKey {
         match self {
             Self::AxisPlanInterleavedF32Lut => "axis-plan/interleaved-f32-lut",
             Self::AxisPlanInterleavedF64Lut => "axis-plan/interleaved-f64-lut",
+            Self::AxisPlanInterleavedDf64Lut => "axis-plan/interleaved-df64-lut",
             Self::BridgeReadWriteReadF32 => "bridge/read-write-read-f32",
             Self::BridgeReadWriteUniformF32 => "bridge/read-write-uniform-f32",
             Self::BridgeTwoWriteUniformF32 => "bridge/two-write-uniform-f32",
@@ -195,6 +199,7 @@ impl PipelineLayoutCacheKey {
             Self::C2cStridedBinaryF64 => "c2c-strided/binary-f64",
             Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
             Self::DirectDftInterleavedF64Lut => "direct-dft/interleaved-f64-lut",
+            Self::DirectDftInterleavedDf64Lut => "direct-dft/interleaved-df64-lut",
             Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
             Self::FusedPrimeInterleavedF64 => "fused-prime/interleaved-f64",
             Self::FourStepUnaryF32 => "four-step/unary-f32",
@@ -528,6 +533,9 @@ impl ComputePipelineCacheKey {
         let layout = match shader.precision {
             AxisPrecision::F32 => PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
             AxisPrecision::F64 => PipelineLayoutCacheKey::FusedPrimeInterleavedF64,
+            AxisPrecision::Df64 => {
+                unreachable!("df64 fused-prime layouts are added by the prime-kernel phase")
+            }
         };
         Self {
             layout,
@@ -553,6 +561,7 @@ impl ComputePipelineCacheKey {
             layout: match precision {
                 AxisPrecision::F32 => PipelineLayoutCacheKey::DirectDftInterleavedF32Lut,
                 AxisPrecision::F64 => PipelineLayoutCacheKey::DirectDftInterleavedF64Lut,
+                AxisPrecision::Df64 => PipelineLayoutCacheKey::DirectDftInterleavedDf64Lut,
             },
             entry_point: String::from("main"),
             shader: ShaderCacheKey::DirectDftC2cLut(precision),
@@ -576,6 +585,9 @@ impl ComputePipelineCacheKey {
         let layout = match shader.precision {
             AxisPrecision::F32 => PipelineLayoutCacheKey::C2cStridedBinaryF32,
             AxisPrecision::F64 => PipelineLayoutCacheKey::C2cStridedBinaryF64,
+            AxisPrecision::Df64 => {
+                unreachable!("df64 strided layouts are added by the strided-I/O phase")
+            }
         };
         Self {
             layout,
@@ -682,6 +694,9 @@ fn rader_layout_for(kind: RaderKernelKind, precision: AxisPrecision) -> Pipeline
         (RaderKernelKind::Post, AxisPrecision::F64) => {
             PipelineLayoutCacheKey::RaderPostInterleavedF64
         }
+        (_, AxisPrecision::Df64) => {
+            unreachable!("df64 Rader layouts are added by the prime-kernel phase")
+        }
     }
 }
 
@@ -708,6 +723,9 @@ fn bluestein_layout_for(
         (BluesteinKernelKind::Post, AxisPrecision::F64) => {
             PipelineLayoutCacheKey::BluesteinPostInterleavedF64
         }
+        (_, AxisPrecision::Df64) => {
+            unreachable!("df64 Bluestein layouts are added by the prime-kernel phase")
+        }
     }
 }
 
@@ -715,6 +733,7 @@ fn axis_plan_layout_for_precision(precision: AxisPrecision) -> PipelineLayoutCac
     match precision {
         AxisPrecision::F32 => PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
         AxisPrecision::F64 => PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut,
+        AxisPrecision::Df64 => PipelineLayoutCacheKey::AxisPlanInterleavedDf64Lut,
     }
 }
 
@@ -1590,6 +1609,10 @@ fn axis_scale_bits(precision: AxisPrecision, apply_scale: bool, scale_factor: f6
     match precision {
         AxisPrecision::F32 => u64::from((value as f32).to_bits()),
         AxisPrecision::F64 => value.to_bits(),
+        AxisPrecision::Df64 => {
+            let value = DoubleFloat::from_f64(value);
+            u64::from(value.hi.to_bits()) | (u64::from(value.lo.to_bits()) << 32)
+        }
     }
 }
 
@@ -1597,6 +1620,9 @@ fn axis_scale_factor(precision: AxisPrecision, bits: u64) -> f64 {
     match precision {
         AxisPrecision::F32 => f64::from(f32::from_bits(bits as u32)),
         AxisPrecision::F64 => f64::from_bits(bits),
+        AxisPrecision::Df64 => {
+            f64::from(f32::from_bits(bits as u32)) + f64::from(f32::from_bits((bits >> 32) as u32))
+        }
     }
 }
 
@@ -1604,6 +1630,7 @@ fn axis_scale_bits_key(precision: AxisPrecision, bits: u64) -> String {
     match precision {
         AxisPrecision::F32 => format!("0x{:08x}", bits as u32),
         AxisPrecision::F64 => format!("0x{bits:016x}"),
+        AxisPrecision::Df64 => format!("hi=0x{:08x},lo=0x{:08x}", bits as u32, (bits >> 32) as u32),
     }
 }
 
@@ -1647,8 +1674,10 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         }
         PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut
         | PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut
+        | PipelineLayoutCacheKey::AxisPlanInterleavedDf64Lut
         | PipelineLayoutCacheKey::DirectDftInterleavedF32Lut
-        | PipelineLayoutCacheKey::DirectDftInterleavedF64Lut => vec![
+        | PipelineLayoutCacheKey::DirectDftInterleavedF64Lut
+        | PipelineLayoutCacheKey::DirectDftInterleavedDf64Lut => vec![
             storage_entry(0, true),
             storage_entry(1, false),
             uniform_entry(2),
@@ -1930,7 +1959,11 @@ mod tests {
         };
         let f32_key = make_pow2(AxisPrecision::F32);
         let f64_key = make_pow2(AxisPrecision::F64);
+        let df64_key = make_pow2(AxisPrecision::Df64);
         assert_ne!(f32_key, f64_key);
+        assert_ne!(f64_key, df64_key);
+        assert!(df64_key.stable_key().contains("precision=df64"));
+        assert!(df64_key.stable_key().contains("scale_bits=hi="));
         assert!(f64_key.stable_key().contains("precision=f64"));
         assert!(f64_key.stable_key().contains("scale_bits=0x"));
         assert!(f64_key.is_supported_by_limits(32 * 1024, 256, 256));
@@ -1950,6 +1983,7 @@ mod tests {
 
         let f32_pipeline = ComputePipelineCacheKey::fused_pow2_stage(f32_key);
         let f64_pipeline = ComputePipelineCacheKey::fused_pow2_stage(f64_key);
+        let df64_pipeline = ComputePipelineCacheKey::fused_pow2_stage(df64_key);
         assert_eq!(
             f32_pipeline.layout,
             PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut
@@ -1958,11 +1992,19 @@ mod tests {
             f64_pipeline.layout,
             PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut
         );
+        assert_eq!(
+            df64_pipeline.layout,
+            PipelineLayoutCacheKey::AxisPlanInterleavedDf64Lut
+        );
         assert_ne!(f32_pipeline.stable_key(), f64_pipeline.stable_key());
 
         assert_eq!(
             ComputePipelineCacheKey::direct_dft_c2c(AxisPrecision::F64).layout,
             PipelineLayoutCacheKey::DirectDftInterleavedF64Lut
+        );
+        assert_eq!(
+            ComputePipelineCacheKey::direct_dft_c2c(AxisPrecision::Df64).layout,
+            PipelineLayoutCacheKey::DirectDftInterleavedDf64Lut
         );
         assert_eq!(
             ComputePipelineCacheKey::c2c_strided_stage(C2cStridedStageKey::new(

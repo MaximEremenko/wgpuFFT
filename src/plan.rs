@@ -1392,6 +1392,7 @@ fn complex_endpoint_format_for(precision: FftPrecision) -> FftEndpointFormat {
     match precision {
         FftPrecision::F32 => FftEndpointFormat::ComplexF32,
         FftPrecision::F64 => FftEndpointFormat::ComplexF64,
+        FftPrecision::Df64 => FftEndpointFormat::ComplexDf64,
     }
 }
 
@@ -1399,6 +1400,7 @@ fn complex_element_format_for(precision: FftPrecision) -> ElementFormat {
     match precision {
         FftPrecision::F32 => ElementFormat::ComplexF32,
         FftPrecision::F64 => ElementFormat::ComplexF64,
+        FftPrecision::Df64 => ElementFormat::ComplexDf64,
     }
 }
 
@@ -2144,6 +2146,18 @@ mod tests {
         assert_eq!(
             complex_endpoint_format_for(FftPrecision::F64).as_str(),
             "complex-f64"
+        );
+        assert_eq!(
+            input_endpoint_format_for(FftTransformKind::C2c, FftPrecision::Df64),
+            FftEndpointFormat::ComplexDf64
+        );
+        assert_eq!(
+            output_format_for(FftTransformKind::C2c, FftPrecision::Df64),
+            "complex-df64"
+        );
+        assert_eq!(
+            complex_element_format_for(FftPrecision::Df64),
+            ElementFormat::ComplexDf64
         );
     }
 

@@ -35,21 +35,26 @@ fn validate_real_precision(
     config: &FftConfig,
     route: &'static str,
 ) -> Result<()> {
-    if config.precision() != FftPrecision::F64 {
-        return Ok(());
-    }
-    if !device_supports_precision(device, FftPrecision::F64) {
-        return Err(FftError::PrecisionUnsupported {
+    match config.precision() {
+        FftPrecision::F32 => Ok(()),
+        FftPrecision::F64 if !device_supports_precision(device, FftPrecision::F64) => {
+            Err(FftError::PrecisionUnsupported {
+                requested: FftPrecision::F64,
+                route,
+                reason: "device-missing-shader-f64",
+            })
+        }
+        FftPrecision::F64 => Err(FftError::PrecisionUnsupported {
             requested: FftPrecision::F64,
             route,
-            reason: "device-missing-shader-f64",
-        });
+            reason: "real-f64-not-implemented",
+        }),
+        FftPrecision::Df64 => Err(FftError::PrecisionUnsupported {
+            requested: FftPrecision::Df64,
+            route,
+            reason: "real-df64-not-implemented",
+        }),
     }
-    Err(FftError::PrecisionUnsupported {
-        requested: FftPrecision::F64,
-        route,
-        reason: "real-f64-not-implemented",
-    })
 }
 
 #[repr(C)]
@@ -1433,6 +1438,13 @@ fn strided_pack_kind(format: FftEndpointFormat) -> Result<RealKernelKind> {
                 reason: "real-f64-not-implemented",
             });
         }
+        FftEndpointFormat::ComplexDf64 => {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::Df64,
+                route: "real",
+                reason: "real-df64-not-implemented",
+            });
+        }
     })
 }
 
@@ -1447,6 +1459,13 @@ fn strided_unpack_kind(format: FftEndpointFormat) -> Result<RealKernelKind> {
                 requested: crate::config::FftPrecision::F64,
                 route: "real",
                 reason: "real-f64-not-implemented",
+            });
+        }
+        FftEndpointFormat::ComplexDf64 => {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::Df64,
+                route: "real",
+                reason: "real-df64-not-implemented",
             });
         }
     })
@@ -3723,6 +3742,23 @@ mod tests {
         assert_eq!(sizes.real_bytes, 17 * 4 * 2 * 4);
         assert_eq!(sizes.full_complex_bytes, 17 * 4 * 2 * 8);
         assert_eq!(sizes.packed_bytes, 9 * 4 * 2 * 8);
+    }
+
+    #[test]
+    fn df64_real_endpoint_helpers_return_structured_precision_errors() {
+        for error in [
+            strided_pack_kind(FftEndpointFormat::ComplexDf64).unwrap_err(),
+            strided_unpack_kind(FftEndpointFormat::ComplexDf64).unwrap_err(),
+        ] {
+            assert_eq!(
+                error,
+                FftError::PrecisionUnsupported {
+                    requested: FftPrecision::Df64,
+                    route: "real",
+                    reason: "real-df64-not-implemented",
+                }
+            );
+        }
     }
 
     #[test]

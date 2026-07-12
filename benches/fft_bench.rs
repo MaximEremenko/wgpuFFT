@@ -1608,6 +1608,23 @@ fn fill_initialization_seed(seed: &wgpu::Buffer, precision: FftPrecision) -> Ben
             }
             mapped.copy_from_slice(bytemuck::cast_slice(&values));
         }
+        FftPrecision::Df64 => {
+            let complex_count = mapped.len() / FftPrecision::Df64.complex_size_bytes() as usize;
+            let mut values = vec![[0.0f32; 4]; complex_count];
+            for (index, value) in values.iter_mut().enumerate() {
+                let re = ((index as u64).wrapping_mul(17) % 251 + 1) as f64 / 251.0;
+                let im = -(((index as u64).wrapping_mul(29) % 251 + 1) as f64 / 251.0);
+                let re_hi = re as f32;
+                let im_hi = im as f32;
+                *value = [
+                    re_hi,
+                    (re - f64::from(re_hi)) as f32,
+                    im_hi,
+                    (im - f64::from(im_hi)) as f32,
+                ];
+            }
+            mapped.copy_from_slice(bytemuck::cast_slice(&values));
+        }
     }
     drop(mapped);
     seed.unmap();

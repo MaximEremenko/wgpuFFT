@@ -148,6 +148,9 @@ impl RaderAxisConfig {
                     _ => 1.0,
                 }
             }
+            AxisPrecision::Df64 => {
+                unreachable!("df64 Rader plans are rejected before scale generation")
+            }
         })
     }
 }
@@ -159,6 +162,13 @@ impl RaderAxis {
         config: RaderAxisConfig,
     ) -> Result<Self> {
         config.validate()?;
+        if config.precision == AxisPrecision::Df64 {
+            return Err(FftError::PrecisionUnsupported {
+                requested: crate::config::FftPrecision::Df64,
+                route: "rader",
+                reason: "rader-df64-not-implemented",
+            });
+        }
 
         let n = config.shape[config.axis];
         let l = n - 1;
@@ -212,6 +222,9 @@ impl RaderAxis {
             }
             AxisPrecision::F64 => {
                 queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft));
+            }
+            AxisPrecision::Df64 => {
+                unreachable!("df64 Rader plans are rejected before LUT upload")
             }
         }
 
@@ -999,6 +1012,9 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
             .precision
             .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
         AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
+        AxisPrecision::Df64 => {
+            unreachable!("df64 fused Rader shaders are not implemented in Phase B")
+        }
     };
     let forward_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -1433,6 +1449,9 @@ fn format_staged_scalar(precision: AxisPrecision, value: f64) -> String {
     match precision {
         AxisPrecision::F32 => format_wgsl_f32(value as f32),
         AxisPrecision::F64 => precision.format_wgsl_scalar(value),
+        AxisPrecision::Df64 => {
+            unreachable!("df64 Rader shader constants are not implemented in Phase B")
+        }
     }
 }
 

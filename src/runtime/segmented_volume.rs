@@ -26,6 +26,9 @@ const COMPLEX_F32_BYTES: u64 = 8;
 const TRANSPOSE_TILE: u32 = 16;
 const TRANSPOSE_WORKGROUP_SIZE: u32 = TRANSPOSE_TILE * TRANSPOSE_TILE;
 const SCALE_WORKGROUP_SIZE: u32 = 64;
+const MIN_SEGMENTED_BURST_DEPTH: usize = 1;
+pub(crate) const DEFAULT_SEGMENTED_BURST_DEPTH: usize = 2;
+const MAX_SEGMENTED_BURST_DEPTH: usize = 3;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -55,8 +58,7 @@ pub(crate) struct SegmentedVolumeC2cPlan {
     stored_limits: LargePolicyLimits,
     arena: SegmentedArena,
     schedule: SegmentedVolumeSchedule,
-    stage_a: wgpu::Buffer,
-    stage_b: wgpu::Buffer,
+    burst_ring: Vec<BurstStagePair>,
     row_plans: Vec<AxisPlan>,
     transpose_pipeline: wgpu::ComputePipeline,
     transpose_bind_group_layout: wgpu::BindGroupLayout,
@@ -72,6 +74,11 @@ struct SegmentedArena {
     buffers: Vec<wgpu::Buffer>,
     segments: Vec<SegmentedArenaSegment>,
     total_bytes: u64,
+}
+
+struct BurstStagePair {
+    stage_a: wgpu::Buffer,
+    stage_b: wgpu::Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,10 +115,30 @@ struct SlabAxisPlan {
     axis: usize,
     axis_len: usize,
     prefix: usize,
-    repetitions: usize,
     prefix_chunk: usize,
+    chunks_per_repetition: usize,
+    dispatch_count: usize,
     max_slab_bytes: u64,
     variants: Vec<SlabVariant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlabDispatch {
+    matrix_base: u64,
+    prefix_start: usize,
+    prefix_count: usize,
+    slab_bytes: u64,
+    variant_index: usize,
+}
+
+impl SlabDispatch {
+    const EMPTY: Self = Self {
+        matrix_base: 0,
+        prefix_start: 0,
+        prefix_count: 0,
+        slab_bytes: 0,
+        variant_index: 0,
+    };
 }
 
 struct SlabVariant {
@@ -133,13 +160,26 @@ struct ScaleDispatch {
     params_buffer: wgpu::Buffer,
 }
 
+pub(crate) fn validate_segmented_burst_depth(burst_depth: usize) -> Result<()> {
+    if (MIN_SEGMENTED_BURST_DEPTH..=MAX_SEGMENTED_BURST_DEPTH).contains(&burst_depth) {
+        Ok(())
+    } else {
+        Err(FftError::LargeGraphStageUnsupported {
+            stage: "segmented-volume-burst-ring",
+            reason: "segmented full-volume burst depth must be in 1..=3",
+        })
+    }
+}
+
 impl SegmentedVolumeC2cPlan {
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: &FftConfig,
         stored_limits: LargePolicyLimits,
+        burst_depth: usize,
     ) -> Result<Self> {
+        validate_segmented_burst_depth(burst_depth)?;
         if config.shape().len() < 2 || config.axes().len() < 2 {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "segmented-volume-plan",
@@ -230,18 +270,23 @@ impl SegmentedVolumeC2cPlan {
         if max_stage_bytes == 0 {
             return Err(FftError::ZeroLength);
         }
-        let stage_a = create_segmented_buffer(
-            device,
-            "wgpu_fft.segmented_volume.stage_a",
-            max_stage_bytes,
-            planning_limits.max_buffer_size,
-        )?;
-        let stage_b = create_segmented_buffer(
-            device,
-            "wgpu_fft.segmented_volume.stage_b",
-            max_stage_bytes,
-            planning_limits.max_buffer_size,
-        )?;
+        let mut burst_ring = Vec::with_capacity(burst_depth);
+        for _ in 0..burst_depth {
+            burst_ring.push(BurstStagePair {
+                stage_a: create_segmented_buffer(
+                    device,
+                    "wgpu_fft.segmented_volume.burst_stage_a",
+                    max_stage_bytes,
+                    planning_limits.max_buffer_size,
+                )?,
+                stage_b: create_segmented_buffer(
+                    device,
+                    "wgpu_fft.segmented_volume.burst_stage_b",
+                    max_stage_bytes,
+                    planning_limits.max_buffer_size,
+                )?,
+            });
+        }
 
         let transpose_key = ComputePipelineCacheKey::four_step_stage(FourStepStageKey::new(
             FourStepKernelKind::StripeTranspose,
@@ -297,12 +342,13 @@ impl SegmentedVolumeC2cPlan {
             &schedule,
             &row_plans,
             max_stage_bytes,
+            burst_depth,
             total_complex as u64,
             planning_limits,
             scheduler_limits.storage_alignment,
         )?;
         let mut staging_bytes = arena.segment_sizes();
-        staging_bytes.extend([max_stage_bytes, max_stage_bytes]);
+        staging_bytes.extend(std::iter::repeat_n(max_stage_bytes, 2 * burst_depth));
         staging_bytes.extend(
             row_plans
                 .iter()
@@ -329,8 +375,7 @@ impl SegmentedVolumeC2cPlan {
             stored_limits,
             arena,
             schedule,
-            stage_a,
-            stage_b,
+            burst_ring,
             row_plans,
             transpose_pipeline,
             transpose_bind_group_layout,
@@ -373,8 +418,7 @@ impl SegmentedVolumeC2cPlan {
                     encoder,
                     &executor,
                     &arena_view,
-                    &self.stage_a,
-                    &self.stage_b,
+                    &self.burst_ring,
                     &self.row_plans,
                 )?,
                 SegmentedVolumeStage::SlabAxis(plan) => plan.execute(
@@ -383,8 +427,7 @@ impl SegmentedVolumeC2cPlan {
                     &scheduler,
                     &executor,
                     &arena_view,
-                    &self.stage_a,
-                    &self.stage_b,
+                    &self.burst_ring,
                     &self.row_plans,
                     &self.transpose_bind_group_layout,
                     &self.transpose_pipeline,
@@ -525,34 +568,40 @@ impl FrontRowBurstPlan {
         encoder: &mut wgpu::CommandEncoder,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
-        stage_a: &wgpu::Buffer,
-        stage_b: &wgpu::Buffer,
+        burst_ring: &[BurstStagePair],
         row_plans: &[AxisPlan],
     ) -> Result<()> {
         let _ = self.axis;
-        for window in &self.windows {
-            executor.copy_view_range_to_buffer(
-                encoder,
-                arena,
-                window.byte_offset,
-                stage_a,
-                0,
-                window.byte_size,
-            )?;
-            row_plans[window.plan_index].execute_views(
-                device,
-                encoder,
-                BufferView::whole(stage_a).prefix(window.byte_size)?,
-                BufferView::whole(stage_b).prefix(window.byte_size)?,
-            )?;
-            executor.copy_buffer_to_view_range(
-                encoder,
-                stage_b,
-                0,
-                arena,
-                window.byte_offset,
-                window.byte_size,
-            )?;
+        debug_assert!(!burst_ring.is_empty());
+        for burst in self.windows.chunks(burst_ring.len()) {
+            for (window, stages) in burst.iter().zip(burst_ring) {
+                executor.copy_view_range_to_buffer(
+                    encoder,
+                    arena,
+                    window.byte_offset,
+                    &stages.stage_a,
+                    0,
+                    window.byte_size,
+                )?;
+            }
+            for (window, stages) in burst.iter().zip(burst_ring) {
+                row_plans[window.plan_index].execute_views(
+                    device,
+                    encoder,
+                    BufferView::whole(&stages.stage_a).prefix(window.byte_size)?,
+                    BufferView::whole(&stages.stage_b).prefix(window.byte_size)?,
+                )?;
+            }
+            for (window, stages) in burst.iter().zip(burst_ring) {
+                executor.copy_buffer_to_view_range(
+                    encoder,
+                    &stages.stage_b,
+                    0,
+                    arena,
+                    window.byte_offset,
+                    window.byte_size,
+                )?;
+            }
         }
         Ok(())
     }
@@ -567,124 +616,195 @@ impl SlabAxisPlan {
         scheduler: &WindowScheduler,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
-        stage_a: &wgpu::Buffer,
-        stage_b: &wgpu::Buffer,
+        burst_ring: &[BurstStagePair],
         row_plans: &[AxisPlan],
         transpose_layout: &wgpu::BindGroupLayout,
         transpose_pipeline: &wgpu::ComputePipeline,
     ) -> Result<()> {
         let _ = self.axis;
-        let matrix_elements = (self.prefix as u64)
-            .checked_mul(self.axis_len as u64)
-            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-        for repetition in 0..self.repetitions {
-            let matrix_base = (repetition as u64)
-                .checked_mul(matrix_elements)
-                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-            for prefix_start in (0..self.prefix).step_by(self.prefix_chunk) {
-                let prefix_count = self.prefix_chunk.min(self.prefix - prefix_start);
-                let variant = self
-                    .variants
-                    .iter()
-                    .find(|variant| variant.prefix_count == prefix_count)
-                    .expect("slab schedule contains main and tail variants");
-                let slab_elements = (prefix_count as u64)
-                    .checked_mul(self.axis_len as u64)
-                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                let slab_bytes = slab_elements
-                    .checked_mul(COMPLEX_F32_BYTES)
-                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-
-                if prefix_count == self.prefix {
-                    executor.copy_view_range_to_buffer(
-                        encoder,
-                        arena,
-                        matrix_base * COMPLEX_F32_BYTES,
-                        stage_a,
-                        0,
-                        slab_bytes,
-                    )?;
-                } else {
-                    let row_bytes = (prefix_count as u64) * COMPLEX_F32_BYTES;
-                    for axis_element in 0..self.axis_len {
-                        let source_element = matrix_base
-                            .checked_add((axis_element as u64) * self.prefix as u64)
-                            .and_then(|value| value.checked_add(prefix_start as u64))
-                            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                        executor.copy_view_range_to_buffer(
-                            encoder,
-                            arena,
-                            source_element * COMPLEX_F32_BYTES,
-                            stage_a,
-                            (axis_element as u64) * row_bytes,
-                            row_bytes,
-                        )?;
-                    }
-                }
-
+        debug_assert!(!burst_ring.is_empty());
+        for burst_start in (0..self.dispatch_count).step_by(burst_ring.len()) {
+            let burst_len = burst_ring.len().min(self.dispatch_count - burst_start);
+            let mut burst = [SlabDispatch::EMPTY; MAX_SEGMENTED_BURST_DEPTH];
+            for (slot, dispatch) in burst.iter_mut().take(burst_len).enumerate() {
+                *dispatch = self.dispatch_for_index(burst_start + slot)?;
+            }
+            let burst = &burst[..burst_len];
+            for (dispatch, stages) in burst.iter().zip(burst_ring) {
+                self.gather_dispatch(encoder, executor, arena, dispatch, &stages.stage_a)?;
+            }
+            for (dispatch, stages) in burst.iter().zip(burst_ring) {
+                let variant = &self.variants[dispatch.variant_index];
                 dispatch_transpose(
                     device,
                     encoder,
                     scheduler,
-                    stage_a,
-                    stage_b,
-                    slab_bytes,
+                    &stages.stage_a,
+                    &stages.stage_b,
+                    dispatch.slab_bytes,
                     &variant.to_front_params_buffer,
-                    prefix_count,
+                    dispatch.prefix_count,
                     self.axis_len,
                     transpose_layout,
                     transpose_pipeline,
                 )?;
+            }
+            for (dispatch, stages) in burst.iter().zip(burst_ring) {
+                let variant = &self.variants[dispatch.variant_index];
                 row_plans[variant.plan_index].execute_views(
                     device,
                     encoder,
-                    BufferView::whole(stage_b).prefix(slab_bytes)?,
-                    BufferView::whole(stage_a).prefix(slab_bytes)?,
+                    BufferView::whole(&stages.stage_b).prefix(dispatch.slab_bytes)?,
+                    BufferView::whole(&stages.stage_a).prefix(dispatch.slab_bytes)?,
                 )?;
+            }
+            for (dispatch, stages) in burst.iter().zip(burst_ring) {
+                let variant = &self.variants[dispatch.variant_index];
                 dispatch_transpose(
                     device,
                     encoder,
                     scheduler,
-                    stage_a,
-                    stage_b,
-                    slab_bytes,
+                    &stages.stage_a,
+                    &stages.stage_b,
+                    dispatch.slab_bytes,
                     &variant.from_front_params_buffer,
                     self.axis_len,
-                    prefix_count,
+                    dispatch.prefix_count,
                     transpose_layout,
                     transpose_pipeline,
                 )?;
-
-                if prefix_count == self.prefix {
-                    executor.copy_buffer_to_view_range(
-                        encoder,
-                        stage_b,
-                        0,
-                        arena,
-                        matrix_base * COMPLEX_F32_BYTES,
-                        slab_bytes,
-                    )?;
-                } else {
-                    let row_bytes = (prefix_count as u64) * COMPLEX_F32_BYTES;
-                    for axis_element in 0..self.axis_len {
-                        let destination_element = matrix_base
-                            .checked_add((axis_element as u64) * self.prefix as u64)
-                            .and_then(|value| value.checked_add(prefix_start as u64))
-                            .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-                        executor.copy_buffer_to_view_range(
-                            encoder,
-                            stage_b,
-                            (axis_element as u64) * row_bytes,
-                            arena,
-                            destination_element * COMPLEX_F32_BYTES,
-                            row_bytes,
-                        )?;
-                    }
-                }
+            }
+            for (dispatch, stages) in burst.iter().zip(burst_ring) {
+                self.scatter_dispatch(encoder, executor, arena, dispatch, &stages.stage_b)?;
             }
         }
         Ok(())
     }
+
+    fn dispatch_for_index(&self, index: usize) -> Result<SlabDispatch> {
+        debug_assert!(index < self.dispatch_count);
+        let (matrix_base, prefix_start, prefix_count, slab_bytes) = slab_dispatch_geometry(
+            index,
+            self.axis_len,
+            self.prefix,
+            self.prefix_chunk,
+            self.chunks_per_repetition,
+        )?;
+        let variant_index = self
+            .variants
+            .iter()
+            .position(|variant| variant.prefix_count == prefix_count)
+            .expect("slab schedule contains main and tail variants");
+        Ok(SlabDispatch {
+            matrix_base,
+            prefix_start,
+            prefix_count,
+            slab_bytes,
+            variant_index,
+        })
+    }
+
+    fn gather_dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        executor: &StageExecutor<'_>,
+        arena: &BufferView<'_>,
+        dispatch: &SlabDispatch,
+        stage_a: &wgpu::Buffer,
+    ) -> Result<()> {
+        if dispatch.prefix_count == self.prefix {
+            executor.copy_view_range_to_buffer(
+                encoder,
+                arena,
+                dispatch.matrix_base * COMPLEX_F32_BYTES,
+                stage_a,
+                0,
+                dispatch.slab_bytes,
+            )?;
+        } else {
+            let row_bytes = (dispatch.prefix_count as u64) * COMPLEX_F32_BYTES;
+            for axis_element in 0..self.axis_len {
+                let source_element = dispatch
+                    .matrix_base
+                    .checked_add((axis_element as u64) * self.prefix as u64)
+                    .and_then(|value| value.checked_add(dispatch.prefix_start as u64))
+                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                executor.copy_view_range_to_buffer(
+                    encoder,
+                    arena,
+                    source_element * COMPLEX_F32_BYTES,
+                    stage_a,
+                    (axis_element as u64) * row_bytes,
+                    row_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scatter_dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        executor: &StageExecutor<'_>,
+        arena: &BufferView<'_>,
+        dispatch: &SlabDispatch,
+        stage_b: &wgpu::Buffer,
+    ) -> Result<()> {
+        if dispatch.prefix_count == self.prefix {
+            executor.copy_buffer_to_view_range(
+                encoder,
+                stage_b,
+                0,
+                arena,
+                dispatch.matrix_base * COMPLEX_F32_BYTES,
+                dispatch.slab_bytes,
+            )?;
+        } else {
+            let row_bytes = (dispatch.prefix_count as u64) * COMPLEX_F32_BYTES;
+            for axis_element in 0..self.axis_len {
+                let destination_element = dispatch
+                    .matrix_base
+                    .checked_add((axis_element as u64) * self.prefix as u64)
+                    .and_then(|value| value.checked_add(dispatch.prefix_start as u64))
+                    .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+                executor.copy_buffer_to_view_range(
+                    encoder,
+                    stage_b,
+                    (axis_element as u64) * row_bytes,
+                    arena,
+                    destination_element * COMPLEX_F32_BYTES,
+                    row_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn slab_dispatch_geometry(
+    index: usize,
+    axis_len: usize,
+    prefix: usize,
+    prefix_chunk: usize,
+    chunks_per_repetition: usize,
+) -> Result<(u64, usize, usize, u64)> {
+    let repetition = index / chunks_per_repetition;
+    let chunk = index % chunks_per_repetition;
+    let prefix_start = chunk
+        .checked_mul(prefix_chunk)
+        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+    let prefix_count = prefix_chunk.min(prefix - prefix_start);
+    let matrix_elements = (prefix as u64)
+        .checked_mul(axis_len as u64)
+        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+    let matrix_base = (repetition as u64)
+        .checked_mul(matrix_elements)
+        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+    let slab_bytes = (prefix_count as u64)
+        .checked_mul(axis_len as u64)
+        .and_then(|elements| elements.checked_mul(COMPLEX_F32_BYTES))
+        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+    Ok((matrix_base, prefix_start, prefix_count, slab_bytes))
 }
 
 impl SegmentedScalePlan {
@@ -939,12 +1059,17 @@ fn build_slab_axis_plan(
     let max_slab_bytes = (prefix_chunk as u64)
         .checked_mul(line_bytes)
         .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+    let chunks_per_repetition = prefix.div_ceil(prefix_chunk);
+    let dispatch_count = repetitions
+        .checked_mul(chunks_per_repetition)
+        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
     Ok(SlabAxisPlan {
         axis,
         axis_len,
         prefix,
-        repetitions,
         prefix_chunk,
+        chunks_per_repetition,
+        dispatch_count,
         max_slab_bytes,
         variants,
     })
@@ -1143,6 +1268,7 @@ fn build_diagnostic_graph(
     schedule: &SegmentedVolumeSchedule,
     row_plans: &[AxisPlan],
     stage_bytes: u64,
+    burst_depth: usize,
     total_complex: u64,
     limits: LargePolicyLimits,
     storage_alignment: u64,
@@ -1175,30 +1301,34 @@ fn build_diagnostic_graph(
             .checked_add(1)
             .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
     }
+    // Logical traffic stages use the first physical ring pair. The remaining
+    // pairs are parallel inventory, not additional traffic-equivalent passes.
     let stage_a_index = helper_index;
     let stage_b_index = helper_index
         .checked_add(1)
         .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-    for (label, index) in [
-        ("segmented-volume-stage-a", stage_a_index),
-        ("segmented-volume-stage-b", stage_b_index),
-    ] {
-        graph.push_stage(
-            LargeStage::WindowedHelper {
-                label,
-                range: LogicalRange::new(
-                    LogicalBufferId::Stage(index),
-                    0,
-                    stage_bytes,
-                    ElementFormat::ComplexF32,
-                )?,
-            },
-            requirements(stage_bytes)?,
-        )?;
+    for _ in 0..burst_depth {
+        for label in [
+            "segmented-volume-burst-stage-a",
+            "segmented-volume-burst-stage-b",
+        ] {
+            graph.push_stage(
+                LargeStage::WindowedHelper {
+                    label,
+                    range: LogicalRange::new(
+                        LogicalBufferId::Stage(helper_index),
+                        0,
+                        stage_bytes,
+                        ElementFormat::ComplexF32,
+                    )?,
+                },
+                requirements(stage_bytes)?,
+            )?;
+            helper_index = helper_index
+                .checked_add(1)
+                .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
+        }
     }
-    helper_index = stage_b_index
-        .checked_add(1)
-        .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
     for plan in row_plans {
         let workspace_bytes = plan.workspace_size_bytes();
         if workspace_bytes == 0 {
@@ -1484,5 +1614,50 @@ mod tests {
             copy_alignment: 4,
         };
         assert_eq!(segmented_scale_chunk_bytes(128, limits).unwrap(), 128);
+    }
+
+    #[test]
+    fn burst_depth_accepts_only_the_supported_ring_range() {
+        for depth in 1..=3 {
+            validate_segmented_burst_depth(depth).unwrap();
+        }
+        for depth in [0, 4, usize::MAX] {
+            assert!(matches!(
+                validate_segmented_burst_depth(depth),
+                Err(FftError::LargeGraphStageUnsupported {
+                    stage: "segmented-volume-burst-ring",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn slab_dispatch_geometry_preserves_tail_and_repetition_boundaries() {
+        let axis_len = 7usize;
+        let prefix = 10usize;
+        let prefix_chunk = 4usize;
+        let chunks_per_repetition = prefix.div_ceil(prefix_chunk);
+        let expected = [
+            (0, 0, 4, 224),
+            (0, 4, 4, 224),
+            (0, 8, 2, 112),
+            (70, 0, 4, 224),
+            (70, 4, 4, 224),
+            (70, 8, 2, 112),
+        ];
+        for (index, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                slab_dispatch_geometry(
+                    index,
+                    axis_len,
+                    prefix,
+                    prefix_chunk,
+                    chunks_per_repetition,
+                )
+                .unwrap(),
+                expected
+            );
+        }
     }
 }

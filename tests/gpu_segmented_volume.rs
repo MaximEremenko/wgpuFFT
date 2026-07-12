@@ -7,8 +7,8 @@ use std::sync::mpsc;
 
 use wgpu_fft::math::{reference_c2c_nd_f64, Complex64};
 use wgpu_fft::{
-    BufferSegment, BufferView, FftConfig, FftDirection, FftError, FftPlan, LargeExecutionKind,
-    LargePolicyLimits, LargeRouteMode, Normalization,
+    BufferSegment, BufferView, FftConfig, FftDiagnostics, FftDirection, FftError, FftPlan,
+    LargeExecutionKind, LargePolicyLimits, LargeRouteMode, Normalization,
 };
 
 const MODERATE_MAX_BIND_BYTES: u64 = 2_048;
@@ -16,6 +16,8 @@ const MODERATE_MAX_BUFFER_BYTES: u64 = 32_768;
 const MODERATE_VOLUME_BYTES: u64 = 102_400;
 const MODERATE_SEGMENT_BYTES: [u64; 4] = [32_768, 32_768, 32_768, 4_096];
 const ARENA_ROLE: &str = "helper:segmented-volume-arena";
+const BURST_STAGE_A_ROLE: &str = "helper:segmented-volume-burst-stage-a";
+const BURST_STAGE_B_ROLE: &str = "helper:segmented-volume-burst-stage-b";
 
 const LARGE_N0: usize = 4_096;
 const LARGE_N1: usize = 8_000;
@@ -90,12 +92,196 @@ async fn run_gpu_cases() {
         }
     }
 
+    run_checked_creation_case(&context).await;
+    run_burst_depth_equivalence(&context);
     run_cross_normalized_limit_case(&context);
     assert_non_mixed_axes_are_rejected(&context);
     run_large_sampled_case(&context);
 
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+async fn run_checked_creation_case(context: &wgpu_fft::device::GpuContext) {
+    let config = FftConfig::new_nd([100, 128]).with_normalization(Normalization::None);
+    let plan = FftPlan::c2c_checked_with_large_policy_limits_for_testing(
+        &context.device,
+        &context.queue,
+        config,
+        LargePolicyLimits {
+            max_storage_buffer_binding_size: MODERATE_MAX_BIND_BYTES,
+            max_buffer_size: MODERATE_MAX_BUFFER_BYTES,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plan.large_routing_policy().execution_kind(),
+        LargeExecutionKind::SegmentedFullVolume
+    );
+    assert_burst_helper_inventory(&plan.diagnostics(), 2);
+}
+
+fn run_burst_depth_equivalence(context: &wgpu_fft::device::GpuContext) {
+    for (label, shape, batch) in [
+        // Axis 0 has 22 windows at the forced 2 KiB binding cap, leaving a
+        // one-window tail when the burst depth is three.
+        ("rank2-tail", vec![75, 64], 1),
+        // Axis 0 has 20 windows, so this covers both a batched rank-3 layout
+        // and a two-window tail at burst depth three.
+        ("batched-rank3-tail", vec![8, 10, 16], 4),
+    ] {
+        for config in [
+            FftConfig::new_nd(shape.clone())
+                .with_batch(batch)
+                .with_normalization(Normalization::None),
+            FftConfig::inverse_nd(shape.clone()).with_batch(batch),
+        ] {
+            run_burst_depth_case(context, label, config);
+        }
+    }
+}
+
+fn run_burst_depth_case(context: &wgpu_fft::device::GpuContext, label: &str, config: FftConfig) {
+    let byte_len = config.required_buffer_size_bytes().unwrap();
+    assert!(byte_len > MODERATE_MAX_BUFFER_BYTES);
+    let expected_arena = expected_segment_sizes(byte_len, MODERATE_MAX_BUFFER_BYTES);
+    let case_label = format!("{label}-{:?}", config.direction());
+    eprintln!("segmented burst-depth start: {case_label}");
+
+    let input = test_signal(config.total_complex_len().unwrap());
+    let expected = reference_f64(&input, &config);
+    let baseline = FftPlan::c2c(&context.device, &context.queue, config.clone()).unwrap();
+    let baseline_output = execute_plan(context, &baseline, &input, "burst-depth-baseline");
+
+    let mut depth_one_output: Option<Vec<f32>> = None;
+    let mut expected_traffic_stage_count: Option<usize> = None;
+    let mut depth_one_arena: Option<Vec<u64>> = None;
+    for depth in [1usize, 2, 3] {
+        let plan = FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
+            &context.device,
+            &context.queue,
+            config.clone(),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: MODERATE_MAX_BIND_BYTES,
+                max_buffer_size: MODERATE_MAX_BUFFER_BYTES,
+            },
+            depth,
+        )
+        .unwrap();
+        assert_segmented_plan(
+            &plan,
+            &config,
+            MODERATE_MAX_BIND_BYTES,
+            MODERATE_MAX_BUFFER_BYTES,
+            byte_len,
+            &expected_arena,
+        );
+
+        let diagnostics = plan.diagnostics();
+        assert_burst_helper_inventory(&diagnostics, depth);
+        let arena = arena_segment_sizes(&diagnostics);
+        assert_eq!(arena, expected_arena, "{case_label}: depth {depth}");
+        if let Some(depth_one_arena) = depth_one_arena.as_ref() {
+            assert_eq!(
+                &arena, depth_one_arena,
+                "{case_label}: burst depth changed the segmented arena"
+            );
+        } else {
+            depth_one_arena = Some(arena);
+        }
+
+        let traffic_stage_count = logical_traffic_stage_count(&diagnostics);
+        assert!(traffic_stage_count > 0);
+        if let Some(expected_count) = expected_traffic_stage_count {
+            assert_eq!(
+                traffic_stage_count, expected_count,
+                "{case_label}: burst depth changed the logical traffic graph"
+            );
+        } else {
+            expected_traffic_stage_count = Some(traffic_stage_count);
+        }
+
+        let output = execute_plan(context, &plan, &input, "segmented-burst-depth");
+        assert_close_f32(
+            &output,
+            &baseline_output,
+            &format!("{case_label}: depth {depth} versus baseline"),
+        );
+        assert_matches_reference(
+            &output,
+            &expected,
+            &format!("{case_label}: depth {depth} versus f64"),
+        );
+        if let Some(depth_one_output) = depth_one_output.as_ref() {
+            assert_close_f32(
+                &output,
+                depth_one_output,
+                &format!("{case_label}: depth {depth} versus depth 1"),
+            );
+        } else {
+            depth_one_output = Some(output);
+        }
+    }
+    eprintln!("segmented burst-depth passed: {case_label}");
+}
+
+fn assert_burst_helper_inventory(diagnostics: &FftDiagnostics, depth: usize) {
+    for role in [BURST_STAGE_A_ROLE, BURST_STAGE_B_ROLE] {
+        let helpers = diagnostics
+            .buffer_requirements()
+            .iter()
+            .filter(|requirement| requirement.role == role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helpers.len(),
+            depth,
+            "{role}: one physical helper is required per burst slot"
+        );
+        assert!(helpers.iter().all(|requirement| {
+            requirement.required_bytes > 0 && requirement.required_bytes <= MODERATE_MAX_BIND_BYTES
+        }));
+    }
+}
+
+fn arena_segment_sizes(diagnostics: &FftDiagnostics) -> Vec<u64> {
+    diagnostics
+        .buffer_requirements()
+        .iter()
+        .filter(|requirement| requirement.role == ARENA_ROLE)
+        .map(|requirement| requirement.required_bytes)
+        .collect()
+}
+
+fn logical_traffic_stage_count(diagnostics: &FftDiagnostics) -> usize {
+    diagnostics
+        .stages()
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.kind.as_str(),
+                "copy"
+                    | "kernel"
+                    | "windowed-kernel"
+                    | "gather-scatter"
+                    | "twiddle-transpose"
+                    | "stripe-transpose"
+                    | "permutation"
+                    | "scale"
+            )
+        })
+        .count()
+}
+
+fn expected_segment_sizes(total_bytes: u64, segment_cap: u64) -> Vec<u64> {
+    let mut sizes = Vec::new();
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        let size = remaining.min(segment_cap);
+        sizes.push(size);
+        remaining -= size;
+    }
+    sizes
 }
 
 fn run_cross_normalized_limit_case(context: &wgpu_fft::device::GpuContext) {

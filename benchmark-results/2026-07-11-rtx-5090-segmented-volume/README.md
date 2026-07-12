@@ -91,3 +91,78 @@ when comparing burst depths.
 - Caller-segmented or strided endpoints combined with the internal arena, and
   caller-provided workspace reuse, remain deferred.
 - No host or disk staging is used.
+
+## Phase B: burst ring and checked allocation
+
+Phase B replaces the single A/B staging pair with a depth-validated ring of
+one to three A/B pairs. Each burst records all gathers, then all forward
+transposes/row FFTs/back-transposes, then all scatters before reusing a slot.
+Slab dispatch geometry is derived into a fixed three-entry stack array during
+encoding, so the ring does not add a volume-sized host schedule. Diagnostics
+inventory every physical A/B buffer while retaining one copy of each logical
+traffic stage.
+
+Plan creation now also has an async checked path. `FftPlan::c2c_checked` and
+`c2c_checked_with_diagnostics` wrap construction in wgpu validation, internal,
+and out-of-memory error scopes and return
+`GpuPlanResourceAllocationFailed` with route, resource, diagnostic helper bytes
+and requirement count, failure kind, and the captured wgpu error text. Existing
+synchronous constructors remain for compatibility; applications that need
+recoverable allocation failure use the checked async constructor.
+
+### Correctness
+
+Depths 1, 2, and 3 match the normal route, depth 1, and the `Complex64` oracle
+for forward and inverse rank-2 `[75,64]` and batched rank-3 `[8,10,16]`, batch
+4. These cases deliberately leave one- and two-slot burst tails. For each
+depth, diagnostics contain exactly that many
+`helper:segmented-volume-burst-stage-a` and stage-B requirements, the arena is
+unchanged, and the logical traffic graph is identical. The checked async path
+is exercised on a forced four-segment plan; structured allocation-error
+formatting and diagnostics have unit coverage.
+
+Final Phase B verification passed 237 unit tests and all eight RTX 5090 Vulkan
+release GPU suites: `gpu_c2c`, `gpu_real`, `gpu_dispatch_split`,
+`gpu_fused_pow2`, `gpu_accuracy`, `gpu_fused_prime`, `gpu_four_step`, and
+`gpu_segmented_volume`.
+
+### Burst-depth benchmark
+
+The tuning control is `[320,320,320]`, batch 1, exactly 250 MiB. It uses the
+same 16 MiB binding cap and 64 MiB sharded arena cap as Phase A, but its cubic
+layout records about 23.5x fewer per-row slab copies than `[4096,8000]`.
+Each depth was run with two recreated-plan samples and its own alternating
+unsharded/sharded control. Timing and traffic methodology are unchanged.
+
+```powershell
+$env:WGPU_BACKEND='vulkan'
+cargo bench --bench fft_bench -- shape 320x320x320 `
+  --plan-max-bind-bytes 16777216 `
+  --compare-max-buffer-bytes 1073741824,67108864 `
+  --segmented-burst-depth <1|2|3> `
+  --runs 2 --iter-cap 1 --adapter "RTX 5090" --wait-timeout-secs 240
+```
+
+| Depth | Sharded raw samples | Sharded pair time | Unsharded control | Sharded passes / FFT | Effective GiB/s | Sharded / control | Combined helper inventory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 50.2165, 49.8643 ms | **50.0404 +/- 0.1761 ms** | 50.97465 +/- 0.00595 ms | 15 | 292.732 | 0.981672x | 591,395,840 B |
+| 2 | 48.2165, 48.7482 ms | **48.48235 +/- 0.26585 ms** | 50.46195 +/- 0.18875 ms | 15 | 302.140 | 0.960770x | 658,498,560 B |
+| 3 | 48.8310, 50.5710 ms | **49.7010 +/- 0.8700 ms** | 50.6978 +/- 0.0375 ms | 15 | 294.731 | 0.980338x | 725,601,280 B |
+
+Using each depth's in-session unsharded control, depth 2 improves the sharded /
+control ratio by 2.13% over depth 1, above the combined run standard errors.
+Depth 3's normalized point estimate is 2.04% slower than depth 2, but its two
+samples have substantially more variance; it demonstrates no benefit while
+adding another two 16 MiB staging buffers per plan. The measured memory/perf
+default is therefore **depth 2**. The sharded route needs 15
+traffic-equivalent passes versus 16 for the unsharded rank-3 four-step control
+because the arena schedule finishes in place and needs no final full-volume
+parity copy.
+
+### Deferred after Phase B
+
+- Prime/Rader/Bluestein axes inside segmented volumes.
+- Caller-segmented or strided endpoints combined with the internal arena.
+- Caller-provided workspace reuse.
+- Public tuning overrides for the measured burst depth and other four-step
+  policy choices.

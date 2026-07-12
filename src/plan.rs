@@ -37,6 +37,118 @@ enum FftPlanInner {
     C2r(C2rPlan),
 }
 
+struct GpuPlanCreationErrorScopes {
+    out_of_memory: wgpu::ErrorScopeGuard,
+    internal: wgpu::ErrorScopeGuard,
+    validation: wgpu::ErrorScopeGuard,
+}
+
+#[derive(Clone, Copy)]
+struct PlanResourceAllocationContext {
+    route: &'static str,
+    resource: &'static str,
+    requested_bytes: u64,
+    buffer_count: usize,
+}
+
+impl GpuPlanCreationErrorScopes {
+    fn push(device: &wgpu::Device) -> Self {
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        Self {
+            out_of_memory,
+            internal,
+            validation,
+        }
+    }
+
+    async fn pop_error(self) -> Option<(&'static str, String)> {
+        // Error scopes are a stack. Pop every scope in strict reverse order,
+        // even when plan construction already returned a synchronous error.
+        let validation_error = self.validation.pop().await;
+        let internal_error = self.internal.pop().await;
+        let out_of_memory_error = self.out_of_memory.pop().await;
+        if let Some(error) = validation_error {
+            Some(("validation", error.to_string()))
+        } else if let Some(error) = internal_error {
+            Some(("internal", error.to_string()))
+        } else if let Some(error) = out_of_memory_error {
+            Some(("out-of-memory", error.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+impl PlanResourceAllocationContext {
+    fn for_config(_config: &FftConfig) -> Self {
+        Self {
+            route: "c2c-plan",
+            resource: "plan-owned-gpu-resources",
+            requested_bytes: 0,
+            buffer_count: 0,
+        }
+    }
+
+    fn for_plan(plan: &FftPlan, fallback: Self) -> Self {
+        let diagnostics = plan.diagnostics();
+        // An error scope covers the complete constructor, so it cannot safely
+        // attribute a device error to one particular helper. Report the full
+        // plan-owned inventory rather than mislabeling a ring/workspace failure
+        // as an arena allocation failure.
+        let helper_requirements = diagnostics
+            .buffer_requirements()
+            .iter()
+            .filter(|requirement| {
+                requirement.role.starts_with("helper:") || requirement.role == "workspace"
+            })
+            .collect::<Vec<_>>();
+        if helper_requirements.is_empty() {
+            return Self {
+                route: plan.large_routing_policy().execution_kind().as_str(),
+                ..fallback
+            };
+        }
+        Self {
+            route: plan.large_routing_policy().execution_kind().as_str(),
+            resource: "plan-owned-gpu-resources",
+            requested_bytes: helper_requirements.iter().fold(0u64, |total, requirement| {
+                total.saturating_add(requirement.required_bytes)
+            }),
+            buffer_count: helper_requirements.len(),
+        }
+    }
+
+    fn into_error(self, kind: &'static str, details: String) -> FftError {
+        FftError::GpuPlanResourceAllocationFailed {
+            route: self.route,
+            resource: self.resource,
+            requested_bytes: self.requested_bytes,
+            buffer_count: self.buffer_count,
+            kind,
+            details,
+        }
+    }
+}
+
+async fn finish_checked_c2c_plan_creation(
+    result: Result<FftPlan>,
+    fallback: PlanResourceAllocationContext,
+    scopes: GpuPlanCreationErrorScopes,
+) -> Result<FftPlan> {
+    let captured_error = scopes.pop_error().await;
+    if let Some((kind, details)) = captured_error {
+        let context = result
+            .as_ref()
+            .map(|plan| PlanResourceAllocationContext::for_plan(plan, fallback))
+            .unwrap_or(fallback);
+        Err(context.into_error(kind, details))
+    } else {
+        result
+    }
+}
+
 impl FftPlan {
     pub fn c2c(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {
         Ok(Self {
@@ -53,6 +165,31 @@ impl FftPlan {
             .map_err(|error| FftPlanCreationError::from_error(error, "c2c"))
     }
 
+    /// Creates a C2C plan while converting scoped GPU validation, internal,
+    /// and out-of-memory failures into a structured [`FftError`].
+    pub async fn c2c_checked(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+    ) -> Result<Self> {
+        let fallback = PlanResourceAllocationContext::for_config(&config);
+        let scopes = GpuPlanCreationErrorScopes::push(device);
+        let result = Self::c2c(device, queue, config);
+        finish_checked_c2c_plan_creation(result, fallback, scopes).await
+    }
+
+    /// Checked C2C plan creation with structured diagnostics attached to any
+    /// synchronous or scoped GPU failure.
+    pub async fn c2c_checked_with_diagnostics(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+    ) -> std::result::Result<Self, FftPlanCreationError> {
+        Self::c2c_checked(device, queue, config)
+            .await
+            .map_err(|error| FftPlanCreationError::from_error(error, "c2c"))
+    }
+
     #[doc(hidden)]
     pub fn c2c_with_large_policy_limits_for_testing(
         device: &wgpu::Device,
@@ -65,6 +202,60 @@ impl FftPlan {
                 device, queue, config, limits,
             )?),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn c2c_with_large_policy_limits_and_burst_depth_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+        limits: LargePolicyLimits,
+        burst_depth: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: FftPlanInner::C2c(
+                C2cPlan::new_with_large_policy_limits_and_burst_depth_for_testing(
+                    device,
+                    queue,
+                    config,
+                    limits,
+                    burst_depth,
+                )?,
+            ),
+        })
+    }
+
+    #[doc(hidden)]
+    pub async fn c2c_checked_with_large_policy_limits_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+        limits: LargePolicyLimits,
+    ) -> Result<Self> {
+        let fallback = PlanResourceAllocationContext::for_config(&config);
+        let scopes = GpuPlanCreationErrorScopes::push(device);
+        let result = Self::c2c_with_large_policy_limits_for_testing(device, queue, config, limits);
+        finish_checked_c2c_plan_creation(result, fallback, scopes).await
+    }
+
+    #[doc(hidden)]
+    pub async fn c2c_checked_with_large_policy_limits_and_burst_depth_for_testing(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: FftConfig,
+        limits: LargePolicyLimits,
+        burst_depth: usize,
+    ) -> Result<Self> {
+        let fallback = PlanResourceAllocationContext::for_config(&config);
+        let scopes = GpuPlanCreationErrorScopes::push(device);
+        let result = Self::c2c_with_large_policy_limits_and_burst_depth_for_testing(
+            device,
+            queue,
+            config,
+            limits,
+            burst_depth,
+        );
+        finish_checked_c2c_plan_creation(result, fallback, scopes).await
     }
 
     pub fn r2c(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {

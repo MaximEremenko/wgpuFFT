@@ -167,3 +167,11 @@ type-3 plan's adjoint swaps source and target sets and reverses the sign.
 
 Licensed under the Apache License, Version 2.0 ([LICENSE](../LICENSE) or
 <http://www.apache.org/licenses/LICENSE-2.0>).
+
+## Known limitation: clustered sources
+
+The GPU spreader is scatter-atomic: when many sources occupy a small fraction
+of the fine grid (e.g. displacement vectors clustered around zero), atomic
+adds serialize and throughput drops by roughly an order of magnitude; on
+Windows a long dispatch can trip the TDR watchdog. Planned fix: a binned
+subproblem spreader (shared-memory accumulation per bin), which removes global atomic contention for clustered inputs.

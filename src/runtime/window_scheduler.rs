@@ -359,7 +359,7 @@ mod tests {
         }
     }
 
-    fn route_source_files() -> [(&'static str, &'static str); 12] {
+    fn route_source_files() -> [(&'static str, &'static str); 13] {
         [
             ("runtime/axis_plan.rs", include_str!("axis_plan.rs")),
             (
@@ -373,6 +373,10 @@ mod tests {
             ("runtime/large_graph.rs", include_str!("large_graph.rs")),
             ("runtime/rader_axis.rs", include_str!("rader_axis.rs")),
             ("runtime/real.rs", include_str!("real.rs")),
+            (
+                "runtime/segmented_volume.rs",
+                include_str!("segmented_volume.rs"),
+            ),
             (
                 "runtime/smooth_decompose.rs",
                 include_str!("smooth_decompose.rs"),

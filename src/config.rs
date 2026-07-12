@@ -223,6 +223,15 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn rejects_total_complex_count_above_u32_index_space() {
+        assert_eq!(
+            FftConfig::new_nd([65_536, 65_536]).validate(),
+            Err(FftError::LengthTooLarge { len: 4_294_967_296 })
+        );
+    }
+
     #[test]
     fn validates_nd_axes_and_batch() {
         assert_eq!(FftConfig::new_nd([2, 3]).shape(), &[2, 3]);

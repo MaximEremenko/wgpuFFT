@@ -801,18 +801,23 @@ impl FftPlan {
             )
         });
 
-        let four_step = matches!(&self.inner, FftPlanInner::C2c(_))
-            && self.large_routing_policy().execution_kind()
-                == LargeExecutionKind::OutOfCoreFourStep;
+        let execution_kind = self.large_routing_policy().execution_kind();
+        let segmented_volume = execution_kind == LargeExecutionKind::SegmentedFullVolume;
+        let windowed_volume = matches!(&self.inner, FftPlanInner::C2c(_))
+            && matches!(
+                execution_kind,
+                LargeExecutionKind::OutOfCoreFourStep | LargeExecutionKind::SegmentedFullVolume
+            );
         match input_bound {
             Ok(input) => {
-                diagnostics = if four_step {
+                diagnostics = if windowed_volume {
                     add_four_step_bound_logical_io_diagnostics(
                         diagnostics,
                         "input",
                         &route,
                         &input,
                         limits,
+                        segmented_volume,
                     )
                 } else {
                     add_bound_logical_io_diagnostics(diagnostics, "input", &route, &input, limits)
@@ -834,13 +839,14 @@ impl FftPlan {
         }
         match output_bound {
             Ok(output) => {
-                diagnostics = if four_step {
+                diagnostics = if windowed_volume {
                     add_four_step_bound_logical_io_diagnostics(
                         diagnostics,
                         "output",
                         &route,
                         &output,
                         limits,
+                        segmented_volume,
                     )
                 } else {
                     add_bound_logical_io_diagnostics(diagnostics, "output", &route, &output, limits)
@@ -1342,8 +1348,20 @@ fn add_four_step_bound_logical_io_diagnostics(
     route: &str,
     io: &BoundLogicalIo<'_>,
     limits: FftDeviceLimits,
+    segmented_volume: bool,
 ) -> FftDiagnostics {
     diagnostics = add_logical_io_stages(diagnostics, role, route, io);
+    if segmented_volume && io.layout_kind() != "contiguous" {
+        return diagnostics.with_blocker(
+            FftBlocker::new(
+                FftBlockerKind::Unsupported,
+                "segmented full-volume execution requires a single zero-offset contiguous endpoint buffer",
+            )
+            .with_route("large-out-of-core")
+            .with_stage(format!("{role}-segmented-volume-endpoint"))
+            .with_layout(io.layout_kind()),
+        );
+    }
     if !io.is_contiguous() {
         return diagnostics.with_blocker(
             FftBlocker::new(
@@ -1362,11 +1380,15 @@ fn add_four_step_bound_logical_io_diagnostics(
 
     let required_usage = if role == "input" {
         wgpu::BufferUsages::COPY_SRC
+    } else if segmented_volume {
+        wgpu::BufferUsages::COPY_DST
     } else {
         wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST
     };
     let usage_label = if role == "input" {
         "COPY_SRC"
+    } else if segmented_volume {
+        "COPY_DST"
     } else {
         "COPY_SRC|COPY_DST"
     };

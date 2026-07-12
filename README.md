@@ -84,6 +84,8 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
 - Four-step C2C endpoints currently require input `COPY_SRC` and output
   `COPY_SRC | COPY_DST`; `STORAGE` enables direct bind windows but is optional
   because unaligned and segmented windows use GPU-copy staging.
+- Segmented full-volume C2C endpoints currently require one zero-offset
+  contiguous input buffer with `COPY_SRC` and output buffer with `COPY_DST`.
 - Public `FftIoView`/`BufferLayout` compatibility views for strided logical I/O.
 - Fallible `FftPlan::*_with_diagnostics` constructors, `execute_checked`,
   `execute_views`, `execute_io_views`, `execute_logical_views`,
@@ -106,10 +108,15 @@ entries that exceed the target device's fused-kernel compute limits are skipped.
   Bluestein. Rank 2 uses stripe transposes; higher ranks move each non-front
   axis through a tiled prefix-by-axis block permutation and restore canonical
   layout afterward. No host or disk staging is required for this route.
-- A dataset above `maxBufferSize` still requires segmented full-volume execution
-  and is rejected with structured diagnostics. Four-step strided logical I/O
-  and caller-workspace reuse also remain deferred as described by the endpoint
-  usage requirements above.
+- Rank>=2 smooth C2C volumes above the active policy `maxBufferSize` can use a
+  plan-owned segmented GPU arena. Axis rows and non-front slabs are staged
+  through binding-safe windows, with one segmented normalization pass and no
+  host or disk staging. On hardware where the logical volume itself exceeds the
+  real device `maxBufferSize`, caller-segmented endpoints are still required and
+  remain deferred; the implemented route is directly executable when an
+  internal/tuning cap is below the real endpoint limit. Prime axes inside a
+  segmented volume, segmented/strided caller views, and caller-workspace reuse
+  remain structured-unsupported.
 - Internal shader/module/pipeline cache keyed by generated fused power-of-two,
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.

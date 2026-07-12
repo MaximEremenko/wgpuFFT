@@ -2,6 +2,12 @@ use crate::config::{FftConfig, FftDirection, Normalization};
 use crate::error::Result;
 use bytemuck::{Pod, Zeroable};
 
+mod double_float;
+
+pub use double_float::{
+    quick_two_sum_f32, split_f32, two_prod_f32, two_sum_f32, ComplexDoubleFloat, DoubleFloat,
+};
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
 pub struct Complex32 {

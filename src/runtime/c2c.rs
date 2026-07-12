@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
-use crate::config::{FftConfig, FftDirection, Normalization};
+use crate::config::{FftConfig, FftDirection, FftPrecision, Normalization};
+use crate::device::device_supports_precision;
 use crate::error::{FftError, Result};
 use crate::math::to_interleaved_f32;
 use crate::runtime::axis_plan::{
@@ -20,7 +21,8 @@ use crate::runtime::large_graph::{
     LogicalBufferId, LogicalRange, StageRequirements,
 };
 use crate::runtime::large_policy::{
-    line_bytes_for_axis_len, resolve_large_routing_policy, LargeExecutionKind, LargeFactorSplit,
+    line_bytes_for_axis_len, non_mixed_axis_window_supported,
+    resolve_large_routing_policy_with_complex_element_bytes, LargeExecutionKind, LargeFactorSplit,
     LargePolicyLimits, LargeRouteMode, LargeRoutingPolicy, LargeRoutingPolicyInput,
 };
 use crate::runtime::logical_io::{FftEndpointFormat, FftLogicalView};
@@ -47,6 +49,98 @@ use crate::runtime::window_scheduler::{strided_span_elements, WindowScheduler};
 
 const WORKGROUP_SIZE: u32 = 64;
 const COMPLEX_F32_BYTES: u64 = 8;
+
+fn validate_c2c_precision_feature(device: &wgpu::Device, config: &FftConfig) -> Result<()> {
+    if config.precision() == FftPrecision::F64
+        && !device_supports_precision(device, FftPrecision::F64)
+    {
+        return Err(FftError::PrecisionUnsupported {
+            requested: FftPrecision::F64,
+            route: "c2c",
+            reason: "device-missing-shader-f64",
+        });
+    }
+    Ok(())
+}
+
+fn phase_a_f64_route_error(
+    config: &FftConfig,
+    axis_kinds: &[AxisKind],
+    limits: LargePolicyLimits,
+    route: C2cRoute,
+) -> Result<()> {
+    if config.precision() != FftPrecision::F64 {
+        return Ok(());
+    }
+    let required_bytes = config.required_buffer_size_bytes()?;
+    let bytes_per_batch = bytes_per_batch(config)?;
+    let needs_large_mode = required_bytes > limits.max_storage_buffer_binding_size;
+    let needs_out_of_core = needs_large_mode
+        && config.shape().len() >= 2
+        && bytes_per_batch > limits.max_storage_buffer_binding_size;
+    let four_step_eligible =
+        needs_out_of_core && lightweight_four_step_eligible(config, axis_kinds, limits)?;
+    let (route, reason) = if !needs_large_mode {
+        (route.as_str(), "native-f64-c2c-kernels-not-implemented")
+    } else if !four_step_eligible {
+        ("large-chunk", "large-chunk-f64-not-implemented")
+    } else if required_bytes > limits.max_buffer_size
+        && axis_kinds.iter().all(|kind| *kind == AxisKind::Mixed)
+    {
+        (
+            "segmented-full-volume",
+            "segmented-volume-f64-not-implemented",
+        )
+    } else if required_bytes > limits.max_buffer_size {
+        ("large-chunk", "large-chunk-f64-not-implemented")
+    } else {
+        ("out-of-core-four-step", "four-step-f64-not-implemented")
+    };
+    Err(FftError::PrecisionUnsupported {
+        requested: FftPrecision::F64,
+        route,
+        reason,
+    })
+}
+
+fn lightweight_four_step_eligible(
+    config: &FftConfig,
+    axis_kinds: &[AxisKind],
+    limits: LargePolicyLimits,
+) -> Result<bool> {
+    let axis_lengths = config
+        .axes()
+        .iter()
+        .map(|&axis| config.shape()[axis])
+        .collect::<Vec<_>>();
+    let complex_element_bytes = config.precision().complex_size_bytes();
+    let line_bytes = axis_lengths
+        .iter()
+        .map(|&len| line_bytes_for_axis_len(len, complex_element_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    if !four_step_route_shape_supported(
+        config.shape().len(),
+        config.axes().len(),
+        axis_kinds,
+        &line_bytes,
+        limits.max_storage_buffer_binding_size,
+    ) {
+        return Ok(false);
+    }
+
+    Ok(axis_kinds.iter().zip(axis_lengths).zip(line_bytes).all(
+        |((&kind, axis_len), line_bytes)| match kind {
+            AxisKind::Mixed => line_bytes <= limits.max_buffer_size,
+            AxisKind::Rader | AxisKind::Bluestein => non_mixed_axis_window_supported(
+                kind,
+                axis_len,
+                line_bytes,
+                limits.max_storage_buffer_binding_size,
+                limits.max_buffer_size,
+            ),
+        },
+    ))
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -541,16 +635,18 @@ impl C2cPlan {
     ) -> Result<Self> {
         validate_segmented_burst_depth(segmented_burst_depth)?;
         config.validate()?;
+        validate_c2c_precision_feature(device, &config)?;
         let device_policy_limits = LargePolicyLimits::from(&device.limits());
         let effective_policy_limits = policy_limits
             .unwrap_or(device_policy_limits)
             .componentwise_min(device_policy_limits);
         let policy_limits = Some(effective_policy_limits);
         let len = config.total_complex_len_u32()?;
+        let route = select_route(&config);
         let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        phase_a_f64_route_error(&config, &axis_kinds, effective_policy_limits, route)?;
         let mut large_routing_policy =
             resolve_c2c_large_routing_policy(device, &config, &axis_kinds, policy_limits)?;
-        let route = select_route(&config);
 
         let execution = match large_routing_policy.route_mode() {
             LargeRouteMode::Normal => C2cExecution::Normal(build_route_impl(
@@ -3465,7 +3561,7 @@ fn large_bridge_route_for(route: C2cRoute) -> Option<LargeBridgeRoute> {
 
 fn bytes_per_batch(config: &FftConfig) -> Result<u64> {
     (config.logical_complex_len()? as u64)
-        .checked_mul(COMPLEX_F32_BYTES)
+        .checked_mul(config.precision().complex_size_bytes())
         .ok_or(FftError::LengthTooLarge { len: usize::MAX })
 }
 
@@ -5248,7 +5344,7 @@ fn resolve_c2c_large_routing_policy(
         .collect::<Vec<_>>();
     let line_bytes = axis_lengths
         .iter()
-        .map(|&len| line_bytes_for_axis_len(len))
+        .map(|&len| line_bytes_for_axis_len(len, config.precision().complex_size_bytes()))
         .collect::<Result<Vec<_>>>()?;
     let bytes_per_batch = bytes_per_batch(config)?;
     let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
@@ -5261,18 +5357,21 @@ fn resolve_c2c_large_routing_policy(
             limits.max_storage_buffer_binding_size,
         ) && four_step_axis_resources_supported(config, axis_kinds, &line_bytes, limits);
 
-    resolve_large_routing_policy(LargeRoutingPolicyInput {
-        limits,
-        required_binding_bytes: &required_bindings,
-        line_bytes: &line_bytes,
-        axis_kinds: Some(axis_kinds),
-        axis_lengths: Some(&axis_lengths),
-        allow_non_mixed_bounded_slicing: true,
-        allow_out_of_core: four_step_supported,
-        rank: config.shape().len(),
-        bytes_per_batch: Some(bytes_per_batch),
-        ..LargeRoutingPolicyInput::new(limits, &[])
-    })
+    resolve_large_routing_policy_with_complex_element_bytes(
+        LargeRoutingPolicyInput {
+            limits,
+            required_binding_bytes: &required_bindings,
+            line_bytes: &line_bytes,
+            axis_kinds: Some(axis_kinds),
+            axis_lengths: Some(&axis_lengths),
+            allow_non_mixed_bounded_slicing: true,
+            allow_out_of_core: four_step_supported,
+            rank: config.shape().len(),
+            bytes_per_batch: Some(bytes_per_batch),
+            ..LargeRoutingPolicyInput::new(limits, &[])
+        },
+        config.precision().complex_size_bytes(),
+    )
 }
 
 fn four_step_axis_resources_supported(
@@ -7181,6 +7280,121 @@ impl DirectDftPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c2c_policy_byte_math_follows_precision() {
+        let f32 = FftConfig::new_nd([8, 4]).with_batch(3);
+        let f64 = f32.clone().with_precision(FftPrecision::F64);
+        assert_eq!(bytes_per_batch(&f32).unwrap(), 8 * 4 * 8);
+        assert_eq!(bytes_per_batch(&f64).unwrap(), 8 * 4 * 16);
+        assert_eq!(f32.required_buffer_size_bytes().unwrap(), 8 * 4 * 3 * 8);
+        assert_eq!(f64.required_buffer_size_bytes().unwrap(), 8 * 4 * 3 * 16);
+    }
+
+    #[test]
+    fn phase_a_f64_boundary_preclassifies_deferred_large_routes() {
+        let error_for = |config: FftConfig, max_buffer_size| {
+            let route = select_route(&config);
+            let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes()).unwrap();
+            phase_a_f64_route_error(
+                &config,
+                &axis_kinds,
+                LargePolicyLimits {
+                    max_storage_buffer_binding_size: 128,
+                    max_buffer_size,
+                },
+                route,
+            )
+            .unwrap_err()
+        };
+
+        assert!(matches!(
+            error_for(FftConfig::new(8).with_precision(FftPrecision::F64), 4096),
+            FftError::PrecisionUnsupported {
+                route: "mixed-radix",
+                reason: "native-f64-c2c-kernels-not-implemented",
+                ..
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new(8)
+                    .with_batch(2)
+                    .with_precision(FftPrecision::F64),
+                4096,
+            ),
+            FftError::PrecisionUnsupported {
+                route: "large-chunk",
+                reason: "large-chunk-f64-not-implemented",
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([8, 8])
+                    .with_axes([0])
+                    .with_precision(FftPrecision::F64),
+                4096,
+            ),
+            FftError::PrecisionUnsupported {
+                route: "large-chunk",
+                reason: "large-chunk-f64-not-implemented",
+                ..
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([16, 8]).with_precision(FftPrecision::F64),
+                4096,
+            ),
+            FftError::PrecisionUnsupported {
+                route: "large-chunk",
+                reason: "large-chunk-f64-not-implemented",
+                ..
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([8, 8]).with_precision(FftPrecision::F64),
+                4096,
+            ),
+            FftError::PrecisionUnsupported {
+                route: "out-of-core-four-step",
+                reason: "four-step-f64-not-implemented",
+                ..
+            }
+        ));
+        assert!(matches!(
+            error_for(
+                FftConfig::new_nd([8, 8]).with_precision(FftPrecision::F64),
+                512,
+            ),
+            FftError::PrecisionUnsupported {
+                route: "segmented-full-volume",
+                reason: "segmented-volume-f64-not-implemented",
+                ..
+            }
+        ));
+
+        let forced_large = FftConfig::new_nd([17, 5]).with_precision(FftPrecision::F64);
+        assert!(matches!(
+            error_for(forced_large.clone(), 2048),
+            FftError::PrecisionUnsupported {
+                route: "out-of-core-four-step",
+                reason: "four-step-f64-not-implemented",
+                ..
+            }
+        ));
+        assert!(matches!(
+            error_for(forced_large, 300),
+            FftError::PrecisionUnsupported {
+                route: "large-chunk",
+                reason: "large-chunk-f64-not-implemented",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn four_step_route_requires_rank_and_two_selected_axes() {

@@ -1,4 +1,4 @@
-use crate::config::FftConfig;
+use crate::config::{FftConfig, FftPrecision};
 use crate::diagnostics::{
     helper_buffer_requirements_from_graph, stage_summaries_for_route, stage_summaries_from_graph,
     FftBlocker, FftBlockerKind, FftBufferRequirement, FftDeviceLimits, FftDiagnostics,
@@ -742,6 +742,7 @@ impl FftPlan {
         };
         let route = self.route().as_str().to_owned();
         let policy = self.large_routing_policy();
+        let precision = self.config().precision();
         let mut diagnostics = FftDiagnostics::new(FftRouteSummary::from_large_policy(
             transform,
             route.clone(),
@@ -751,18 +752,18 @@ impl FftPlan {
         .with_buffer_requirement(FftBufferRequirement::new(
             "input",
             self.required_input_buffer_size_bytes(),
-            input_format_for(self.kind()),
+            input_format_for(self.kind(), precision),
         ))
         .with_buffer_requirement(FftBufferRequirement::new(
             "output",
             self.required_output_buffer_size_bytes(),
-            output_format_for(self.kind()),
+            output_format_for(self.kind(), precision),
         ));
         if self.workspace_size_bytes() > 0 {
             diagnostics = diagnostics.with_buffer_requirement(FftBufferRequirement::new(
                 "workspace",
                 self.workspace_size_bytes(),
-                "complex-f32",
+                complex_endpoint_format_for(precision).as_str(),
             ));
         }
         let twiddle_lut_storage_bytes = self.twiddle_lut_storage_bytes();
@@ -770,7 +771,7 @@ impl FftPlan {
             diagnostics = diagnostics.with_buffer_requirement(FftBufferRequirement::new(
                 "helper:twiddle-luts-total",
                 twiddle_lut_storage_bytes,
-                "complex-f32",
+                complex_endpoint_format_for(precision).as_str(),
             ));
         }
         let stages = match self.execution_graph() {
@@ -971,14 +972,16 @@ impl FftPlan {
         let mut diagnostics = self.diagnostics_for_limits(limits);
         let route = self.route().as_str().to_owned();
         let kind = self.kind();
-        let batch = self.config().batch() as u64;
+        let config = self.config();
+        let precision = config.precision();
+        let batch = config.batch() as u64;
         let scheduler = WindowScheduler::new(scheduler_limits_from_diagnostics(limits));
         let input_elements = self.input_elements_per_batch();
         let output_elements = self.output_elements_per_batch();
         let input_bound = input_elements.and_then(|elements| {
             scheduler.bind_logical_io(
                 input.clone(),
-                input_endpoint_format_for(kind),
+                input_endpoint_format_for(kind, precision),
                 elements,
                 batch,
             )
@@ -986,7 +989,7 @@ impl FftPlan {
         let output_bound = output_elements.and_then(|elements| {
             scheduler.bind_logical_io(
                 output.clone(),
-                output_endpoint_format_for(kind),
+                output_endpoint_format_for(kind, precision),
                 elements,
                 batch,
             )
@@ -1022,7 +1025,7 @@ impl FftPlan {
                     &error,
                     input,
                     self.required_input_buffer_size_bytes(),
-                    input_endpoint_format_for(kind),
+                    input_endpoint_format_for(kind, precision),
                     self.input_elements_per_batch().ok(),
                     batch,
                 );
@@ -1051,7 +1054,7 @@ impl FftPlan {
                     &error,
                     output,
                     self.required_output_buffer_size_bytes(),
-                    output_endpoint_format_for(kind),
+                    output_endpoint_format_for(kind, precision),
                     self.output_elements_per_batch().ok(),
                     batch,
                 );
@@ -1099,18 +1102,20 @@ impl FftPlan {
     }
 
     fn input_elements_per_batch(&self) -> Result<u64> {
+        let config = self.config();
         elements_per_batch(
             self.required_input_buffer_size_bytes(),
-            self.config().batch() as u64,
-            input_endpoint_format_for(self.kind()),
+            config.batch() as u64,
+            input_endpoint_format_for(self.kind(), config.precision()),
         )
     }
 
     fn output_elements_per_batch(&self) -> Result<u64> {
+        let config = self.config();
         elements_per_batch(
             self.required_output_buffer_size_bytes(),
-            self.config().batch() as u64,
-            output_endpoint_format_for(self.kind()),
+            config.batch() as u64,
+            output_endpoint_format_for(self.kind(), config.precision()),
         )
     }
 
@@ -1190,13 +1195,15 @@ impl FftPlan {
         input: &FftLogicalView<'_>,
         output: &FftLogicalView<'_>,
     ) -> Vec<FftBlocker> {
-        let batch = self.config().batch() as u64;
+        let config = self.config();
+        let precision = config.precision();
+        let batch = config.batch() as u64;
         let mut blockers = logical_view_size_blockers(
             "input",
             error,
             input,
             self.required_input_buffer_size_bytes(),
-            input_endpoint_format_for(self.kind()),
+            input_endpoint_format_for(self.kind(), precision),
             self.input_elements_per_batch().ok(),
             batch,
         );
@@ -1205,7 +1212,7 @@ impl FftPlan {
             error,
             output,
             self.required_output_buffer_size_bytes(),
-            output_endpoint_format_for(self.kind()),
+            output_endpoint_format_for(self.kind(), precision),
             self.output_elements_per_batch().ok(),
             batch,
         ));
@@ -1331,8 +1338,8 @@ impl FftPlan {
             return blockers;
         };
         let scheduler = WindowScheduler::new(scheduler_limits_from_diagnostics(limits));
-        if let Err(error) =
-            scheduler.storage_binding_resource(&workspace_prefix, ElementFormat::ComplexF32)
+        let workspace_format = complex_element_format_for(self.config().precision());
+        if let Err(error) = scheduler.storage_binding_resource(&workspace_prefix, workspace_format)
         {
             if let Some(blocker) = self.workspace_blocker_for_error(&error, workspace) {
                 blockers.push(blocker);
@@ -1381,17 +1388,34 @@ fn elements_per_batch(total_bytes: u64, batch: u64, format: FftEndpointFormat) -
     Ok(total_bytes / batch / element_bytes)
 }
 
-fn input_endpoint_format_for(kind: FftTransformKind) -> FftEndpointFormat {
+fn complex_endpoint_format_for(precision: FftPrecision) -> FftEndpointFormat {
+    match precision {
+        FftPrecision::F32 => FftEndpointFormat::ComplexF32,
+        FftPrecision::F64 => FftEndpointFormat::ComplexF64,
+    }
+}
+
+fn complex_element_format_for(precision: FftPrecision) -> ElementFormat {
+    match precision {
+        FftPrecision::F32 => ElementFormat::ComplexF32,
+        FftPrecision::F64 => ElementFormat::ComplexF64,
+    }
+}
+
+fn input_endpoint_format_for(kind: FftTransformKind, precision: FftPrecision) -> FftEndpointFormat {
     match kind {
-        FftTransformKind::C2c => FftEndpointFormat::ComplexF32,
+        FftTransformKind::C2c => complex_endpoint_format_for(precision),
         FftTransformKind::R2c => FftEndpointFormat::RealF32,
         FftTransformKind::C2r => FftEndpointFormat::PackedComplexF32,
     }
 }
 
-fn output_endpoint_format_for(kind: FftTransformKind) -> FftEndpointFormat {
+fn output_endpoint_format_for(
+    kind: FftTransformKind,
+    precision: FftPrecision,
+) -> FftEndpointFormat {
     match kind {
-        FftTransformKind::C2c => FftEndpointFormat::ComplexF32,
+        FftTransformKind::C2c => complex_endpoint_format_for(precision),
         FftTransformKind::R2c => FftEndpointFormat::PackedComplexF32,
         FftTransformKind::C2r => FftEndpointFormat::RealF32,
     }
@@ -2019,17 +2043,17 @@ fn with_blocker_if_missing(diagnostics: FftDiagnostics, blocker: FftBlocker) -> 
     }
 }
 
-fn input_format_for(kind: FftTransformKind) -> &'static str {
+fn input_format_for(kind: FftTransformKind, precision: FftPrecision) -> &'static str {
     match kind {
-        FftTransformKind::C2c => "complex-f32",
+        FftTransformKind::C2c => complex_endpoint_format_for(precision).as_str(),
         FftTransformKind::R2c => "real-f32",
         FftTransformKind::C2r => "packed-complex-f32",
     }
 }
 
-fn output_format_for(kind: FftTransformKind) -> &'static str {
+fn output_format_for(kind: FftTransformKind, precision: FftPrecision) -> &'static str {
     match kind {
-        FftTransformKind::C2c => "complex-f32",
+        FftTransformKind::C2c => complex_endpoint_format_for(precision).as_str(),
         FftTransformKind::R2c => "packed-complex-f32",
         FftTransformKind::C2r => "real-f32",
     }
@@ -2093,6 +2117,34 @@ mod tests {
             max_buffer_size: 256,
             min_storage_buffer_offset_alignment: 64,
         }
+    }
+
+    #[test]
+    fn c2c_endpoint_and_diagnostic_formats_follow_precision() {
+        assert_eq!(
+            input_endpoint_format_for(FftTransformKind::C2c, FftPrecision::F32),
+            FftEndpointFormat::ComplexF32
+        );
+        assert_eq!(
+            output_endpoint_format_for(FftTransformKind::C2c, FftPrecision::F64),
+            FftEndpointFormat::ComplexF64
+        );
+        assert_eq!(
+            input_format_for(FftTransformKind::C2c, FftPrecision::F64),
+            "complex-f64"
+        );
+        assert_eq!(
+            output_format_for(FftTransformKind::C2c, FftPrecision::F32),
+            "complex-f32"
+        );
+        assert_eq!(
+            complex_element_format_for(FftPrecision::F64),
+            ElementFormat::ComplexF64
+        );
+        assert_eq!(
+            complex_endpoint_format_for(FftPrecision::F64).as_str(),
+            "complex-f64"
+        );
     }
 
     #[test]

@@ -1043,6 +1043,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-nufft"
+version = "0.1.0"
+dependencies = [
+ "wgpu-fft",
+]
+
+[[package]]
 name = "wgpu-types"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

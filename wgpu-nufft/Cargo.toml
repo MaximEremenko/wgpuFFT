@@ -1,0 +1,14 @@
+[package]
+name = "wgpu-nufft"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "Portable GPU NUFFT plans built on wgpu-fft."
+
+[lib]
+name = "wgpu_nufft"
+path = "src/lib.rs"
+
+[dependencies]
+wgpu-fft = { path = "..", version = "0.1.0" }

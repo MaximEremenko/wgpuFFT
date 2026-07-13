@@ -5,18 +5,32 @@ public API. Planning is separate from execution and plans are reusable.
 
 ## Current scope
 
-Phase A provides CPU-only foundations:
+The current implementation provides:
 
 - FINUFFT-compatible type-1 and type-2 definitions in one to three dimensions;
 - direct `f64` NDFT execution as the correctness oracle and tiny-problem fallback;
 - `sigma = 2` default exponential-of-semicircle kernel planning;
 - host-`f64` centered-grid kernel Fourier coefficients; and
 - even fine-grid selection through `wgpu-fft`'s public supported-length
-  factorization.
+  factorization; and
+- reusable 1D type-2 `f32` GPU plans with caller-owned point, Fourier
+  coefficient, and output buffers.
 
-There is no GPU NUFFT execution yet. The next slices add 1D type-2 gathering,
-then deterministic no-atomic type-1 spreading. The planned spreading baseline
-uses exclusive output ownership rather than unavailable WGSL `f32` atomics.
+The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
+`wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
+kernel at each nonuniform point. The caller records execution into its own
+command encoder and can consume the caller-owned output buffer without a
+readback. Plan-owned fine-grid buffers are reused between ordered executions.
+Points are scalar `f32` values, while coefficients and outputs are interleaved
+complex `(re, im)` `f32` pairs; all require `STORAGE` buffer usage.
+The Vulkan accuracy matrix enforces relative L2 error at most `4*eps` over the
+complete random-plus-adversarial vector and `8*eps` for each isolated boundary,
+cluster, duplicate, and seeded-random subset. The latter remains stricter than
+FINUFFT's pinned float regression factors while preserving its ES parameters.
+
+The next slice adds deterministic no-atomic 1D type-1 spreading. Its planned
+baseline uses exclusive output ownership rather than unavailable WGSL `f32`
+atomics.
 
 Deferred work includes 2D/3D GPU execution, type 3, batching, NUFFT `f64`/df64
 GPU arithmetic, and WASM packaging.

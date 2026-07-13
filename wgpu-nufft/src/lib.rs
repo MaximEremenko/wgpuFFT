@@ -1,15 +1,17 @@
 //! Portable nonuniform FFT plans built on `wgpu-fft`.
 //!
-//! This first implementation slice provides reusable host-side type-1 and
-//! type-2 planning metadata, FINUFFT-compatible direct `f64` reference
-//! transforms, and exponential-of-semicircle kernel tables. GPU execution is
-//! added in later phases without changing the mathematical conventions here.
+//! The crate provides reusable host-side type-1 and type-2 planning metadata,
+//! FINUFFT-compatible direct `f64` reference transforms, and
+//! exponential-of-semicircle kernel tables. Reusable 1D type-2 `f32` plans can
+//! encode deconvolution, a fine-grid C2C transform, and interpolation entirely
+//! on the GPU using caller-owned input and output buffers.
 
 #![forbid(unsafe_code)]
 
 mod config;
 mod direct;
 mod error;
+mod gpu;
 mod kernel;
 mod plan;
 

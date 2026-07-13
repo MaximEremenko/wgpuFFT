@@ -354,6 +354,21 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
     let first = type1.execute_direct_f64(&points, &strengths).unwrap();
     let second = type1.execute_direct_f64(&points, &strengths).unwrap();
     assert_eq!(first, second);
+    assert!(!type2.is_gpu_ready());
+    assert_eq!(
+        NufftPlan::required_type2_point_buffer_size_bytes(7).unwrap(),
+        28
+    );
+    assert_eq!(
+        type2
+            .required_type2_coefficient_buffer_size_bytes()
+            .unwrap(),
+        64
+    );
+    assert_eq!(
+        NufftPlan::required_type2_output_buffer_size_bytes(7).unwrap(),
+        56
+    );
 }
 
 #[test]

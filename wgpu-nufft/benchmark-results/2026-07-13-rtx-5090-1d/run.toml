@@ -1,0 +1,74 @@
+date = "2026-07-13"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+cargo = "1.95.0 (f2d3ce0bd 2026-03-21)"
+wgpu = "29.0.3"
+wgpu_nufft_base_commit = "77ef0241d50adf2ea3b51852c2911da3f7d0692e"
+
+[method]
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+mode_order = "centered / FINUFFT modeord=0"
+seed = "0x4E554646"
+cases = [262144, 1048576]
+runs = 3
+warmups_per_run = 1
+samples_per_run = 10
+gpu_type1_transforms_per_sample = 1
+gpu_type2_transforms_per_sample = 32
+gpu_seconds = 20.352
+finufft_seconds = 2.399
+combined_seconds = 22.751
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "NVIDIA 610.47"
+backend = "Vulkan"
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[cpu]
+name = "13th Gen Intel(R) Core(TM) i9-13900K"
+physical_cores = 24
+logical_processors = 32
+finufft_threads = 32
+thread_note = "explicit all-logical-processor setting; FINUFFT warned that this exceeds the 24 physical cores"
+
+[finufft]
+version = "2.4.1"
+python = "3.12.3"
+numpy = "2.4.0"
+artifact = "installed official Windows Python wheel; local source checkout not used"
+library = "finufft/libfinufft.dll"
+library_sha256 = "0ADE06CB82FE5AFEBF4C3E7D872851714C681911B8BD25B9738D4BAD0F3DE90E"
+fft_backend = "bundled FFTW3/FFTW3f with OpenMP (libgomp)"
+fftw3f_sha256 = "90F5067DFB0642D1D1386CB9E8F4D1EEAD4E5FB586307C160E7F64DC6169D901"
+fftw3f_omp_sha256 = "BF46B65B120C1558A3CA5DDCE02C5F7ABBD2917708DACA859C1E8D24747FCD19"
+libgomp_sha256 = "1893BFF74421373A17DCE0B9296062471F514F2AA2AC06F28F69F269E9A44CE1"
+local_checkout_commit = "d919b19bae518b858a2504c01867333488d40935"
+local_checkout_describe = "v2.5.0-132-gd919b19b"
+local_checkout_used = false
+
+[harness]
+gpu_measured_source_sha256 = "CB3C88F4DAB32766971CCE4231971E705FECBC31439A7E640F1F4F1391839F10"
+gpu_archived_source_sha256 = "F6470BC60FFC9F29EBDC968D354ED6317082873875F3A34C67B32B84470DB50F"
+gpu_post_run_change = "help text corrected from 5 to the actual 10 default samples; no timed path changed"
+cpu_measured_and_archived_source_sha256 = "FB95D788D63AB731E68251B04F3312C2661612772D7A14A93004CF0397D27CEB"
+
+[commands]
+gpu = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_bench -- --adapter "RTX 5090"
+'''
+cpu = '''
+python wgpu-nufft/benches/finufft_cpu_bench.py --runs 3 --samples 10 --warmups 1 --threads 32
+'''

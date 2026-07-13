@@ -18,3 +18,7 @@ wgpu-fft = { path = "..", version = "0.1.0" }
 
 [dev-dependencies]
 pollster = "0.4"
+
+[[bench]]
+name = "nufft_bench"
+harness = false

@@ -13,6 +13,8 @@ mod direct;
 mod error;
 mod gpu;
 mod gpu_dispatch;
+#[cfg(feature = "gpu-profiling")]
+mod gpu_profile;
 mod gpu_scan;
 mod gpu_type1;
 mod kernel;
@@ -21,6 +23,8 @@ mod plan;
 pub use config::{ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};
+#[cfg(feature = "gpu-profiling")]
+pub use gpu_profile::{NufftGpuProfileLayout, NufftGpuStage, NufftGpuStageQuery};
 pub use kernel::{select_fine_grid_size, EsKernel, MAX_ES_KERNEL_WIDTH, MIN_ES_KERNEL_WIDTH};
 pub use plan::{NufftKind, NufftPlan};
 pub use wgpu_fft::math::Complex64;

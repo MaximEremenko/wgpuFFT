@@ -8,6 +8,8 @@ use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
 use crate::gpu_dispatch::split_workgroups;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::kernel::EsKernel;
 
@@ -239,6 +241,62 @@ impl Type1GpuPlan {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            output,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn encode_profiled(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
+    ) -> Result<NufftGpuProfileLayout> {
+        if point_count == 0 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-1 stage profiling",
+                reason: "at least one point is required",
+            });
+        }
+        let layout =
+            NufftGpuProfileLayout::type1(first_query).map_err(|_| NufftError::LengthOverflow {
+                context: "type-1 stage-profile query range",
+            })?;
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            output,
+            GpuProfileQueryWriter::enabled(query_set, &layout),
+        )?;
+        Ok(layout)
+    }
+
+    fn encode_impl(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
         let output_bytes =
             Self::complex_buffer_size_bytes("type-1 Fourier output buffer", self.mode_count)?;
         validate_external_storage_buffer(
@@ -269,7 +327,12 @@ impl Type1GpuPlan {
             // not leave stale plan scratch or return early as type-2 may.
             encoder.clear_buffer(&self.fine_input, 0, None);
             self.encode_fft(device, encoder)?;
-            self.encode_deconvolution(encoder, &output_bind_group);
+            self.encode_deconvolution(
+                encoder,
+                &output_bind_group,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            );
             return Ok(());
         }
 
@@ -415,6 +478,8 @@ impl Type1GpuPlan {
             ],
         });
 
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_type1_start_marker(encoder);
         encoder.clear_buffer(&bin_counts, 0, None);
         encoder.clear_buffer(&bin_cursors, 0, None);
         encode_pass(
@@ -423,6 +488,8 @@ impl Type1GpuPlan {
             &self.count_pipeline,
             &count_bind_group,
             point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(1)),
         );
         self.prefix_scan
             .encode(device, encoder, &bin_counts, &bin_offsets)?;
@@ -432,6 +499,8 @@ impl Type1GpuPlan {
             &self.terminal_pipeline,
             &terminal_bind_group,
             (1, 1, 1),
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(2)),
         );
         encode_pass(
             encoder,
@@ -439,6 +508,8 @@ impl Type1GpuPlan {
             &self.scatter_pipeline,
             &scatter_bind_group,
             point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(3)),
         );
         encode_pass(
             encoder,
@@ -446,6 +517,8 @@ impl Type1GpuPlan {
             &self.sort_pipeline,
             &sort_bind_group,
             self.sort_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(4)),
         );
         encode_pass(
             encoder,
@@ -453,9 +526,16 @@ impl Type1GpuPlan {
             &self.gather_pipeline,
             &gather_bind_group,
             self.gather_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(5)),
         );
         self.encode_fft(device, encoder)?;
-        self.encode_deconvolution(encoder, &output_bind_group);
+        self.encode_deconvolution(
+            encoder,
+            &output_bind_group,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
+        );
         Ok(())
     }
 
@@ -477,6 +557,7 @@ impl Type1GpuPlan {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) {
         encode_pass(
             encoder,
@@ -484,7 +565,14 @@ impl Type1GpuPlan {
             &self.deconvolution_pipeline,
             bind_group,
             self.deconvolution_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(Some(6), Some(7)),
         );
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
+        self.fft.diagnostics()
     }
 }
 
@@ -537,10 +625,22 @@ fn encode_pass(
     pipeline: &wgpu::ComputePipeline,
     bind_group: &wgpu::BindGroup,
     dispatch: (u32, u32, u32),
+    #[cfg(feature = "gpu-profiling")] timestamp_writes: Option<
+        wgpu::ComputePassTimestampWrites<'_>,
+    >,
 ) {
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
         label: Some(label),
-        timestamp_writes: None,
+        timestamp_writes: {
+            #[cfg(feature = "gpu-profiling")]
+            {
+                timestamp_writes
+            }
+            #[cfg(not(feature = "gpu-profiling"))]
+            {
+                None
+            }
+        },
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);

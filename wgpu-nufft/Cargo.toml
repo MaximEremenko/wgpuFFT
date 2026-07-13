@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 description = "Portable GPU NUFFT plans built on wgpu-fft."
 readme = "README.md"
 
+[features]
+default = []
+gpu-profiling = []
+
 [lib]
 name = "wgpu_nufft"
 path = "src/lib.rs"
@@ -22,3 +26,8 @@ pollster = "0.4"
 [[bench]]
 name = "nufft_bench"
 harness = false
+
+[[bench]]
+name = "nufft_stage_profile"
+harness = false
+required-features = ["gpu-profiling"]

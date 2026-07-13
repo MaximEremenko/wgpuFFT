@@ -12,6 +12,12 @@ const WORKGROUP_SIZE: u32 = 64;
 const COMPLEX_F32_BYTES: u64 = 8;
 const F32_BYTES: u64 = 4;
 
+pub(crate) fn max_supported_workgroup_size(limits: &wgpu::Limits) -> u32 {
+    limits
+        .max_compute_invocations_per_workgroup
+        .min(limits.max_compute_workgroup_size_x)
+}
+
 pub(crate) struct Type2GpuPlan {
     fft: FftPlan,
     amplitudes: wgpu::Buffer,
@@ -54,10 +60,12 @@ impl Type2GpuPlan {
                 maximum: maximum_signed_length,
             });
         }
-        if device.limits().max_compute_invocations_per_workgroup < WORKGROUP_SIZE {
+        let limits = device.limits();
+        let maximum_workgroup_size = max_supported_workgroup_size(&limits);
+        if maximum_workgroup_size < WORKGROUP_SIZE {
             return Err(NufftError::GpuWorkgroupSizeUnsupported {
                 requested: WORKGROUP_SIZE,
-                maximum: device.limits().max_compute_invocations_per_workgroup,
+                maximum: maximum_workgroup_size,
             });
         }
 
@@ -65,7 +73,6 @@ impl Type2GpuPlan {
         let fine_bytes = Self::complex_buffer_size_bytes("type-2 fine grid", fine_length)?;
         let amplitude_bytes =
             checked_buffer_size("type-2 deconvolution amplitudes", mode_count, F32_BYTES)?;
-        let limits = device.limits();
         let max_storage_binding_bytes = limits.max_storage_buffer_binding_size;
         validate_binding_limit("type-2 fine grid", fine_bytes, max_storage_binding_bytes)?;
         validate_binding_limit(
@@ -627,5 +634,22 @@ mod tests {
         assert!(source.contains("let remainder = df64_sub(value, Df64(base, 0.0));"));
         assert!(source.contains("let start = ceil_df64_to_i32(shifted);"));
         assert!(!source.contains("ceil(shifted.hi + shifted.lo)"));
+    }
+
+    #[test]
+    fn workgroup_limit_accounts_for_the_x_dimension() {
+        let limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 128,
+            max_compute_workgroup_size_x: 32,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(max_supported_workgroup_size(&limits), 32);
+
+        let limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 16,
+            max_compute_workgroup_size_x: 256,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(max_supported_workgroup_size(&limits), 16);
     }
 }

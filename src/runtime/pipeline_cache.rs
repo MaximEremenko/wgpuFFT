@@ -148,32 +148,42 @@ pub(crate) enum PipelineLayoutCacheKey {
     BluesteinBridgePostF32,
     BluesteinPackInterleavedF32,
     BluesteinPackInterleavedF64,
+    BluesteinPackInterleavedDf64,
     BluesteinMulInterleavedF32,
     BluesteinMulInterleavedF64,
+    BluesteinMulInterleavedDf64,
     BluesteinPostInterleavedF32,
     BluesteinPostInterleavedF64,
+    BluesteinPostInterleavedDf64,
     C2cSmoothBinaryF32,
     C2cSmoothTwiddleLutF32,
     C2cStridedBinaryF32,
     C2cStridedBinaryF64,
+    C2cStridedBinaryDf64,
     DirectDftInterleavedF32Lut,
     DirectDftInterleavedF64Lut,
     DirectDftInterleavedDf64Lut,
     FusedPrimeInterleavedF32,
     FusedPrimeInterleavedF64,
+    FusedPrimeInterleavedDf64,
     FourStepUnaryF32,
     RealBinaryF32,
     RaderBridgePostF32,
     RaderSumInterleavedF32,
     RaderSumInterleavedF64,
+    RaderSumInterleavedDf64,
     RaderPackInterleavedF32,
     RaderPackInterleavedF64,
+    RaderPackInterleavedDf64,
     RaderMulInterleavedF32,
     RaderMulInterleavedF64,
+    RaderMulInterleavedDf64,
     RaderWriteY0InterleavedF32,
     RaderWriteY0InterleavedF64,
+    RaderWriteY0InterleavedDf64,
     RaderPostInterleavedF32,
     RaderPostInterleavedF64,
+    RaderPostInterleavedDf64,
 }
 
 impl PipelineLayoutCacheKey {
@@ -189,32 +199,42 @@ impl PipelineLayoutCacheKey {
             Self::BluesteinBridgePostF32 => "bridge/bluestein-post-f32",
             Self::BluesteinPackInterleavedF32 => "bluestein/pack/interleaved-f32",
             Self::BluesteinPackInterleavedF64 => "bluestein/pack/interleaved-f64",
+            Self::BluesteinPackInterleavedDf64 => "bluestein/pack/interleaved-df64",
             Self::BluesteinMulInterleavedF32 => "bluestein/mul/interleaved-f32",
             Self::BluesteinMulInterleavedF64 => "bluestein/mul/interleaved-f64",
+            Self::BluesteinMulInterleavedDf64 => "bluestein/mul/interleaved-df64",
             Self::BluesteinPostInterleavedF32 => "bluestein/post/interleaved-f32",
             Self::BluesteinPostInterleavedF64 => "bluestein/post/interleaved-f64",
+            Self::BluesteinPostInterleavedDf64 => "bluestein/post/interleaved-df64",
             Self::C2cSmoothBinaryF32 => "c2c-smooth/binary-f32",
             Self::C2cSmoothTwiddleLutF32 => "c2c-smooth/twiddle-lut-f32",
             Self::C2cStridedBinaryF32 => "c2c-strided/binary-f32",
             Self::C2cStridedBinaryF64 => "c2c-strided/binary-f64",
+            Self::C2cStridedBinaryDf64 => "c2c-strided/binary-df64",
             Self::DirectDftInterleavedF32Lut => "direct-dft/interleaved-f32-lut",
             Self::DirectDftInterleavedF64Lut => "direct-dft/interleaved-f64-lut",
             Self::DirectDftInterleavedDf64Lut => "direct-dft/interleaved-df64-lut",
             Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
             Self::FusedPrimeInterleavedF64 => "fused-prime/interleaved-f64",
+            Self::FusedPrimeInterleavedDf64 => "fused-prime/interleaved-df64",
             Self::FourStepUnaryF32 => "four-step/unary-f32",
             Self::RealBinaryF32 => "real/binary-f32",
             Self::RaderBridgePostF32 => "bridge/rader-post-f32",
             Self::RaderSumInterleavedF32 => "rader/sum/interleaved-f32",
             Self::RaderSumInterleavedF64 => "rader/sum/interleaved-f64",
+            Self::RaderSumInterleavedDf64 => "rader/sum/interleaved-df64",
             Self::RaderPackInterleavedF32 => "rader/pack/interleaved-f32",
             Self::RaderPackInterleavedF64 => "rader/pack/interleaved-f64",
+            Self::RaderPackInterleavedDf64 => "rader/pack/interleaved-df64",
             Self::RaderMulInterleavedF32 => "rader/mul/interleaved-f32",
             Self::RaderMulInterleavedF64 => "rader/mul/interleaved-f64",
+            Self::RaderMulInterleavedDf64 => "rader/mul/interleaved-df64",
             Self::RaderWriteY0InterleavedF32 => "rader/write-y0/interleaved-f32",
             Self::RaderWriteY0InterleavedF64 => "rader/write-y0/interleaved-f64",
+            Self::RaderWriteY0InterleavedDf64 => "rader/write-y0/interleaved-df64",
             Self::RaderPostInterleavedF32 => "rader/post/interleaved-f32",
             Self::RaderPostInterleavedF64 => "rader/post/interleaved-f64",
+            Self::RaderPostInterleavedDf64 => "rader/post/interleaved-df64",
         }
     }
 }
@@ -533,9 +553,7 @@ impl ComputePipelineCacheKey {
         let layout = match shader.precision {
             AxisPrecision::F32 => PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
             AxisPrecision::F64 => PipelineLayoutCacheKey::FusedPrimeInterleavedF64,
-            AxisPrecision::Df64 => {
-                unreachable!("df64 fused-prime layouts are added by the prime-kernel phase")
-            }
+            AxisPrecision::Df64 => PipelineLayoutCacheKey::FusedPrimeInterleavedDf64,
         };
         Self {
             layout,
@@ -585,9 +603,7 @@ impl ComputePipelineCacheKey {
         let layout = match shader.precision {
             AxisPrecision::F32 => PipelineLayoutCacheKey::C2cStridedBinaryF32,
             AxisPrecision::F64 => PipelineLayoutCacheKey::C2cStridedBinaryF64,
-            AxisPrecision::Df64 => {
-                unreachable!("df64 strided layouts are added by the strided-I/O phase")
-            }
+            AxisPrecision::Df64 => PipelineLayoutCacheKey::C2cStridedBinaryDf64,
         };
         Self {
             layout,
@@ -694,8 +710,20 @@ fn rader_layout_for(kind: RaderKernelKind, precision: AxisPrecision) -> Pipeline
         (RaderKernelKind::Post, AxisPrecision::F64) => {
             PipelineLayoutCacheKey::RaderPostInterleavedF64
         }
-        (_, AxisPrecision::Df64) => {
-            unreachable!("df64 Rader layouts are added by the prime-kernel phase")
+        (RaderKernelKind::Sum, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::RaderSumInterleavedDf64
+        }
+        (RaderKernelKind::Pack, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::RaderPackInterleavedDf64
+        }
+        (RaderKernelKind::Mul, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::RaderMulInterleavedDf64
+        }
+        (RaderKernelKind::WriteY0, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::RaderWriteY0InterleavedDf64
+        }
+        (RaderKernelKind::Post, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::RaderPostInterleavedDf64
         }
     }
 }
@@ -723,8 +751,14 @@ fn bluestein_layout_for(
         (BluesteinKernelKind::Post, AxisPrecision::F64) => {
             PipelineLayoutCacheKey::BluesteinPostInterleavedF64
         }
-        (_, AxisPrecision::Df64) => {
-            unreachable!("df64 Bluestein layouts are added by the prime-kernel phase")
+        (BluesteinKernelKind::Pack, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::BluesteinPackInterleavedDf64
+        }
+        (BluesteinKernelKind::Mul, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::BluesteinMulInterleavedDf64
+        }
+        (BluesteinKernelKind::Post, AxisPrecision::Df64) => {
+            PipelineLayoutCacheKey::BluesteinPostInterleavedDf64
         }
     }
 }
@@ -1663,9 +1697,11 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         PipelineLayoutCacheKey::C2cSmoothBinaryF32
         | PipelineLayoutCacheKey::C2cStridedBinaryF32
         | PipelineLayoutCacheKey::C2cStridedBinaryF64
+        | PipelineLayoutCacheKey::C2cStridedBinaryDf64
         | PipelineLayoutCacheKey::RealBinaryF32
         | PipelineLayoutCacheKey::RaderWriteY0InterleavedF32
-        | PipelineLayoutCacheKey::RaderWriteY0InterleavedF64 => {
+        | PipelineLayoutCacheKey::RaderWriteY0InterleavedF64
+        | PipelineLayoutCacheKey::RaderWriteY0InterleavedDf64 => {
             vec![
                 storage_entry(0, true),
                 storage_entry(1, false),
@@ -1691,7 +1727,8 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
             storage_entry(4, true),
         ],
         PipelineLayoutCacheKey::FusedPrimeInterleavedF32
-        | PipelineLayoutCacheKey::FusedPrimeInterleavedF64 => vec![
+        | PipelineLayoutCacheKey::FusedPrimeInterleavedF64
+        | PipelineLayoutCacheKey::FusedPrimeInterleavedDf64 => vec![
             storage_entry(0, true),
             storage_entry(1, false),
             storage_entry(2, true),
@@ -1725,14 +1762,16 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         ],
         PipelineLayoutCacheKey::BluesteinBridgePostF32
         | PipelineLayoutCacheKey::BluesteinPostInterleavedF32
-        | PipelineLayoutCacheKey::BluesteinPostInterleavedF64 => vec![
+        | PipelineLayoutCacheKey::BluesteinPostInterleavedF64
+        | PipelineLayoutCacheKey::BluesteinPostInterleavedDf64 => vec![
             storage_entry(0, true),
             storage_entry(1, true),
             storage_entry(2, false),
             uniform_entry(3),
         ],
         PipelineLayoutCacheKey::RaderSumInterleavedF32
-        | PipelineLayoutCacheKey::RaderSumInterleavedF64 => vec![
+        | PipelineLayoutCacheKey::RaderSumInterleavedF64
+        | PipelineLayoutCacheKey::RaderSumInterleavedDf64 => vec![
             storage_entry(0, true),
             storage_entry(1, false),
             storage_entry(2, false),
@@ -1740,8 +1779,10 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         ],
         PipelineLayoutCacheKey::RaderPackInterleavedF32
         | PipelineLayoutCacheKey::RaderPackInterleavedF64
+        | PipelineLayoutCacheKey::RaderPackInterleavedDf64
         | PipelineLayoutCacheKey::BluesteinPackInterleavedF32
-        | PipelineLayoutCacheKey::BluesteinPackInterleavedF64 => vec![
+        | PipelineLayoutCacheKey::BluesteinPackInterleavedF64
+        | PipelineLayoutCacheKey::BluesteinPackInterleavedDf64 => vec![
             storage_entry(0, true),
             storage_entry(1, false),
             storage_entry(2, true),
@@ -1749,8 +1790,10 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         ],
         PipelineLayoutCacheKey::RaderMulInterleavedF32
         | PipelineLayoutCacheKey::RaderMulInterleavedF64
+        | PipelineLayoutCacheKey::RaderMulInterleavedDf64
         | PipelineLayoutCacheKey::BluesteinMulInterleavedF32
-        | PipelineLayoutCacheKey::BluesteinMulInterleavedF64 => {
+        | PipelineLayoutCacheKey::BluesteinMulInterleavedF64
+        | PipelineLayoutCacheKey::BluesteinMulInterleavedDf64 => {
             vec![
                 storage_entry(0, false),
                 storage_entry(1, true),
@@ -1758,7 +1801,8 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
             ]
         }
         PipelineLayoutCacheKey::RaderPostInterleavedF32
-        | PipelineLayoutCacheKey::RaderPostInterleavedF64 => vec![
+        | PipelineLayoutCacheKey::RaderPostInterleavedF64
+        | PipelineLayoutCacheKey::RaderPostInterleavedDf64 => vec![
             storage_entry(0, true),
             storage_entry(1, true),
             storage_entry(2, true),
@@ -2015,6 +2059,15 @@ mod tests {
             .layout,
             PipelineLayoutCacheKey::C2cStridedBinaryF64
         );
+        assert_eq!(
+            ComputePipelineCacheKey::c2c_strided_stage(C2cStridedStageKey::new(
+                C2cStridedKernelKind::Unpack,
+                64,
+                AxisPrecision::Df64,
+            ))
+            .layout,
+            PipelineLayoutCacheKey::C2cStridedBinaryDf64
+        );
     }
 
     #[test]
@@ -2110,6 +2163,100 @@ mod tests {
         assert!(pipeline.stable_key().starts_with(
             "pipeline:v1:layout=fused-prime/interleaved-f32:entry=main:shader:v2:fused-prime:rader:"
         ));
+    }
+
+    #[test]
+    fn df64_prime_pipeline_keys_use_distinct_typed_layouts() {
+        let factors = [8, 5, 5];
+        let fused = ComputePipelineCacheKey::fused_prime_stage(FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            1,
+            0,
+            &[101],
+            101,
+            1,
+            200,
+            &factors,
+            FftDirection::Inverse,
+            256,
+            true,
+            1.0 / 101.0,
+            AxisPrecision::Df64,
+        ));
+        assert_eq!(
+            fused.layout,
+            PipelineLayoutCacheKey::FusedPrimeInterleavedDf64
+        );
+        assert!(fused.stable_key().contains("precision=df64"));
+        assert!(fused.stable_key().contains("scale_bits=hi="));
+
+        for (kind, expected) in [
+            (
+                RaderKernelKind::Sum,
+                PipelineLayoutCacheKey::RaderSumInterleavedDf64,
+            ),
+            (
+                RaderKernelKind::Pack,
+                PipelineLayoutCacheKey::RaderPackInterleavedDf64,
+            ),
+            (
+                RaderKernelKind::Mul,
+                PipelineLayoutCacheKey::RaderMulInterleavedDf64,
+            ),
+            (
+                RaderKernelKind::WriteY0,
+                PipelineLayoutCacheKey::RaderWriteY0InterleavedDf64,
+            ),
+            (
+                RaderKernelKind::Post,
+                PipelineLayoutCacheKey::RaderPostInterleavedDf64,
+            ),
+        ] {
+            let pipeline = ComputePipelineCacheKey::rader_stage(RaderStageKey::new(
+                kind,
+                1,
+                0,
+                &[17],
+                17,
+                1,
+                32,
+                64,
+                true,
+                1.0 / 17.0,
+                AxisPrecision::Df64,
+            ));
+            assert_eq!(pipeline.layout, expected);
+        }
+
+        for (kind, expected) in [
+            (
+                BluesteinKernelKind::Pack,
+                PipelineLayoutCacheKey::BluesteinPackInterleavedDf64,
+            ),
+            (
+                BluesteinKernelKind::Mul,
+                PipelineLayoutCacheKey::BluesteinMulInterleavedDf64,
+            ),
+            (
+                BluesteinKernelKind::Post,
+                PipelineLayoutCacheKey::BluesteinPostInterleavedDf64,
+            ),
+        ] {
+            let pipeline = ComputePipelineCacheKey::bluestein_stage(BluesteinStageKey::new(
+                kind,
+                1,
+                0,
+                &[34],
+                34,
+                1,
+                70,
+                64,
+                true,
+                1.0 / 34.0,
+                AxisPrecision::Df64,
+            ));
+            assert_eq!(pipeline.layout, expected);
+        }
     }
 
     #[test]
@@ -2301,6 +2448,17 @@ mod tests {
         assert_eq!(
             pipeline.stable_key(),
             "pipeline:v1:layout=c2c-strided/binary-f32:entry=main:shader:v2:c2c-strided:pack-c2c-strided:precision=f32:workgroup=64"
+        );
+
+        let df64 = ComputePipelineCacheKey::c2c_strided_stage(C2cStridedStageKey::new(
+            C2cStridedKernelKind::Unpack,
+            64,
+            AxisPrecision::Df64,
+        ));
+        assert_eq!(df64.layout, PipelineLayoutCacheKey::C2cStridedBinaryDf64);
+        assert_eq!(
+            df64.stable_key(),
+            "pipeline:v1:layout=c2c-strided/binary-df64:entry=main:shader:v2:c2c-strided:unpack-c2c-strided:precision=df64:workgroup=64"
         );
     }
 

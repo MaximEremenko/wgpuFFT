@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd_f64, Complex32, Complex64};
+use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
     AxisStageKind, AxisTwiddleLutPool,
@@ -14,7 +14,8 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
-    format_wgsl_f32, lines_per_batch, product, stride_for_axis, wgsl_line_base_fn,
+    format_wgsl_f32, format_wgsl_f32_roundtrip, lines_per_batch, product, stride_for_axis,
+    wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
@@ -138,7 +139,7 @@ impl RaderAxisConfig {
                     _ => 1.0,
                 })
             }
-            AxisPrecision::F64 => {
+            AxisPrecision::F64 | AxisPrecision::Df64 => {
                 let total = product(&self.shape) as f64;
                 match (self.direction, self.normalization) {
                     (_, Normalization::None) => 1.0,
@@ -147,9 +148,6 @@ impl RaderAxisConfig {
                     (_, Normalization::Orthogonal) => 1.0 / total.sqrt(),
                     _ => 1.0,
                 }
-            }
-            AxisPrecision::Df64 => {
-                unreachable!("df64 Rader plans are rejected before scale generation")
             }
         })
     }
@@ -162,14 +160,6 @@ impl RaderAxis {
         config: RaderAxisConfig,
     ) -> Result<Self> {
         config.validate()?;
-        if config.precision == AxisPrecision::Df64 {
-            return Err(FftError::PrecisionUnsupported {
-                requested: crate::config::FftPrecision::Df64,
-                route: "rader",
-                reason: "rader-df64-not-implemented",
-            });
-        }
-
         let n = config.shape[config.axis];
         let l = n - 1;
         let m = rader_convolution_length(n)?;
@@ -224,7 +214,11 @@ impl RaderAxis {
                 queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&bfft));
             }
             AxisPrecision::Df64 => {
-                unreachable!("df64 Rader plans are rejected before LUT upload")
+                let values = bfft
+                    .iter()
+                    .map(|value| ComplexDoubleFloat::from_f64(value.re, value.im))
+                    .collect::<Vec<_>>();
+                queue.write_buffer(&bfft_buffer, 0, bytemuck::cast_slice(&values));
             }
         }
 
@@ -1006,15 +1000,26 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     let reduction_size = 1usize << reduction_capacity.ilog2();
     let sum_slot_count = l.div_ceil(reduction_size);
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    let scale = key.precision.format_wgsl_scalar(key.scale_factor());
+    let scale = match key.precision {
+        AxisPrecision::Df64 => format_df64(key.scale_factor()),
+        _ => key.precision.format_wgsl_scalar(key.scale_factor()),
+    };
     let inverse_m = match key.precision {
         AxisPrecision::F32 => key
             .precision
             .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
         AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
-        AxisPrecision::Df64 => {
-            unreachable!("df64 fused Rader shaders are not implemented in Phase B")
-        }
+        AxisPrecision::Df64 => format_df64(1.0 / m as f64),
+    };
+    let scale_ref = if key.precision == AxisPrecision::Df64 {
+        scale.as_str()
+    } else {
+        "SCALE"
+    };
+    let inverse_m_ref = if key.precision == AxisPrecision::Df64 {
+        inverse_m.as_str()
+    } else {
+        "INVERSE_M"
     };
     let forward_stages = generate_fused_scratch_fft_stages_wgsl(
         m,
@@ -1035,8 +1040,27 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         key.precision,
     );
 
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let zero = complex_zero(key.precision);
+    let twiddle_inverse_value = match key.precision {
+        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
+        _ => "vec2<f32>(value.x, -value.y)",
+    };
+    let line_sum_add = complex_add_expr(key.precision, "lineSum", "value");
+    let reduction_add = complex_add_expr(
+        key.precision,
+        "scratch[L + lid.x]",
+        "scratch[L + lid.x + reductionStride]",
+    );
+    let scaled_sum = complex_scale_expr(key.precision, "scratch[L]", scale_ref);
+    let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
+    let scaled_wrap = complex_scale_expr(key.precision, "scratch[wrap]", inverse_m_ref);
+    let wrap_add = complex_add_expr(key.precision, "convolution", &scaled_wrap);
+    let x0_add = complex_add_expr(key.precision, "x0Shared", "convolution");
+    let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
+
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1071,7 +1095,7 @@ fn twiddle_forward(index: u32) -> vec2<f32> {{
 
 fn twiddle_inverse(index: u32) -> vec2<f32> {{
   let value: vec2<f32> = axisTwiddles[index];
-  return vec2<f32>(value.x, -value.y);
+  return {twiddle_inverse_value};
 }}
 
 const N: u32 = {n}u;
@@ -1100,7 +1124,7 @@ fn main({entry_params}) {{
   }}
 
   let base: u32 = line_base(params.lineOffset + lineLocal);
-  var lineSum: vec2<f32> = vec2<f32>(0.0, 0.0);
+  var lineSum: vec2<f32> = {zero};
   if (lid.x == 0u) {{
     x0Shared = input[base];
     lineSum = x0Shared;
@@ -1110,7 +1134,7 @@ fn main({entry_params}) {{
     if (lid.x < REDUCTION_SIZE && t < L) {{
       let value: vec2<f32> = input[base + perm[(L - 1u) - t] * STRIDE];
       scratch[t] = value;
-      lineSum = lineSum + value;
+      lineSum = {line_sum_add};
     }}
   }}
   if (lid.x < REDUCTION_SIZE) {{
@@ -1124,20 +1148,20 @@ fn main({entry_params}) {{
       break;
     }}
     if (lid.x < reductionStride) {{
-      scratch[L + lid.x] = scratch[L + lid.x] + scratch[L + lid.x + reductionStride];
+      scratch[L + lid.x] = {reduction_add};
     }}
     workgroupBarrier();
     reductionStride = reductionStride / 2u;
   }}
   if (lid.x == 0u) {{
-    output[base] = scratch[L] * vec2<f32>(SCALE, SCALE);
+    output[base] = {scaled_sum};
   }}
   workgroupBarrier();
 
   for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
     let t: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (t >= L && t < M) {{
-      scratch[t] = vec2<f32>(0.0, 0.0);
+      scratch[t] = {zero};
     }}
   }}
   workgroupBarrier();
@@ -1155,23 +1179,25 @@ fn main({entry_params}) {{
   for (var slot: u32 = 0u; slot < L_SLOT_COUNT; slot = slot + 1u) {{
     let t: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (t < L) {{
-      var convolution: vec2<f32> = scratch[t] * vec2<f32>(INVERSE_M, INVERSE_M);
+      var convolution: vec2<f32> = {scaled_convolution};
       let wrap: u32 = t + L;
       if (wrap < M) {{
-        convolution = convolution + scratch[wrap] * vec2<f32>(INVERSE_M, INVERSE_M);
+        convolution = {wrap_add};
       }}
-      let value: vec2<f32> = x0Shared + convolution;
-      output[base + perm[t] * STRIDE] = value * vec2<f32>(SCALE, SCALE);
+      let value: vec2<f32> = {x0_add};
+      output[base + perm[t] * STRIDE] = {scaled_value};
     }}
   }}
 }}
 "#,
-        stride = key.stride_complex,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
-        scalar = key.precision.wgsl_scalar_type(),
-    ))
+            stride = key.stride_complex,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+            scalar = staged_scalar_type(key.precision),
+        ),
+        key.precision,
+    )
 }
 
 pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {
@@ -1186,8 +1212,13 @@ pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {
 
 fn generate_rader_sum_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let zero = complex_zero(key.precision);
+    let acc_add = complex_add_expr(key.precision, "acc", "input[base + i * STRIDE]");
+    let reduction_add =
+        complex_add_expr(key.precision, "scratch[lid.x]", "scratch[lid.x + stride]");
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1215,13 +1246,13 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
   }}
 
   let base: u32 = line_base(params.lineOffset + lineLocal);
-  var acc: vec2<f32> = vec2<f32>(0.0, 0.0);
+  var acc: vec2<f32> = {zero};
   var i: u32 = lid.x;
   loop {{
     if (i >= N) {{
       break;
     }}
-    acc = acc + input[base + i * STRIDE];
+    acc = {acc_add};
     i = i + WORKGROUP_SIZE;
   }}
   scratch[lid.x] = acc;
@@ -1233,7 +1264,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
       break;
     }}
     if (lid.x < stride) {{
-      scratch[lid.x] = scratch[lid.x] + scratch[lid.x + stride];
+      scratch[lid.x] = {reduction_add};
     }}
     workgroupBarrier();
     stride = stride / 2u;
@@ -1245,17 +1276,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
   }}
 }}
 "#,
-        n = key.axis_length,
-        stride = key.stride_complex,
-        workgroup_size = key.workgroup_size,
-        line_base_fn = line_base_fn,
-    ))
+            n = key.axis_length,
+            stride = key.stride_complex,
+            workgroup_size = key.workgroup_size,
+            line_base_fn = line_base_fn,
+        ),
+        key.precision,
+    )
 }
 
 fn generate_rader_pack_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let zero = complex_zero(key.precision);
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1282,7 +1317,7 @@ fn main({entry_params}) {{
   let t: u32 = i - lineLocal * M;
   let dst: u32 = lineLocal * M + t;
   if (t >= L) {{
-    work[dst] = vec2<f32>(0.0, 0.0);
+    work[dst] = {zero};
     return;
   }}
 
@@ -1291,24 +1326,27 @@ fn main({entry_params}) {{
   work[dst] = input[base + sourceIndex * STRIDE];
 }}
 "#,
-        n = key.axis_length,
-        l = key.axis_length - 1,
-        m = key.convolution_length,
-        stride = key.stride_complex,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "i",
-            "params.lines * M",
-            key.workgroup_size,
+            n = key.axis_length,
+            l = key.axis_length - 1,
+            m = key.convolution_length,
+            stride = key.stride_complex,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.lines * M",
+                key.workgroup_size,
+            ),
+            line_base_fn = line_base_fn,
         ),
-        line_base_fn = line_base_fn,
-    ))
+        key.precision,
+    )
 }
 
 fn generate_rader_mul_wgsl(key: &RaderStageKey) -> String {
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   total: u32,
   pad0: u32,
   pad1: u32,
@@ -1335,22 +1373,31 @@ fn main({entry_params}) {{
   work[i] = c_mul(work[i], bfft[t]);
 }}
 "#,
-        m = key.convolution_length,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "i",
-            "params.total",
-            key.workgroup_size
+            m = key.convolution_length,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.total",
+                key.workgroup_size
+            ),
         ),
-    ))
+        key.precision,
+    )
 }
 
 fn generate_rader_write_y0_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let scale = format_staged_scalar(key.precision, key.scale_factor());
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let scale_ref = if key.precision == AxisPrecision::Df64 {
+        scale.as_str()
+    } else {
+        "SCALE"
+    };
+    let scaled_sum = complex_scale_expr(key.precision, "sumAll[lineLocal]", scale_ref);
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1370,27 +1417,36 @@ fn main({entry_params}) {{
   {flat_index}
 
   let base: u32 = line_base(params.lineOffset + lineLocal);
-  output[base] = sumAll[lineLocal] * vec2<f32>(SCALE, SCALE);
+  output[base] = {scaled_sum};
 }}
 "#,
-        scale = scale,
-        line_base_fn = line_base_fn,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "lineLocal",
-            "params.lines",
-            key.workgroup_size,
+            scale = scale,
+            line_base_fn = line_base_fn,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "lineLocal",
+                "params.lines",
+                key.workgroup_size,
+            ),
+            scalar = staged_scalar_type(key.precision),
         ),
-        scalar = key.precision.wgsl_scalar_type(),
-    ))
+        key.precision,
+    )
 }
 
 fn generate_rader_post_wgsl(key: &RaderStageKey) -> String {
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let scale = format_staged_scalar(key.precision, key.scale_factor());
-    key.precision.specialize_wgsl(format!(
-        r#"struct Params {{
+    let wrap_add = complex_add_expr(key.precision, "value", "conv[baseWork + wrap]");
+    let x0_add = complex_add_expr(key.precision, "x0[lineLocal]", "value");
+    let scaled_value = match key.precision {
+        AxisPrecision::Df64 => complex_scale_expr(key.precision, &x0_add, &scale),
+        _ => format!("({x0_add}) * vec2<f32>(SCALE, SCALE)"),
+    };
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
   lines: u32,
   lineOffset: u32,
   pad0: u32,
@@ -1420,40 +1476,126 @@ fn main({entry_params}) {{
   var value: vec2<f32> = conv[baseWork + t];
   let wrap: u32 = t + L;
   if (wrap < M) {{
-    value = value + conv[baseWork + wrap];
+    value = {wrap_add};
   }}
 
   let baseOutput: u32 = line_base(params.lineOffset + lineLocal);
   let outputIndex: u32 = perm[t];
   output[baseOutput + outputIndex * STRIDE] =
-    (x0[lineLocal] + value) * vec2<f32>(SCALE, SCALE);
+    {scaled_value};
 }}
 "#,
-        l = key.axis_length - 1,
-        m = key.convolution_length,
-        stride = key.stride_complex,
-        scale = scale,
-        workgroup_size = key.workgroup_size,
-        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
-        flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
-            "i",
-            "params.lines * L",
-            key.workgroup_size,
+            l = key.axis_length - 1,
+            m = key.convolution_length,
+            stride = key.stride_complex,
+            scale = scale,
+            workgroup_size = key.workgroup_size,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_index = crate::runtime::dispatch::wgsl_flat_index_stmts(
+                "i",
+                "params.lines * L",
+                key.workgroup_size,
+            ),
+            line_base_fn = line_base_fn,
+            scalar = staged_scalar_type(key.precision),
         ),
-        line_base_fn = line_base_fn,
-        scalar = key.precision.wgsl_scalar_type(),
-    ))
+        key.precision,
+    )
 }
 
 fn format_staged_scalar(precision: AxisPrecision, value: f64) -> String {
     match precision {
         AxisPrecision::F32 => format_wgsl_f32(value as f32),
         AxisPrecision::F64 => precision.format_wgsl_scalar(value),
-        AxisPrecision::Df64 => {
-            unreachable!("df64 Rader shader constants are not implemented in Phase B")
-        }
+        AxisPrecision::Df64 => format_df64(value),
     }
 }
+
+fn format_df64(value: f64) -> String {
+    let value = DoubleFloat::from_f64(value);
+    format!(
+        "Df64({}, {})",
+        format_wgsl_f32_roundtrip(value.hi),
+        format_wgsl_f32_roundtrip(value.lo)
+    )
+}
+
+fn staged_scalar_type(precision: AxisPrecision) -> &'static str {
+    match precision {
+        AxisPrecision::Df64 => "Df64",
+        _ => precision.wgsl_scalar_type(),
+    }
+}
+
+fn complex_zero(precision: AxisPrecision) -> &'static str {
+    match precision {
+        AxisPrecision::Df64 => "vec4<f32>(0.0, 0.0, 0.0, 0.0)",
+        _ => "vec2<f32>(0.0, 0.0)",
+    }
+}
+
+fn complex_add_expr(precision: AxisPrecision, a: &str, b: &str) -> String {
+    match precision {
+        AxisPrecision::Df64 => format!("df64_complex_add({a}, {b})"),
+        _ => format!("{a} + {b}"),
+    }
+}
+
+fn complex_scale_expr(precision: AxisPrecision, value: &str, scale: &str) -> String {
+    match precision {
+        AxisPrecision::Df64 => format!("df64_complex_scale({value}, {scale})"),
+        _ => format!("{value} * vec2<f32>({scale}, {scale})"),
+    }
+}
+
+fn specialize_rader_wgsl(source: String, precision: AxisPrecision) -> String {
+    if precision != AxisPrecision::Df64 {
+        return precision.specialize_wgsl(source);
+    }
+    let source = source
+        .replace(F32_COMPLEX_HELPERS, DF64_COMPLEX_HELPERS)
+        .replace(F32_COMPLEX_MUL_HELPER, DF64_COMPLEX_MUL_HELPER)
+        .replace("vec2<f32>", "vec4<f32>");
+    format!("{}\n{source}", crate::kernels::DF64_WGSL)
+}
+
+const F32_COMPLEX_HELPERS: &str = r#"fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return a + b;
+}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return a - b;
+}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}"#;
+
+const DF64_COMPLEX_HELPERS: &str = r#"fn c_add(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_add(a, b);
+}
+
+fn c_sub(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_sub(a, b);
+}
+
+fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_mul(a, b);
+}"#;
+
+const F32_COMPLEX_MUL_HELPER: &str = r#"fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}"#;
+
+const DF64_COMPLEX_MUL_HELPER: &str = r#"fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+  return df64_complex_mul(a, b);
+}"#;
 
 #[cfg(test)]
 mod tests {
@@ -1517,6 +1659,20 @@ mod tests {
             256,
             256
         ));
+        assert!(fused_rader_supported_by_limits(
+            3071,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
+        assert!(!fused_rader_supported_by_limits(
+            3072,
+            AxisPrecision::Df64,
+            48 * 1024,
+            256,
+            256
+        ));
     }
 
     #[test]
@@ -1552,6 +1708,49 @@ mod tests {
     }
 
     #[test]
+    fn fused_rader_f32_scale_uses_roundtrip_literal_and_staged_post_keeps_parentheses() {
+        let factors = crate::runtime::factor_supported_length(6000).unwrap();
+        let key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            1,
+            0,
+            &[2999],
+            2999,
+            1,
+            6000,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 2999.0,
+            AxisPrecision::F32,
+        );
+        let wgsl = generate_fused_rader_wgsl_for_key(&key);
+        let scale = format_wgsl_f32_roundtrip(1.0f32 / 2999.0);
+        assert!(wgsl.contains(&format!("const SCALE: f32 = {scale};")));
+        assert_ne!(scale, format_wgsl_f32(1.0f32 / 2999.0));
+
+        let post_key = RaderStageKey::new(
+            RaderKernelKind::Post,
+            1,
+            0,
+            &[17],
+            17,
+            1,
+            32,
+            WORKGROUP_SIZE,
+            true,
+            1.0 / 17.0,
+            AxisPrecision::F32,
+        );
+        let post = generate_rader_post_wgsl(&post_key);
+        assert!(post.contains(
+            "output[baseOutput + outputIndex * STRIDE] =\n    (x0[lineLocal] + value) * vec2<f32>(SCALE, SCALE);"
+        ));
+        assert!(!post.contains("x0[lineLocal] + value * vec2<f32>"));
+    }
+
+    #[test]
     fn fused_rader_wgsl_specializes_storage_and_scalars_to_f64() {
         let factors = crate::runtime::factor_supported_length(200).unwrap();
         let key = FusedPrimeStageKey::new(
@@ -1574,6 +1773,63 @@ mod tests {
         assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f64>"));
         assert!(wgsl.contains("const INVERSE_M: f64 = 0.005lf;"));
         assert!(!wgsl.contains("vec2<f32>"));
+    }
+
+    #[test]
+    fn df64_rader_generators_use_split_complex_ops_for_fused_and_staged_paths() {
+        let factors = crate::runtime::factor_supported_length(200).unwrap();
+        let fused_key = FusedPrimeStageKey::new(
+            FusedPrimeKind::Rader,
+            1,
+            0,
+            &[101],
+            101,
+            1,
+            200,
+            &factors,
+            FftDirection::Inverse,
+            FUSED_WORKGROUP_SIZE,
+            true,
+            1.0 / 101.0,
+            AxisPrecision::Df64,
+        );
+        let fused = generate_fused_rader_wgsl_for_key(&fused_key);
+        assert!(fused.starts_with(crate::kernels::DF64_WGSL));
+        assert!(fused.contains("array<vec4<f32>, 200>"));
+        assert!(fused.contains("const INVERSE_M: Df64 = Df64("));
+        assert!(fused.contains("return vec4<f32>(value.x, value.y, -value.z, -value.w)"));
+        assert!(fused.contains("df64_complex_add(lineSum, value)"));
+        assert!(fused.contains("df64_complex_scale(value, Df64("));
+        assert!(!fused.contains("lineSum = lineSum + value"));
+        assert!(!fused.contains("vec2<f64>"));
+
+        for kind in [
+            RaderKernelKind::Sum,
+            RaderKernelKind::Pack,
+            RaderKernelKind::Mul,
+            RaderKernelKind::WriteY0,
+            RaderKernelKind::Post,
+        ] {
+            let key = RaderStageKey::new(
+                kind,
+                1,
+                0,
+                &[17],
+                17,
+                1,
+                32,
+                WORKGROUP_SIZE,
+                true,
+                1.0 / 17.0,
+                AxisPrecision::Df64,
+            );
+            let wgsl = generate_rader_wgsl_for_key(&key);
+            assert!(wgsl.starts_with(crate::kernels::DF64_WGSL));
+            assert!(wgsl.contains("array<vec4<f32>>"));
+            assert!(!wgsl.contains("vec2<f64>"));
+            assert!(!wgsl.contains("sin("));
+            assert!(!wgsl.contains("cos("));
+        }
     }
 
     #[test]

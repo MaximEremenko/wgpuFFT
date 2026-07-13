@@ -2,13 +2,19 @@
 
 Rust `wgpu` FFT library.
 
-This crate exposes a native Rust API for out-of-place complex-to-complex `f32`
-and native `f64` transforms, plus real/packed-complex `f32` transforms, over
-1D/ND shapes and batches. C2C buffers are interleaved complex values in the
-configured scalar precision:
+This crate exposes a native Rust API for out-of-place complex-to-complex `f32`,
+native `f64`, and portable double-float (`df64`) transforms, plus
+real/packed-complex `f32` transforms, over 1D/ND shapes and batches. F32 and
+native-f64 C2C buffers are interleaved complex scalars:
 
 ```text
 [re0, im0, re1, im1, ...]
+```
+
+Df64 uses four `f32` words per complex element:
+
+```text
+[re_hi0, re_lo0, im_hi0, im_lo0, ...]
 ```
 
 R2C/C2R use the WebGPU-FFT packed-spectrum convention. For a logical real
@@ -17,8 +23,8 @@ stored as interleaved complex values.
 
 Power-of-two axes and multi-stage smooth axes use a single-workgroup fused
 kernel when the complete line fits device workgroup storage (8 bytes per `f32`
-complex element or 16 bytes per `f64` complex element) and 256 invocations are
-supported. This covers mixed-radix
+complex element or 16 bytes per native-`f64`/`df64` complex element) and 256
+invocations are supported. This covers mixed-radix
 lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`; single-stage smooth axes and
 larger lines use generated Stockham stages. Other prime axes route through
 Rader, unsupported composite axes route through Bluestein convolution over a
@@ -60,6 +66,24 @@ pipelines. Typed in-memory cache snapshots can be exported and imported through
 entries that exceed the target device's fused-kernel compute limits or require
 an unavailable shader feature are skipped.
 
+## Precision
+
+- `FftPrecision::F32` uses native `f32` storage and arithmetic. It is the
+  default and is supported by every backend.
+- `FftPrecision::F64` uses native `f64` storage and arithmetic. The current
+  implementation targets Vulkan devices exposing `wgpu::Features::SHADER_F64`;
+  plan creation returns structured `PrecisionUnsupported` diagnostics when the
+  feature is unavailable.
+- `FftPrecision::Df64` represents each scalar as an unevaluated `hi + lo` pair
+  of `f32` words and uses pure-f32 WGSL. It needs no optional device features
+  and provides roughly 44-48 effective mantissa bits. Its exponent range is
+  still the `f32` range (approximately `1e-38` through `1e38`), and preservation
+  of subnormal low words is backend-dependent. Normal C2C mixed-radix, Rader,
+  Bluestein, batched/ND, and strided routes support df64; real transforms and
+  large execution routes remain structured-unsupported. Vulkan and DX12 exact
+  arithmetic canaries are tested on the RTX 5090. Metal's fast-math compiler
+  makes it the riskiest backend and it remains untested.
+
 ## Current Scope
 
 - C2C `f32` over 1D/ND shapes on native `wgpu` backends.
@@ -68,6 +92,8 @@ an unavailable shader feature are skipped.
   `FftConfig::with_precision(FftPrecision::F64)`. It requires a Vulkan adapter
   and device exposing `wgpu::Features::SHADER_F64`; unsupported devices return
   structured `FftError::PrecisionUnsupported` errors.
+- Portable C2C `df64` over normal 1D/ND mixed-radix, Rader, Bluestein, batched,
+  and strided routes. It uses only core `f32` WGSL and no optional features.
 - R2C/C2R `f32` over full-shape axes only.
 - C2C axis subsets through `FftConfig::with_axes(...)`.
 - Batch count through `FftConfig::with_batch(...)`.
@@ -130,9 +156,9 @@ an unavailable shader feature are skipped.
   segmented volume, segmented/strided caller views, and caller-workspace reuse
   remain structured-unsupported.
 - Large-chunk, GPU-resident four-step, and segmented full-volume execution are
-  currently `f32` routes. Native-`f64` plans that require one of those routes,
-  and all real `f64` transforms, return structured `PrecisionUnsupported`
-  diagnostics rather than silently changing precision.
+  currently `f32` routes. Native-`f64` or `df64` plans that require one of
+  those routes, and all real extended-precision transforms, return structured
+  `PrecisionUnsupported` diagnostics rather than silently changing precision.
 - Internal shader/module/pipeline cache keyed by generated fused power-of-two,
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.
@@ -143,8 +169,8 @@ an unavailable shader feature are skipped.
 - R2C requires forward direction; C2R requires inverse direction. Real
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
-- In-place execution, `f16`, portable `df64` emulation, DCT/DST, public
-  convolution, NUFFT, and the WASM wrapper are out of scope.
+- In-place execution, `f16`, DCT/DST, public convolution, NUFFT, and the WASM
+  wrapper are out of scope.
 - No serde/JSON cache snapshot persistence yet.
 - Native `wgpu` first; WASM is planned later. `wgpuFFT` stays `wgpu`-only; use
   `WGPU_BACKEND=vulkan` for Vulkan/native validation where available.
@@ -160,6 +186,7 @@ cargo test
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_c2c -- --nocapture
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_real -- --nocapture
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_f64 --release -- --nocapture
+WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_df64 --release -- --nocapture
 ```
 
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`

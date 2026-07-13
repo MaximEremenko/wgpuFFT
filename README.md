@@ -24,7 +24,8 @@ stored as interleaved complex values.
 Power-of-two axes and multi-stage smooth axes use a single-workgroup fused
 kernel when the complete line fits device workgroup storage (8 bytes per `f32`
 complex element or 16 bytes per native-`f64`/`df64` complex element) and 256
-invocations are supported. This covers mixed-radix
+invocations are supported by default. The fused workgroup size is tunable per
+plan. This covers mixed-radix
 lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`; single-stage smooth axes and
 larger lines use generated Stockham stages. Other prime axes route through
 Rader, unsupported composite axes route through Bluestein convolution over a
@@ -84,6 +85,42 @@ an unavailable shader feature are skipped.
   arithmetic canaries are tested on the RTX 5090. Metal's fast-math compiler
   makes it the riskiest backend and it remains untested.
 
+## Tuning
+
+Attach validated per-plan controls with
+`FftConfig::with_tuning(FftTuning::new()...)`. Defaults preserve the untuned
+planner. Invalid values, incompatible forced algorithms, device-limit
+violations, and infeasible forced routes return structured
+`FftError::InvalidTuning`; `FftPlan::diagnostics()` reports both requested and
+effective tuning. Limit overrides can only lower the adapter's real limits.
+
+| Control | Default | Effect |
+|---|---:|---|
+| `workgroup_size` | `64` | Staged FFT and linear helper kernels. |
+| `fused_workgroup_size` | `256` | Fused power-of-two, smooth, and prime kernels, subject to device invocation and storage limits. |
+| `rader_max_prime` | `4096` | Largest non-smooth prime selected for Rader automatically. |
+| `force_rader_axes` | `[]` | Physical selected axes that must use Rader; infeasible requests fail instead of changing algorithm. |
+| `force_bluestein_axes` | `[]` | Physical selected axes that must use Bluestein. |
+| `large_route` | `Auto` | C2C `Auto`, `ForceChunk`, `ForceFourStep`, or `ForceSegmented`; forced real-transform routes are currently unsupported. |
+| `large_chunk_max_batches` | `None` | Optional cap on batches per large-chunk staging/execution chunk. |
+| `grouped_batch` | `None` | Optional preferred multiple for sequential four-step line windows. |
+| `swap_to_2_stage_4_step` | `0` | Axis-length threshold that divides four-step binding capacity into two smaller sequential windows; `0` disables it. |
+| `swap_to_3_stage_4_step` | `0` | Axis-length threshold that divides four-step binding capacity into three smaller sequential windows; `0` disables it. |
+| `segmented_burst_depth` | `2` | Segmented full-volume A/B staging-ring depth (`1..=3`). |
+| `max_storage_buffer_binding_size` | `None` | Optional planning cap, clamped to the device and effective buffer-size limit. |
+| `max_buffer_size` | `None` | Optional planning cap, clamped to the device limit. |
+| `fused_min_convolution_length` | `128` | Minimum Rader/Bluestein convolution length eligible for fused-prime execution. |
+
+The four-step swap thresholds change sequential window sizing; they do not
+create concurrent window rings or add FFT stages. There is no public
+normal-route coalescing-transpose threshold because that transpose route does
+not exist in the Rust implementation. The direct-DFT 64-lane workgroup and
+four-step 16x16 transpose tile are internal and are not changed by
+`workgroup_size`. FFT convolution is used internally by Rader/Bluestein but is
+not exposed as a public `fftconv`/`conv2d` API. Single-stage smooth-axis fusion
+also remains an internal route choice because it would not remove a global
+pass.
+
 ## Current Scope
 
 - C2C `f32` over 1D/ND shapes on native `wgpu` backends.
@@ -97,6 +134,8 @@ an unavailable shader feature are skipped.
 - R2C/C2R `f32` over full-shape axes only.
 - C2C axis subsets through `FftConfig::with_axes(...)`.
 - Batch count through `FftConfig::with_batch(...)`.
+- Validated per-plan performance tuning through `FftConfig::with_tuning(...)`;
+  default tuning preserves the measured planner choices.
 - Out-of-place execution only.
 - Caller-owned `wgpu::Buffer` input and output.
 - `FftPlan::r2c(...)`, `FftPlan::c2r(...)`, `create_r2c_plan(...)`, and
@@ -138,17 +177,20 @@ an unavailable shader feature are skipped.
 - In this API, out-of-core means outside one storage-binding window: data stays
   GPU-resident. Rank>=2 C2C volumes with at least two selected axes can execute
   when one batch exceeds `maxStorageBufferBindingSize` but the full dataset and
-  route-owned helpers fit `maxBufferSize`. Mixed-radix axes use bind-sized FFT
-  windows; Rader and Bluestein axes reuse their normal child plan or a bounded
-  prime bridge, with oversized Rader lines deliberately falling back to
-  Bluestein. Rank 2 uses stripe transposes; higher ranks move each non-front
-  axis through a tiled prefix-by-axis block permutation and restore canonical
-  layout afterward. No host or disk staging is required for this route.
-- Rank>=2 smooth C2C volumes above the active policy `maxBufferSize` can use a
-  plan-owned segmented GPU arena. Axis rows and non-front slabs are staged
-  through a measured two-slot ring of binding-safe A/B window pairs, with one
-  segmented normalization pass and no host or disk staging. The burst depth is
-  currently an internal policy choice; a public tuning override is deferred.
+  route-owned helpers fit `maxBufferSize`. Every selected smooth-axis line must
+  fit the active binding cap; Rader and Bluestein axes can instead reuse their
+  normal child plan or a bounded prime bridge. Automatically selected oversized
+  Rader lines may use Bluestein; explicitly forced Rader returns
+  `InvalidTuning` instead of changing algorithms. Rank 2 uses stripe
+  transposes; higher ranks move each non-front axis through a tiled
+  prefix-by-axis block permutation and restore canonical layout afterward. No
+  host or disk staging is required for this route.
+- Rank>=2 smooth C2C volumes with at least two selected axes and above the
+  active policy `maxBufferSize` can use a plan-owned segmented GPU arena when
+  every front row and non-front slab line fits a binding-safe staging window.
+  Axis rows and slabs are staged through a configurable one-to-three-slot ring
+  of A/B window pairs, with one segmented normalization pass and no host or
+  disk staging. The measured burst depth defaults to 2.
   On hardware where the logical volume itself exceeds the real device
   `maxBufferSize`, caller-segmented endpoints are still required and remain
   deferred; the implemented route is directly executable when an

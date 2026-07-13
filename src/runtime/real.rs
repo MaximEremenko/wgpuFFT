@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, FftPrecision};
 use crate::device::device_supports_precision;
 use crate::error::{FftError, Result};
-use crate::runtime::axis_policy::{resolve_axis_kinds_for_axes, AxisKind};
+use crate::runtime::axis_policy::{resolve_axis_kinds_for_config, AxisKind};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::c2c::{C2cPlan, C2cRoute};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -25,8 +25,12 @@ use crate::runtime::pipeline_cache::{
 };
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::WindowScheduler;
+use crate::tuning::{FftLargeRoute, FftTuningErrorKind};
 
-const WORKGROUP_SIZE: u32 = 64;
+// Generator/key tests use the default to keep cache-key compatibility explicit;
+// executable real helpers always receive FftTuning::workgroup_size().
+#[cfg(test)]
+const DEFAULT_WORKGROUP_SIZE: u32 = 64;
 const F32_BYTES: u64 = 4;
 const COMPLEX_F32_BYTES: u64 = 8;
 
@@ -215,6 +219,44 @@ fn policy_limits(policy: &LargeRoutingPolicy) -> LargePolicyLimits {
         max_storage_buffer_binding_size: policy.max_bind_bytes,
         max_buffer_size: policy.max_buffer_size,
     }
+}
+
+fn effective_real_policy_limits(
+    device: &wgpu::Device,
+    config: &FftConfig,
+    explicit: Option<LargePolicyLimits>,
+) -> LargePolicyLimits {
+    effective_real_policy_limits_for_device_limits(&device.limits(), config, explicit)
+}
+
+fn effective_real_policy_limits_for_device_limits(
+    device_limits: &wgpu::Limits,
+    config: &FftConfig,
+    explicit: Option<LargePolicyLimits>,
+) -> LargePolicyLimits {
+    let tuned = LargePolicyLimits::effective_with_overrides(
+        device_limits,
+        config.tuning().max_storage_buffer_binding_size(),
+        config.tuning().max_buffer_size(),
+    );
+    explicit.map_or(tuned, |limits| limits.componentwise_min(tuned))
+}
+
+fn validate_real_tuning(device: &wgpu::Device, config: &FftConfig) -> Result<()> {
+    config.tuning().validate_for_device(&device.limits())?;
+    validate_real_route_tuning(config)
+}
+
+fn validate_real_route_tuning(config: &FftConfig) -> Result<()> {
+    if config.tuning().large_route() != FftLargeRoute::Auto {
+        return Err(FftError::InvalidTuning {
+            kind: FftTuningErrorKind::UnsupportedForTransform,
+            field: "large_route",
+            value: config.tuning().large_route().as_str().to_owned(),
+            reason: "forced large-route selection is not implemented for real transforms",
+        });
+    }
+    Ok(())
 }
 
 fn graph_requirements(limits: LargePolicyLimits, scratch_bytes: u64) -> Result<StageRequirements> {
@@ -684,7 +726,12 @@ impl R2cPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Self::new_with_large_policy_limits(device, queue, config, Some(limits))
+        let tuning = config
+            .tuning()
+            .clone()
+            .with_max_storage_buffer_binding_size(limits.max_storage_buffer_binding_size)
+            .with_max_buffer_size(limits.max_buffer_size);
+        Self::new_with_large_policy_limits(device, queue, config.with_tuning(tuning), None)
     }
 
     fn new_with_large_policy_limits(
@@ -694,10 +741,11 @@ impl R2cPlan {
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
         validate_real_config(&config, RealTransform::R2c)?;
+        validate_real_tuning(device, &config)?;
         validate_real_precision(device, &config, "r2c")?;
         let packed_shape = packed_shape_for(config.shape())?;
         let sizes = RealPlanSizes::new(&config, &packed_shape)?;
-        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        let axis_kinds = resolve_axis_kinds_for_config(&config)?;
         let mut large_routing_policy = resolve_real_large_routing_policy(
             device,
             &config,
@@ -715,8 +763,7 @@ impl R2cPlan {
                 policy_limits,
             )?),
             LargeRouteMode::LargeChunk if config.batch() == 1 => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 let plan = R2cNormalPlan::new(
                     device,
                     queue,
@@ -738,8 +785,7 @@ impl R2cPlan {
                 R2cExecution::LargeDecomposition(plan)
             }
             LargeRouteMode::LargeChunk => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 match R2cLargeChunkPlan::new(device, queue, &config, &packed_shape, &sizes, limits)
                 {
                     Ok(plan) => R2cExecution::LargeChunk(plan),
@@ -767,8 +813,7 @@ impl R2cPlan {
                 }
             }
             LargeRouteMode::LargeOutOfCore => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 let plan = R2cNormalPlan::new(
                     device,
                     queue,
@@ -963,7 +1008,12 @@ impl C2rPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Self::new_with_large_policy_limits(device, queue, config, Some(limits))
+        let tuning = config
+            .tuning()
+            .clone()
+            .with_max_storage_buffer_binding_size(limits.max_storage_buffer_binding_size)
+            .with_max_buffer_size(limits.max_buffer_size);
+        Self::new_with_large_policy_limits(device, queue, config.with_tuning(tuning), None)
     }
 
     fn new_with_large_policy_limits(
@@ -973,10 +1023,11 @@ impl C2rPlan {
         policy_limits: Option<LargePolicyLimits>,
     ) -> Result<Self> {
         validate_real_config(&config, RealTransform::C2r)?;
+        validate_real_tuning(device, &config)?;
         validate_real_precision(device, &config, "c2r")?;
         let packed_shape = packed_shape_for(config.shape())?;
         let sizes = RealPlanSizes::new(&config, &packed_shape)?;
-        let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+        let axis_kinds = resolve_axis_kinds_for_config(&config)?;
         let mut large_routing_policy = resolve_real_large_routing_policy(
             device,
             &config,
@@ -994,8 +1045,7 @@ impl C2rPlan {
                 policy_limits,
             )?),
             LargeRouteMode::LargeChunk if config.batch() == 1 => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 let plan = C2rNormalPlan::new(
                     device,
                     queue,
@@ -1017,8 +1067,7 @@ impl C2rPlan {
                 C2rExecution::LargeDecomposition(plan)
             }
             LargeRouteMode::LargeChunk => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 match C2rLargeChunkPlan::new(device, queue, &config, &packed_shape, &sizes, limits)
                 {
                     Ok(plan) => C2rExecution::LargeChunk(plan),
@@ -1045,8 +1094,7 @@ impl C2rPlan {
                 }
             }
             LargeRouteMode::LargeOutOfCore => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_real_policy_limits(device, &config, policy_limits);
                 let plan = C2rNormalPlan::new(
                     device,
                     queue,
@@ -1259,6 +1307,7 @@ fn execute_r2c_logical_views(
         &output,
         plan.sizes.real_bytes,
         plan.sizes.packed_bytes,
+        plan.config.tuning().workgroup_size(),
         |device, encoder, input, output| plan.execute_views(device, encoder, input, output),
     )
 }
@@ -1292,6 +1341,7 @@ fn execute_c2r_logical_views(
         &output,
         plan.sizes.packed_bytes,
         plan.sizes.real_bytes,
+        plan.config.tuning().workgroup_size(),
         |device, encoder, input, output| plan.execute_views(device, encoder, input, output),
     )
 }
@@ -1303,6 +1353,7 @@ fn execute_real_logical_views(
     output: &BoundLogicalIo<'_>,
     required_input_bytes: u64,
     required_output_bytes: u64,
+    workgroup_size: u32,
     execute: impl for<'i, 'o> FnOnce(
         &wgpu::Device,
         &mut wgpu::CommandEncoder,
@@ -1354,6 +1405,7 @@ fn execute_real_logical_views(
             input.layout,
             input.logical_elements_per_batch,
             input.batch,
+            workgroup_size,
         )?;
         Some(buffer)
     };
@@ -1408,6 +1460,7 @@ fn execute_real_logical_views(
             output.layout,
             output.logical_elements_per_batch,
             output.batch,
+            workgroup_size,
         )?;
         if let Some(physical) = output_physical_stage.as_ref() {
             copy_buffer_to_view_range(
@@ -1594,6 +1647,7 @@ impl R2cNormalPlan {
             config.shape(),
             config.total_complex_len_u32()?,
             config.total_complex_len_u32()?,
+            config.tuning().workgroup_size(),
             "wgpu_fft.r2c.real_to_complex",
         )?;
         let pack = RealKernel::new(
@@ -1603,6 +1657,7 @@ impl R2cNormalPlan {
             config.shape(),
             config.batch() as u32,
             packed_total_complex_len(packed_shape, config.batch())? as u32,
+            config.tuning().workgroup_size(),
             "wgpu_fft.r2c.pack",
         )?;
 
@@ -1728,16 +1783,25 @@ impl R2cNormalPlan {
             BufferView::whole(&self.full_input_buffer).prefix(sizes.full_complex_bytes)?;
         let full_output =
             BufferView::whole(&self.full_output_buffer).prefix(sizes.full_complex_bytes)?;
-        dispatch_real_to_complex_windowed(device, encoder, real_input, full_input.clone())?;
+        let config = self.c2c.config();
+        let workgroup_size = config.tuning().workgroup_size();
+        dispatch_real_to_complex_windowed(
+            device,
+            encoder,
+            real_input,
+            full_input.clone(),
+            workgroup_size,
+        )?;
         self.c2c
             .execute_views(device, encoder, full_input, full_output.clone())?;
         dispatch_pack_r2c_windowed(
             device,
             encoder,
-            self.c2c.config().shape(),
-            self.c2c.config().batch(),
+            config.shape(),
+            config.batch(),
             full_output,
             packed_output,
+            workgroup_size,
         )?;
 
         if let Some(buffer) = output_stage.as_ref() {
@@ -1763,8 +1827,20 @@ impl R2cLargeChunkPlan {
         sizes: &RealPlanSizes,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        let chunk = RealLargeChunkPlan::new(sizes, config.batch() as u64, limits)?;
-        let child_config = config.clone().with_batch(chunk.chunk_batch_count as usize);
+        let chunk = RealLargeChunkPlan::new_with_max_batches(
+            sizes,
+            config.batch() as u64,
+            limits,
+            config.tuning().large_chunk_max_batches(),
+        )?;
+        let child_tuning = config
+            .tuning()
+            .clone()
+            .with_large_route(FftLargeRoute::Auto);
+        let child_config = config
+            .clone()
+            .with_batch(chunk.chunk_batch_count as usize)
+            .with_tuning(child_tuning);
         let child = Box::new(R2cPlan::new_with_large_policy_limits(
             device,
             queue,
@@ -1889,6 +1965,7 @@ impl C2rNormalPlan {
             config.shape(),
             config.batch() as u32,
             config.total_complex_len_u32()?,
+            config.tuning().workgroup_size(),
             "wgpu_fft.c2r.unpack",
         )?;
         let complex_to_real = RealKernel::new(
@@ -1898,6 +1975,7 @@ impl C2rNormalPlan {
             config.shape(),
             config.total_complex_len_u32()?,
             config.total_complex_len_u32()?,
+            config.tuning().workgroup_size(),
             "wgpu_fft.c2r.complex_to_real",
         )?;
 
@@ -2038,10 +2116,17 @@ impl C2rNormalPlan {
             config.batch(),
             packed_input,
             full_input.clone(),
+            config.tuning().workgroup_size(),
         )?;
         self.c2c
             .execute_views(device, encoder, full_input, full_output.clone())?;
-        dispatch_complex_to_real_windowed(device, encoder, full_output, real_output)?;
+        dispatch_complex_to_real_windowed(
+            device,
+            encoder,
+            full_output,
+            real_output,
+            config.tuning().workgroup_size(),
+        )?;
 
         if let Some(buffer) = output_stage.as_ref() {
             executor.copy_buffer_to_view_range(encoder, buffer, 0, &output, 0, sizes.real_bytes)?;
@@ -2059,8 +2144,20 @@ impl C2rLargeChunkPlan {
         sizes: &RealPlanSizes,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        let chunk = RealLargeChunkPlan::new(sizes, config.batch() as u64, limits)?;
-        let child_config = config.clone().with_batch(chunk.chunk_batch_count as usize);
+        let chunk = RealLargeChunkPlan::new_with_max_batches(
+            sizes,
+            config.batch() as u64,
+            limits,
+            config.tuning().large_chunk_max_batches(),
+        )?;
+        let child_tuning = config
+            .tuning()
+            .clone()
+            .with_large_route(FftLargeRoute::Auto);
+        let child_config = config
+            .clone()
+            .with_batch(chunk.chunk_batch_count as usize)
+            .with_tuning(child_tuning);
         let child = Box::new(C2rPlan::new_with_large_policy_limits(
             device,
             queue,
@@ -2146,9 +2243,10 @@ impl RealKernel {
         shape: &[usize],
         param_value: u32,
         work_items: u32,
+        workgroup_size: u32,
         label: &'static str,
     ) -> Result<Self> {
-        let shader_key = RealStageKey::new(kind, shape, WORKGROUP_SIZE);
+        let shader_key = RealStageKey::new(kind, shape, workgroup_size);
         validate_real_stage_key(&shader_key)?;
         let pipeline_key = ComputePipelineCacheKey::real_stage(shader_key.clone());
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
@@ -2186,7 +2284,7 @@ impl RealKernel {
             pipeline,
             bind_group_layout,
             params_buffer,
-            workgroups_x: work_items.div_ceil(WORKGROUP_SIZE),
+            workgroups_x: work_items.div_ceil(workgroup_size),
         })
     }
 
@@ -2264,6 +2362,7 @@ fn dispatch_real_to_complex_windowed(
     encoder: &mut wgpu::CommandEncoder,
     input: BufferView<'_>,
     output: BufferView<'_>,
+    workgroup_size: u32,
 ) -> Result<()> {
     dispatch_linear_real_windowed(
         device,
@@ -2274,6 +2373,7 @@ fn dispatch_real_to_complex_windowed(
         output,
         ElementFormat::RealF32,
         ElementFormat::ComplexF32,
+        workgroup_size,
     )
 }
 
@@ -2282,6 +2382,7 @@ fn dispatch_complex_to_real_windowed(
     encoder: &mut wgpu::CommandEncoder,
     input: BufferView<'_>,
     output: BufferView<'_>,
+    workgroup_size: u32,
 ) -> Result<()> {
     dispatch_linear_real_windowed(
         device,
@@ -2292,6 +2393,7 @@ fn dispatch_complex_to_real_windowed(
         output,
         ElementFormat::ComplexF32,
         ElementFormat::RealF32,
+        workgroup_size,
     )
 }
 
@@ -2304,6 +2406,7 @@ fn dispatch_linear_real_windowed(
     output: BufferView<'_>,
     input_format: ElementFormat,
     output_format: ElementFormat,
+    workgroup_size: u32,
 ) -> Result<()> {
     let input_count = input.size() / input_format.bytes_per_element();
     let output_count = output.size() / output_format.bytes_per_element();
@@ -2342,6 +2445,7 @@ fn dispatch_linear_real_windowed(
                 _pad1: 0,
                 _pad2: 0,
             },
+            workgroup_size,
         )?;
         start += count;
     }
@@ -2355,6 +2459,7 @@ fn dispatch_pack_r2c_windowed(
     batch: usize,
     input: BufferView<'_>,
     output: BufferView<'_>,
+    workgroup_size: u32,
 ) -> Result<()> {
     let packed_shape = packed_shape_for(shape)?;
     let full_n0 = shape[0] as u64;
@@ -2397,6 +2502,7 @@ fn dispatch_pack_r2c_windowed(
                 ElementFormat::PackedComplexF32,
                 count,
                 batch,
+                workgroup_size,
             )?;
             x += count;
         }
@@ -2411,6 +2517,7 @@ fn dispatch_unpack_c2r_windowed(
     batch: usize,
     input: BufferView<'_>,
     output: BufferView<'_>,
+    workgroup_size: u32,
 ) -> Result<()> {
     let packed_shape = packed_shape_for(shape)?;
     let full_n0 = shape[0] as u64;
@@ -2468,6 +2575,7 @@ fn dispatch_unpack_c2r_windowed(
                 ElementFormat::ComplexF32,
                 count,
                 batch,
+                workgroup_size,
             )?;
             x += count;
         }
@@ -2488,6 +2596,7 @@ fn dispatch_real_windowed_pair(
     output_format: ElementFormat,
     count: u64,
     batch: usize,
+    workgroup_size: u32,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let (input_binding, input_base) =
@@ -2513,6 +2622,7 @@ fn dispatch_real_windowed_pair(
             _pad1: 0,
             _pad2: 0,
         },
+        workgroup_size,
     )
 }
 
@@ -2561,12 +2671,13 @@ fn dispatch_real_windowed_kernel(
     input: &BufferView<'_>,
     output: &BufferView<'_>,
     params: RealWindowParams,
+    workgroup_size: u32,
 ) -> Result<()> {
     let scheduler = WindowScheduler::for_device(device);
     let (input_format, output_format) = real_kernel_storage_formats(kind);
     let input_resource = scheduler.storage_binding_resource(input, input_format)?;
     let output_resource = scheduler.storage_binding_resource(output, output_format)?;
-    let shader_key = RealStageKey::new(kind, shape, WORKGROUP_SIZE);
+    let shader_key = RealStageKey::new(kind, shape, workgroup_size);
     validate_real_stage_key(&shader_key)?;
     let pipeline_key = ComputePipelineCacheKey::real_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
@@ -2615,7 +2726,7 @@ fn dispatch_real_windowed_kernel(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        params.total.div_ceil(WORKGROUP_SIZE),
+        params.total.div_ceil(workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -2632,6 +2743,7 @@ fn dispatch_real_strided_copy(
     layout: FftLogicalLayout,
     logical_per_batch: u64,
     batch: u64,
+    workgroup_size: u32,
 ) -> Result<()> {
     validate_real_strided_kind(kind, format)?;
     let scheduler = WindowScheduler::for_device(device);
@@ -2641,7 +2753,7 @@ fn dispatch_real_strided_copy(
     let total_elements = logical_per_batch
         .checked_mul(batch)
         .ok_or(FftError::LengthTooLarge { len: usize::MAX })?;
-    let shader_key = RealStageKey::new(kind, &[], WORKGROUP_SIZE);
+    let shader_key = RealStageKey::new(kind, &[], workgroup_size);
     validate_real_stage_key(&shader_key)?;
     let pipeline_key = ComputePipelineCacheKey::real_stage(shader_key.clone());
     let bind_group_layout = with_device_pipeline_cache(device, |cache| {
@@ -2704,7 +2816,7 @@ fn dispatch_real_strided_copy(
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
-        params.total_elements.div_ceil(WORKGROUP_SIZE),
+        params.total_elements.div_ceil(workgroup_size),
         max_workgroups_per_dimension(device),
     )?;
     pass.dispatch_workgroups(x, y, z);
@@ -2820,13 +2932,28 @@ impl RealPlanSizes {
 }
 
 impl RealLargeChunkPlan {
+    #[cfg(test)]
     fn new(sizes: &RealPlanSizes, batch_count: u64, limits: LargePolicyLimits) -> Result<Self> {
+        Self::new_with_max_batches(sizes, batch_count, limits, None)
+    }
+
+    fn new_with_max_batches(
+        sizes: &RealPlanSizes,
+        batch_count: u64,
+        limits: LargePolicyLimits,
+        max_batches: Option<usize>,
+    ) -> Result<Self> {
         let per_batch = sizes.per_batch(batch_count)?;
         let bytes_per_batch = per_batch
             .real_bytes
             .max(per_batch.packed_bytes)
             .max(per_batch.full_complex_bytes);
-        let chunk = LargeChunkPlan::new(bytes_per_batch, batch_count, limits)?;
+        let chunk = LargeChunkPlan::new_with_max_batches(
+            bytes_per_batch,
+            batch_count,
+            limits,
+            max_batches,
+        )?;
         let chunk_batch_count = chunk.chunk_batch_count();
         let real_staging_size_bytes = checked_mul_for_real_chunk(
             per_batch.real_bytes,
@@ -3016,7 +3143,7 @@ fn resolve_real_large_routing_policy(
     sizes: &RealPlanSizes,
     policy_limits: Option<LargePolicyLimits>,
 ) -> Result<LargeRoutingPolicy> {
-    let axis_kinds = resolve_axis_kinds_for_axes(config.shape(), config.axes())?;
+    let axis_kinds = resolve_axis_kinds_for_config(config)?;
     let line_bytes = [
         (config.shape()[0] as u64)
             .checked_mul(F32_BYTES)
@@ -3039,8 +3166,7 @@ fn resolve_real_large_routing_policy(
         .real_bytes
         .max(per_batch.packed_bytes)
         .max(per_batch.full_complex_bytes);
-    let device_limits = device.limits();
-    let limits = policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device_limits));
+    let limits = effective_real_policy_limits(device, config, policy_limits);
 
     resolve_large_routing_policy(LargeRoutingPolicyInput {
         limits,
@@ -3665,6 +3791,7 @@ fn product(values: &[usize]) -> usize {
 mod tests {
     use super::*;
     use crate::config::Normalization;
+    use crate::tuning::FftTuning;
 
     fn test_child_c2c_graph(
         sizes: &RealPlanSizes,
@@ -3811,6 +3938,18 @@ mod tests {
                 },
             ]
         );
+
+        let capped = RealLargeChunkPlan::new_with_max_batches(
+            &sizes,
+            config.batch() as u64,
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 16 * COMPLEX_F32_BYTES * 2,
+                max_buffer_size: 1 << 20,
+            },
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(capped.chunk_batch_count, 1);
     }
 
     #[test]
@@ -4119,6 +4258,61 @@ mod tests {
     }
 
     #[test]
+    fn real_policy_limits_honor_tuning_and_explicit_caps() {
+        let mut device_limits = wgpu::Limits::default();
+        device_limits.max_storage_buffer_binding_size = 8_192;
+        device_limits.max_buffer_size = 16_384;
+        let config = FftConfig::new(16).with_tuning(
+            FftTuning::default()
+                .with_max_storage_buffer_binding_size(4_096u64)
+                .with_max_buffer_size(12_288u64),
+        );
+
+        assert_eq!(
+            effective_real_policy_limits_for_device_limits(&device_limits, &config, None),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 4_096,
+                max_buffer_size: 12_288,
+            }
+        );
+        assert_eq!(
+            effective_real_policy_limits_for_device_limits(
+                &device_limits,
+                &config,
+                Some(LargePolicyLimits {
+                    max_storage_buffer_binding_size: 2_048,
+                    max_buffer_size: 8_192,
+                }),
+            ),
+            LargePolicyLimits {
+                max_storage_buffer_binding_size: 2_048,
+                max_buffer_size: 8_192,
+            }
+        );
+    }
+
+    #[test]
+    fn real_transforms_reject_forced_large_routes_structurally() {
+        assert!(validate_real_route_tuning(&FftConfig::new(16)).is_ok());
+        for route in [
+            FftLargeRoute::ForceChunk,
+            FftLargeRoute::ForceFourStep,
+            FftLargeRoute::ForceSegmented,
+        ] {
+            let config =
+                FftConfig::new(16).with_tuning(FftTuning::default().with_large_route(route));
+            assert!(matches!(
+                validate_real_route_tuning(&config),
+                Err(FftError::InvalidTuning {
+                    kind: FftTuningErrorKind::UnsupportedForTransform,
+                    field: "large_route",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn real_strided_copy_rejects_kind_format_mismatch() {
         assert_eq!(
             validate_real_strided_kind(
@@ -4154,7 +4348,8 @@ mod tests {
 
     #[test]
     fn real_shader_key_validation_rejects_invalid_shapes() {
-        let mut rank_mismatch = RealStageKey::new(RealKernelKind::PackR2c, &[16], WORKGROUP_SIZE);
+        let mut rank_mismatch =
+            RealStageKey::new(RealKernelKind::PackR2c, &[16], DEFAULT_WORKGROUP_SIZE);
         rank_mismatch.rank = 2;
         assert_eq!(
             validate_real_stage_key(&rank_mismatch),
@@ -4167,7 +4362,7 @@ mod tests {
             validate_real_stage_key(&RealStageKey::new(
                 RealKernelKind::PackR2c,
                 &[],
-                WORKGROUP_SIZE
+                DEFAULT_WORKGROUP_SIZE
             )),
             Err(FftError::LargeGraphStageUnsupported {
                 stage: "real-shader-key",
@@ -4178,7 +4373,7 @@ mod tests {
             validate_real_stage_key(&RealStageKey::new(
                 RealKernelKind::UnpackC2r,
                 &[16, 0],
-                WORKGROUP_SIZE,
+                DEFAULT_WORKGROUP_SIZE,
             )),
             Err(FftError::LargeGraphStageUnsupported {
                 stage: "real-shader-key",
@@ -4189,7 +4384,7 @@ mod tests {
             validate_real_stage_key(&RealStageKey::new(
                 RealKernelKind::PackRealStrided,
                 &[16],
-                WORKGROUP_SIZE,
+                DEFAULT_WORKGROUP_SIZE,
             )),
             Err(FftError::LargeGraphStageUnsupported {
                 stage: "real-shader-key",
@@ -4199,13 +4394,13 @@ mod tests {
         assert!(validate_real_stage_key(&RealStageKey::new(
             RealKernelKind::PackR2c,
             &[16],
-            WORKGROUP_SIZE,
+            DEFAULT_WORKGROUP_SIZE,
         ))
         .is_ok());
         assert!(validate_real_stage_key(&RealStageKey::new(
             RealKernelKind::PackRealStrided,
             &[],
-            WORKGROUP_SIZE,
+            DEFAULT_WORKGROUP_SIZE,
         ))
         .is_ok());
     }
@@ -4215,16 +4410,27 @@ mod tests {
         let pack = generate_real_wgsl_for_key(&RealStageKey::new(
             RealKernelKind::PackR2c,
             &[17, 4],
-            WORKGROUP_SIZE,
+            DEFAULT_WORKGROUP_SIZE,
         ));
         assert!(pack.contains("const OUT_TOTAL_PER_BATCH: u32 = 36u;"));
 
         let unpack = generate_real_wgsl_for_key(&RealStageKey::new(
             RealKernelKind::UnpackC2r,
             &[17, 4],
-            WORKGROUP_SIZE,
+            DEFAULT_WORKGROUP_SIZE,
         ));
         assert!(unpack.contains("const NX: u32 = 17u;"));
         assert!(unpack.contains("const IN_NX: u32 = 9u;"));
+    }
+
+    #[test]
+    fn real_shader_keys_and_wgsl_include_tuned_workgroup_size() {
+        let default_key =
+            RealStageKey::new(RealKernelKind::RealToComplex, &[16], DEFAULT_WORKGROUP_SIZE);
+        assert!(default_key.stable_key().ends_with("workgroup=64"));
+
+        let tuned_key = RealStageKey::new(RealKernelKind::RealToComplex, &[16], 128);
+        assert!(tuned_key.stable_key().ends_with("workgroup=128"));
+        assert!(generate_real_wgsl_for_key(&tuned_key).contains("@workgroup_size(128, 1, 1)"));
     }
 }

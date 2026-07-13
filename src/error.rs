@@ -4,6 +4,7 @@ use crate::config::FftPrecision;
 use crate::diagnostics::{
     large_route_blocker, FftBlocker, FftBlockerKind, FftDiagnostics, FftRouteSummary,
 };
+use crate::tuning::{FftTuning, FftTuningErrorKind, FftTuningSummary};
 
 pub type Result<T> = std::result::Result<T, FftError>;
 
@@ -24,6 +25,12 @@ pub enum FftError {
     PrecisionUnsupported {
         requested: FftPrecision,
         route: &'static str,
+        reason: &'static str,
+    },
+    InvalidTuning {
+        kind: FftTuningErrorKind,
+        field: &'static str,
+        value: String,
         reason: &'static str,
     },
     EmptyAxes,
@@ -199,6 +206,17 @@ impl FftPlanCreationError {
         Self { error, diagnostics }
     }
 
+    pub fn from_error_with_tuning(
+        error: FftError,
+        transform: &'static str,
+        tuning: FftTuning,
+    ) -> Self {
+        let diagnostics = error
+            .diagnostics_for_transform(transform)
+            .with_active_tuning(FftTuningSummary::new(tuning.clone(), tuning));
+        Self { error, diagnostics }
+    }
+
     pub fn error(&self) -> &FftError {
         &self.error
     }
@@ -245,6 +263,15 @@ impl fmt::Display for FftError {
                 f,
                 "FFT precision {} is unsupported for {route}: {reason}",
                 requested.as_str()
+            ),
+            Self::InvalidTuning {
+                kind,
+                field,
+                value,
+                reason,
+            } => write!(
+                f,
+                "invalid FFT tuning {field}={value:?} ({kind:?}): {reason}"
             ),
             Self::EmptyAxes => write!(f, "FFT axes must not be empty"),
             Self::InvalidAxis { axis, rank } => write!(
@@ -766,6 +793,24 @@ impl FftError {
                     .with_route(*route)
                     .with_stage("precision-capability")
                     .with_layout(format!("complex-{}", requested.as_str()))
+            }
+            Self::InvalidTuning { kind, field, .. } => {
+                let blocker_kind = match kind {
+                    FftTuningErrorKind::DeviceLimit => FftBlockerKind::DeviceLimit,
+                    FftTuningErrorKind::RouteInfeasible => FftBlockerKind::Route,
+                    FftTuningErrorKind::AxisAlgorithmIncompatible
+                    | FftTuningErrorKind::UnsupportedForTransform => FftBlockerKind::Unsupported,
+                    FftTuningErrorKind::InvalidValue
+                    | FftTuningErrorKind::ConflictingValues
+                    | FftTuningErrorKind::DuplicateAxis
+                    | FftTuningErrorKind::ConflictingAxes
+                    | FftTuningErrorKind::AxisOutOfRange
+                    | FftTuningErrorKind::AxisNotSelected => FftBlockerKind::Validation,
+                };
+                FftBlocker::new(blocker_kind, self.to_string())
+                    .with_route("plan-tuning")
+                    .with_stage("tuning-validation")
+                    .with_layout(*field)
             }
         };
         let route = route_summary_for_blocker(&blocker);
@@ -2165,6 +2210,45 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tuning_maps_to_structured_diagnostics() {
+        let validation = FftError::InvalidTuning {
+            kind: FftTuningErrorKind::InvalidValue,
+            field: "workgroup_size",
+            value: String::from("0"),
+            reason: "must be a non-zero power of two",
+        };
+        let diagnostics = validation.diagnostics();
+        let blocker = &diagnostics.blockers()[0];
+        assert_eq!(blocker.kind, FftBlockerKind::Validation);
+        assert_eq!(blocker.route.as_deref(), Some("plan-tuning"));
+        assert_eq!(blocker.stage.as_deref(), Some("tuning-validation"));
+        assert_eq!(blocker.layout.as_deref(), Some("workgroup_size"));
+        assert!(blocker.reason.contains("workgroup_size"));
+
+        let device = FftError::InvalidTuning {
+            kind: FftTuningErrorKind::DeviceLimit,
+            field: "fused_workgroup_size",
+            value: String::from("256"),
+            reason: "exceeds the active device limit",
+        };
+        assert_eq!(
+            device.diagnostics().blockers()[0].kind,
+            FftBlockerKind::DeviceLimit
+        );
+
+        let route = FftError::InvalidTuning {
+            kind: FftTuningErrorKind::RouteInfeasible,
+            field: "large_route",
+            value: String::from("force-four-step"),
+            reason: "the complete dataset exceeds max_buffer_size",
+        };
+        assert_eq!(
+            route.diagnostics().blockers()[0].kind,
+            FftBlockerKind::Route
+        );
+    }
+
+    #[test]
     fn plan_creation_error_preserves_error_and_transform_diagnostics() {
         let error = FftError::LargeRouteUnsupported {
             route_mode: "large-out-of-core",
@@ -2187,5 +2271,20 @@ mod tests {
         let (actual_error, actual_diagnostics) = creation_error.into_parts();
         assert_eq!(actual_error, error);
         assert_eq!(actual_diagnostics.route().transform, "c2c");
+
+        let tuning = FftTuning::default().with_workgroup_size(128);
+        let tuned_error = FftPlanCreationError::from_error_with_tuning(
+            FftError::ZeroLength,
+            "c2c",
+            tuning.clone(),
+        );
+        assert_eq!(
+            tuned_error.diagnostics().active_tuning().requested(),
+            &tuning
+        );
+        assert_eq!(
+            tuned_error.diagnostics().active_tuning().effective(),
+            &tuning
+        );
     }
 }

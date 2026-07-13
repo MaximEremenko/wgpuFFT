@@ -1413,7 +1413,15 @@ fn run_r2c_large_chunk_case(
     ));
     let input = real_input_for_config(&config);
     let expected = reference_r2c_packed_interleaved(&input, &config).unwrap();
-    let limits = real_large_chunk_test_limits(&config, 2);
+    // Public max-buffer caps also apply to the child FFT's route-owned
+    // helpers. Leave four batches of capacity for Bluestein so its one-line
+    // convolution helper fits while the five-batch endpoint still chunks.
+    let chunk_batches = if expected_route == C2cRoute::Bluestein {
+        4
+    } else {
+        2
+    };
+    let limits = real_large_chunk_test_limits(&config, chunk_batches);
     let plan = FftPlan::r2c_with_large_policy_limits_for_testing(
         &context.device,
         &context.queue,
@@ -1563,7 +1571,12 @@ fn run_c2r_large_chunk_case(
     let packed = reference_r2c_packed_interleaved(&real, &forward).unwrap();
     let expected = reference_c2r_from_packed_interleaved(&packed, &config).unwrap();
 
-    let limits = real_large_chunk_test_limits(&config, 2);
+    let chunk_batches = if expected_route == C2cRoute::Bluestein {
+        4
+    } else {
+        2
+    };
+    let limits = real_large_chunk_test_limits(&config, chunk_batches);
     let plan = FftPlan::c2r_with_large_policy_limits_for_testing(
         &context.device,
         &context.queue,

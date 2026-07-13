@@ -2,6 +2,7 @@ use crate::runtime::large_graph::{
     ElementFormat, LargeExecutionGraph, LargeStage, LargeStageKind, LogicalBufferId,
 };
 use crate::runtime::large_policy::{LargeExecutionKind, LargeRouteMode, LargeRoutingPolicy};
+use crate::tuning::FftTuningSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FftDiagnostics {
@@ -10,6 +11,7 @@ pub struct FftDiagnostics {
     blockers: Vec<FftBlocker>,
     device_limits: Option<FftDeviceLimits>,
     buffer_requirements: Vec<FftBufferRequirement>,
+    active_tuning: FftTuningSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,7 @@ impl FftDiagnostics {
             blockers: Vec::new(),
             device_limits: None,
             buffer_requirements: Vec::new(),
+            active_tuning: FftTuningSummary::default(),
         }
     }
 
@@ -101,6 +104,10 @@ impl FftDiagnostics {
         &self.buffer_requirements
     }
 
+    pub fn active_tuning(&self) -> &FftTuningSummary {
+        &self.active_tuning
+    }
+
     pub(crate) fn with_stage(mut self, stage: FftStageSummary) -> Self {
         self.stages.push(stage);
         self
@@ -118,6 +125,12 @@ impl FftDiagnostics {
 
     pub(crate) fn with_buffer_requirement(mut self, requirement: FftBufferRequirement) -> Self {
         self.buffer_requirements.push(requirement);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_active_tuning(mut self, summary: FftTuningSummary) -> Self {
+        self.active_tuning = summary;
         self
     }
 
@@ -622,6 +635,25 @@ mod tests {
 
     fn req() -> StageRequirements {
         StageRequirements::new(64, 128, 1, 4, 128).unwrap()
+    }
+
+    #[test]
+    fn diagnostics_always_include_a_full_default_tuning_summary() {
+        let implicit = FftDiagnostics::new(FftRouteSummary::new("c2c", "mixed-radix"));
+        let explicit = FftDiagnostics::new(FftRouteSummary::new("c2c", "mixed-radix"))
+            .with_active_tuning(FftTuningSummary::new(
+                crate::tuning::FftTuning::default(),
+                crate::tuning::FftTuning::default(),
+            ));
+        assert_eq!(implicit, explicit);
+        assert_eq!(
+            implicit.active_tuning().requested(),
+            &crate::tuning::FftTuning::default()
+        );
+        assert_eq!(
+            implicit.active_tuning().effective(),
+            &crate::tuning::FftTuning::default()
+        );
     }
 
     #[test]

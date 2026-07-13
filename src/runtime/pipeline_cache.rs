@@ -470,33 +470,74 @@ impl ShaderCacheKey {
         {
             return false;
         }
+        let limits = device.limits();
+        if !self.is_supported_by_1d_workgroup_limits(&limits) {
+            return false;
+        }
         match self {
-            Self::FusedPow2Stage(key) => {
-                let limits = device.limits();
-                key.is_supported_by_limits(
-                    u64::from(limits.max_compute_workgroup_storage_size),
-                    limits.max_compute_invocations_per_workgroup,
-                    limits.max_compute_workgroup_size_x,
-                )
-            }
-            Self::FusedSmoothStage(key) => {
-                let limits = device.limits();
-                key.is_supported_by_limits(
-                    u64::from(limits.max_compute_workgroup_storage_size),
-                    limits.max_compute_invocations_per_workgroup,
-                    limits.max_compute_workgroup_size_x,
-                )
-            }
-            Self::FusedPrimeStage(key) => {
-                let limits = device.limits();
-                key.is_supported_by_limits(
-                    u64::from(limits.max_compute_workgroup_storage_size),
-                    limits.max_compute_invocations_per_workgroup,
-                    limits.max_compute_workgroup_size_x,
-                )
-            }
+            Self::FusedPow2Stage(key) => key.is_supported_by_limits(
+                u64::from(limits.max_compute_workgroup_storage_size),
+                limits.max_compute_invocations_per_workgroup,
+                limits.max_compute_workgroup_size_x,
+            ),
+            Self::FusedSmoothStage(key) => key.is_supported_by_limits(
+                u64::from(limits.max_compute_workgroup_storage_size),
+                limits.max_compute_invocations_per_workgroup,
+                limits.max_compute_workgroup_size_x,
+            ),
+            Self::FusedPrimeStage(key) => key.is_supported_by_limits(
+                u64::from(limits.max_compute_workgroup_storage_size),
+                limits.max_compute_invocations_per_workgroup,
+                limits.max_compute_workgroup_size_x,
+            ),
             _ => true,
         }
+    }
+
+    fn is_supported_by_1d_workgroup_limits(&self, limits: &wgpu::Limits) -> bool {
+        if let Self::FourStepStage(key) = self {
+            if key.kind == FourStepKernelKind::StripeTranspose {
+                const TILE: u32 = 16;
+                return key.workgroup_size <= limits.max_compute_invocations_per_workgroup
+                    && TILE <= limits.max_compute_workgroup_size_x
+                    && TILE <= limits.max_compute_workgroup_size_y;
+            }
+        }
+        let workgroup_size = match self {
+            Self::StockhamStage(key) => key.workgroup_size,
+            Self::FusedPow2Stage(key) => key.workgroup_size,
+            Self::FusedSmoothStage(key) => key.workgroup_size,
+            Self::FusedPrimeStage(key) => key.workgroup_size,
+            Self::BridgeStage(key) => key.workgroup_size,
+            Self::RaderStage(key) => key.workgroup_size,
+            Self::BluesteinStage(key) => key.workgroup_size,
+            Self::RealStage(key) => key.workgroup_size,
+            Self::C2cSmoothStage(key) => key.workgroup_size,
+            Self::C2cStridedStage(key) => key.workgroup_size,
+            Self::FourStepStage(key) if key.kind == FourStepKernelKind::Scale => key.workgroup_size,
+            // Direct DFT has a fixed 64-lane shader. Four-step transpose is
+            // 16x16 even though its key records 256 total invocations, so it
+            // must not be validated as a 256x1 kernel here.
+            Self::DirectDftC2cLut(_) | Self::FourStepStage(_) => return true,
+        };
+        if workgroup_size == 0
+            || workgroup_size > limits.max_compute_invocations_per_workgroup
+            || workgroup_size > limits.max_compute_workgroup_size_x
+        {
+            return false;
+        }
+
+        let scratch_bytes = match self {
+            Self::RaderStage(key) if key.kind == RaderKernelKind::Sum => {
+                u64::from(workgroup_size).checked_mul(key.precision.complex_size_bytes())
+            }
+            Self::BridgeStage(key) if key.kind == BridgeKernelKind::RaderSumAccumulate => {
+                u64::from(workgroup_size).checked_mul(8)
+            }
+            _ => Some(0),
+        };
+        scratch_bytes
+            .is_some_and(|bytes| bytes <= u64::from(limits.max_compute_workgroup_storage_size))
     }
 
     fn precision(&self) -> Option<AxisPrecision> {
@@ -1872,6 +1913,69 @@ mod tests {
             key.stable_key(),
             "shader:v3:stockham:precision=f32:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=host-f64-f32-v1"
         );
+    }
+
+    #[test]
+    fn dynamic_1d_keys_check_lane_and_reduction_storage_limits_without_flattening_tiles() {
+        let mut limits = wgpu::Limits::default();
+        limits.max_compute_invocations_per_workgroup = 64;
+        limits.max_compute_workgroup_size_x = 64;
+        limits.max_compute_workgroup_storage_size = 1024;
+
+        let stockham = ShaderCacheKey::StockhamStage(StockhamStageKey::new(
+            1,
+            0,
+            &[8],
+            8,
+            1,
+            8,
+            8,
+            FftDirection::Forward,
+            64,
+            false,
+            1.0,
+            AxisPrecision::F32,
+        ));
+        assert!(stockham.is_supported_by_1d_workgroup_limits(&limits));
+        let mut oversized = stockham.clone();
+        if let ShaderCacheKey::StockhamStage(key) = &mut oversized {
+            key.workgroup_size = 128;
+        }
+        assert!(!oversized.is_supported_by_1d_workgroup_limits(&limits));
+
+        let rader_sum = ShaderCacheKey::RaderStage(RaderStageKey::new(
+            RaderKernelKind::Sum,
+            1,
+            0,
+            &[17],
+            17,
+            1,
+            32,
+            64,
+            false,
+            1.0,
+            AxisPrecision::Df64,
+        ));
+        assert!(rader_sum.is_supported_by_1d_workgroup_limits(&limits));
+        limits.max_compute_workgroup_storage_size = 1023;
+        assert!(!rader_sum.is_supported_by_1d_workgroup_limits(&limits));
+
+        let transpose = ShaderCacheKey::FourStepStage(FourStepStageKey::new(
+            FourStepKernelKind::StripeTranspose,
+            256,
+        ));
+        assert!(!transpose.is_supported_by_1d_workgroup_limits(&limits));
+        limits.max_compute_invocations_per_workgroup = 256;
+        limits.max_compute_workgroup_size_x = 16;
+        limits.max_compute_workgroup_size_y = 16;
+        assert!(transpose.is_supported_by_1d_workgroup_limits(&limits));
+        limits.max_compute_workgroup_size_y = 8;
+        assert!(!transpose.is_supported_by_1d_workgroup_limits(&limits));
+        limits.max_compute_workgroup_size_y = 16;
+        limits.max_compute_workgroup_size_x = 64;
+        let scale =
+            ShaderCacheKey::FourStepStage(FourStepStageKey::new(FourStepKernelKind::Scale, 64));
+        assert!(scale.is_supported_by_1d_workgroup_limits(&limits));
     }
 
     #[test]

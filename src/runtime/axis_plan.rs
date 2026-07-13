@@ -18,9 +18,16 @@ use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::twiddle::twiddle_lut_f32;
 use crate::runtime::window_scheduler::WindowScheduler;
 
-const WORKGROUP_SIZE: u32 = 64;
-const FUSED_POW2_WORKGROUP_SIZE: u32 = 256;
-const FUSED_SMOOTH_WORKGROUP_SIZE: u32 = 256;
+#[cfg(test)]
+const DEFAULT_WORKGROUP_SIZE: u32 = 64;
+#[cfg(test)]
+const DEFAULT_FUSED_WORKGROUP_SIZE: u32 = 256;
+#[cfg(test)]
+const WORKGROUP_SIZE: u32 = DEFAULT_WORKGROUP_SIZE;
+#[cfg(test)]
+const FUSED_POW2_WORKGROUP_SIZE: u32 = DEFAULT_FUSED_WORKGROUP_SIZE;
+#[cfg(test)]
+const FUSED_SMOOTH_WORKGROUP_SIZE: u32 = DEFAULT_FUSED_WORKGROUP_SIZE;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -145,6 +152,8 @@ pub(crate) struct AxisPlanConfig {
     pub(crate) scale_override_bits: Option<u32>,
     pub(crate) layout: AxisLayout,
     pub(crate) precision: AxisPrecision,
+    pub(crate) workgroup_size: u32,
+    pub(crate) fused_workgroup_size: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +302,8 @@ impl AxisPlanConfig {
             scale_override_bits: None,
             layout: AxisLayout::Interleaved,
             precision: config.precision().into(),
+            workgroup_size: config.tuning().workgroup_size(),
+            fused_workgroup_size: config.tuning().fused_workgroup_size(),
         }
     }
 
@@ -314,6 +325,19 @@ impl AxisPlanConfig {
                 AxisLayout::Interleaved,
                 AxisPrecision::F32 | AxisPrecision::F64 | AxisPrecision::Df64,
             ) => {}
+        }
+
+        if self.workgroup_size == 0 || !self.workgroup_size.is_power_of_two() {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "axis-plan-tuning",
+                reason: "staged workgroup size must be a nonzero power of two",
+            });
+        }
+        if self.fused_workgroup_size == 0 {
+            return Err(FftError::LargeGraphStageUnsupported {
+                stage: "axis-plan-tuning",
+                reason: "fused workgroup size must be nonzero",
+            });
         }
 
         let rank = self.shape.len();
@@ -428,6 +452,11 @@ impl AxisPlan {
         twiddle_lut_pool: &mut AxisTwiddleLutPool,
     ) -> Result<Self> {
         config.validate()?;
+        validate_1d_workgroup_size(
+            config.workgroup_size,
+            &device.limits(),
+            "axis-plan-staged-workgroup",
+        )?;
         if !device_supports_precision(device, config.precision.as_fft_precision()) {
             return Err(FftError::PrecisionUnsupported {
                 requested: config.precision.as_fft_precision(),
@@ -492,7 +521,12 @@ impl AxisPlan {
                 index
             };
 
-            if fused_pow2_supported(axis_len, config.precision, &device.limits()) {
+            if fused_pow2_supported(
+                axis_len,
+                config.precision,
+                config.fused_workgroup_size,
+                &device.limits(),
+            ) {
                 let apply_scale = apply_any_scale && final_axis;
                 let shader_key = FusedPow2StageKey::new(
                     config.shape.len(),
@@ -501,7 +535,7 @@ impl AxisPlan {
                     axis_len,
                     stride_complex,
                     config.direction,
-                    FUSED_POW2_WORKGROUP_SIZE,
+                    config.fused_workgroup_size,
                     apply_scale,
                     scale,
                     config.precision,
@@ -538,6 +572,7 @@ impl AxisPlan {
                 axis_len,
                 &axis_factors,
                 config.precision,
+                config.fused_workgroup_size,
                 &device.limits(),
             ) {
                 let apply_scale = apply_any_scale && final_axis;
@@ -549,7 +584,7 @@ impl AxisPlan {
                     stride_complex,
                     &axis_factors,
                     config.direction,
-                    FUSED_SMOOTH_WORKGROUP_SIZE,
+                    config.fused_workgroup_size,
                     apply_scale,
                     scale,
                     config.precision,
@@ -597,7 +632,7 @@ impl AxisPlan {
                         radix,
                         ns,
                         config.direction,
-                        WORKGROUP_SIZE,
+                        config.workgroup_size,
                         apply_scale,
                         scale,
                         config.precision,
@@ -627,7 +662,8 @@ impl AxisPlan {
                         apply_scale,
                         pipeline_key,
                         twiddle_lut_index,
-                        workgroups_x: (total_complex_u32 / radix as u32).div_ceil(WORKGROUP_SIZE),
+                        workgroups_x: (total_complex_u32 / radix as u32)
+                            .div_ceil(config.workgroup_size),
                         pipeline,
                     });
                 }
@@ -907,14 +943,32 @@ fn create_axis_temp_buffer(
     }))
 }
 
+fn validate_1d_workgroup_size(
+    workgroup_size: u32,
+    limits: &wgpu::Limits,
+    stage: &'static str,
+) -> Result<()> {
+    if workgroup_size > limits.max_compute_invocations_per_workgroup
+        || workgroup_size > limits.max_compute_workgroup_size_x
+    {
+        return Err(FftError::LargeGraphStageUnsupported {
+            stage,
+            reason: "configured workgroup size exceeds the active device compute limits",
+        });
+    }
+    Ok(())
+}
+
 fn fused_pow2_supported(
     axis_length: usize,
     precision: AxisPrecision,
+    workgroup_size: u32,
     limits: &wgpu::Limits,
 ) -> bool {
     fused_pow2_supported_by_limits(
         axis_length,
         precision,
+        workgroup_size,
         u64::from(limits.max_compute_workgroup_storage_size),
         limits.max_compute_invocations_per_workgroup,
         limits.max_compute_workgroup_size_x,
@@ -924,6 +978,7 @@ fn fused_pow2_supported(
 fn fused_pow2_supported_by_limits(
     axis_length: usize,
     precision: AxisPrecision,
+    workgroup_size: u32,
     max_workgroup_storage_bytes: u64,
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
@@ -936,20 +991,23 @@ fn fused_pow2_supported_by_limits(
         return false;
     };
     scratch_bytes as u64 <= max_workgroup_storage_bytes
-        && FUSED_POW2_WORKGROUP_SIZE <= max_invocations_per_workgroup
-        && FUSED_POW2_WORKGROUP_SIZE <= max_workgroup_size_x
+        && workgroup_size > 0
+        && workgroup_size <= max_invocations_per_workgroup
+        && workgroup_size <= max_workgroup_size_x
 }
 
 fn fused_smooth_supported(
     axis_length: usize,
     factors: &[usize],
     precision: AxisPrecision,
+    workgroup_size: u32,
     limits: &wgpu::Limits,
 ) -> bool {
     fused_smooth_supported_by_limits(
         axis_length,
         factors,
         precision,
+        workgroup_size,
         u64::from(limits.max_compute_workgroup_storage_size),
         limits.max_compute_invocations_per_workgroup,
         limits.max_compute_workgroup_size_x,
@@ -960,6 +1018,7 @@ fn fused_smooth_supported_by_limits(
     axis_length: usize,
     factors: &[usize],
     precision: AxisPrecision,
+    workgroup_size: u32,
     max_workgroup_storage_bytes: u64,
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
@@ -976,15 +1035,16 @@ fn fused_smooth_supported_by_limits(
         return false;
     };
     scratch_bytes as u64 <= max_workgroup_storage_bytes
-        && FUSED_SMOOTH_WORKGROUP_SIZE <= max_invocations_per_workgroup
-        && FUSED_SMOOTH_WORKGROUP_SIZE <= max_workgroup_size_x
+        && workgroup_size > 0
+        && workgroup_size <= max_invocations_per_workgroup
+        && workgroup_size <= max_workgroup_size_x
 }
 
 pub(crate) fn generate_fused_pow2_stage_wgsl(config: &FusedPow2StageWgslConfig<'_>) -> String {
     debug_assert_eq!(config.rank, config.dims.len());
     debug_assert_eq!(config.axis_length, config.dims[config.axis]);
     debug_assert!(config.axis_length.is_power_of_two());
-    debug_assert_eq!(config.workgroup_size, FUSED_POW2_WORKGROUP_SIZE);
+    debug_assert!(config.workgroup_size > 0);
 
     let maybe_scale = if config.apply_scale {
         let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
@@ -1235,7 +1295,7 @@ pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConf
     debug_assert_eq!(config.axis_length, config.dims[config.axis]);
     debug_assert!(!config.axis_length.is_power_of_two());
     debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
-    debug_assert_eq!(config.workgroup_size, FUSED_SMOOTH_WORKGROUP_SIZE);
+    debug_assert!(config.workgroup_size > 0);
 
     let scale_factor = config.apply_scale.then_some(config.scale_factor);
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
@@ -2492,6 +2552,7 @@ mod tests {
             assert!(fused_pow2_supported_by_limits(
                 length,
                 AxisPrecision::F32,
+                DEFAULT_FUSED_WORKGROUP_SIZE,
                 16 * 1024,
                 256,
                 256
@@ -2510,6 +2571,7 @@ mod tests {
                 fused_pow2_supported_by_limits(
                     length,
                     AxisPrecision::F32,
+                    DEFAULT_FUSED_WORKGROUP_SIZE,
                     storage,
                     invocations,
                     size_x,
@@ -2520,6 +2582,7 @@ mod tests {
         assert!(fused_pow2_supported_by_limits(
             2048,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2527,6 +2590,7 @@ mod tests {
         assert!(!fused_pow2_supported_by_limits(
             4096,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2534,6 +2598,7 @@ mod tests {
         assert!(fused_pow2_supported_by_limits(
             2048,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2541,9 +2606,26 @@ mod tests {
         assert!(!fused_pow2_supported_by_limits(
             4096,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
+        ));
+        assert!(fused_pow2_supported_by_limits(
+            2048,
+            AxisPrecision::F32,
+            128,
+            16 * 1024,
+            128,
+            128
+        ));
+        assert!(!fused_pow2_supported_by_limits(
+            2048,
+            AxisPrecision::F32,
+            128,
+            16 * 1024,
+            127,
+            128
         ));
     }
 
@@ -2558,6 +2640,7 @@ mod tests {
             2048,
             &factors_2048,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2566,6 +2649,7 @@ mod tests {
             13,
             &factors_13,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2574,6 +2658,7 @@ mod tests {
             2187,
             &factors_2187,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             16 * 1024,
             256,
             256
@@ -2582,6 +2667,7 @@ mod tests {
             2187,
             &factors_2187,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2590,6 +2676,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2598,6 +2685,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             255,
             256
@@ -2606,6 +2694,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             255
@@ -2614,6 +2703,7 @@ mod tests {
             3000,
             &[8, 5, 5, 3],
             AxisPrecision::F32,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2622,6 +2712,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2630,6 +2721,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::F64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             47_999,
             256,
             256
@@ -2638,6 +2730,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             48 * 1024,
             256,
             256
@@ -2646,6 +2739,7 @@ mod tests {
             3000,
             &factors_3000,
             AxisPrecision::Df64,
+            DEFAULT_FUSED_WORKGROUP_SIZE,
             47_999,
             256,
             256

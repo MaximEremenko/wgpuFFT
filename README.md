@@ -2,10 +2,8 @@
 
 Rust `wgpu` FFT library. The package name is `wgpu-fft`; the library target is
 imported as `wgpu_fft`. This is the Rust counterpart of the JavaScript
-[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) and
-[WebGPU-NUFFT](https://github.com/MaximEremenko/WebGPU-NUFFT) projects. The
-workspace also contains the [`wgpu-nufft`](wgpu-nufft/README.md) NUFFT crate
-and the [`wgpu-web`](wgpu-web/README.md) browser surface.
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The downstream
+`wgpuNUFFT` library builds nonuniform transforms on this FFT crate.
 
 ## Installation
 
@@ -232,13 +230,9 @@ pass.
 - R2C requires forward direction; C2R requires inverse direction. Real
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
-- In-place execution, `f16`, DCT/DST, and public convolution remain out of
-  scope. NUFFT types 1/2/3 live in the `wgpu-nufft` workspace member.
-- The `wgpu-web` workspace member provides `wasm-bindgen` C2C and NUFFT type
-  1/2/3 surfaces with GPU-resident plan/buffer handles, df64 compiler-canary
-  gating, and a `localStorage` cache demo. Browser tests cover FFT real/large
-  routes and the full 1D-3D F32/Df64 NUFFT matrix at WebGPU default limits. Use
-  `WGPU_BACKEND=vulkan` for Vulkan/native validation where available.
+- In-place execution, `f16`, DCT/DST, public convolution, and nonuniform
+  transforms remain out of scope. NUFFT functionality lives in the downstream
+  `wgpuNUFFT` library.
 - The native test/example device helper requests the selected adapter's active
   limits so planner diagnostics and huge-route scheduling see the real storage
   binding and buffer-size limits exposed by that adapter.
@@ -262,7 +256,7 @@ $env:WGPU_BACKEND = 'dx12'; $env:WGPU_FFT_RUN_GPU_TESTS = '1'
 cargo test --test gpu_df64_canary --release -- --nocapture
 ```
 
-Browser (wasm) tests run through the tracked runner, which needs a
+Standalone FFT browser (Wasm) tests run through the tracked runner, which needs a
 ChromeDriver matching the installed Chrome build (set `CHROMEDRIVER` or put
 `chromedriver.exe` on `PATH`):
 
@@ -270,8 +264,8 @@ ChromeDriver matching the installed Chrome build (set `CHROMEDRIVER` or put
 web\run_browser_tests.cmd
 ```
 
-See [wgpu-nufft/README.md](wgpu-nufft/README.md) and
-[wgpu-web/README.md](wgpu-web/README.md) for the sub-crate build commands.
+The runner covers only this crate's FFT smoke, correctness-matrix, and large-route
+tests. See [web/README.md](web/README.md) for browser prerequisites and details.
 
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
 is set. The native test helper excludes the GL backend by default because EGL

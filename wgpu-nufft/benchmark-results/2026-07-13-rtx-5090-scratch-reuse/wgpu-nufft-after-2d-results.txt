@@ -1,0 +1,299 @@
+cargo.exe :    Compiling wgpu-nufft v0.1.0 (<repo>\wgpu-nufft)
+At line:2 char:507
++ ... .Restart(); & cargo bench --locked -p wgpu-nufft --bench nufft_2d_ben ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling wg...FFT\wgpu-nufft):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+    Finished `bench` profile [optimized] target(s) in 1.71s
+     Running benches\nufft_2d_bench.rs (target\release\deps\nufft_2d_bench-6c05c61f9a3e88d9.exe)
+wgpu-nufft 2D GPU benchmark
+configuration: shapes=[[512, 512], [1024, 1024]] point_count_equals_total_mode_count=true axis_zero_fastest=true point_layout=point-major-[x,y] runs=3 samples_per_run=10 seed=0x4e554646 point_y_seed_mask=0xb7e15162 eps=0.000001 sigma=2 sign=positive mode_order=centered adapter_selector=RTX 5090 wait_timeout_secs=120
+method: reusable plan recreated for every run; caller buffers initialized once; one untimed warmup; type-1 uses one transform per timed submit, while type-2 batches 32 transforms per timed submit; wall clock starts immediately before queue.submit and ends after device.poll(Wait), then is divided per transform
+scope: plan creation, command encoding, upload, and readback excluded from headline; host command-encoding time and plan creation are reported separately; all transform inputs and outputs remain GPU-resident
+cuFINUFFT pairing: wgpu type-1 submit-wait includes per-execution binning and pairs with cuFINUFFT setpts+execute; wgpu type-2 submit-wait pairs with cuFINUFFT execute after setpts; the CUDA harness reports all spans
+enumerated Vulkan adapters:
+  index=0 name="NVIDIA GeForce RTX 5090" vendor=0x10de device=0x2b85 type=DiscreteGpu driver="NVIDIA"
+selected Vulkan adapter index=0 name="NVIDIA GeForce RTX 5090" vendor=0x10de device=0x2b85 type=DiscreteGpu
+adapter info:
+AdapterInfo {
+    name: "NVIDIA GeForce RTX 5090",
+    vendor: 4318,
+    device: 11141,
+    device_type: DiscreteGpu,
+    device_pci_bus_id: "0000:01:00.0",
+    driver: "NVIDIA",
+    driver_info: "610.47",
+    backend: Vulkan,
+    subgroup_min_size: 32,
+    subgroup_max_size: 32,
+    transient_saves_memory: false,
+}
+adapter limits:
+Limits {
+    max_texture_dimension_1d: 32768,
+    max_texture_dimension_2d: 32768,
+    max_texture_dimension_3d: 16384,
+    max_texture_array_layers: 2048,
+    max_bind_groups: 8,
+    max_bindings_per_bind_group: 4294967295,
+    max_dynamic_uniform_buffers_per_pipeline_layout: 15,
+    max_dynamic_storage_buffers_per_pipeline_layout: 16,
+    max_sampled_textures_per_shader_stage: 524288,
+    max_samplers_per_shader_stage: 524288,
+    max_storage_buffers_per_shader_stage: 524288,
+    max_storage_textures_per_shader_stage: 524288,
+    max_uniform_buffers_per_shader_stage: 524288,
+    max_binding_array_elements_per_shader_stage: 1048576,
+    max_binding_array_acceleration_structure_elements_per_shader_stage: 524288,
+    max_binding_array_sampler_elements_per_shader_stage: 1048576,
+    max_uniform_buffer_binding_size: 65536,
+    max_storage_buffer_binding_size: 2147483644,
+    max_vertex_buffers: 16,
+    max_buffer_size: 1099511627776,
+    max_vertex_attributes: 32,
+    max_vertex_buffer_array_stride: 2048,
+    max_inter_stage_shader_variables: 31,
+    min_uniform_buffer_offset_alignment: 64,
+    min_storage_buffer_offset_alignment: 32,
+    max_color_attachments: 8,
+    max_color_attachment_bytes_per_sample: 128,
+    max_compute_workgroup_storage_size: 49152,
+    max_compute_invocations_per_workgroup: 1024,
+    max_compute_workgroup_size_x: 1024,
+    max_compute_workgroup_size_y: 1024,
+    max_compute_workgroup_size_z: 64,
+    max_compute_workgroups_per_dimension: 65535,
+    max_immediate_size: 256,
+    max_non_sampler_bindings: 4294967295,
+    max_task_mesh_workgroup_total_count: 4194304,
+    max_task_mesh_workgroups_per_dimension: 65535,
+    max_task_invocations_per_workgroup: 128,
+    max_task_invocations_per_dimension: 128,
+    max_mesh_invocations_per_workgroup: 128,
+    max_mesh_invocations_per_dimension: 128,
+    max_task_payload_size: 16384,
+    max_mesh_output_vertices: 256,
+    max_mesh_output_primitives: 256,
+    max_mesh_output_layers: 2048,
+    max_mesh_multiview_view_count: 4,
+    max_blas_primitive_count: 536870911,
+    max_blas_geometry_count: 16777215,
+    max_tlas_instance_count: 16777215,
+    max_acceleration_structures_per_shader_stage: 524288,
+    max_multiview_view_count: 32,
+}
+device limits:
+Limits {
+    max_texture_dimension_1d: 32768,
+    max_texture_dimension_2d: 32768,
+    max_texture_dimension_3d: 16384,
+    max_texture_array_layers: 2048,
+    max_bind_groups: 8,
+    max_bindings_per_bind_group: 4294967295,
+    max_dynamic_uniform_buffers_per_pipeline_layout: 15,
+    max_dynamic_storage_buffers_per_pipeline_layout: 16,
+    max_sampled_textures_per_shader_stage: 524288,
+    max_samplers_per_shader_stage: 524288,
+    max_storage_buffers_per_shader_stage: 524288,
+    max_storage_textures_per_shader_stage: 524288,
+    max_uniform_buffers_per_shader_stage: 524288,
+    max_binding_array_elements_per_shader_stage: 1048576,
+    max_binding_array_acceleration_structure_elements_per_shader_stage: 524288,
+    max_binding_array_sampler_elements_per_shader_stage: 1048576,
+    max_uniform_buffer_binding_size: 65536,
+    max_storage_buffer_binding_size: 2147483644,
+    max_vertex_buffers: 16,
+    max_buffer_size: 1099511627776,
+    max_vertex_attributes: 32,
+    max_vertex_buffer_array_stride: 2048,
+    max_inter_stage_shader_variables: 31,
+    min_uniform_buffer_offset_alignment: 64,
+    min_storage_buffer_offset_alignment: 32,
+    max_color_attachments: 8,
+    max_color_attachment_bytes_per_sample: 128,
+    max_compute_workgroup_storage_size: 49152,
+    max_compute_invocations_per_workgroup: 1024,
+    max_compute_workgroup_size_x: 1024,
+    max_compute_workgroup_size_y: 1024,
+    max_compute_workgroup_size_z: 64,
+    max_compute_workgroups_per_dimension: 65535,
+    max_immediate_size: 256,
+    max_non_sampler_bindings: 4294967295,
+    max_task_mesh_workgroup_total_count: 4194304,
+    max_task_mesh_workgroups_per_dimension: 65535,
+    max_task_invocations_per_workgroup: 128,
+    max_task_invocations_per_dimension: 128,
+    max_mesh_invocations_per_workgroup: 128,
+    max_mesh_invocations_per_dimension: 128,
+    max_task_payload_size: 16384,
+    max_mesh_output_vertices: 256,
+    max_mesh_output_primitives: 256,
+    max_mesh_output_layers: 2048,
+    max_mesh_multiview_view_count: 4,
+    max_blas_primitive_count: 536870911,
+    max_blas_geometry_count: 16777215,
+    max_tlas_instance_count: 16777215,
+    max_acceleration_structures_per_shader_stage: 524288,
+    max_multiview_view_count: 32,
+}
+
+=== case dimensions=2 N0=512 N1=512 N_total=262144 M=262144 input_points_bytes=2097152 input_complex_bytes=2097152 ===
+
+type-1: starting transforms_per_sample=1
+run 1/3 plan_create_ms=16.695400 warmup: encode_ms=0.573900 submit_wait_ms=2.567600
+run 1/3 sample 1/10: encode_ms=0.157600 submit_wait_ms=2.841300
+run 1/3 sample 2/10: encode_ms=0.145100 submit_wait_ms=2.239200
+run 1/3 sample 3/10: encode_ms=0.125800 submit_wait_ms=2.206000
+run 1/3 sample 4/10: encode_ms=0.109800 submit_wait_ms=2.260400
+run 1/3 sample 5/10: encode_ms=0.260800 submit_wait_ms=2.249400
+run 1/3 sample 6/10: encode_ms=0.133500 submit_wait_ms=2.191400
+run 1/3 sample 7/10: encode_ms=0.119500 submit_wait_ms=2.243300
+run 1/3 sample 8/10: encode_ms=0.170600 submit_wait_ms=2.626900
+run 1/3 sample 9/10: encode_ms=0.330000 submit_wait_ms=2.314900
+run 1/3 sample 10/10: encode_ms=0.139900 submit_wait_ms=2.225700
+run 1/3 summary: avg_submit_wait_ms=2.339850 min_submit_wait_ms=2.191400 avg_encode_ms=0.169260 min_encode_ms=0.109800
+run 2/3 plan_create_ms=5.976500 warmup: encode_ms=0.204600 submit_wait_ms=2.422000
+run 2/3 sample 1/10: encode_ms=0.150700 submit_wait_ms=2.712500
+run 2/3 sample 2/10: encode_ms=0.128400 submit_wait_ms=2.213400
+run 2/3 sample 3/10: encode_ms=0.128400 submit_wait_ms=2.241100
+run 2/3 sample 4/10: encode_ms=0.142400 submit_wait_ms=2.252000
+run 2/3 sample 5/10: encode_ms=0.136000 submit_wait_ms=2.223100
+run 2/3 sample 6/10: encode_ms=0.122700 submit_wait_ms=2.218300
+run 2/3 sample 7/10: encode_ms=0.121800 submit_wait_ms=2.522900
+run 2/3 sample 8/10: encode_ms=0.138800 submit_wait_ms=2.219800
+run 2/3 sample 9/10: encode_ms=0.130800 submit_wait_ms=2.408000
+run 2/3 sample 10/10: encode_ms=0.130100 submit_wait_ms=2.316500
+run 2/3 summary: avg_submit_wait_ms=2.332760 min_submit_wait_ms=2.213400 avg_encode_ms=0.133010 min_encode_ms=0.121800
+run 3/3 plan_create_ms=5.059800 warmup: encode_ms=0.156700 submit_wait_ms=2.404400
+run 3/3 sample 1/10: encode_ms=0.215700 submit_wait_ms=2.552600
+run 3/3 sample 2/10: encode_ms=0.205300 submit_wait_ms=2.257700
+run 3/3 sample 3/10: encode_ms=0.138700 submit_wait_ms=2.255300
+run 3/3 sample 4/10: encode_ms=0.146800 submit_wait_ms=2.236300
+run 3/3 sample 5/10: encode_ms=0.147100 submit_wait_ms=2.238700
+run 3/3 sample 6/10: encode_ms=0.128500 submit_wait_ms=2.263600
+run 3/3 sample 7/10: encode_ms=0.152800 submit_wait_ms=2.426700
+run 3/3 sample 8/10: encode_ms=0.154300 submit_wait_ms=2.320800
+run 3/3 sample 9/10: encode_ms=0.123100 submit_wait_ms=2.232900
+run 3/3 sample 10/10: encode_ms=0.127700 submit_wait_ms=2.271800
+run 3/3 summary: avg_submit_wait_ms=2.305640 min_submit_wait_ms=2.232900 avg_encode_ms=0.154000 min_encode_ms=0.123100
+RESULT kind=type-1 dimensions=2 N0=512 N1=512 N_total=262144 M=262144 fine_grid_shape=1024x1024 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=1 total_samples=30 raw_submit_wait_ms_per_transform=[2.8413000000000004, 2.2392, 2.206, 2.2604, 2.2494, 2.1914000000000002, 2.2433, 2.6269, 2.3148999999999997, 2.2257000000000002, 2.7125, 2.2134, 2.2411000000000003, 2.2520000000000002, 2.2231, 2.2182999999999997, 2.5229, 2.2198, 2.408, 2.3165, 2.5526, 2.2577000000000003, 2.2553, 2.2363, 2.2387, 2.2636000000000003, 2.4267, 2.3208, 2.2329, 2.2718] run_avg_submit_wait_ms_per_transform=[2.33985, 2.33276, 2.3056399999999995] avg_submit_wait_ms_per_transform=2.326083 stderr_submit_wait_ms_per_transform=0.010425 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=2.191400 million_points_per_second=112.697596 raw_encode_ms_per_transform=[0.15760000000000002, 0.1451, 0.1258, 0.1098, 0.2608, 0.13349999999999998, 0.11950000000000001, 0.1706, 0.33, 0.13990000000000002, 0.1507, 0.12840000000000001, 0.12840000000000001, 0.1424, 0.136, 0.1227, 0.1218, 0.1388, 0.1308, 0.1301, 0.2157, 0.2053, 0.13870000000000002, 0.14679999999999999, 0.1471, 0.1285, 0.1528, 0.15430000000000002, 0.12310000000000001, 0.12769999999999998] run_avg_encode_ms_per_transform=[0.16926000000000002, 0.13301000000000002, 0.15400000000000003] avg_encode_ms_per_transform=0.152090 stderr_encode_ms_per_transform=0.010508 min_encode_ms_per_transform=0.109800 raw_plan_create_ms=[16.6954, 5.9765, 5.0598] avg_plan_create_ms=9.243900 stderr_plan_create_ms=3.735136 min_plan_create_ms=5.059800 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+type-2: starting transforms_per_sample=32
+run 1/3 plan_create_ms=2.580000 warmup: encode_ms=0.085000 submit_wait_ms=0.425700
+run 1/3 sample 1/10: encode_ms=0.081975 submit_wait_ms=0.195100
+run 1/3 sample 2/10: encode_ms=0.029256 submit_wait_ms=0.178519
+run 1/3 sample 3/10: encode_ms=0.027388 submit_wait_ms=0.176919
+run 1/3 sample 4/10: encode_ms=0.027191 submit_wait_ms=0.179253
+run 1/3 sample 5/10: encode_ms=0.028809 submit_wait_ms=0.175769
+run 1/3 sample 6/10: encode_ms=0.027631 submit_wait_ms=0.190394
+run 1/3 sample 7/10: encode_ms=0.031591 submit_wait_ms=0.181234
+run 1/3 sample 8/10: encode_ms=0.033794 submit_wait_ms=0.185084
+run 1/3 sample 9/10: encode_ms=0.030097 submit_wait_ms=0.182125
+run 1/3 sample 10/10: encode_ms=0.030800 submit_wait_ms=0.177928
+run 1/3 summary: avg_submit_wait_ms=0.182232 min_submit_wait_ms=0.175769 avg_encode_ms=0.034853 min_encode_ms=0.027191
+run 2/3 plan_create_ms=2.584500 warmup: encode_ms=0.092500 submit_wait_ms=0.717000
+run 2/3 sample 1/10: encode_ms=0.029028 submit_wait_ms=0.178391
+run 2/3 sample 2/10: encode_ms=0.030681 submit_wait_ms=0.200147
+run 2/3 sample 3/10: encode_ms=0.028356 submit_wait_ms=0.186231
+run 2/3 sample 4/10: encode_ms=0.028316 submit_wait_ms=0.179269
+run 2/3 sample 5/10: encode_ms=0.029225 submit_wait_ms=0.185181
+run 2/3 sample 6/10: encode_ms=0.036334 submit_wait_ms=0.182056
+run 2/3 sample 7/10: encode_ms=0.028737 submit_wait_ms=0.179397
+run 2/3 sample 8/10: encode_ms=0.059300 submit_wait_ms=0.181384
+run 2/3 sample 9/10: encode_ms=0.028894 submit_wait_ms=0.177947
+run 2/3 sample 10/10: encode_ms=0.028756 submit_wait_ms=0.189906
+run 2/3 summary: avg_submit_wait_ms=0.183991 min_submit_wait_ms=0.177947 avg_encode_ms=0.032763 min_encode_ms=0.028316
+run 3/3 plan_create_ms=2.452000 warmup: encode_ms=0.084000 submit_wait_ms=0.396500
+run 3/3 sample 1/10: encode_ms=0.031803 submit_wait_ms=0.179522
+run 3/3 sample 2/10: encode_ms=0.028766 submit_wait_ms=0.191784
+run 3/3 sample 3/10: encode_ms=0.028772 submit_wait_ms=0.179975
+run 3/3 sample 4/10: encode_ms=0.028538 submit_wait_ms=0.184934
+run 3/3 sample 5/10: encode_ms=0.028344 submit_wait_ms=0.181816
+run 3/3 sample 6/10: encode_ms=0.028931 submit_wait_ms=0.178419
+run 3/3 sample 7/10: encode_ms=0.028044 submit_wait_ms=0.191347
+run 3/3 sample 8/10: encode_ms=0.030822 submit_wait_ms=0.178828
+run 3/3 sample 9/10: encode_ms=0.029441 submit_wait_ms=0.185294
+run 3/3 sample 10/10: encode_ms=0.028894 submit_wait_ms=0.179978
+run 3/3 summary: avg_submit_wait_ms=0.183190 min_submit_wait_ms=0.178419 avg_encode_ms=0.029235 min_encode_ms=0.028044
+RESULT kind=type-2 dimensions=2 N0=512 N1=512 N_total=262144 M=262144 fine_grid_shape=1024x1024 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=32 total_samples=30 raw_submit_wait_ms_per_transform=[0.1951, 0.17851875, 0.17691874999999999, 0.179253125, 0.17576875, 0.19039375, 0.181234375, 0.18508437500000002, 0.18212499999999998, 0.17792812500000002, 0.178390625, 0.200146875, 0.18623125000000001, 0.17926874999999998, 0.18518125, 0.18205625, 0.17939687499999998, 0.18138437500000001, 0.177946875, 0.18990625, 0.179521875, 0.191784375, 0.179975, 0.184934375, 0.18181562499999998, 0.17841875, 0.191346875, 0.178828125, 0.18529374999999998, 0.17997812500000002] run_avg_submit_wait_ms_per_transform=[0.1822325, 0.18399093749999998, 0.18318968750000003] avg_submit_wait_ms_per_transform=0.183138 stderr_submit_wait_ms_per_transform=0.000508 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=0.175769 million_points_per_second=1431.403736 raw_encode_ms_per_transform=[0.081975, 0.02925625, 0.027387500000000002, 0.027190625, 0.028809375, 0.02763125, 0.031590625, 0.03379375, 0.030096875000000002, 0.030800000000000004, 0.029028125, 0.030681249999999997, 0.028356250000000003, 0.028315624999999997, 0.029224999999999998, 0.036334375, 0.0287375, 0.0593, 0.02889375, 0.02875625, 0.031803125, 0.028765625, 0.028771875, 0.0285375, 0.02834375, 0.02893125, 0.02804375, 0.030821875000000002, 0.029440624999999998, 0.02889375] run_avg_encode_ms_per_transform=[0.034853125, 0.0327628125, 0.0292353125] avg_encode_ms_per_transform=0.032284 stderr_encode_ms_per_transform=0.001639 min_encode_ms_per_transform=0.027191 raw_plan_create_ms=[2.5799999999999996, 2.5845, 2.4520000000000004] avg_plan_create_ms=2.538833 stderr_plan_create_ms=0.043436 min_plan_create_ms=2.452000 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+=== case dimensions=2 N0=1024 N1=1024 N_total=1048576 M=1048576 input_points_bytes=8388608 input_complex_bytes=8388608 ===
+
+type-1: starting transforms_per_sample=1
+run 1/3 plan_create_ms=11.620700 warmup: encode_ms=0.140600 submit_wait_ms=8.145100
+run 1/3 sample 1/10: encode_ms=0.119300 submit_wait_ms=7.418600
+run 1/3 sample 2/10: encode_ms=0.089900 submit_wait_ms=7.733700
+run 1/3 sample 3/10: encode_ms=0.133600 submit_wait_ms=7.446600
+run 1/3 sample 4/10: encode_ms=0.158100 submit_wait_ms=7.846000
+run 1/3 sample 5/10: encode_ms=0.171900 submit_wait_ms=7.446500
+run 1/3 sample 6/10: encode_ms=0.141300 submit_wait_ms=7.806800
+run 1/3 sample 7/10: encode_ms=0.176100 submit_wait_ms=7.496400
+run 1/3 sample 8/10: encode_ms=0.147400 submit_wait_ms=7.777100
+run 1/3 sample 9/10: encode_ms=0.151900 submit_wait_ms=7.462900
+run 1/3 sample 10/10: encode_ms=0.144000 submit_wait_ms=8.150100
+run 1/3 summary: avg_submit_wait_ms=7.658470 min_submit_wait_ms=7.418600 avg_encode_ms=0.143350 min_encode_ms=0.089900
+run 2/3 plan_create_ms=9.447900 warmup: encode_ms=0.162800 submit_wait_ms=8.058500
+run 2/3 sample 1/10: encode_ms=0.161100 submit_wait_ms=7.439700
+run 2/3 sample 2/10: encode_ms=0.160300 submit_wait_ms=7.825500
+run 2/3 sample 3/10: encode_ms=0.152400 submit_wait_ms=7.523200
+run 2/3 sample 4/10: encode_ms=0.155800 submit_wait_ms=7.809700
+run 2/3 sample 5/10: encode_ms=0.155800 submit_wait_ms=7.486900
+run 2/3 sample 6/10: encode_ms=0.150800 submit_wait_ms=7.664800
+run 2/3 sample 7/10: encode_ms=0.157500 submit_wait_ms=7.618900
+run 2/3 sample 8/10: encode_ms=0.218600 submit_wait_ms=7.518700
+run 2/3 sample 9/10: encode_ms=0.270800 submit_wait_ms=7.843800
+run 2/3 sample 10/10: encode_ms=0.164900 submit_wait_ms=7.495000
+run 2/3 summary: avg_submit_wait_ms=7.622620 min_submit_wait_ms=7.439700 avg_encode_ms=0.174800 min_encode_ms=0.150800
+run 3/3 plan_create_ms=9.152500 warmup: encode_ms=0.156400 submit_wait_ms=8.016700
+run 3/3 sample 1/10: encode_ms=0.146200 submit_wait_ms=7.490500
+run 3/3 sample 2/10: encode_ms=0.158100 submit_wait_ms=7.492700
+run 3/3 sample 3/10: encode_ms=0.168500 submit_wait_ms=8.005800
+run 3/3 sample 4/10: encode_ms=0.155900 submit_wait_ms=7.477000
+run 3/3 sample 5/10: encode_ms=0.154900 submit_wait_ms=7.840000
+run 3/3 sample 6/10: encode_ms=0.154300 submit_wait_ms=7.500500
+run 3/3 sample 7/10: encode_ms=0.151300 submit_wait_ms=7.886600
+run 3/3 sample 8/10: encode_ms=0.147700 submit_wait_ms=7.465700
+run 3/3 sample 9/10: encode_ms=0.146300 submit_wait_ms=7.790100
+run 3/3 sample 10/10: encode_ms=0.142900 submit_wait_ms=7.533500
+run 3/3 summary: avg_submit_wait_ms=7.648240 min_submit_wait_ms=7.465700 avg_encode_ms=0.152610 min_encode_ms=0.142900
+RESULT kind=type-1 dimensions=2 N0=1024 N1=1024 N_total=1048576 M=1048576 fine_grid_shape=2048x2048 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=1 total_samples=30 raw_submit_wait_ms_per_transform=[7.4186, 7.7337, 7.4466, 7.846000000000001, 7.4465, 7.8068, 7.4964, 7.7771, 7.462899999999999, 8.1501, 7.439699999999999, 7.825500000000001, 7.5232, 7.8097, 7.4869, 7.6648000000000005, 7.6189, 7.5187, 7.8438, 7.495, 7.4905, 7.4927, 8.0058, 7.477, 7.84, 7.500500000000001, 7.8866000000000005, 7.4657, 7.790100000000001, 7.5335] run_avg_submit_wait_ms_per_transform=[7.6584699999999994, 7.62262, 7.6482399999999995] avg_submit_wait_ms_per_transform=7.643110 stderr_submit_wait_ms_per_transform=0.010662 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=7.418600 million_points_per_second=137.192321 raw_encode_ms_per_transform=[0.1193, 0.08990000000000001, 0.1336, 0.1581, 0.1719, 0.14129999999999998, 0.1761, 0.1474, 0.1519, 0.14400000000000002, 0.16110000000000002, 0.1603, 0.15239999999999998, 0.1558, 0.1558, 0.15080000000000002, 0.1575, 0.2186, 0.27080000000000004, 0.1649, 0.1462, 0.1581, 0.1685, 0.15589999999999998, 0.1549, 0.15430000000000002, 0.1513, 0.14770000000000003, 0.1463, 0.1429] run_avg_encode_ms_per_transform=[0.14335, 0.1748, 0.15261] avg_encode_ms_per_transform=0.156920 stderr_encode_ms_per_transform=0.009331 min_encode_ms_per_transform=0.089900 raw_plan_create_ms=[11.6207, 9.4479, 9.1525] avg_plan_create_ms=10.073700 stderr_plan_create_ms=0.778186 min_plan_create_ms=9.152500 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+type-2: starting transforms_per_sample=32
+run 1/3 plan_create_ms=5.923000 warmup: encode_ms=0.095400 submit_wait_ms=1.699200
+run 1/3 sample 1/10: encode_ms=0.031303 submit_wait_ms=0.646212
+run 1/3 sample 2/10: encode_ms=0.034391 submit_wait_ms=0.645887
+run 1/3 sample 3/10: encode_ms=0.030775 submit_wait_ms=0.657359
+run 1/3 sample 4/10: encode_ms=0.029659 submit_wait_ms=0.645447
+run 1/3 sample 5/10: encode_ms=0.028962 submit_wait_ms=0.646422
+run 1/3 sample 6/10: encode_ms=0.032606 submit_wait_ms=0.657047
+run 1/3 sample 7/10: encode_ms=0.031150 submit_wait_ms=0.644766
+run 1/3 sample 8/10: encode_ms=0.031747 submit_wait_ms=0.645325
+run 1/3 sample 9/10: encode_ms=0.029472 submit_wait_ms=0.652041
+run 1/3 sample 10/10: encode_ms=0.029609 submit_wait_ms=0.647194
+run 1/3 summary: avg_submit_wait_ms=0.648770 min_submit_wait_ms=0.644766 avg_encode_ms=0.030967 min_encode_ms=0.028962
+run 2/3 plan_create_ms=5.914300 warmup: encode_ms=0.086000 submit_wait_ms=1.780000
+run 2/3 sample 1/10: encode_ms=0.040291 submit_wait_ms=0.654134
+run 2/3 sample 2/10: encode_ms=0.032006 submit_wait_ms=0.644525
+run 2/3 sample 3/10: encode_ms=0.029334 submit_wait_ms=0.645453
+run 2/3 sample 4/10: encode_ms=0.031956 submit_wait_ms=0.655791
+run 2/3 sample 5/10: encode_ms=0.030156 submit_wait_ms=0.644656
+run 2/3 sample 6/10: encode_ms=0.031925 submit_wait_ms=0.645981
+run 2/3 sample 7/10: encode_ms=0.038559 submit_wait_ms=0.654653
+run 2/3 sample 8/10: encode_ms=0.041706 submit_wait_ms=0.648913
+run 2/3 sample 9/10: encode_ms=0.029063 submit_wait_ms=0.647437
+run 2/3 sample 10/10: encode_ms=0.028975 submit_wait_ms=0.658434
+run 2/3 summary: avg_submit_wait_ms=0.649998 min_submit_wait_ms=0.644525 avg_encode_ms=0.033397 min_encode_ms=0.028975
+run 3/3 plan_create_ms=6.201600 warmup: encode_ms=0.096500 submit_wait_ms=1.608400
+run 3/3 sample 1/10: encode_ms=0.040253 submit_wait_ms=0.646878
+run 3/3 sample 2/10: encode_ms=0.037525 submit_wait_ms=0.636900
+run 3/3 sample 3/10: encode_ms=0.033772 submit_wait_ms=0.648669
+run 3/3 sample 4/10: encode_ms=0.029697 submit_wait_ms=0.645394
+run 3/3 sample 5/10: encode_ms=0.031147 submit_wait_ms=0.674109
+run 3/3 sample 6/10: encode_ms=0.030159 submit_wait_ms=0.646403
+run 3/3 sample 7/10: encode_ms=0.042428 submit_wait_ms=0.647091
+run 3/3 sample 8/10: encode_ms=0.030494 submit_wait_ms=0.654559
+run 3/3 sample 9/10: encode_ms=0.033809 submit_wait_ms=0.650241
+run 3/3 sample 10/10: encode_ms=0.036581 submit_wait_ms=0.648991
+run 3/3 summary: avg_submit_wait_ms=0.649923 min_submit_wait_ms=0.636900 avg_encode_ms=0.034587 min_encode_ms=0.029697
+RESULT kind=type-2 dimensions=2 N0=1024 N1=1024 N_total=1048576 M=1048576 fine_grid_shape=2048x2048 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=32 total_samples=30 raw_submit_wait_ms_per_transform=[0.6462125, 0.6458875, 0.657359375, 0.645446875, 0.6464218749999999, 0.6570468749999999, 0.644765625, 0.6453249999999999, 0.652040625, 0.64719375, 0.654134375, 0.644525, 0.645453125, 0.655790625, 0.64465625, 0.64598125, 0.654653125, 0.6489125, 0.6474375, 0.658434375, 0.646878125, 0.6369, 0.64866875, 0.64539375, 0.674109375, 0.646403125, 0.647090625, 0.6545593749999999, 0.6502406249999999, 0.648990625] run_avg_submit_wait_ms_per_transform=[0.6487699999999998, 0.6499978124999999, 0.6499234375] avg_submit_wait_ms_per_transform=0.649564 stderr_submit_wait_ms_per_transform=0.000397 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=0.636900 million_points_per_second=1614.277275 raw_encode_ms_per_transform=[0.031303124999999994, 0.034390624999999994, 0.030775000000000004, 0.029659375, 0.0289625, 0.03260625, 0.031149999999999997, 0.031746875, 0.029471874999999998, 0.029609375, 0.040290625, 0.03200625, 0.029334375, 0.03195625, 0.030156250000000002, 0.031924999999999995, 0.038559375, 0.04170625, 0.0290625, 0.028975, 0.040253125, 0.037524999999999996, 0.033771875, 0.029696874999999998, 0.031146875000000004, 0.030159375, 0.042428125000000004, 0.03049375, 0.033809375, 0.036581249999999996] run_avg_encode_ms_per_transform=[0.0309675, 0.0333971875, 0.03458656250000001] avg_encode_ms_per_transform=0.032984 stderr_encode_ms_per_transform=0.001065 min_encode_ms_per_transform=0.028962 raw_plan_create_ms=[5.923, 5.9143, 6.2016] avg_plan_create_ms=6.012967 stderr_plan_create_ms=0.094350 min_plan_create_ms=5.914300 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback

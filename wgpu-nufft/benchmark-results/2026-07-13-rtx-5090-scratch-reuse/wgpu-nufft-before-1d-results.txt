@@ -1,0 +1,299 @@
+cargo.exe :    Compiling wgpu-nufft v0.1.0 (<repo>\wgpu-nufft)
+At line:2 char:164
++ ... StartNew(); & cargo bench --locked -p wgpu-nufft --bench nufft_bench  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling wg...FFT\wgpu-nufft):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+    Finished `bench` profile [optimized] target(s) in 1.46s
+     Running benches\nufft_bench.rs (target\release\deps\nufft_bench-b83f5981f50ff7a5.exe)
+wgpu-nufft 1D GPU benchmark
+configuration: sizes=[262144, 1048576] point_count_equals_mode_count=true runs=3 samples_per_run=10 seed=0x4e554646 data_streams=field-specific-xor eps=0.000001 sigma=2 sign=positive mode_order=centered adapter_selector=RTX 5090 wait_timeout_secs=120
+method: reusable plan; caller buffers initialized once; one untimed warmup; type-1 uses one transform per timed submit, while type-2 batches 32 transforms per timed submit to amortize queue-wait jitter; headline wall clock starts immediately before queue.submit and ends after device.poll(Wait), then is divided per transform
+scope: plan creation, command encoding, upload, and readback excluded from headline; host command-encoding time is reported separately; no output readback is performed
+comparison caveat: these are f32 GPU execution measurements; any FINUFFT CPU results are contextual CPU-versus-GPU data, not an apples-to-apples device comparison
+enumerated Vulkan adapters:
+  index=0 name="NVIDIA GeForce RTX 5090" vendor=0x10de device=0x2b85 type=DiscreteGpu driver="NVIDIA"
+selected Vulkan adapter index=0 name="NVIDIA GeForce RTX 5090" vendor=0x10de device=0x2b85 type=DiscreteGpu
+adapter info:
+AdapterInfo {
+    name: "NVIDIA GeForce RTX 5090",
+    vendor: 4318,
+    device: 11141,
+    device_type: DiscreteGpu,
+    device_pci_bus_id: "0000:01:00.0",
+    driver: "NVIDIA",
+    driver_info: "610.47",
+    backend: Vulkan,
+    subgroup_min_size: 32,
+    subgroup_max_size: 32,
+    transient_saves_memory: false,
+}
+adapter limits:
+Limits {
+    max_texture_dimension_1d: 32768,
+    max_texture_dimension_2d: 32768,
+    max_texture_dimension_3d: 16384,
+    max_texture_array_layers: 2048,
+    max_bind_groups: 8,
+    max_bindings_per_bind_group: 4294967295,
+    max_dynamic_uniform_buffers_per_pipeline_layout: 15,
+    max_dynamic_storage_buffers_per_pipeline_layout: 16,
+    max_sampled_textures_per_shader_stage: 524288,
+    max_samplers_per_shader_stage: 524288,
+    max_storage_buffers_per_shader_stage: 524288,
+    max_storage_textures_per_shader_stage: 524288,
+    max_uniform_buffers_per_shader_stage: 524288,
+    max_binding_array_elements_per_shader_stage: 1048576,
+    max_binding_array_acceleration_structure_elements_per_shader_stage: 524288,
+    max_binding_array_sampler_elements_per_shader_stage: 1048576,
+    max_uniform_buffer_binding_size: 65536,
+    max_storage_buffer_binding_size: 2147483644,
+    max_vertex_buffers: 16,
+    max_buffer_size: 1099511627776,
+    max_vertex_attributes: 32,
+    max_vertex_buffer_array_stride: 2048,
+    max_inter_stage_shader_variables: 31,
+    min_uniform_buffer_offset_alignment: 64,
+    min_storage_buffer_offset_alignment: 32,
+    max_color_attachments: 8,
+    max_color_attachment_bytes_per_sample: 128,
+    max_compute_workgroup_storage_size: 49152,
+    max_compute_invocations_per_workgroup: 1024,
+    max_compute_workgroup_size_x: 1024,
+    max_compute_workgroup_size_y: 1024,
+    max_compute_workgroup_size_z: 64,
+    max_compute_workgroups_per_dimension: 65535,
+    max_immediate_size: 256,
+    max_non_sampler_bindings: 4294967295,
+    max_task_mesh_workgroup_total_count: 4194304,
+    max_task_mesh_workgroups_per_dimension: 65535,
+    max_task_invocations_per_workgroup: 128,
+    max_task_invocations_per_dimension: 128,
+    max_mesh_invocations_per_workgroup: 128,
+    max_mesh_invocations_per_dimension: 128,
+    max_task_payload_size: 16384,
+    max_mesh_output_vertices: 256,
+    max_mesh_output_primitives: 256,
+    max_mesh_output_layers: 2048,
+    max_mesh_multiview_view_count: 4,
+    max_blas_primitive_count: 536870911,
+    max_blas_geometry_count: 16777215,
+    max_tlas_instance_count: 16777215,
+    max_acceleration_structures_per_shader_stage: 524288,
+    max_multiview_view_count: 32,
+}
+device limits:
+Limits {
+    max_texture_dimension_1d: 32768,
+    max_texture_dimension_2d: 32768,
+    max_texture_dimension_3d: 16384,
+    max_texture_array_layers: 2048,
+    max_bind_groups: 8,
+    max_bindings_per_bind_group: 4294967295,
+    max_dynamic_uniform_buffers_per_pipeline_layout: 15,
+    max_dynamic_storage_buffers_per_pipeline_layout: 16,
+    max_sampled_textures_per_shader_stage: 524288,
+    max_samplers_per_shader_stage: 524288,
+    max_storage_buffers_per_shader_stage: 524288,
+    max_storage_textures_per_shader_stage: 524288,
+    max_uniform_buffers_per_shader_stage: 524288,
+    max_binding_array_elements_per_shader_stage: 1048576,
+    max_binding_array_acceleration_structure_elements_per_shader_stage: 524288,
+    max_binding_array_sampler_elements_per_shader_stage: 1048576,
+    max_uniform_buffer_binding_size: 65536,
+    max_storage_buffer_binding_size: 2147483644,
+    max_vertex_buffers: 16,
+    max_buffer_size: 1099511627776,
+    max_vertex_attributes: 32,
+    max_vertex_buffer_array_stride: 2048,
+    max_inter_stage_shader_variables: 31,
+    min_uniform_buffer_offset_alignment: 64,
+    min_storage_buffer_offset_alignment: 32,
+    max_color_attachments: 8,
+    max_color_attachment_bytes_per_sample: 128,
+    max_compute_workgroup_storage_size: 49152,
+    max_compute_invocations_per_workgroup: 1024,
+    max_compute_workgroup_size_x: 1024,
+    max_compute_workgroup_size_y: 1024,
+    max_compute_workgroup_size_z: 64,
+    max_compute_workgroups_per_dimension: 65535,
+    max_immediate_size: 256,
+    max_non_sampler_bindings: 4294967295,
+    max_task_mesh_workgroup_total_count: 4194304,
+    max_task_mesh_workgroups_per_dimension: 65535,
+    max_task_invocations_per_workgroup: 128,
+    max_task_invocations_per_dimension: 128,
+    max_mesh_invocations_per_workgroup: 128,
+    max_mesh_invocations_per_dimension: 128,
+    max_task_payload_size: 16384,
+    max_mesh_output_vertices: 256,
+    max_mesh_output_primitives: 256,
+    max_mesh_output_layers: 2048,
+    max_mesh_multiview_view_count: 4,
+    max_blas_primitive_count: 536870911,
+    max_blas_geometry_count: 16777215,
+    max_tlas_instance_count: 16777215,
+    max_acceleration_structures_per_shader_stage: 524288,
+    max_multiview_view_count: 32,
+}
+
+=== case N=262144 M=262144 input_points_bytes=1048576 input_complex_bytes=2097152 ===
+
+type-1: starting transforms_per_sample=1
+run 1/3 plan_create_ms=404.652200 warmup: encode_ms=0.516700 submit_wait_ms=0.716100
+run 1/3 sample 1/10: encode_ms=0.161700 submit_wait_ms=0.334300
+run 1/3 sample 2/10: encode_ms=0.120700 submit_wait_ms=0.392900
+run 1/3 sample 3/10: encode_ms=0.136000 submit_wait_ms=0.409700
+run 1/3 sample 4/10: encode_ms=0.213300 submit_wait_ms=0.351800
+run 1/3 sample 5/10: encode_ms=0.126200 submit_wait_ms=0.439300
+run 1/3 sample 6/10: encode_ms=0.131000 submit_wait_ms=0.443600
+run 1/3 sample 7/10: encode_ms=0.126800 submit_wait_ms=0.344300
+run 1/3 sample 8/10: encode_ms=0.119400 submit_wait_ms=0.349700
+run 1/3 sample 9/10: encode_ms=0.119800 submit_wait_ms=0.342300
+run 1/3 sample 10/10: encode_ms=0.129500 submit_wait_ms=0.343800
+run 1/3 summary: avg_submit_wait_ms=0.375170 min_submit_wait_ms=0.334300 avg_encode_ms=0.138440 min_encode_ms=0.119400
+run 2/3 plan_create_ms=21.185700 warmup: encode_ms=0.194900 submit_wait_ms=0.585400
+run 2/3 sample 1/10: encode_ms=0.116100 submit_wait_ms=0.320900
+run 2/3 sample 2/10: encode_ms=0.105200 submit_wait_ms=0.317400
+run 2/3 sample 3/10: encode_ms=0.095300 submit_wait_ms=0.311000
+run 2/3 sample 4/10: encode_ms=0.095600 submit_wait_ms=0.309300
+run 2/3 sample 5/10: encode_ms=0.088000 submit_wait_ms=0.311400
+run 2/3 sample 6/10: encode_ms=0.087200 submit_wait_ms=0.310900
+run 2/3 sample 7/10: encode_ms=0.089200 submit_wait_ms=0.307400
+run 2/3 sample 8/10: encode_ms=0.086400 submit_wait_ms=0.312200
+run 2/3 sample 9/10: encode_ms=0.093000 submit_wait_ms=0.307000
+run 2/3 sample 10/10: encode_ms=0.085800 submit_wait_ms=0.311200
+run 2/3 summary: avg_submit_wait_ms=0.311870 min_submit_wait_ms=0.307000 avg_encode_ms=0.094180 min_encode_ms=0.085800
+run 3/3 plan_create_ms=22.172100 warmup: encode_ms=0.200900 submit_wait_ms=0.578500
+run 3/3 sample 1/10: encode_ms=0.196100 submit_wait_ms=0.358700
+run 3/3 sample 2/10: encode_ms=0.134500 submit_wait_ms=0.359200
+run 3/3 sample 3/10: encode_ms=0.129100 submit_wait_ms=0.339400
+run 3/3 sample 4/10: encode_ms=0.117700 submit_wait_ms=0.352100
+run 3/3 sample 5/10: encode_ms=0.130700 submit_wait_ms=0.344500
+run 3/3 sample 6/10: encode_ms=0.141400 submit_wait_ms=0.346200
+run 3/3 sample 7/10: encode_ms=0.176100 submit_wait_ms=0.351000
+run 3/3 sample 8/10: encode_ms=0.118700 submit_wait_ms=0.343200
+run 3/3 sample 9/10: encode_ms=0.119000 submit_wait_ms=0.344400
+run 3/3 sample 10/10: encode_ms=0.120000 submit_wait_ms=0.343300
+run 3/3 summary: avg_submit_wait_ms=0.348200 min_submit_wait_ms=0.339400 avg_encode_ms=0.138330 min_encode_ms=0.117700
+RESULT kind=type-1 N=262144 M=262144 fine_grid_length=524288 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=1 total_samples=30 raw_submit_wait_ms_per_transform=[0.3343, 0.3929, 0.4097, 0.3518, 0.4393, 0.4436, 0.3443, 0.3497, 0.34230000000000005, 0.3438, 0.3209, 0.3174, 0.311, 0.30929999999999996, 0.31139999999999995, 0.3109, 0.3074, 0.3122, 0.307, 0.3112, 0.3587, 0.3592, 0.33940000000000003, 0.35209999999999997, 0.34450000000000003, 0.3462, 0.35100000000000003, 0.3432, 0.34440000000000004, 0.3433] run_avg_submit_wait_ms_per_transform=[0.37516999999999995, 0.31187, 0.3482] avg_submit_wait_ms_per_transform=0.345080 stderr_submit_wait_ms_per_transform=0.018340 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=0.307000 million_points_per_second=759.661528 raw_encode_ms_per_transform=[0.1617, 0.1207, 0.136, 0.21330000000000002, 0.1262, 0.131, 0.1268, 0.1194, 0.1198, 0.1295, 0.11610000000000001, 0.1052, 0.0953, 0.0956, 0.088, 0.0872, 0.0892, 0.0864, 0.093, 0.0858, 0.1961, 0.13449999999999998, 0.1291, 0.1177, 0.1307, 0.1414, 0.1761, 0.1187, 0.11900000000000001, 0.12000000000000001] run_avg_encode_ms_per_transform=[0.13843999999999998, 0.09417999999999999, 0.13833] avg_encode_ms_per_transform=0.123650 stderr_encode_ms_per_transform=0.014735 min_encode_ms_per_transform=0.085800 raw_plan_create_ms=[404.6522, 21.185699999999997, 22.1721] avg_plan_create_ms=149.336667 stderr_plan_create_ms=127.658084 min_plan_create_ms=21.185700 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+type-2: starting transforms_per_sample=32
+run 1/3 plan_create_ms=94.571400 warmup: encode_ms=0.157900 submit_wait_ms=0.377900
+run 1/3 sample 1/10: encode_ms=0.163038 submit_wait_ms=0.110512
+run 1/3 sample 2/10: encode_ms=0.065631 submit_wait_ms=0.105875
+run 1/3 sample 3/10: encode_ms=0.058059 submit_wait_ms=0.102328
+run 1/3 sample 4/10: encode_ms=0.056028 submit_wait_ms=0.097769
+run 1/3 sample 5/10: encode_ms=0.054488 submit_wait_ms=0.096609
+run 1/3 sample 6/10: encode_ms=0.056234 submit_wait_ms=0.100791
+run 1/3 sample 7/10: encode_ms=0.056850 submit_wait_ms=0.098538
+run 1/3 sample 8/10: encode_ms=0.055850 submit_wait_ms=0.100628
+run 1/3 sample 9/10: encode_ms=0.054297 submit_wait_ms=0.110575
+run 1/3 sample 10/10: encode_ms=0.059106 submit_wait_ms=0.098400
+run 1/3 summary: avg_submit_wait_ms=0.102203 min_submit_wait_ms=0.096609 avg_encode_ms=0.067958 min_encode_ms=0.054297
+run 2/3 plan_create_ms=19.656800 warmup: encode_ms=0.145700 submit_wait_ms=0.435500
+run 2/3 sample 1/10: encode_ms=0.070144 submit_wait_ms=0.108753
+run 2/3 sample 2/10: encode_ms=0.065809 submit_wait_ms=0.105916
+run 2/3 sample 3/10: encode_ms=0.066775 submit_wait_ms=0.102637
+run 2/3 sample 4/10: encode_ms=0.061756 submit_wait_ms=0.104516
+run 2/3 sample 5/10: encode_ms=0.068997 submit_wait_ms=0.104606
+run 2/3 sample 6/10: encode_ms=0.063359 submit_wait_ms=0.100059
+run 2/3 sample 7/10: encode_ms=0.060562 submit_wait_ms=0.107178
+run 2/3 sample 8/10: encode_ms=0.081866 submit_wait_ms=0.104738
+run 2/3 sample 9/10: encode_ms=0.063291 submit_wait_ms=0.101138
+run 2/3 sample 10/10: encode_ms=0.067328 submit_wait_ms=0.105734
+run 2/3 summary: avg_submit_wait_ms=0.104528 min_submit_wait_ms=0.100059 avg_encode_ms=0.066989 min_encode_ms=0.060562
+run 3/3 plan_create_ms=19.372900 warmup: encode_ms=0.136700 submit_wait_ms=0.379400
+run 3/3 sample 1/10: encode_ms=0.068772 submit_wait_ms=0.103762
+run 3/3 sample 2/10: encode_ms=0.063725 submit_wait_ms=0.101931
+run 3/3 sample 3/10: encode_ms=0.060481 submit_wait_ms=0.112522
+run 3/3 sample 4/10: encode_ms=0.058641 submit_wait_ms=0.098947
+run 3/3 sample 5/10: encode_ms=0.056337 submit_wait_ms=0.097966
+run 3/3 sample 6/10: encode_ms=0.055303 submit_wait_ms=0.110331
+run 3/3 sample 7/10: encode_ms=0.059147 submit_wait_ms=0.099559
+run 3/3 sample 8/10: encode_ms=0.057409 submit_wait_ms=0.098794
+run 3/3 sample 9/10: encode_ms=0.055228 submit_wait_ms=0.105594
+run 3/3 sample 10/10: encode_ms=0.061559 submit_wait_ms=0.106075
+run 3/3 summary: avg_submit_wait_ms=0.103548 min_submit_wait_ms=0.097966 avg_encode_ms=0.059660 min_encode_ms=0.055228
+RESULT kind=type-2 N=262144 M=262144 fine_grid_length=524288 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=32 total_samples=30 raw_submit_wait_ms_per_transform=[0.1105125, 0.105875, 0.102328125, 0.09776875, 0.096609375, 0.100790625, 0.0985375, 0.100628125, 0.110575, 0.0984, 0.10875312499999999, 0.105915625, 0.10263749999999999, 0.104515625, 0.10460625, 0.100059375, 0.107178125, 0.10473750000000001, 0.1011375, 0.10573437499999999, 0.1037625, 0.10193125, 0.11252187500000001, 0.098946875, 0.097965625, 0.11033125, 0.099559375, 0.09879375, 0.10559375, 0.106075] run_avg_submit_wait_ms_per_transform=[0.1022025, 0.10452750000000002, 0.10354812499999999] avg_submit_wait_ms_per_transform=0.103426 stderr_submit_wait_ms_per_transform=0.000674 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=0.096609 million_points_per_second=2534.603430 raw_encode_ms_per_transform=[0.1630375, 0.06563125, 0.058059375, 0.056028125, 0.0544875, 0.056234375, 0.05685, 0.055850000000000004, 0.054296874999999994, 0.05910625, 0.07014374999999999, 0.065809375, 0.066775, 0.06175625, 0.068996875, 0.063359375, 0.0605625, 0.081865625, 0.06329062499999999, 0.067328125, 0.068771875, 0.063725, 0.06048125, 0.058640624999999995, 0.0563375, 0.055303124999999995, 0.059146875, 0.057409375, 0.055228125, 0.061559375000000006] run_avg_encode_ms_per_transform=[0.06795812500000001, 0.06698875, 0.05966031249999999] avg_encode_ms_per_transform=0.064869 stderr_encode_ms_per_transform=0.002619 min_encode_ms_per_transform=0.054297 raw_plan_create_ms=[94.5714, 19.656799999999997, 19.372899999999998] avg_plan_create_ms=44.533700 stderr_plan_create_ms=25.018984 min_plan_create_ms=19.372900 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+=== case N=1048576 M=1048576 input_points_bytes=4194304 input_complex_bytes=8388608 ===
+
+type-1: starting transforms_per_sample=1
+run 1/3 plan_create_ms=400.876000 warmup: encode_ms=0.726200 submit_wait_ms=4.419400
+run 1/3 sample 1/10: encode_ms=0.585100 submit_wait_ms=4.671600
+run 1/3 sample 2/10: encode_ms=0.492700 submit_wait_ms=4.182300
+run 1/3 sample 3/10: encode_ms=0.481900 submit_wait_ms=4.191300
+run 1/3 sample 4/10: encode_ms=0.485700 submit_wait_ms=4.172600
+run 1/3 sample 5/10: encode_ms=0.496200 submit_wait_ms=4.212300
+run 1/3 sample 6/10: encode_ms=0.627400 submit_wait_ms=4.334000
+run 1/3 sample 7/10: encode_ms=0.670300 submit_wait_ms=4.290200
+run 1/3 sample 8/10: encode_ms=0.550900 submit_wait_ms=4.139800
+run 1/3 sample 9/10: encode_ms=0.552200 submit_wait_ms=4.102000
+run 1/3 sample 10/10: encode_ms=0.626000 submit_wait_ms=4.017400
+run 1/3 summary: avg_submit_wait_ms=4.231350 min_submit_wait_ms=4.017400 avg_encode_ms=0.556840 min_encode_ms=0.481900
+run 2/3 plan_create_ms=75.199400 warmup: encode_ms=0.627200 submit_wait_ms=4.665000
+run 2/3 sample 1/10: encode_ms=0.521000 submit_wait_ms=4.266800
+run 2/3 sample 2/10: encode_ms=0.458700 submit_wait_ms=4.127200
+run 2/3 sample 3/10: encode_ms=0.595300 submit_wait_ms=4.165800
+run 2/3 sample 4/10: encode_ms=0.454500 submit_wait_ms=4.399000
+run 2/3 sample 5/10: encode_ms=0.619500 submit_wait_ms=4.301700
+run 2/3 sample 6/10: encode_ms=0.536700 submit_wait_ms=4.255400
+run 2/3 sample 7/10: encode_ms=0.558100 submit_wait_ms=4.620600
+run 2/3 sample 8/10: encode_ms=0.549100 submit_wait_ms=4.407100
+run 2/3 sample 9/10: encode_ms=0.672300 submit_wait_ms=4.277500
+run 2/3 sample 10/10: encode_ms=0.567400 submit_wait_ms=4.283300
+run 2/3 summary: avg_submit_wait_ms=4.310440 min_submit_wait_ms=4.127200 avg_encode_ms=0.553260 min_encode_ms=0.454500
+run 3/3 plan_create_ms=77.063900 warmup: encode_ms=0.613500 submit_wait_ms=4.400400
+run 3/3 sample 1/10: encode_ms=0.451000 submit_wait_ms=4.065700
+run 3/3 sample 2/10: encode_ms=0.600000 submit_wait_ms=4.482000
+run 3/3 sample 3/10: encode_ms=0.500700 submit_wait_ms=4.147000
+run 3/3 sample 4/10: encode_ms=0.475500 submit_wait_ms=4.520100
+run 3/3 sample 5/10: encode_ms=0.459000 submit_wait_ms=4.384100
+run 3/3 sample 6/10: encode_ms=0.814200 submit_wait_ms=4.098300
+run 3/3 sample 7/10: encode_ms=0.632100 submit_wait_ms=4.785100
+run 3/3 sample 8/10: encode_ms=1.015600 submit_wait_ms=3.979000
+run 3/3 sample 9/10: encode_ms=0.628100 submit_wait_ms=4.256400
+run 3/3 sample 10/10: encode_ms=0.543800 submit_wait_ms=4.270100
+run 3/3 summary: avg_submit_wait_ms=4.298780 min_submit_wait_ms=3.979000 avg_encode_ms=0.612000 min_encode_ms=0.451000
+RESULT kind=type-1 N=1048576 M=1048576 fine_grid_length=2097152 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=1 total_samples=30 raw_submit_wait_ms_per_transform=[4.6716, 4.1823, 4.1913, 4.1726, 4.212300000000001, 4.3340000000000005, 4.2902000000000005, 4.1398, 4.101999999999999, 4.0174, 4.2668, 4.1272, 4.1658, 4.399, 4.3017, 4.255400000000001, 4.6206, 4.4071, 4.2775, 4.2833000000000006, 4.0657000000000005, 4.482, 4.146999999999999, 4.5201, 4.3841, 4.0983, 4.7851, 3.979, 4.256399999999999, 4.270099999999999] run_avg_submit_wait_ms_per_transform=[4.231350000000001, 4.31044, 4.29878] avg_submit_wait_ms_per_transform=4.280190 stderr_submit_wait_ms_per_transform=0.024651 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=3.979000 million_points_per_second=244.983517 raw_encode_ms_per_transform=[0.5851, 0.49269999999999997, 0.4819, 0.48569999999999997, 0.49620000000000003, 0.6274, 0.6703, 0.5509, 0.5522, 0.626, 0.521, 0.4587, 0.5952999999999999, 0.4545, 0.6195, 0.5367, 0.5580999999999999, 0.5490999999999999, 0.6723, 0.5674, 0.451, 0.6, 0.5006999999999999, 0.47550000000000003, 0.45899999999999996, 0.8141999999999999, 0.6321, 1.0156, 0.6281, 0.5438] run_avg_encode_ms_per_transform=[0.55684, 0.55326, 0.612] avg_encode_ms_per_transform=0.574033 stderr_encode_ms_per_transform=0.019011 min_encode_ms_per_transform=0.451000 raw_plan_create_ms=[400.87600000000003, 75.1994, 77.0639] avg_plan_create_ms=184.379767 stderr_plan_create_ms=108.249455 min_plan_create_ms=75.199400 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback
+
+type-2: starting transforms_per_sample=32
+run 1/3 plan_create_ms=136.371700 warmup: encode_ms=0.157900 submit_wait_ms=0.632600
+run 1/3 sample 1/10: encode_ms=0.068256 submit_wait_ms=0.248872
+run 1/3 sample 2/10: encode_ms=0.067478 submit_wait_ms=0.266084
+run 1/3 sample 3/10: encode_ms=0.067725 submit_wait_ms=0.249391
+run 1/3 sample 4/10: encode_ms=0.074125 submit_wait_ms=0.249347
+run 1/3 sample 5/10: encode_ms=0.065322 submit_wait_ms=0.258069
+run 1/3 sample 6/10: encode_ms=0.072291 submit_wait_ms=0.246278
+run 1/3 sample 7/10: encode_ms=0.070450 submit_wait_ms=0.258188
+run 1/3 sample 8/10: encode_ms=0.069413 submit_wait_ms=0.252194
+run 1/3 sample 9/10: encode_ms=0.062744 submit_wait_ms=0.245825
+run 1/3 sample 10/10: encode_ms=0.059616 submit_wait_ms=0.254891
+run 1/3 summary: avg_submit_wait_ms=0.252914 min_submit_wait_ms=0.245825 avg_encode_ms=0.067742 min_encode_ms=0.059616
+run 2/3 plan_create_ms=71.748100 warmup: encode_ms=0.135500 submit_wait_ms=0.669200
+run 2/3 sample 1/10: encode_ms=0.070731 submit_wait_ms=0.260466
+run 2/3 sample 2/10: encode_ms=0.070450 submit_wait_ms=0.245909
+run 2/3 sample 3/10: encode_ms=0.070016 submit_wait_ms=0.249800
+run 2/3 sample 4/10: encode_ms=0.065931 submit_wait_ms=0.256947
+run 2/3 sample 5/10: encode_ms=0.067356 submit_wait_ms=0.244103
+run 2/3 sample 6/10: encode_ms=0.073269 submit_wait_ms=0.259069
+run 2/3 sample 7/10: encode_ms=0.065919 submit_wait_ms=0.245359
+run 2/3 sample 8/10: encode_ms=0.067816 submit_wait_ms=0.245919
+run 2/3 sample 9/10: encode_ms=0.063278 submit_wait_ms=0.257100
+run 2/3 sample 10/10: encode_ms=0.069456 submit_wait_ms=0.246594
+run 2/3 summary: avg_submit_wait_ms=0.251127 min_submit_wait_ms=0.244103 avg_encode_ms=0.068422 min_encode_ms=0.063278
+run 3/3 plan_create_ms=72.246600 warmup: encode_ms=0.134400 submit_wait_ms=0.596800
+run 3/3 sample 1/10: encode_ms=0.067062 submit_wait_ms=0.254694
+run 3/3 sample 2/10: encode_ms=0.071269 submit_wait_ms=0.257066
+run 3/3 sample 3/10: encode_ms=0.063716 submit_wait_ms=0.249178
+run 3/3 sample 4/10: encode_ms=0.066987 submit_wait_ms=0.247431
+run 3/3 sample 5/10: encode_ms=0.063475 submit_wait_ms=0.254981
+run 3/3 sample 6/10: encode_ms=0.064831 submit_wait_ms=0.248709
+run 3/3 sample 7/10: encode_ms=0.080800 submit_wait_ms=0.251128
+run 3/3 sample 8/10: encode_ms=0.068234 submit_wait_ms=0.258900
+run 3/3 sample 9/10: encode_ms=0.069294 submit_wait_ms=0.247881
+run 3/3 sample 10/10: encode_ms=0.066228 submit_wait_ms=0.263194
+run 3/3 summary: avg_submit_wait_ms=0.253316 min_submit_wait_ms=0.247431 avg_encode_ms=0.068190 min_encode_ms=0.063475
+RESULT kind=type-2 N=1048576 M=1048576 fine_grid_length=2097152 eps=0.000001 sigma=2 sign=positive mode_order=centered precision=f32 runs=3 samples_per_run=10 transforms_per_sample=32 total_samples=30 raw_submit_wait_ms_per_transform=[0.248871875, 0.266084375, 0.249390625, 0.24934687499999997, 0.25806875, 0.246278125, 0.2581875, 0.25219375, 0.24582500000000002, 0.25489062500000004, 0.260465625, 0.245909375, 0.2498, 0.256946875, 0.244103125, 0.25906874999999996, 0.24535937500000002, 0.24591875000000002, 0.2571, 0.24659375, 0.25469375, 0.257065625, 0.249178125, 0.24743124999999996, 0.25498125000000005, 0.24870937500000004, 0.251128125, 0.2589, 0.24788125, 0.26319375] run_avg_submit_wait_ms_per_transform=[0.25291375, 0.2511265625, 0.25331625] avg_submit_wait_ms_per_transform=0.252452 stderr_submit_wait_ms_per_transform=0.000673 stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform=0.244103 million_points_per_second=4153.562741 raw_encode_ms_per_transform=[0.06825624999999999, 0.067478125, 0.06772500000000001, 0.074125, 0.06532187499999999, 0.072290625, 0.07045, 0.0694125, 0.06274375, 0.059615625, 0.07073125, 0.07045, 0.070015625, 0.06593125, 0.06735625, 0.07326875000000001, 0.06591875, 0.06781562499999999, 0.063278125, 0.06945625, 0.0670625, 0.07126874999999999, 0.06371562500000001, 0.06698749999999999, 0.063475, 0.06483124999999999, 0.0808, 0.068234375, 0.06929375, 0.066228125] run_avg_encode_ms_per_transform=[0.067741875, 0.06842218749999998, 0.0681896875] avg_encode_ms_per_transform=0.068118 stderr_encode_ms_per_transform=0.000200 min_encode_ms_per_transform=0.059616 raw_plan_create_ms=[136.3717, 71.7481, 72.2466] avg_plan_create_ms=93.455467 stderr_plan_create_ms=21.458599 min_plan_create_ms=71.748100 timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback

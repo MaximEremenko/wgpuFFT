@@ -1,0 +1,130 @@
+date = "2026-07-13"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+cargo = "1.95.0 (f2d3ce0bd 2026-03-21)"
+wgpu = "29.0.3"
+wgpu_nufft_before_commit = "5f18b20acf6a78955f1c78b03530f4a5123ccdc8"
+wgpu_nufft_after_commit = "cf6239b7984a2a49f4bce6ccf605198f6e0881f0"
+same_session_after_matrix_wall_seconds = 56.7
+final_profile_wall_seconds = 7.3
+
+[method]
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+mode_order = "centered / FINUFFT modeord=0"
+seed = "0x4E554646"
+point_y_seed_mask = "0xB7E15162"
+cases_1d = [262144, 1048576]
+cases_2d = ["512x512", "1024x1024"]
+point_count_equals_mode_count = true
+runs = 3
+warmups_per_run = 1
+samples_per_run = 10
+type1_transforms_per_sample = 1
+type2_transforms_per_sample = 32
+wgpu_timing = "queue.submit through exact-submission device.poll, divided per transform"
+cuda_timing = "host wall clock with explicit synchronization of the plan's dedicated nonblocking CUDA stream"
+input_output_transfers_in_timed_region = false
+outputs_preallocated = true
+plan_creation_and_encoding_excluded = true
+scratch_first_growth = "paid by excluded warmup"
+scratch_policy = "fixed plan-owned counts/cursors/offsets; grow-only sorted-index capacity; per-execution GPU clears of counts/cursors"
+
+[profile]
+feature = "gpu-profiling"
+timestamp_query = true
+timestamp_period_ns = 1.0
+gpu_intervals = "adjacent ComputePassTimestampWrites boundaries; exact type-1 pipeline envelope"
+host_scope = "queue.submit call plus exact-submission device.poll; encoder.finish and map registration excluded"
+query_resolve_copy_in_profiled_host_span = true
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "NVIDIA 610.47"
+backend = "Vulkan"
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[cuda]
+driver_api = 13030
+driver_api_version = "13.3"
+cupy_linked_runtime = 12090
+cupy_linked_runtime_version = "12.9"
+cuda_path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+nvcc = "12.8.93"
+
+[cufinufft]
+version = "2.5.1"
+artifact = "installed official Python wheel"
+python = "3.12.3"
+numpy = "2.4.0"
+cupy_cuda12x = "14.1.1"
+library = "cufinufft/cufinufft.dll"
+library_bytes = 173319168
+library_sha256 = "DEA7281755EEB8A0E090822F14E2A3E09742F5CAEFCAF4C4FBFB0E0E717FDD53"
+
+[comparison]
+type1_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+type2_pair = "wgpu submit-to-wait versus cuFINUFFT execute"
+wgpu_plan_encoding_upload_readback_excluded = true
+cufinufft_plan_h2d_d2h_excluded = true
+prior_stage_profile_archive = "../2026-07-13-rtx-5090-stage-profile"
+prior_cuda_comparison_archive = "../2026-07-13-rtx-5090-cufinufft"
+timings_reused_from_prior_archives = false
+finufft_cpu_rerun = false
+vkfft_rerun = false
+
+[commands]
+wgpu_1d = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_bench -- --adapter "RTX 5090"
+'''
+wgpu_2d = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_2d_bench -- --adapter "RTX 5090"
+'''
+wgpu_profile_1d = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling --bench nufft_stage_profile -- --adapter "RTX 5090"
+'''
+cufinufft_1d = '''
+python -u wgpu-nufft/benches/cufinufft_gpu_bench.py
+'''
+cufinufft_2d = '''
+python -u wgpu-nufft/benches/cufinufft_gpu_bench.py --2d
+'''
+
+[artifacts]
+wgpu_1d_harness_sha256 = "F6470BC60FFC9F29EBDC968D354ED6317082873875F3A34C67B32B84470DB50F"
+wgpu_2d_harness_sha256 = "0598F472FE69FB1A8BCB05C0A310FCD83A9A84D2CB5D3F73A2D40D40F3060AC4"
+wgpu_profile_harness_sha256 = "27CF4A087D500CE0CFD0D5A3200B327476D720AB494833147C582F7D9776D447"
+cufinufft_harness_sha256 = "7B32BBA70E314B94E861916F48C8F94D8459850EEE18B47A3F29A9A73B318690"
+cargo_lock_sha256 = "24EFF885C10262A26639BB801365D251E6A43EF0CBC59C3AF73587A4D6596B29"
+scratch_cache_source_sha256 = "3191759DA261BA2C6C79AF872AC67EC834AD779FDD5B4EF608B2B2958E9364A4"
+gpu_type1_source_sha256 = "9C1B71BB66C02D8D8F2707657EC58771194DF2A6AFEA715551F93FBA8438FE0C"
+gpu_type1_2d_source_sha256 = "61F4C3B19B09332B265D02FA1BC23FC19C643912164A23AE6F59163999EB5D95"
+gpu_nufft_test_sha256 = "E10B1AB5473030BD5056A22033EF4CD03AF29DF079B7CDB1F80193BADAB4F5E2"
+gpu_nufft_2d_test_sha256 = "9859E129519C3A442CB526427ECB2A5F9679470A26788127F39C28E711B79EBD"
+before_1d_executable_sha256 = "EBB18B2F91ACF0AA523F390BF83F3B818E20DA066F83560E25800A79321C40F8"
+before_2d_executable_sha256 = "411A4EE14D029684A7BBA64FB84F53A665B071AEBB11D6822D231677E5A95589"
+before_profile_executable_sha256 = "C30470D4863DE06F609DAB09B3E8798EC86E9996E720D46BB1C9F9ECC12F5910"
+after_1d_executable_sha256 = "7DC6C68DE7286542B89FE21A9DB59A956C60E87AC17BA39DC9A5253BCDADB215"
+after_2d_executable_sha256 = "27DEDBFE4CC5EC49195C78188CCBEBE03D89EC5A53B2FF6A2456F5F1C67DF204"
+after_profile_executable_sha256 = "F1DDB341DBA79AB906A902AFFC25B43F3115F0FF3D27B3BC56BB8CA81E701207"
+before_1d_results_sha256 = "18888FD1FA86A96C57E5D34A8C28BC526BE263CE32762CEF09294614B0A34C9B"
+before_2d_results_sha256 = "B3C39C2CEA1786EBD91683B298B6FB8134331C93A6F9C8E25603E26304F7AC6C"
+before_profile_results_sha256 = "540FD012FE197A205152D084E2B84C4AFF5FC71CEE190039CDF84E4E041BAD28"
+after_1d_results_sha256 = "1A34787A7722B6E80DCBFBE860448004B0F27CF5BE11C29A6508CD34EBD40B5D"
+after_2d_results_sha256 = "D3098C71123B1D485F6FD029500CD09A9ACCEB45DB7AFCF19CAA5616EDC92FA7"
+after_profile_results_sha256 = "BDBCC1DFA8A3B3898A4A7D88BE5C137F70F874DEFCD1801755BF898BD14DF538"
+cufinufft_1d_results_sha256 = "0690CF9928E6B516D6995D2AAD2661642C9255A9E7221FDC35AAD62208640B0F"
+cufinufft_2d_results_sha256 = "0C4CEB00BD8EA30C4FCBA7747FC12B6567C84E8384910BD5DE031A988077FD78"

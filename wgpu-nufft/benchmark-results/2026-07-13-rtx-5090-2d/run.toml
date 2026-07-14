@@ -1,0 +1,85 @@
+date = "2026-07-13"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+cargo = "1.95.0 (f2d3ce0bd 2026-03-21)"
+wgpu = "29.0.3"
+wgpu_nufft_base_commit = "503fd05b2571fcdad3de4c25fdea176ed349b759"
+benchmark_wall_seconds = 54.0
+
+[method]
+dimensions = 2
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+mode_order = "centered / FINUFFT modeord=0"
+logical_axis_order = "axis 0 fastest"
+point_layout_wgpu = "point-major AoS [x0,y0,...]"
+point_layout_cuda = "separate x/y device arrays; setpts(x1,x0) compensates Python C-shape reversal"
+seed = "0x4E554646"
+cases = ["512x512:M=262144", "1024x1024:M=1048576"]
+runs = 3
+warmups_per_run = 1
+samples_per_run = 10
+type1_transforms_per_sample = 1
+type2_transforms_per_sample = 32
+transfers_in_timed_region = false
+outputs_preallocated = true
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+compute_capability = "12.0 / sm_120"
+driver = "NVIDIA 610.47"
+wgpu_backend = "Vulkan"
+cuda_driver_api = 13030
+cupy_linked_runtime = 12090
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[cufinufft]
+version = "2.5.1"
+artifact = "installed official Python wheel"
+python = "3.12.3"
+numpy = "2.4.0"
+cupy_cuda12x = "14.1.1"
+library_sha256 = "DEA7281755EEB8A0E090822F14E2A3E09742F5CAEFCAF4C4FBFB0E0E717FDD53"
+
+[correctness]
+wgpu_worst_type1_eps_1e_6 = 1.023759773e-6
+wgpu_worst_type2_eps_1e_6 = 4.324480978e-6
+wgpu_adjoint_residual_min = 4.869111311e-9
+wgpu_adjoint_residual_max = 1.908280828e-8
+cuda_smoke_type1_relative_l2 = 8.064752010e-7
+cuda_smoke_type2_relative_l2 = 1.010377839e-6
+cuda_smoke_threshold = 2.0e-5
+
+[artifacts]
+wgpu_harness_sha256 = "0598F472FE69FB1A8BCB05C0A310FCD83A9A84D2CB5D3F73A2D40D40F3060AC4"
+cufinufft_harness_sha256 = "7B32BBA70E314B94E861916F48C8F94D8459850EEE18B47A3F29A9A73B318690"
+wgpu_executable_sha256 = "EAE8F787F4F605445976B53F8099B662A684E4B25BD0E95C4DF271B27A185927"
+wgpu_log_sha256 = "4C73281E4D5A7B57A7FD1770EB5F3F549A689132C552368C85AE90A58FA8DD72"
+cufinufft_log_sha256 = "7E98E616F761AFAAD1B89920928FA6D40F7CEB8F398654BB6D069C366999396C"
+
+[commands]
+wgpu = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench -p wgpu-nufft --bench nufft_2d_bench -- --runs 3 --samples 10
+'''
+cufinufft = '''
+python -u wgpu-nufft/benches/cufinufft_gpu_bench.py --2d
+'''
+
+[comparison]
+type1_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+type2_pair = "wgpu submit-to-wait versus cuFINUFFT execute"
+wgpu_plan_encoding_upload_readback_excluded = true
+cufinufft_plan_h2d_d2h_excluded = true
+finufft_cpu_rerun = false
+vkfft_rerun = false

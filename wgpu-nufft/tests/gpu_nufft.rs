@@ -554,12 +554,20 @@ fn execute_type1(
 
 fn validate_structured_gpu_errors(device: &wgpu::Device, queue: &wgpu::Queue) {
     assert!(matches!(
-        NufftPlan::type2_gpu(device, queue, NufftConfig::new([4, 4], 1.0e-6)),
-        Err(NufftError::GpuDimensionsUnsupported { actual: 2, .. })
+        NufftPlan::type2_gpu(device, queue, NufftConfig::new([4, 4, 4], 1.0e-6)),
+        Err(NufftError::GpuDimensionsUnsupported {
+            actual: 3,
+            supported: 2,
+            ..
+        })
     ));
     assert!(matches!(
-        NufftPlan::type1_gpu(device, queue, NufftConfig::new([4, 4], 1.0e-6)),
-        Err(NufftError::GpuDimensionsUnsupported { actual: 2, .. })
+        NufftPlan::type1_gpu(device, queue, NufftConfig::new([4, 4, 4], 1.0e-6)),
+        Err(NufftError::GpuDimensionsUnsupported {
+            actual: 3,
+            supported: 2,
+            ..
+        })
     ));
     let config = NufftConfig::new([8], 1.0e-6);
     let host_only = NufftPlan::type2(config.clone()).unwrap();

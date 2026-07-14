@@ -1,0 +1,1449 @@
+use std::num::NonZeroU64;
+
+use wgpu::util::DeviceExt;
+use wgpu_fft::{BufferView, FftConfig, FftDirection, FftPlan, FftPrecision, Normalization};
+
+use crate::config::{NufftConfig, NufftSign};
+use crate::direct::mode_for_storage_index;
+use crate::error::{NufftError, Result};
+use crate::gpu::max_supported_workgroup_size;
+use crate::gpu_dispatch::split_workgroups;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
+use crate::gpu_scan::GpuExclusiveScanU32;
+use crate::kernel::EsKernel;
+
+const DIMENSIONS: usize = 2;
+const WORKGROUP_SIZE: u32 = 64;
+const COMPLEX_F32_BYTES: u64 = 8;
+const POINT_F32_BYTES: u64 = DIMENSIONS as u64 * 4;
+const F32_BYTES: u64 = 4;
+const U32_BYTES: u64 = 4;
+
+/// Device-specific resources for deterministic, atomics-free 2D spreading.
+///
+/// Points are point-major `x, y` pairs. Integer atomics construct one bin per
+/// fine-grid cell, the point indices in each flattened `x + F0*y` bin are
+/// sorted into their original input order, and one invocation owns each
+/// fine-grid output cell.
+pub(crate) struct Type1GpuPlan2d {
+    fft: FftPlan,
+    amplitudes: wgpu::Buffer,
+    fine_input: wgpu::Buffer,
+    fine_output: wgpu::Buffer,
+    count_pipeline: wgpu::ComputePipeline,
+    count_layout: wgpu::BindGroupLayout,
+    prefix_scan: GpuExclusiveScanU32,
+    terminal_pipeline: wgpu::ComputePipeline,
+    terminal_layout: wgpu::BindGroupLayout,
+    scatter_pipeline: wgpu::ComputePipeline,
+    scatter_layout: wgpu::BindGroupLayout,
+    sort_pipeline: wgpu::ComputePipeline,
+    sort_layout: wgpu::BindGroupLayout,
+    gather_pipeline: wgpu::ComputePipeline,
+    gather_layout: wgpu::BindGroupLayout,
+    deconvolution_pipeline: wgpu::ComputePipeline,
+    deconvolution_layout: wgpu::BindGroupLayout,
+    sort_dispatch: (u32, u32, u32),
+    gather_dispatch: (u32, u32, u32),
+    deconvolution_dispatch: (u32, u32, u32),
+    max_workgroups_per_dimension: u32,
+    mode_count: usize,
+    fine_count: usize,
+    max_storage_binding_bytes: u64,
+    max_buffer_bytes: u64,
+}
+
+impl Type1GpuPlan2d {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &NufftConfig,
+        kernel: EsKernel,
+        fine_shape: [usize; DIMENSIONS],
+        kernel_fourier_coefficients: [&[f64]; DIMENSIONS],
+    ) -> Result<Self> {
+        if config.dimensions() != DIMENSIONS {
+            return Err(NufftError::GpuDimensionsUnsupported {
+                kind: "type-1",
+                actual: config.dimensions(),
+                supported: DIMENSIONS,
+            });
+        }
+
+        // Each support coordinate is represented as an exact f32 integer in
+        // WGSL. Reserve the support halo beyond the final cell independently
+        // on both axes.
+        let maximum_signed_length = (1usize << f32::MANTISSA_DIGITS)
+            .saturating_sub(kernel.width())
+            .min(i32::MAX as usize - kernel.width());
+        for &length in &fine_shape {
+            if !length.is_multiple_of(2) {
+                return Err(NufftError::FineGridMustBeEven { length });
+            }
+            if length > maximum_signed_length {
+                return Err(NufftError::GpuFineGridIndexUnsupported {
+                    length,
+                    maximum: maximum_signed_length,
+                });
+            }
+        }
+
+        let limits = device.limits();
+        let maximum_workgroup_size = max_supported_workgroup_size(&limits);
+        if maximum_workgroup_size < WORKGROUP_SIZE {
+            return Err(NufftError::GpuWorkgroupSizeUnsupported {
+                requested: WORKGROUP_SIZE,
+                maximum: maximum_workgroup_size,
+            });
+        }
+
+        let fft_direction = match config.sign() {
+            NufftSign::Positive => FftDirection::Inverse,
+            NufftSign::Negative => FftDirection::Forward,
+        };
+        let fft_config = FftConfig::new_nd(fine_shape)
+            .with_direction(fft_direction)
+            .with_normalization(Normalization::None)
+            .with_precision(FftPrecision::F32);
+        fft_config
+            .validate()
+            .map_err(|source| NufftError::FftShapeUnsupported {
+                stage: "type-1 2D oversampled-grid C2C plan",
+                source,
+            })?;
+        let fine_count =
+            fft_config
+                .total_complex_len()
+                .map_err(|source| NufftError::FftShapeUnsupported {
+                    stage: "type-1 2D oversampled-grid C2C plan",
+                    source,
+                })?;
+        let mode_count = config.mode_count()?;
+        let fine_bytes = Self::complex_buffer_size_bytes("type-1 2D fine grid", fine_count)?;
+        let amplitude_bytes =
+            checked_buffer_size("type-1 2D deconvolution amplitudes", mode_count, F32_BYTES)?;
+        let count_bytes = checked_buffer_size("type-1 2D bin counts", fine_count, U32_BYTES)?;
+        let offset_count = fine_count
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 2D bin offset count",
+            })?;
+        let offset_bytes = checked_buffer_size("type-1 2D bin offsets", offset_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 2D fine grid", fine_bytes),
+            ("type-1 2D deconvolution amplitudes", amplitude_bytes),
+            ("type-1 2D bin counts", count_bytes),
+            ("type-1 2D bin offsets", offset_bytes),
+        ] {
+            validate_binding_limit(label, bytes, limits.max_storage_buffer_binding_size)?;
+            validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
+        }
+
+        let amplitudes = mode_amplitudes(config, kernel_fourier_coefficients)?;
+        let amplitudes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgpu_nufft.type1_2d.deconvolution_amplitudes"),
+            contents: bytemuck::cast_slice(&amplitudes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let fine_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST;
+        let fine_input = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.fine_input"),
+            size: fine_bytes,
+            usage: fine_usage,
+            mapped_at_creation: false,
+        });
+        let fine_output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.fine_output"),
+            size: fine_bytes,
+            usage: fine_usage,
+            mapped_at_creation: false,
+        });
+        let fft = FftPlan::c2c(device, queue, fft_config).map_err(|source| {
+            NufftError::FftShapeUnsupported {
+                stage: "type-1 2D oversampled-grid C2C plan",
+                source,
+            }
+        })?;
+
+        let count_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.bin_count",
+            &generate_count_wgsl(fine_shape),
+        );
+        let count_layout = count_pipeline.get_bind_group_layout(0);
+        let prefix_scan = GpuExclusiveScanU32::new(device, fine_count)?;
+        let terminal_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.bin_terminal",
+            &generate_terminal_wgsl(),
+        );
+        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
+        let scatter_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.bin_scatter",
+            &generate_scatter_wgsl(fine_shape),
+        );
+        let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
+        let sort_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.bin_sort",
+            &generate_sort_wgsl(),
+        );
+        let sort_layout = sort_pipeline.get_bind_group_layout(0);
+        let gather_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.spread_gather",
+            &generate_gather_wgsl(kernel, fine_shape),
+        );
+        let gather_layout = gather_pipeline.get_bind_group_layout(0);
+        let deconvolution_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.deconvolution",
+            &generate_deconvolution_wgsl(config, fine_shape),
+        );
+        let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
+
+        let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
+        let sort_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
+        let gather_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
+        let deconvolution_dispatch =
+            dispatch_for_elements(mode_count, max_workgroups_per_dimension)?;
+
+        Ok(Self {
+            fft,
+            amplitudes,
+            fine_input,
+            fine_output,
+            count_pipeline,
+            count_layout,
+            prefix_scan,
+            terminal_pipeline,
+            terminal_layout,
+            scatter_pipeline,
+            scatter_layout,
+            sort_pipeline,
+            sort_layout,
+            gather_pipeline,
+            gather_layout,
+            deconvolution_pipeline,
+            deconvolution_layout,
+            sort_dispatch,
+            gather_dispatch,
+            deconvolution_dispatch,
+            max_workgroups_per_dimension,
+            mode_count,
+            fine_count,
+            max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
+            max_buffer_bytes: limits.max_buffer_size,
+        })
+    }
+
+    pub(crate) fn point_buffer_size_bytes(point_count: usize) -> Result<u64> {
+        checked_buffer_size("type-1 2D point buffer", point_count, POINT_F32_BYTES)
+    }
+
+    pub(crate) fn strength_buffer_size_bytes(point_count: usize) -> Result<u64> {
+        Self::complex_buffer_size_bytes("type-1 2D strength buffer", point_count)
+    }
+
+    pub(crate) fn complex_buffer_size_bytes(
+        buffer: &'static str,
+        element_count: usize,
+    ) -> Result<u64> {
+        checked_buffer_size(buffer, element_count, COMPLEX_F32_BYTES)
+    }
+
+    pub(crate) fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            output,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn encode_profiled(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
+    ) -> Result<NufftGpuProfileLayout> {
+        if point_count == 0 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-1 2D stage profiling",
+                reason: "at least one point is required",
+            });
+        }
+        let layout =
+            NufftGpuProfileLayout::type1(first_query).map_err(|_| NufftError::LengthOverflow {
+                context: "type-1 2D stage-profile query range",
+            })?;
+        self.encode_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            output,
+            GpuProfileQueryWriter::enabled(query_set, &layout),
+        )?;
+        Ok(layout)
+    }
+
+    fn encode_impl(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
+        let output_bytes =
+            Self::complex_buffer_size_bytes("type-1 2D Fourier output buffer", self.mode_count)?;
+        validate_external_storage_buffer(
+            "type-1 2D Fourier output",
+            output,
+            output_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+
+        let output_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.deconvolution.bind_group"),
+            layout: &self.deconvolution_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.fine_output.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.amplitudes.as_entire_binding(),
+                },
+                binding_entry(2, output, output_bytes),
+            ],
+        });
+
+        if point_count == 0 {
+            encoder.clear_buffer(&self.fine_input, 0, None);
+            self.encode_fft(device, encoder)?;
+            self.encode_deconvolution(
+                encoder,
+                &output_bind_group,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            );
+            return Ok(());
+        }
+
+        let point_count_u32 =
+            u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+                context: "type-1 2D GPU point count",
+            })?;
+        validate_point_coordinate_shader_index(point_count)?;
+        let point_bytes = Self::point_buffer_size_bytes(point_count)?;
+        let strength_bytes = Self::strength_buffer_size_bytes(point_count)?;
+        validate_external_storage_buffer(
+            "type-1 2D point",
+            points,
+            point_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+        validate_external_storage_buffer(
+            "type-1 2D strength",
+            strengths,
+            strength_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+
+        let count_bytes = checked_buffer_size("type-1 2D bin counts", self.fine_count, U32_BYTES)?;
+        let offset_count = self
+            .fine_count
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 2D bin offset count",
+            })?;
+        let offset_bytes = checked_buffer_size("type-1 2D bin offsets", offset_count, U32_BYTES)?;
+        let index_bytes =
+            checked_buffer_size("type-1 2D sorted point indices", point_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 2D bin counts", count_bytes),
+            ("type-1 2D bin cursors", count_bytes),
+            ("type-1 2D bin offsets", offset_bytes),
+            ("type-1 2D sorted point indices", index_bytes),
+        ] {
+            validate_binding_limit(label, bytes, self.max_storage_binding_bytes)?;
+            validate_buffer_limit(label, bytes, self.max_buffer_bytes)?;
+        }
+        let point_dispatch = split_workgroups(
+            point_count_u32.div_ceil(WORKGROUP_SIZE),
+            self.max_workgroups_per_dimension,
+        )?;
+
+        let atomic_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let bin_counts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_counts"),
+            size: count_bytes,
+            usage: atomic_usage,
+            mapped_at_creation: false,
+        });
+        let bin_cursors = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_cursors"),
+            size: count_bytes,
+            usage: atomic_usage,
+            mapped_at_creation: false,
+        });
+        let bin_offsets = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_offsets"),
+            size: offset_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let sorted_indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.sorted_point_indices"),
+            size: index_bytes,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_count.bind_group"),
+            layout: &self.count_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_counts.as_entire_binding(),
+                },
+            ],
+        });
+        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_terminal.bind_group"),
+            layout: &self.terminal_layout,
+            entries: &[
+                binding_entry(0, &bin_counts, count_bytes),
+                binding_entry(1, &bin_offsets, offset_bytes),
+            ],
+        });
+        let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_scatter.bind_group"),
+            layout: &self.scatter_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_cursors.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sorted_indices.as_entire_binding(),
+                },
+            ],
+        });
+        let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.bin_sort.bind_group"),
+            layout: &self.sort_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sorted_indices.as_entire_binding(),
+                },
+            ],
+        });
+        let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.spread_gather.bind_group"),
+            layout: &self.gather_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                binding_entry(1, strengths, strength_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sorted_indices.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.fine_input.as_entire_binding(),
+                },
+            ],
+        });
+
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_type1_start_marker(encoder);
+        encoder.clear_buffer(&bin_counts, 0, None);
+        encoder.clear_buffer(&bin_cursors, 0, None);
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.bin_count.pass",
+            &self.count_pipeline,
+            &count_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(1)),
+        );
+        self.prefix_scan
+            .encode(device, encoder, &bin_counts, &bin_offsets)?;
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.bin_terminal.pass",
+            &self.terminal_pipeline,
+            &terminal_bind_group,
+            (1, 1, 1),
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(2)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.bin_scatter.pass",
+            &self.scatter_pipeline,
+            &scatter_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(3)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.bin_sort.pass",
+            &self.sort_pipeline,
+            &sort_bind_group,
+            self.sort_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(4)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.spread_gather.pass",
+            &self.gather_pipeline,
+            &gather_bind_group,
+            self.gather_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(5)),
+        );
+        self.encode_fft(device, encoder)?;
+        self.encode_deconvolution(
+            encoder,
+            &output_bind_group,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
+        );
+        Ok(())
+    }
+
+    fn encode_fft(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
+        self.fft
+            .execute_views(
+                device,
+                encoder,
+                BufferView::whole(&self.fine_input),
+                BufferView::whole(&self.fine_output),
+            )
+            .map_err(|source| NufftError::FftExecutionFailed {
+                stage: "type-1 2D oversampled-grid C2C transform",
+                source,
+            })
+    }
+
+    fn encode_deconvolution(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) {
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_2d.deconvolution.pass",
+            &self.deconvolution_pipeline,
+            bind_group,
+            self.deconvolution_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(Some(6), Some(7)),
+        );
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
+        self.fft.diagnostics()
+    }
+}
+
+fn mode_amplitudes(config: &NufftConfig, coefficients: [&[f64]; DIMENSIONS]) -> Result<Vec<f32>> {
+    let mode_shape = config.n_modes();
+    debug_assert_eq!(mode_shape.len(), DIMENSIONS);
+    let mode_count = config.mode_count()?;
+    let mut amplitudes = Vec::new();
+    amplitudes
+        .try_reserve_exact(mode_count)
+        .map_err(|_| NufftError::HostAllocationFailed {
+            buffer: "type-1 2D deconvolution amplitudes",
+            elements: mode_count,
+        })?;
+    for linear in 0..mode_count {
+        let storage_0 = linear % mode_shape[0];
+        let storage_1 = linear / mode_shape[0];
+        let mode_0 = mode_for_storage_index(config.mode_order(), storage_0, mode_shape[0]);
+        let mode_1 = mode_for_storage_index(config.mode_order(), storage_1, mode_shape[1]);
+        let coefficient_0 = coefficients[0][mode_0.unsigned_abs() as usize];
+        let coefficient_1 = coefficients[1][mode_1.unsigned_abs() as usize];
+        for (mode, coefficient) in [(mode_0, coefficient_0), (mode_1, coefficient_1)] {
+            if !coefficient.is_finite() || coefficient == 0.0 {
+                return Err(NufftError::InvalidKernelFourierCoefficient {
+                    mode,
+                    value: coefficient,
+                });
+            }
+        }
+        let denominator = coefficient_0 * coefficient_1;
+        let amplitude = (1.0 / denominator) as f32;
+        if !denominator.is_finite() || denominator == 0.0 || !amplitude.is_finite() {
+            return Err(NufftError::InvalidKernelFourierCoefficient {
+                mode: mode_0,
+                value: denominator,
+            });
+        }
+        amplitudes.push(amplitude);
+    }
+    Ok(amplitudes)
+}
+
+fn create_compute_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    })
+}
+
+fn encode_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    dispatch: (u32, u32, u32),
+    #[cfg(feature = "gpu-profiling")] timestamp_writes: Option<
+        wgpu::ComputePassTimestampWrites<'_>,
+    >,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: {
+            #[cfg(feature = "gpu-profiling")]
+            {
+                timestamp_writes
+            }
+            #[cfg(not(feature = "gpu-profiling"))]
+            {
+                None
+            }
+        },
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(dispatch.0, dispatch.1, dispatch.2);
+}
+
+fn generate_position_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
+    let scale_0 = fine_shape[0] as f64 / std::f64::consts::TAU;
+    let scale_1 = fine_shape[1] as f64 / std::f64::consts::TAU;
+    let scale_0_hi = scale_0 as f32;
+    let scale_1_hi = scale_1 as f32;
+    let scale_0_lo = (scale_0 - f64::from(scale_0_hi)) as f32;
+    let scale_1_lo = (scale_1 - f64::from(scale_1_hi)) as f32;
+    format!(
+        r#"const FINE_0: u32 = {fine_0}u;
+const FINE_1: u32 = {fine_1}u;
+const FINE_0_I32: i32 = {fine_0}i;
+const FINE_1_I32: i32 = {fine_1}i;
+const FINE_0_F32: f32 = {fine_0_f32};
+const FINE_1_F32: f32 = {fine_1_f32};
+const FINE_COUNT: u32 = {fine_count}u;
+const POSITION_SCALE_0_HI: f32 = {scale_0_hi};
+const POSITION_SCALE_0_LO: f32 = {scale_0_lo};
+const POSITION_SCALE_1_HI: f32 = {scale_1_hi};
+const POSITION_SCALE_1_LO: f32 = {scale_1_lo};
+const GRID_ORIGIN_0: f32 = {origin_0};
+const GRID_ORIGIN_1: f32 = {origin_1};
+
+fn position_is_negative(value: Df64) -> bool {{
+    return value.hi < 0.0 || (value.hi == 0.0 && value.lo < 0.0);
+}}
+
+fn position_at_least_grid(value: Df64, fine_length: f32) -> bool {{
+    return value.hi > fine_length ||
+        (value.hi == fine_length && value.lo >= 0.0);
+}}
+
+fn fold_position(
+    point: f32,
+    scale_hi: f32,
+    scale_lo: f32,
+    grid_origin: f32,
+    fine_length: f32,
+) -> Df64 {{
+    let scaled = df64_mul(Df64(point, 0.0), Df64(scale_hi, scale_lo));
+    var position = df64_add(scaled, Df64(grid_origin, 0.0));
+    if (position_is_negative(position)) {{
+        position = df64_add(position, Df64(fine_length, 0.0));
+    }}
+    if (position_is_negative(position)) {{
+        position = df64_add(position, Df64(fine_length, 0.0));
+    }}
+    if (position_at_least_grid(position, fine_length)) {{
+        position = df64_sub(position, Df64(fine_length, 0.0));
+    }}
+    if (position_at_least_grid(position, fine_length)) {{
+        position = df64_sub(position, Df64(fine_length, 0.0));
+    }}
+    return position;
+}}
+
+fn fold_position_0(point: f32) -> Df64 {{
+    return fold_position(
+        point,
+        POSITION_SCALE_0_HI,
+        POSITION_SCALE_0_LO,
+        GRID_ORIGIN_0,
+        FINE_0_F32,
+    );
+}}
+
+fn fold_position_1(point: f32) -> Df64 {{
+    return fold_position(
+        point,
+        POSITION_SCALE_1_HI,
+        POSITION_SCALE_1_LO,
+        GRID_ORIGIN_1,
+        FINE_1_F32,
+    );
+}}
+
+fn floor_df64_to_i32(value: Df64) -> i32 {{
+    let base = floor(value.hi);
+    let remainder = df64_sub(value, Df64(base, 0.0));
+    let has_negative_remainder = remainder.hi < 0.0 ||
+        (remainder.hi == 0.0 && remainder.lo < 0.0);
+    return i32(base) - select(0, 1, has_negative_remainder);
+}}
+"#,
+        fine_0 = fine_shape[0],
+        fine_1 = fine_shape[1],
+        fine_0_f32 = format_wgsl_f32(fine_shape[0] as f32),
+        fine_1_f32 = format_wgsl_f32(fine_shape[1] as f32),
+        fine_count = fine_shape[0] * fine_shape[1],
+        scale_0_hi = format_wgsl_f32(scale_0_hi),
+        scale_0_lo = format_wgsl_f32(scale_0_lo),
+        scale_1_hi = format_wgsl_f32(scale_1_hi),
+        scale_1_lo = format_wgsl_f32(scale_1_lo),
+        origin_0 = format_wgsl_f32((fine_shape[0] / 2) as f32),
+        origin_1 = format_wgsl_f32((fine_shape[1] / 2) as f32),
+    )
+}
+
+fn generate_count_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<f32>;
+@group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points) / 2u;
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+
+    let point_base = point_index * 2u;
+    let position_0 = fold_position_0(points[point_base]);
+    let position_1 = fold_position_1(points[point_base + 1u]);
+    let bin_0 = u32(floor_df64_to_i32(position_0));
+    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin = bin_0 + FINE_0 * bin_1;
+    atomicAdd(&bin_counts[bin], 1u);
+}}
+"#,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+fn generate_terminal_wgsl() -> String {
+    r#"@group(0) @binding(0) var<storage, read> bin_counts: array<u32>;
+@group(0) @binding(1) var<storage, read_write> bin_offsets: array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let bin_count = arrayLength(&bin_counts);
+    bin_offsets[bin_count] =
+        bin_offsets[bin_count - 1u] + bin_counts[bin_count - 1u];
+}
+"#
+    .to_owned()
+}
+
+fn generate_scatter_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<f32>;
+@group(0) @binding(1) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read_write> bin_cursors: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> sorted_indices: array<u32>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points) / 2u;
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+
+    let point_base = point_index * 2u;
+    let position_0 = fold_position_0(points[point_base]);
+    let position_1 = fold_position_1(points[point_base + 1u]);
+    let bin_0 = u32(floor_df64_to_i32(position_0));
+    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin = bin_0 + FINE_0 * bin_1;
+    let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
+    sorted_indices[slot] = point_index;
+}}
+"#,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+fn generate_sort_wgsl() -> String {
+    format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(1) var<storage, read_write> sorted_indices: array<u32>;
+
+fn swap_indices(left: u32, right: u32) {{
+    let temporary = sorted_indices[left];
+    sorted_indices[left] = sorted_indices[right];
+    sorted_indices[right] = temporary;
+}}
+
+fn sift_down(start: u32, count: u32, initial_root: u32) {{
+    var root = initial_root;
+    loop {{
+        let child = root * 2u + 1u;
+        if (child >= count) {{ break; }}
+        var greatest = root;
+        if (sorted_indices[start + greatest] < sorted_indices[start + child]) {{
+            greatest = child;
+        }}
+        if (child + 1u < count &&
+            sorted_indices[start + greatest] < sorted_indices[start + child + 1u]) {{
+            greatest = child + 1u;
+        }}
+        if (greatest == root) {{ break; }}
+        swap_indices(start + root, start + greatest);
+        root = greatest;
+    }}
+}}
+
+fn heap_sort(start: u32, end: u32) {{
+    let count = end - start;
+    if (count < 2u) {{ return; }}
+    var root = count / 2u;
+    loop {{
+        if (root == 0u) {{ break; }}
+        root = root - 1u;
+        sift_down(start, count, root);
+    }}
+    var remaining = count;
+    loop {{
+        if (remaining <= 1u) {{ break; }}
+        remaining = remaining - 1u;
+        swap_indices(start, start + remaining);
+        sift_down(start, remaining, 0u);
+    }}
+}}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total_bins = arrayLength(&bin_offsets) - 1u;
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total_bins - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let bin = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (bin >= total_bins) {{ return; }}
+    heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);
+}}
+"#,
+    )
+}
+
+fn generate_gather_wgsl(kernel: EsKernel, fine_shape: [usize; DIMENSIONS]) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let width = kernel.width();
+    let bin_radius = width.div_ceil(2);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const WIDTH: u32 = {width}u;
+const WIDTH_I32: i32 = {width}i;
+const WIDTH_F32: f32 = {width}.0;
+const HALF_WIDTH: f32 = {half_width};
+const BETA: f32 = {beta};
+const BIN_RADIUS: i32 = {bin_radius}i;
+
+@group(0) @binding(0) var<storage, read> points: array<f32>;
+@group(0) @binding(1) var<storage, read> strengths: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(4) var<storage, read_write> fine_grid: array<vec2<f32>>;
+
+fn ceil_df64_to_i32(value: Df64) -> i32 {{
+    let base = floor(value.hi);
+    let remainder = df64_sub(value, Df64(base, 0.0));
+    let has_positive_remainder = remainder.hi > 0.0 ||
+        (remainder.hi == 0.0 && remainder.lo > 0.0);
+    return i32(base) + select(0, 1, has_positive_remainder);
+}}
+
+fn wrap_bin(index: i32, fine_length: i32) -> u32 {{
+    var wrapped = index;
+    if (wrapped < 0) {{ wrapped = wrapped + fine_length; }}
+    if (wrapped >= fine_length) {{ wrapped = wrapped - fine_length; }}
+    return u32(wrapped);
+}}
+
+fn es_weight(distance: f32) -> f32 {{
+    let scaled = 2.0 * abs(distance) / WIDTH_F32;
+    let squared = scaled * scaled;
+    if (squared >= 1.0) {{ return 0.0; }}
+    return exp(BETA * (sqrt(max(0.0, 1.0 - squared)) - 1.0));
+}}
+
+fn support_cell(
+    wrapped_cell: u32,
+    start: i32,
+    fine_length: i32,
+) -> i32 {{
+    var unwrapped = i32(wrapped_cell);
+    if (unwrapped < start) {{ unwrapped = unwrapped + fine_length; }}
+    if (unwrapped >= start + WIDTH_I32) {{
+        unwrapped = unwrapped - fine_length;
+    }}
+    return unwrapped;
+}}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (FINE_COUNT - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let cell = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (cell >= FINE_COUNT) {{ return; }}
+
+    let cell_0 = cell % FINE_0;
+    let cell_1 = cell / FINE_0;
+    var sum = vec2<f32>(0.0, 0.0);
+    for (var bin_offset_1 = -BIN_RADIUS; bin_offset_1 < BIN_RADIUS;
+         bin_offset_1 = bin_offset_1 + 1) {{
+        let bin_1 = wrap_bin(i32(cell_1) + bin_offset_1, FINE_1_I32);
+        for (var bin_offset_0 = -BIN_RADIUS; bin_offset_0 < BIN_RADIUS;
+             bin_offset_0 = bin_offset_0 + 1) {{
+            let bin_0 = wrap_bin(i32(cell_0) + bin_offset_0, FINE_0_I32);
+            let bin = bin_0 + FINE_0 * bin_1;
+            let begin = bin_offsets[bin];
+            let end = bin_offsets[bin + 1u];
+            for (var slot = begin; slot < end; slot = slot + 1u) {{
+                let point_index = sorted_indices[slot];
+                let point_base = point_index * 2u;
+                let position_0 = fold_position_0(points[point_base]);
+                let position_1 = fold_position_1(points[point_base + 1u]);
+                let start_0 = ceil_df64_to_i32(
+                    df64_sub(position_0, Df64(HALF_WIDTH, 0.0)),
+                );
+                let start_1 = ceil_df64_to_i32(
+                    df64_sub(position_1, Df64(HALF_WIDTH, 0.0)),
+                );
+                let unwrapped_0 = support_cell(cell_0, start_0, FINE_0_I32);
+                let unwrapped_1 = support_cell(cell_1, start_1, FINE_1_I32);
+                if (unwrapped_0 >= start_0 && unwrapped_0 < start_0 + WIDTH_I32 &&
+                    unwrapped_1 >= start_1 && unwrapped_1 < start_1 + WIDTH_I32) {{
+                    let distance_0 = df64_sub(
+                        Df64(f32(unwrapped_0), 0.0),
+                        position_0,
+                    );
+                    let distance_1 = df64_sub(
+                        Df64(f32(unwrapped_1), 0.0),
+                        position_1,
+                    );
+                    let weight = es_weight(distance_0.hi + distance_0.lo) *
+                        es_weight(distance_1.hi + distance_1.lo);
+                    sum = sum + strengths[point_index] * weight;
+                }}
+            }}
+        }}
+    }}
+    fine_grid[cell] = sum;
+}}
+"#,
+        half_width = format_wgsl_f32(kernel.half_width() as f32),
+        beta = format_wgsl_f32(kernel.beta() as f32),
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+fn generate_deconvolution_wgsl(config: &NufftConfig, fine_shape: [usize; DIMENSIONS]) -> String {
+    let mode_shape = config.n_modes();
+    debug_assert_eq!(mode_shape.len(), DIMENSIONS);
+    let mode_count = mode_shape[0] * mode_shape[1];
+    let centered = matches!(config.mode_order(), crate::config::ModeOrder::Centered);
+    format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const MODE_0: u32 = {mode_0}u;
+const MODE_1: u32 = {mode_1}u;
+const MODE_COUNT: u32 = {mode_count}u;
+const FINE_0: u32 = {fine_0}u;
+const FINE_1: u32 = {fine_1}u;
+const CENTERED_ORDER: bool = {centered};
+
+@group(0) @binding(0) var<storage, read> fine_grid: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read> amplitudes: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_values: array<vec2<f32>>;
+
+fn fine_axis_index(
+    storage_index: u32,
+    mode_length: u32,
+    fine_length: u32,
+) -> u32 {{
+    let half_mode_count = mode_length / 2u;
+    let nonnegative_count = (mode_length + 1u) / 2u;
+    if (CENTERED_ORDER) {{
+        if (storage_index < half_mode_count) {{
+            return fine_length - (half_mode_count - storage_index);
+        }}
+        return storage_index - half_mode_count;
+    }}
+    if (storage_index < nonnegative_count) {{
+        return storage_index;
+    }}
+    return fine_length - (mode_length - storage_index);
+}}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (MODE_COUNT - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let output_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (output_index >= MODE_COUNT) {{ return; }}
+
+    let storage_0 = output_index % MODE_0;
+    let storage_1 = output_index / MODE_0;
+    let fine_0 = fine_axis_index(storage_0, MODE_0, FINE_0);
+    let fine_1 = fine_axis_index(storage_1, MODE_1, FINE_1);
+    let fine_index = fine_0 + FINE_0 * fine_1;
+    output_values[output_index] = fine_grid[fine_index] * amplitudes[output_index];
+}}
+"#,
+        mode_0 = mode_shape[0],
+        mode_1 = mode_shape[1],
+        fine_0 = fine_shape[0],
+        fine_1 = fine_shape[1],
+    )
+}
+
+fn format_wgsl_f32(value: f32) -> String {
+    debug_assert!(value.is_finite());
+    let mut formatted = value.to_string();
+    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+        formatted.push_str(".0");
+    }
+    formatted
+}
+
+fn dispatch_for_elements(
+    element_count: usize,
+    max_workgroups_per_dimension: u32,
+) -> Result<(u32, u32, u32)> {
+    let elements = u32::try_from(element_count).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 2D GPU dispatch element count",
+    })?;
+    split_workgroups(
+        elements.div_ceil(WORKGROUP_SIZE),
+        max_workgroups_per_dimension,
+    )
+}
+
+fn checked_buffer_size(
+    context: &'static str,
+    elements: usize,
+    bytes_per_element: u64,
+) -> Result<u64> {
+    u64::try_from(elements)
+        .ok()
+        .and_then(|count| count.checked_mul(bytes_per_element))
+        .ok_or(NufftError::LengthOverflow { context })
+}
+
+fn validate_point_coordinate_shader_index(point_count: usize) -> Result<()> {
+    let coordinate_count =
+        point_count
+            .checked_mul(DIMENSIONS)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 2D point-coordinate count",
+            })?;
+    u32::try_from(coordinate_count)
+        .map(|_| ())
+        .map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 2D point-coordinate shader index space",
+        })
+}
+
+fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
+    if bytes > limit {
+        Err(NufftError::GpuBufferBindingTooLarge {
+            buffer,
+            required_bytes: bytes,
+            limit_bytes: limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_buffer_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
+    if bytes > limit {
+        Err(NufftError::GpuBufferBindingTooLarge {
+            buffer,
+            required_bytes: bytes,
+            limit_bytes: limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_external_storage_buffer(
+    label: &'static str,
+    buffer: &wgpu::Buffer,
+    required_bytes: u64,
+    max_storage_binding_bytes: u64,
+) -> Result<()> {
+    if !buffer.usage().contains(wgpu::BufferUsages::STORAGE) {
+        return Err(NufftError::GpuBufferMissingUsage {
+            buffer: label,
+            required_usage: "STORAGE",
+        });
+    }
+    if buffer.size() < required_bytes {
+        return Err(NufftError::GpuBufferTooSmall {
+            buffer: label,
+            required_bytes,
+            actual_bytes: buffer.size(),
+        });
+    }
+    validate_binding_limit(label, required_bytes, max_storage_binding_bytes)
+}
+
+fn binding_entry(binding: u32, buffer: &wgpu::Buffer, size: u64) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset: 0,
+            size: NonZeroU64::new(size),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModeOrder;
+
+    #[test]
+    fn count_uses_point_major_coordinates_and_axis_zero_fast_bins() {
+        let source = generate_count_wgsl([64, 96]);
+        assert!(source.contains("let total = arrayLength(&points) / 2u;"));
+        assert!(source.contains("let point_base = point_index * 2u;"));
+        assert!(source.contains("let bin = bin_0 + FINE_0 * bin_1;"));
+        assert!(source.contains("const FINE_COUNT: u32 = 6144u;"));
+    }
+
+    #[test]
+    fn position_folding_preserves_df64_low_words_on_both_axes() {
+        let source = generate_position_wgsl([65_536, 98_304]);
+        assert!(source.contains("const POSITION_SCALE_0_LO: f32"));
+        assert!(source.contains("const POSITION_SCALE_1_LO: f32"));
+        assert!(source.contains("fn floor_df64_to_i32(value: Df64) -> i32"));
+        assert!(source.contains("has_negative_remainder"));
+    }
+
+    #[test]
+    fn gather_is_one_writer_with_tensor_product_weights() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let source = generate_gather_wgsl(kernel, [64, 96]);
+        assert!(source.contains("const BIN_RADIUS: i32 = 4i;"));
+        assert!(source.contains("for (var bin_offset_1 = -BIN_RADIUS"));
+        assert!(source.contains("for (var bin_offset_0 = -BIN_RADIUS"));
+        assert!(source.contains("es_weight(distance_0.hi + distance_0.lo) *"));
+        assert!(source.contains("es_weight(distance_1.hi + distance_1.lo)"));
+        assert!(source.contains("fine_grid[cell] = sum;"));
+        assert!(!source.contains("fine_grid[cell] = fine_grid[cell] + sum"));
+    }
+
+    #[test]
+    fn each_flattened_bin_is_sorted_by_original_point_index() {
+        let source = generate_sort_wgsl();
+        assert!(source.contains("fn heap_sort(start: u32, end: u32)"));
+        assert!(source.contains("sorted_indices[start + greatest] <"));
+        assert!(source.contains("heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);"));
+    }
+
+    #[test]
+    fn terminal_offset_extends_the_total_bin_scan() {
+        let source = generate_terminal_wgsl();
+        assert!(source.contains("bin_offsets[bin_count - 1u] + bin_counts[bin_count - 1u]"));
+        assert!(!source.contains("for ("));
+        assert!(!source.contains("atomic"));
+    }
+
+    #[test]
+    fn deconvolution_maps_axes_independently_in_both_mode_orders() {
+        for order in [ModeOrder::Centered, ModeOrder::Fft] {
+            let config = NufftConfig::new([17, 19], 1.0e-6).with_mode_order(order);
+            let source = generate_deconvolution_wgsl(&config, [36, 40]);
+            assert!(source.contains("const MODE_0: u32 = 17u;"));
+            assert!(source.contains("const MODE_1: u32 = 19u;"));
+            assert!(source.contains("let storage_0 = output_index % MODE_0;"));
+            assert!(source.contains("let storage_1 = output_index / MODE_0;"));
+            assert!(source.contains("let fine_index = fine_0 + FINE_0 * fine_1;"));
+        }
+    }
+
+    #[test]
+    fn amplitudes_are_tensor_products_in_axis_zero_fast_order() {
+        let config = NufftConfig::new([3, 5], 1.0e-6);
+        let coefficients_0 = [2.0, 4.0];
+        let coefficients_1 = [5.0, 10.0, 20.0];
+        let values = mode_amplitudes(&config, [&coefficients_0, &coefficients_1]).unwrap();
+        assert_eq!(values.len(), 15);
+        // Centered storage index (0,0) is mode (-1,-2).
+        assert_eq!(values[0].to_bits(), (1.0f32 / 80.0).to_bits());
+        // Centered storage index (1,2) is mode (0,0), linear index 1+3*2.
+        assert_eq!(values[7].to_bits(), (1.0f32 / 10.0).to_bits());
+    }
+
+    #[test]
+    fn buffer_sizes_are_exact_point_major_prefixes() {
+        assert_eq!(Type1GpuPlan2d::point_buffer_size_bytes(7).unwrap(), 56);
+        assert_eq!(Type1GpuPlan2d::strength_buffer_size_bytes(7).unwrap(), 56);
+        assert_eq!(
+            Type1GpuPlan2d::complex_buffer_size_bytes("test", 11).unwrap(),
+            88
+        );
+    }
+
+    #[test]
+    fn point_coordinate_shader_index_checks_the_aos_scalar_count() {
+        let maximum_points = u32::MAX as usize / DIMENSIONS;
+        assert_eq!(
+            validate_point_coordinate_shader_index(maximum_points),
+            Ok(())
+        );
+        assert_eq!(
+            validate_point_coordinate_shader_index(maximum_points + 1),
+            Err(NufftError::LengthOverflow {
+                context: "type-1 2D point-coordinate shader index space"
+            })
+        );
+    }
+
+    #[test]
+    fn gpu_pipeline_matches_the_direct_oracle_when_requested() {
+        if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
+            return;
+        }
+        pollster::block_on(async {
+            let Some(context) = wgpu_fft::device::request_default_device().await else {
+                panic!("GPU tests were requested but no suitable adapter was found");
+            };
+            let config = NufftConfig::new([8, 10], 1.0e-6);
+            let kernel = EsKernel::for_tolerance(config.eps(), config.sigma()).unwrap();
+            let fine_shape = [
+                crate::kernel::select_fine_grid_size(8, config.sigma(), kernel.width()).unwrap(),
+                crate::kernel::select_fine_grid_size(10, config.sigma(), kernel.width()).unwrap(),
+            ];
+            let coefficients_0 = kernel.centered_fourier_coefficients(fine_shape[0]).unwrap();
+            let coefficients_1 = kernel.centered_fourier_coefficients(fine_shape[1]).unwrap();
+            let scope = context
+                .device
+                .push_error_scope(wgpu::ErrorFilter::Validation);
+            let plan = Type1GpuPlan2d::new(
+                &context.device,
+                &context.queue,
+                &config,
+                kernel,
+                fine_shape,
+                [&coefficients_0, &coefficients_1],
+            )
+            .unwrap();
+
+            let points = [-2.9f32, 2.8, -0.25, 0.75, 0.0, 0.0, 1.2, -1.7, 1.2, -1.7];
+            let strengths = [0.75f32, -0.5, -0.25, 0.125, 1.0, 0.25, -0.6, 0.4, 0.2, -0.8];
+            let points_buffer =
+                context
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("wgpu_nufft.type1_2d.test.points"),
+                        contents: bytemuck::cast_slice(&points),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            let strengths_buffer =
+                context
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("wgpu_nufft.type1_2d.test.strengths"),
+                        contents: bytemuck::cast_slice(&strengths),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            let output_bytes = config.mode_count().unwrap() as u64 * COMPLEX_F32_BYTES;
+            let output = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wgpu_nufft.type1_2d.test.output"),
+                size: output_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = context.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wgpu_nufft.type1_2d.test.readback"),
+                size: output_bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("wgpu_nufft.type1_2d.test.encoder"),
+                    });
+            plan.encode(
+                &context.device,
+                &mut encoder,
+                points.len() / DIMENSIONS,
+                &points_buffer,
+                &strengths_buffer,
+                &output,
+            )
+            .unwrap();
+            encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+            context.queue.submit([encoder.finish()]);
+            let slice = readback.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
+            context
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            receiver.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range();
+            let actual = bytemuck::cast_slice::<u8, f32>(&mapped);
+            let coordinates = points
+                .iter()
+                .map(|&value| f64::from(value))
+                .collect::<Vec<_>>();
+            let strengths_f64 = strengths
+                .chunks_exact(2)
+                .map(|value| crate::Complex64::new(f64::from(value[0]), f64::from(value[1])))
+                .collect::<Vec<_>>();
+            let reference =
+                crate::direct::reference_type1_f64(&config, &coordinates, &strengths_f64).unwrap();
+            let (error_squared, norm_squared) = actual.chunks_exact(2).zip(&reference).fold(
+                (0.0, 0.0),
+                |(error, norm), (value, reference)| {
+                    let delta_re = f64::from(value[0]) - reference.re;
+                    let delta_im = f64::from(value[1]) - reference.im;
+                    (
+                        error + delta_re * delta_re + delta_im * delta_im,
+                        norm + reference.re * reference.re + reference.im * reference.im,
+                    )
+                },
+            );
+            let relative_l2 = (error_squared / norm_squared.max(f64::MIN_POSITIVE)).sqrt();
+            assert!(
+                relative_l2 <= 8.0 * config.eps(),
+                "2D type-1 relative L2 {relative_l2} exceeds {}",
+                8.0 * config.eps()
+            );
+            drop(mapped);
+            readback.unmap();
+            if let Some(error) = scope.pop().await {
+                panic!("2D type-1 pipeline validation failed: {error}");
+            }
+            #[cfg(windows)]
+            std::mem::forget((plan, context));
+            #[cfg(not(windows))]
+            drop((plan, context));
+        });
+    }
+}

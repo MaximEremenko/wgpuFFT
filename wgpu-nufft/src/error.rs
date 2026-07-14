@@ -213,7 +213,7 @@ impl fmt::Display for NufftError {
                 supported,
             } => write!(
                 f,
-                "GPU {kind} execution supports {supported} dimension, but the plan has {actual}"
+                "GPU {kind} execution supports up to {supported} dimensions, but the plan has {actual}"
             ),
             Self::GpuExecutionUnavailable { kind, reason } => {
                 write!(f, "GPU {kind} execution is unavailable: {reason}")

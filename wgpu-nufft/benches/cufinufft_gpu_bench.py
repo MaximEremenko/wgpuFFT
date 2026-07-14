@@ -26,6 +26,10 @@ import numpy as np
 
 
 DEFAULT_CASES = ((262_144, 262_144), (1_048_576, 1_048_576))
+DEFAULT_CASES_2D = (
+    (512, 512, 512 * 512),
+    (1_024, 1_024, 1_024 * 1_024),
+)
 DEFAULT_SEED = 0x4E55_4646
 DEFAULT_RUNS = 3
 DEFAULT_SAMPLES = 10
@@ -35,6 +39,7 @@ DEFAULT_EPS = 1.0e-6
 LCG_MULTIPLIER = 1_664_525
 LCG_INCREMENT = 1_013_904_223
 U24_SCALE = np.float32(1.0 / (1 << 24))
+POINT_Y_SEED_MASK = 0xB7E1_5162
 
 
 def configure_windows_dll_search() -> list[object]:
@@ -90,6 +95,29 @@ def parse_case(value: str) -> tuple[int, int]:
     return n_modes, point_count
 
 
+def parse_case_2d(value: str) -> tuple[int, int, int]:
+    fields = value.split(":")
+    if len(fields) > 2:
+        raise argparse.ArgumentTypeError("2D case must be N0xN1 or N0xN1:M")
+    dimensions = fields[0].lower().split("x")
+    if len(dimensions) != 2:
+        raise argparse.ArgumentTypeError("2D case must be N0xN1 or N0xN1:M")
+    n0, n1 = map(positive_int, dimensions)
+    mode_count = n0 * n1
+    point_count = mode_count if len(fields) == 1 else positive_int(fields[1])
+    return n0, n1, point_count
+
+
+def normalized_mode_shape(n_modes: int | tuple[int, ...]) -> tuple[int, ...]:
+    return (n_modes,) if isinstance(n_modes, int) else tuple(n_modes)
+
+
+def cufinufft_mode_shape(n_modes: int | tuple[int, ...]) -> tuple[int, ...]:
+    """Return the C/Python shape whose last (x) axis is wgpu axis zero."""
+
+    return normalized_mode_shape(n_modes)[::-1]
+
+
 def lcg_uniform(count: int, seed: int) -> np.ndarray:
     """Return the same prefix-stable f32 LCG stream as the Rust harness."""
 
@@ -127,6 +155,35 @@ def make_inputs(n_modes: int, point_count: int, seed: int):
     return points, strengths, modes
 
 
+def make_inputs_2d(n0: int, n1: int, point_count: int, seed: int):
+    """Generate axis-zero-fast 2D inputs matching the Rust benchmark."""
+
+    points_x_u = lcg_uniform(point_count, seed ^ 0xA341_316C)
+    points_y_u = lcg_uniform(point_count, seed ^ POINT_Y_SEED_MASK)
+    strength_re = lcg_uniform(point_count, seed ^ 0xC801_3EA4)
+    strength_im = lcg_uniform(point_count, seed ^ 0xAD90_777D)
+    mode_count = n0 * n1
+    mode_re = lcg_uniform(mode_count, seed ^ 0x7E95_761E)
+    mode_im = lcg_uniform(mode_count, seed ^ 0x6C8E_9CF5)
+
+    def coordinates(values: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(
+            values * np.float32(2.0 * math.pi) - np.float32(math.pi),
+            dtype=np.float32,
+        )
+
+    strengths = np.empty(point_count, dtype=np.complex64)
+    strengths.real = strength_re * np.float32(2.0) - np.float32(1.0)
+    strengths.imag = strength_im * np.float32(2.0) - np.float32(1.0)
+    modes = np.empty(mode_count, dtype=np.complex64)
+    modes.real = mode_re * np.float32(2.0) - np.float32(1.0)
+    modes.imag = mode_im * np.float32(2.0) - np.float32(1.0)
+    # cuFINUFFT's Python arrays are C ordered `(n1, n0)`, so their last
+    # dimension is the same axis-zero-fast layout used by wgpu-nufft.
+    modes = modes.reshape((n1, n0))
+    return (coordinates(points_x_u), coordinates(points_y_u)), strengths, modes
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -148,14 +205,14 @@ def library_metadata() -> tuple[Path, str]:
 
 def make_plan(
     kind: int,
-    n_modes: int,
+    n_modes: int | tuple[int, ...],
     eps: float,
     stream: cp.cuda.Stream,
     device_id: int,
 ):
     return cufinufft.Plan(
         kind,
-        (n_modes,),
+        cufinufft_mode_shape(n_modes),
         eps=eps,
         isign=1,
         dtype="complex64",
@@ -164,6 +221,17 @@ def make_plan(
         gpu_device_id=device_id,
         gpu_stream=stream.ptr,
     )
+
+
+def set_plan_points(plan, points) -> None:
+    if isinstance(points, tuple):
+        # The Python wrapper treats n_modes as C array shape `(N1, N0)` and
+        # reverses both that shape and the setpts arguments for cuFINUFFT's
+        # column-major C API.  Our tuple is in wgpu logical order `(x0, x1)`,
+        # so present it in Python array-axis order `(x1, x0)` here.
+        plan.setpts(*points[::-1])
+    else:
+        plan.setpts(points)
 
 
 def relative_l2(actual: np.ndarray, reference: np.ndarray) -> float:
@@ -187,6 +255,46 @@ def direct_type2(points: np.ndarray, modes: np.ndarray) -> np.ndarray:
     )
     phase = np.exp(1j * np.outer(points.astype(np.float64), mode_indices))
     return phase @ modes.astype(np.complex128)
+
+
+def centered_modes(length: int) -> np.ndarray:
+    return np.arange(-(length // 2), (length - 1) // 2 + 1, dtype=np.float64)
+
+
+def direct_type1_2d(
+    points: tuple[np.ndarray, np.ndarray],
+    strengths: np.ndarray,
+    n_modes: tuple[int, int],
+) -> np.ndarray:
+    n0, n1 = n_modes
+    k0 = np.tile(centered_modes(n0), n1)
+    k1 = np.repeat(centered_modes(n1), n0)
+    x, y = points
+    phase = np.exp(
+        1j
+        * (
+            np.outer(k0, x.astype(np.float64))
+            + np.outer(k1, y.astype(np.float64))
+        )
+    )
+    return (phase @ strengths.astype(np.complex128)).reshape((n1, n0))
+
+
+def direct_type2_2d(
+    points: tuple[np.ndarray, np.ndarray], modes: np.ndarray
+) -> np.ndarray:
+    n1, n0 = modes.shape
+    k0 = np.tile(centered_modes(n0), n1)
+    k1 = np.repeat(centered_modes(n1), n0)
+    x, y = points
+    phase = np.exp(
+        1j
+        * (
+            np.outer(x.astype(np.float64), k0)
+            + np.outer(y.astype(np.float64), k1)
+        )
+    )
+    return phase @ modes.astype(np.complex128).reshape(-1)
 
 
 def run_correctness_smoke(device_id: int, eps: float, seed: int) -> None:
@@ -217,8 +325,8 @@ def run_correctness_smoke(device_id: int, eps: float, seed: int) -> None:
 
     type1 = make_plan(1, n_modes, eps, stream, device_id)
     type2 = make_plan(2, n_modes, eps, stream, device_id)
-    type1.setpts(gpu_points)
-    type2.setpts(gpu_points)
+    set_plan_points(type1, gpu_points)
+    set_plan_points(type2, gpu_points)
     type1.execute(gpu_strengths, out=type1_output)
     type2.execute(gpu_modes, out=type2_output)
     stream.synchronize()
@@ -232,11 +340,12 @@ def run_correctness_smoke(device_id: int, eps: float, seed: int) -> None:
 
     zero_points = cp.zeros(point_count, dtype=cp.float32)
     cp.cuda.runtime.deviceSynchronize()
-    type1.setpts(zero_points)
-    type2.setpts(zero_points)
+    set_plan_points(type1, zero_points)
+    set_plan_points(type2, zero_points)
     type1.execute(gpu_strengths, out=type1_output)
     type2.execute(gpu_modes, out=type2_output)
     stream.synchronize()
+
     analytic_type1 = np.full(
         n_modes, strengths.astype(np.complex128).sum(), dtype=np.complex128
     )
@@ -273,6 +382,103 @@ def run_correctness_smoke(device_id: int, eps: float, seed: int) -> None:
     stream.synchronize()
 
 
+def run_correctness_smoke_2d(device_id: int, eps: float, seed: int) -> None:
+    n_modes = (8, 6)
+    point_count = 41
+    points, strengths, modes = make_inputs_2d(*n_modes, point_count, seed)
+    points[0][:6] = np.array(
+        [
+            -np.float32(math.pi),
+            np.nextafter(np.float32(math.pi), np.float32(-math.inf)),
+            np.float32(0.0),
+            np.float32(0.0),
+            np.float32(0.125),
+            np.float32(-0.75),
+        ],
+        dtype=np.float32,
+    )
+    points[1][:6] = np.array(
+        [
+            np.float32(math.pi),
+            -np.float32(math.pi),
+            np.float32(0.0),
+            np.float32(0.0),
+            np.float32(-0.375),
+            np.float32(0.5),
+        ],
+        dtype=np.float32,
+    )
+
+    device = cp.cuda.Device(device_id)
+    device.use()
+    stream = cp.cuda.Stream(non_blocking=True)
+    gpu_points = tuple(cp.asarray(axis) for axis in points)
+    gpu_strengths = cp.asarray(strengths)
+    gpu_modes = cp.asarray(modes)
+    type1_output = cp.empty(cufinufft_mode_shape(n_modes), dtype=cp.complex64)
+    type2_output = cp.empty(point_count, dtype=cp.complex64)
+    cp.cuda.runtime.deviceSynchronize()
+
+    type1 = make_plan(1, n_modes, eps, stream, device_id)
+    type2 = make_plan(2, n_modes, eps, stream, device_id)
+    set_plan_points(type1, gpu_points)
+    set_plan_points(type2, gpu_points)
+    type1.execute(gpu_strengths, out=type1_output)
+    type2.execute(gpu_modes, out=type2_output)
+    stream.synchronize()
+
+    type1_error = relative_l2(
+        cp.asnumpy(type1_output), direct_type1_2d(points, strengths, n_modes)
+    )
+    type2_error = relative_l2(
+        cp.asnumpy(type2_output), direct_type2_2d(points, modes)
+    )
+
+    zero_points = tuple(cp.zeros(point_count, dtype=cp.float32) for _ in range(2))
+    cp.cuda.runtime.deviceSynchronize()
+    set_plan_points(type1, zero_points)
+    set_plan_points(type2, zero_points)
+    type1.execute(gpu_strengths, out=type1_output)
+    type2.execute(gpu_modes, out=type2_output)
+    stream.synchronize()
+    analytic_type1 = np.full(
+        cufinufft_mode_shape(n_modes),
+        strengths.astype(np.complex128).sum(),
+        dtype=np.complex128,
+    )
+    analytic_type2 = np.full(
+        point_count, modes.astype(np.complex128).sum(), dtype=np.complex128
+    )
+    analytic_type1_error = relative_l2(cp.asnumpy(type1_output), analytic_type1)
+    analytic_type2_error = relative_l2(cp.asnumpy(type2_output), analytic_type2)
+
+    threshold = 20.0 * eps
+    print(
+        "CUFINUFFT_SMOKE "
+        f"dimensions=2 N0={n_modes[0]} N1={n_modes[1]} M={point_count} "
+        f"eps={eps:.9g} direct_type1_relative_l2={type1_error:.9e} "
+        f"direct_type2_relative_l2={type2_error:.9e} "
+        f"analytic_type1_relative_l2={analytic_type1_error:.9e} "
+        f"analytic_type2_relative_l2={analytic_type2_error:.9e} "
+        f"threshold={threshold:.9e}"
+    )
+    errors = (
+        type1_error,
+        type2_error,
+        analytic_type1_error,
+        analytic_type2_error,
+    )
+    worst = max(errors)
+    if any(not math.isfinite(error) for error in errors) or worst > threshold:
+        raise RuntimeError(
+            f"cuFINUFFT 2D correctness smoke failed: worst relative L2 {worst}"
+        )
+
+    del type1, type2
+    gc.collect()
+    stream.synchronize()
+
+
 def elapsed_batch_ms(
     operation: Callable[[], None], repeats: int, stream: cp.cuda.Stream
 ) -> float:
@@ -300,7 +506,7 @@ def flatten(values: list[list[float]]) -> list[float]:
 
 def benchmark_kind(
     kind: int,
-    n_modes: int,
+    n_modes: int | tuple[int, ...],
     point_count: int,
     points,
     input_values,
@@ -314,8 +520,8 @@ def benchmark_kind(
 ) -> None:
     kind_name = f"type-{kind}"
     transforms_per_sample = 1 if kind == 1 else type2_batch
-    output_length = n_modes if kind == 1 else point_count
-    output = cp.empty(output_length, dtype=cp.complex64)
+    output_shape = cufinufft_mode_shape(n_modes) if kind == 1 else point_count
+    output = cp.empty(output_shape, dtype=cp.complex64)
     plan_samples: list[float] = []
     setpts_samples: list[list[float]] = []
     execute_samples: list[list[float]] = []
@@ -334,7 +540,7 @@ def benchmark_kind(
         plan_samples.append(plan_ms)
 
         for _ in range(warmups):
-            plan.setpts(points)
+            set_plan_points(plan, points)
             plan.execute(input_values, out=output)
         stream.synchronize()
 
@@ -343,7 +549,7 @@ def benchmark_kind(
         run_combined: list[float] = []
         for sample_index in range(samples):
             setpts_ms = elapsed_batch_ms(
-                lambda: plan.setpts(points), transforms_per_sample, stream
+                lambda: set_plan_points(plan, points), transforms_per_sample, stream
             )
             execute_ms = elapsed_batch_ms(
                 lambda: plan.execute(input_values, out=output),
@@ -352,7 +558,7 @@ def benchmark_kind(
             )
 
             def setpts_and_execute() -> None:
-                plan.setpts(points)
+                set_plan_points(plan, points)
                 plan.execute(input_values, out=output)
 
             combined_ms = elapsed_batch_ms(
@@ -400,9 +606,18 @@ def benchmark_kind(
         print(f"  execute_run_{run_index}_ms={format_samples(values)}")
     for run_index, values in enumerate(combined_samples, start=1):
         print(f"  combined_run_{run_index}_ms={format_samples(values)}")
+    mode_shape = normalized_mode_shape(n_modes)
+    shape_fields = (
+        f"N={mode_shape[0]}"
+        if len(mode_shape) == 1
+        else (
+            f"dimensions=2,N0={mode_shape[0]},N1={mode_shape[1]},"
+            f"N_total={math.prod(mode_shape)}"
+        )
+    )
     print(
         "RESULT,"
-        f"kind={kind_name},N={n_modes},M={point_count},eps={eps:.9g},"
+        f"kind={kind_name},{shape_fields},M={point_count},eps={eps:.9g},"
         f"runs={runs},samples_per_run={samples},"
         f"transforms_per_sample={transforms_per_sample},"
         f"plan_ms={statistics.mean(plan_samples):.6f},"
@@ -432,12 +647,26 @@ def benchmark_kind(
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--2d",
+        action="store_true",
+        dest="two_d",
+        help="run the opt-in 2D matrix instead of the unchanged 1D matrix",
+    )
+    parser.add_argument(
         "--case",
         action="append",
         type=parse_case,
         dest="cases",
         metavar="N[:M]",
         help="mode and point counts; repeat for multiple cases",
+    )
+    parser.add_argument(
+        "--case-2d",
+        action="append",
+        type=parse_case_2d,
+        dest="cases_2d",
+        metavar="N0xN1[:M]",
+        help="2D mode shape and point count; requires --2d",
     )
     parser.add_argument("--runs", type=positive_int, default=DEFAULT_RUNS)
     parser.add_argument("--samples", type=positive_int, default=DEFAULT_SAMPLES)
@@ -458,6 +687,10 @@ def main() -> int:
     args = make_parser().parse_args()
     if not math.isfinite(args.eps) or args.eps <= 0.0:
         raise SystemExit("--eps must be finite and positive")
+    if args.two_d and args.cases:
+        raise SystemExit("use --case-2d, not --case, with --2d")
+    if not args.two_d and args.cases_2d:
+        raise SystemExit("--case-2d requires --2d")
 
     device = cp.cuda.Device(args.device)
     device.use()
@@ -466,9 +699,13 @@ def main() -> int:
     if isinstance(device_name, bytes):
         device_name = device_name.decode(errors="replace")
     library, library_sha256 = library_metadata()
-    cases = args.cases or list(DEFAULT_CASES)
+    cases = (
+        args.cases_2d or list(DEFAULT_CASES_2D)
+        if args.two_d
+        else args.cases or list(DEFAULT_CASES)
+    )
 
-    print("cuFINUFFT 1D GPU benchmark")
+    print(f"cuFINUFFT {'2D' if args.two_d else '1D'} GPU benchmark")
     print(f"python={platform.python_version()} executable={sys.executable}")
     print(f"numpy={np.__version__}")
     print(f"cupy={cp.__version__} package={Path(cp.__file__).resolve()}")
@@ -488,9 +725,11 @@ def main() -> int:
         f"cuda_path={os.environ.get('CUDA_PATH', 'unset')}"
     )
     print(f"platform={platform.platform()}")
+    dimension_method = "dimensions=2, " if args.two_d else ""
     print(
         "method=complex64, eps="
         f"{args.eps:.9g}, sigma=2.0, isign=+1, modeord=0 "
+        f"{dimension_method}"
         f"(centered/CMCL), runs={args.runs}, samples={args.samples}, "
         f"warmups={args.warmups}, type1_batch=1, "
         f"type2_batch={args.type2_batch}, preallocated outputs"
@@ -505,26 +744,57 @@ def main() -> int:
         "wgpu type-2 submit-wait versus cuFINUFFT execute; all cuFINUFFT "
         "spans are also reported"
     )
-    print(
+    data_description = (
         "data=u32 LCG state=1664525*state+1013904223 mod 2^32, "
         f"high 24 bits, seed=0x{args.seed & 0xFFFF_FFFF:08X}; "
         "field-specific streams match the Rust benchmark"
     )
+    if args.two_d:
+        data_description += (
+            f"; point_y_seed_mask=0x{POINT_Y_SEED_MASK:08X}; "
+            "mode arrays use C shape (N1,N0) and setpts uses (x1,x0) so "
+            "N0/x0 remains axis-zero-fast"
+        )
+    print(data_description)
 
-    run_correctness_smoke(args.device, args.eps, args.seed)
+    if args.two_d:
+        run_correctness_smoke_2d(args.device, args.eps, args.seed)
+    else:
+        run_correctness_smoke(args.device, args.eps, args.seed)
     if args.smoke_only:
         return 0
 
-    for n_modes, point_count in cases:
+    for case in cases:
+        if args.two_d:
+            n0, n1, point_count = case
+            n_modes: int | tuple[int, ...] = (n0, n1)
+            points, strengths, modes = make_inputs_2d(
+                n0, n1, point_count, args.seed
+            )
+            case_label = (
+                f"dimensions=2 N0={n0} N1={n1} "
+                f"N_total={n0 * n1} M={point_count}"
+            )
+            gpu_points = tuple(cp.asarray(axis) for axis in points)
+        else:
+            n_modes, point_count = case
+            points, strengths, modes = make_inputs(
+                n_modes, point_count, args.seed
+            )
+            case_label = f"N={n_modes} M={point_count}"
+            gpu_points = cp.asarray(points)
         print()
-        print(f"case N={n_modes} M={point_count}")
-        points, strengths, modes = make_inputs(n_modes, point_count, args.seed)
-        gpu_points = cp.asarray(points)
+        print(f"case {case_label}")
         gpu_strengths = cp.asarray(strengths)
         gpu_modes = cp.asarray(modes)
         cp.cuda.runtime.deviceSynchronize()
+        point_bytes = (
+            sum(axis.nbytes for axis in gpu_points)
+            if isinstance(gpu_points, tuple)
+            else gpu_points.nbytes
+        )
         print(
-            f"device_inputs points_bytes={gpu_points.nbytes} "
+            f"device_inputs points_bytes={point_bytes} "
             f"strengths_bytes={gpu_strengths.nbytes} modes_bytes={gpu_modes.nbytes}"
         )
         benchmark_kind(

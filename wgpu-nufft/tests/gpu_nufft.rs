@@ -147,6 +147,7 @@ async fn run_gpu_nufft_cases() {
     assert!(relative_l2(&interleaved_to_complex64(&odd_actual), &odd_reference) <= 4.0e-6);
 
     run_gpu_type1_cases(&context.device, &context.queue).await;
+    validate_type1_scratch_grow_then_shrink(&context.device, &context.queue);
     validate_gpu_adjoint_consistency(&context.device, &context.queue);
     validate_structured_gpu_errors(&context.device, &context.queue);
 
@@ -192,7 +193,10 @@ async fn run_gpu_type1_cases(device: &wgpu::Device, queue: &wgpu::Queue) {
                     let first = execute_type1(device, queue, &plan, &points, &strengths);
                     let second = execute_type1(device, queue, &plan, &points, &strengths);
                     assert_eq!(
-                        first.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                        first
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
                         second
                             .iter()
                             .map(|value| value.to_bits())
@@ -243,6 +247,105 @@ async fn run_gpu_type1_cases(device: &wgpu::Device, queue: &wgpu::Queue) {
         "odd-modes",
         4.0e-6,
     );
+}
+
+fn validate_type1_scratch_grow_then_shrink(device: &wgpu::Device, queue: &wgpu::Queue) {
+    const EPS: f64 = 1.0e-6;
+    const LARGE_POINT_COUNT: usize = 257;
+
+    let config = NufftConfig::new([64], EPS)
+        .with_sign(NufftSign::Negative)
+        .with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+
+    // The first execution grows the cached point-index scratch and leaves a
+    // deliberately large, broadly distributed signal in every reusable stage.
+    // The clustered tail also poisons a high-occupancy bin.
+    let mut large_points = Vec::with_capacity(LARGE_POINT_COUNT);
+    let mut large_strengths = Vec::with_capacity(LARGE_POINT_COUNT * 2);
+    let pi = PI as f32;
+    for index in 0..LARGE_POINT_COUNT {
+        let point = if index >= 224 {
+            1.375 + (index - 224) as f32 * 1.0e-5
+        } else {
+            let permuted = (index * 97) % LARGE_POINT_COUNT;
+            -pi + 2.0 * pi * (permuted as f32 + 0.25) / LARGE_POINT_COUNT as f32
+        };
+        let phase = index as f32 * 0.173;
+        let magnitude = 32.0 + (index % 11) as f32;
+        large_points.push(point);
+        large_strengths.extend([magnitude * phase.cos(), -magnitude * phase.sin()]);
+    }
+
+    // The second execution is much smaller, occupies a different set of bins,
+    // includes a duplicate and wrap-boundary points, and has low amplitudes so
+    // any leakage from the first execution is conspicuous.
+    let three_pi = (3.0 * PI) as f32;
+    let three_pi_inside = f32::from_bits(three_pi.to_bits() - 1);
+    let small_points = [
+        -three_pi_inside,
+        -2.75,
+        -0.8125,
+        -0.8125,
+        0.125,
+        2.9375,
+        three_pi_inside,
+    ];
+    let small_strengths = [
+        0.25, -0.5, -1.25, 0.75, 2.0, -1.0, -0.125, 0.375, 0.625, 1.5, -0.75, -0.25, 1.125, -1.75,
+    ];
+    assert!(large_points.len() > small_points.len());
+
+    let large_point_f64 = large_points
+        .iter()
+        .map(|&point| f64::from(point))
+        .collect::<Vec<_>>();
+    let small_point_f64 = small_points
+        .iter()
+        .map(|&point| f64::from(point))
+        .collect::<Vec<_>>();
+    let large_reference = reference_type1_f64(
+        &config,
+        &large_point_f64,
+        &interleaved_to_complex64(&large_strengths),
+    )
+    .unwrap();
+    let small_reference = reference_type1_f64(
+        &config,
+        &small_point_f64,
+        &interleaved_to_complex64(&small_strengths),
+    )
+    .unwrap();
+
+    // `execute_type1` waits for the exact returned submission before the next
+    // execution, making the grow-then-shrink ordering explicit.
+    let large_actual = interleaved_to_complex64(&execute_type1(
+        device,
+        queue,
+        &plan,
+        &large_points,
+        &large_strengths,
+    ));
+    let small_actual = interleaved_to_complex64(&execute_type1(
+        device,
+        queue,
+        &plan,
+        &small_points,
+        &small_strengths,
+    ));
+
+    for (label, actual, reference) in [
+        ("scratch-grow-large", &large_actual, &large_reference),
+        ("scratch-shrink-stale", &small_actual, &small_reference),
+    ] {
+        let error = relative_l2(actual, reference);
+        eprintln!("NUFFT_ACCURACY kind=type1 class={label} relative_l2={error:.9e}");
+        assert!(
+            error <= ADVERSARIAL_TOLERANCE_FACTOR * EPS,
+            "type-1 class={label}: relative l2 {error} exceeds {}",
+            ADVERSARIAL_TOLERANCE_FACTOR * EPS
+        );
+    }
 }
 
 fn assert_type1_matches_oracle(
@@ -529,14 +632,19 @@ fn execute_type1(
     )
     .unwrap();
     encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, readback_bytes);
-    queue.submit([encoder.finish()]);
+    let submission = queue.submit([encoder.finish()]);
 
     let slice = readback.slice(..);
     let (sender, receiver) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
         sender.send(result).unwrap();
     });
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: None,
+        })
+        .unwrap();
     receiver.recv().unwrap().unwrap();
     let mapped = slice.get_mapped_range();
     let values = bytemuck::cast_slice::<u8, f32>(&mapped);

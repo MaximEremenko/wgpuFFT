@@ -43,8 +43,10 @@ executions accumulate strengths in deterministic point order. In 2D, both the
 ES spreading/interpolation weights and deconvolution amplitudes are tensor
 products, with dimension zero stored fastest. The gathered grid passes through
 a public `wgpu-fft` ND C2C plan before deconvolution and truncation into the
-caller-owned mode buffer. Both GPU routes reuse plan-owned fine-grid scratch
-and must execute in queue order on a given plan.
+caller-owned mode buffer. Both GPU routes reuse plan-owned fine-grid scratch.
+Type 1 also reuses fixed bin-count, cursor, and offset buffers and grows its
+sorted-point-index buffer only when a larger point set requires it. Executions
+on a given plan must remain in queue order.
 
 Deferred work includes 3D GPU execution, type 3, batching, NUFFT `f64`/df64 GPU
 arithmetic, faster multidimensional bin sorting/spreading, and WASM packaging.

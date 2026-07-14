@@ -1,0 +1,155 @@
+date = "2026-07-14"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+cargo = "1.95.0 (f2d3ce0bd 2026-03-21)"
+wgpu = "29.0.3"
+base_commit = "bb4cee71dec719a4237e47c40aa0189c87882d10"
+implementation_commit = "70659a5932ab7c7a7046cfce946145da2b08c703"
+
+[method]
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+mode_order = "centered / FINUFFT modeord=0"
+axis_zero_fastest = true
+point_layout = "point-major [x,y]"
+seed = "0x4E554646"
+point_y_seed_mask = "0xB7E15162"
+mode_shapes = [[512, 512], [1024, 1024]]
+fine_grid_shapes = [[1024, 1024], [2048, 2048]]
+point_count_equals_mode_count = true
+runs = 3
+warmups_per_run = 1
+samples_per_run = 10
+type1_transforms_per_sample = 1
+type2_transforms_per_sample = 32
+gpu_intervals = "adjacent ComputePassTimestampWrites boundaries; exact pipeline command envelope"
+ordinary_scope = "queue.submit through exact-submission device.poll"
+input_output_transfers_in_timed_region = false
+plan_and_encoding_in_timed_region = false
+outputs_preallocated = true
+samples_retained = "all"
+stderr_basis = "three plan-recreated run means"
+
+[prototype]
+tile_shape = [16, 16]
+workgroup_size = 256
+kernel_width = 7
+halo_shape = [23, 23]
+halo_bin_count = 529
+blelloch_scan_elements = 1024
+bank_padded_scan_elements = 1056
+cache_capacity_points = 154
+workgroup_storage_bytes = 15312
+uniform_batched_cache = true
+single_writer_per_cell = true
+global_f32_atomics = false
+preserves_global_accumulation_order = true
+benchmark_halo_population_mean = 132.25
+benchmark_halo_population_p99_approx = 160
+benchmark_halo_population_max = 188
+dense_correctness_point_count = 513
+dense_correctness_batches = 4
+
+[gates]
+minimum_gather_speedup = 1.5
+minimum_ordinary_type1_speedup = 1.25
+maximum_control_regression_percent = 2.0
+gather_speedup_512 = 7.731424
+gather_speedup_1024 = 7.201661
+ordinary_first_speedup_512 = 6.556014
+ordinary_first_speedup_1024 = 3.734487
+ordinary_repeat_speedup_512 = 4.868922
+ordinary_repeat_speedup_1024 = 6.654976
+formal_type2_change_percent_512 = -3.274
+formal_type2_change_percent_1024 = -0.405
+verdict = "accepted"
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "NVIDIA 610.47"
+backend = "Vulkan"
+timestamp_query = true
+timestamp_period_ns = 1.0
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[cuda]
+python = "3.12.3"
+numpy = "2.4.0"
+cupy = "14.1.1"
+cufinufft = "2.5.1"
+cufinufft_library_sha256 = "DEA7281755EEB8A0E090822F14E2A3E09742F5CAEFCAF4C4FBFB0E0E717FDD53"
+compute_capability = 120
+cuda_driver_api = 13030
+cuda_runtime_linked = 12090
+cuda_toolkit_path = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8"
+type1_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+type2_pair = "wgpu submit-to-wait versus cuFINUFFT execute"
+finufft_cpu_rerun = false
+vkfft_rerun = false
+
+[commands]
+stage_512_global = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling,type1-2d-tile-prototype --bench nufft_stage_profile -- --adapter "RTX 5090" --runs 3 --samples 10 --2d-size 512 --type1-gather global
+'''
+stage_512_tiled = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling,type1-2d-tile-prototype --bench nufft_stage_profile -- --adapter "RTX 5090" --runs 3 --samples 10 --2d-size 512 --type1-gather tiled16
+'''
+stage_1024_global = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling,type1-2d-tile-prototype --bench nufft_stage_profile -- --adapter "RTX 5090" --runs 3 --samples 10 --2d-size 1024 --type1-gather global
+'''
+stage_1024_tiled = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling,type1-2d-tile-prototype --bench nufft_stage_profile -- --adapter "RTX 5090" --runs 3 --samples 10 --2d-size 1024 --type1-gather tiled16
+'''
+ordinary_global = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features type1-2d-tile-prototype --bench nufft_2d_bench -- --adapter "RTX 5090" --runs 3 --samples 10 --type1-gather global
+'''
+ordinary_tiled = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features type1-2d-tile-prototype --bench nufft_2d_bench -- --adapter "RTX 5090" --runs 3 --samples 10 --type1-gather tiled16
+'''
+cufinufft = '''
+$env:CUDA_PATH='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+python -u wgpu-nufft/benches/cufinufft_gpu_bench.py --2d --case-2d 512x512:262144 --case-2d 1024x1024:1048576 --runs 3 --samples 10 --warmups 1 --type2-batch 32 --eps 1e-6 --seed 0x4E554646 --device 0
+'''
+gpu_validation = '''
+$env:WGPU_FFT_RUN_GPU_TESTS='1'
+$env:WGPU_BACKEND='vulkan'
+cargo test --locked -p wgpu-nufft --features type1-2d-tile-prototype --test gpu_nufft_2d --release -- --nocapture
+cargo test --locked -p wgpu-nufft --features gpu-profiling,type1-2d-tile-prototype --test gpu_stage_profile --release -- --nocapture
+'''
+
+[artifacts]
+cargo_lock_sha256 = "24EFF885C10262A26639BB801365D251E6A43EF0CBC59C3AF73587A4D6596B29"
+gpu_type1_2d_source_sha256 = "2CD9A875F38A8FCDC66A329A1C06413F7A8C2EDC0D2BFB848B7FEF970014E1B0"
+plan_source_sha256 = "DAF25E5FA771BCF1CEF9D0810CDD726B347C29608E8417C7FB5651ADFE916DBF"
+ordinary_harness_sha256 = "7853A9B5FD54937870B0D8EEC7BEA7AD32F387BB5A056334235AE1CAF695B768"
+stage_harness_sha256 = "79796C18AA073183698FD45140509247008DBB47189A5B467D8025055B3DBB7A"
+cuda_harness_sha256 = "7B32BBA70E314B94E861916F48C8F94D8459850EEE18B47A3F29A9A73B318690"
+gpu_nufft_2d_test_sha256 = "E5C2F2949BB654E7BE4318C7E883322856208004A99E483611B5DF3F3D8C57E5"
+gpu_stage_profile_test_sha256 = "9D489638601DD16E84ED1589E6AF67BA62D564E6EDC524FB20838482BCBE11A6"
+cufinufft_results_sha256 = "0609430AF32FF62DA79CA68C45B32236E20A2E0EEE8F708AF067F16B695DDABD"
+gpu_nufft_2d_results_sha256 = "EEB1A61A108568B193DB00EF54689D472A7B4F1579392913F6F36C37243CC04A"
+gpu_stage_profile_results_sha256 = "6DE1F300E1F2FDEEBD207639453DAA9890714B0A5A789FC1A68ED38DF6655FB2"
+ordinary_first_global_sha256 = "C284B9964A7A2A19C2E4A8AAA920C6E0107E04FFC8626501DA147186C6392C5B"
+ordinary_first_tiled_sha256 = "3AB5B7D3765C79C1832BB8B526E10F85BDFF146D213FB8036E72537619DFE015"
+ordinary_repeat_global_sha256 = "D4344E0A487CAE43AED3A6B0655794AA29B0D137E2DE1E801A0D1C9A32825AC2"
+ordinary_repeat_tiled_sha256 = "8FC6E89DB9A83F46A6E85892314D7C562DFCD3BC025B12B1A36E9D62CDE380C7"
+stage_512_global_sha256 = "6CAE2EE3EFC852B894ED224D0B5615B3C88AABFA9CA1E132581473431110E4D9"
+stage_512_tiled_sha256 = "4719F887736E1BD862EF667B503BFF0DD98FF7CD7CE039D93E7E8EF628837267"
+stage_1024_global_sha256 = "0BAD69446DBE4EB27BAF18A07598E02B3D3DC3B90B11DBA38656C79A00214B32"
+stage_1024_tiled_sha256 = "20DCCFF3F1FAD0CE0CD38467F8721EB53074B30576F1FA0409EFDF3E358BE1D1"

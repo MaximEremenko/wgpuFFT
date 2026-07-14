@@ -16,10 +16,24 @@ use crate::kernel::EsKernel;
 
 const DIMENSIONS: usize = 2;
 const WORKGROUP_SIZE: u32 = 64;
+const TILED_GATHER_TILE_SIDE: usize = 16;
+const TILED_GATHER_WORKGROUP_SIZE: u32 = 256;
+const TILED_GATHER_SCAN_ELEMENTS: usize = 1024;
+const TILED_GATHER_SCAN_BANK_WIDTH: usize = 32;
+const TILED_GATHER_PADDED_SCAN_ELEMENTS: usize =
+    TILED_GATHER_SCAN_ELEMENTS + TILED_GATHER_SCAN_ELEMENTS / TILED_GATHER_SCAN_BANK_WIDTH;
+const TILED_GATHER_STORAGE_BUDGET_BYTES: usize = 15 * 1024;
 const COMPLEX_F32_BYTES: u64 = 8;
 const POINT_F32_BYTES: u64 = DIMENSIONS as u64 * 4;
 const F32_BYTES: u64 = 4;
 const U32_BYTES: u64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Type1Gather2d {
+    #[cfg_attr(not(feature = "type1-2d-tile-prototype"), allow(dead_code))]
+    Global,
+    Tiled16,
+}
 
 /// Device-specific resources for deterministic, atomics-free 2D spreading.
 ///
@@ -64,6 +78,7 @@ impl Type1GpuPlan2d {
         kernel: EsKernel,
         fine_shape: [usize; DIMENSIONS],
         kernel_fourier_coefficients: [&[f64]; DIMENSIONS],
+        gather: Type1Gather2d,
     ) -> Result<Self> {
         if config.dimensions() != DIMENSIONS {
             return Err(NufftError::GpuDimensionsUnsupported {
@@ -197,11 +212,43 @@ impl Type1GpuPlan2d {
             &generate_sort_wgsl(),
         );
         let sort_layout = sort_pipeline.get_bind_group_layout(0);
-        let gather_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1_2d.spread_gather",
-            &generate_gather_wgsl(kernel, fine_shape),
-        );
+        let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
+        let (gather_label, gather_source, gather_dispatch) = match gather {
+            Type1Gather2d::Global => (
+                "wgpu_nufft.type1_2d.spread_gather",
+                generate_gather_wgsl(kernel, fine_shape),
+                dispatch_for_elements(fine_count, max_workgroups_per_dimension)?,
+            ),
+            Type1Gather2d::Tiled16 => {
+                let halo_side = tiled_gather_halo_side(kernel.width())?;
+                if fine_shape.iter().any(|&length| length < halo_side)
+                    || maximum_workgroup_size < TILED_GATHER_WORKGROUP_SIZE
+                {
+                    (
+                        "wgpu_nufft.type1_2d.spread_gather",
+                        generate_gather_wgsl(kernel, fine_shape),
+                        dispatch_for_elements(fine_count, max_workgroups_per_dimension)?,
+                    )
+                } else {
+                    let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
+                    let storage_bytes = tiled_gather_storage_bytes(kernel.width(), cache_capacity)?;
+                    if storage_bytes > limits.max_compute_workgroup_storage_size {
+                        (
+                            "wgpu_nufft.type1_2d.spread_gather",
+                            generate_gather_wgsl(kernel, fine_shape),
+                            dispatch_for_elements(fine_count, max_workgroups_per_dimension)?,
+                        )
+                    } else {
+                        (
+                            "wgpu_nufft.type1_2d.spread_gather_tiled16",
+                            generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
+                            tiled_gather_dispatch(fine_shape, max_workgroups_per_dimension)?,
+                        )
+                    }
+                }
+            }
+        };
+        let gather_pipeline = create_compute_pipeline(device, gather_label, &gather_source);
         let gather_layout = gather_pipeline.get_bind_group_layout(0);
         let deconvolution_pipeline = create_compute_pipeline(
             device,
@@ -210,9 +257,7 @@ impl Type1GpuPlan2d {
         );
         let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
 
-        let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
         let sort_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
-        let gather_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
         let deconvolution_dispatch =
             dispatch_for_elements(mode_count, max_workgroups_per_dimension)?;
 
@@ -1023,6 +1068,302 @@ fn main(
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
+fn generate_tiled_gather_wgsl(
+    kernel: EsKernel,
+    fine_shape: [usize; DIMENSIONS],
+    cache_capacity: usize,
+) -> Result<String> {
+    let position = generate_position_wgsl(fine_shape);
+    let width = kernel.width();
+    let bin_radius = width.div_ceil(2);
+    let halo_side = tiled_gather_halo_side(width)?;
+    let halo_bin_count = halo_side
+        .checked_mul(halo_side)
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather halo-bin count",
+        })?;
+    let cache_weight_count =
+        cache_capacity
+            .checked_mul(width)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 2D tiled gather cached-weight count",
+            })?;
+    let cache_load_rounds = cache_capacity.div_ceil(TILED_GATHER_WORKGROUP_SIZE as usize);
+    let (tile_count_0, _tile_count_1, tile_count) = tiled_gather_tile_counts(fine_shape)?;
+    debug_assert!(halo_bin_count < TILED_GATHER_SCAN_ELEMENTS);
+    debug_assert!(cache_capacity > 0);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const TILE_SIDE: u32 = {tile_side}u;
+const TILE_COUNT_0: u32 = {tile_count_0}u;
+const TILE_COUNT: u32 = {tile_count}u;
+const WIDTH: u32 = {width}u;
+const WIDTH_I32: i32 = {width}i;
+const WIDTH_F32: f32 = {width}.0;
+const HALF_WIDTH: f32 = {half_width};
+const BETA: f32 = {beta};
+const BIN_RADIUS: i32 = {bin_radius}i;
+const HALO_SIDE: u32 = {halo_side}u;
+const HALO_BIN_COUNT: u32 = {halo_bin_count}u;
+const SCAN_ELEMENTS: u32 = {scan_elements}u;
+const SCAN_ITEMS_PER_INVOCATION: u32 = {scan_items_per_invocation}u;
+const CACHE_CAPACITY: u32 = {cache_capacity}u;
+const CACHE_LOAD_ROUNDS: u32 = {cache_load_rounds}u;
+
+@group(0) @binding(0) var<storage, read> points: array<f32>;
+@group(0) @binding(1) var<storage, read> strengths: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(4) var<storage, read_write> fine_grid: array<vec2<f32>>;
+
+var<workgroup> halo_prefix: array<u32, {padded_scan_elements}>;
+var<workgroup> cached_starts: array<vec2<i32>, {cache_capacity}>;
+var<workgroup> cached_strengths: array<vec2<f32>, {cache_capacity}>;
+var<workgroup> cached_weights_0: array<f32, {cache_weight_count}>;
+var<workgroup> cached_weights_1: array<f32, {cache_weight_count}>;
+
+fn physical_index(logical: u32) -> u32 {{
+    return logical + (logical >> 5u);
+}}
+
+fn ceil_df64_to_i32(value: Df64) -> i32 {{
+    let base = floor(value.hi);
+    let remainder = df64_sub(value, Df64(base, 0.0));
+    let has_positive_remainder = remainder.hi > 0.0 ||
+        (remainder.hi == 0.0 && remainder.lo > 0.0);
+    return i32(base) + select(0, 1, has_positive_remainder);
+}}
+
+fn wrap_bin(index: i32, fine_length: i32) -> u32 {{
+    var wrapped = index;
+    if (wrapped < 0) {{ wrapped = wrapped + fine_length; }}
+    if (wrapped >= fine_length) {{ wrapped = wrapped - fine_length; }}
+    return u32(wrapped);
+}}
+
+fn halo_global_bin(halo_bin: u32, tile_origin: vec2<u32>) -> u32 {{
+    let halo_0 = halo_bin % HALO_SIDE;
+    let halo_1 = halo_bin / HALO_SIDE;
+    let bin_0 = wrap_bin(i32(tile_origin.x + halo_0) - BIN_RADIUS, FINE_0_I32);
+    let bin_1 = wrap_bin(i32(tile_origin.y + halo_1) - BIN_RADIUS, FINE_1_I32);
+    return bin_0 + FINE_0 * bin_1;
+}}
+
+fn halo_bin_for_record(record: u32) -> u32 {{
+    var low = 0u;
+    var high = HALO_BIN_COUNT;
+    loop {{
+        if (low >= high) {{ break; }}
+        let middle = (low + high) / 2u;
+        let middle_end = halo_prefix[physical_index(middle + 1u)];
+        if (middle_end <= record) {{
+            low = middle + 1u;
+        }} else {{
+            high = middle;
+        }}
+    }}
+    return low;
+}}
+
+fn es_weight(distance: f32) -> f32 {{
+    let scaled = 2.0 * abs(distance) / WIDTH_F32;
+    let squared = scaled * scaled;
+    if (squared >= 1.0) {{ return 0.0; }}
+    return exp(BETA * (sqrt(max(0.0, 1.0 - squared)) - 1.0));
+}}
+
+fn support_cell(
+    wrapped_cell: u32,
+    start: i32,
+    fine_length: i32,
+) -> i32 {{
+    var unwrapped = i32(wrapped_cell);
+    if (unwrapped < start) {{ unwrapped = unwrapped + fine_length; }}
+    if (unwrapped >= start + WIDTH_I32) {{
+        unwrapped = unwrapped - fine_length;
+    }}
+    return unwrapped;
+}}
+
+@compute @workgroup_size({workgroup_size})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat >= TILE_COUNT) {{ return; }}
+
+    let tile = vec2<u32>(wg_flat % TILE_COUNT_0, wg_flat / TILE_COUNT_0);
+    let tile_origin = tile * TILE_SIDE;
+    let local_cell = vec2<u32>(lid.x % TILE_SIDE, lid.x / TILE_SIDE);
+    let cell = tile_origin + local_cell;
+    let cell_in_bounds = cell.x < FINE_0 && cell.y < FINE_1;
+
+    for (var item = 0u; item < SCAN_ITEMS_PER_INVOCATION; item = item + 1u) {{
+        let logical = item * WORKGROUP_SIZE + lid.x;
+        var count = 0u;
+        if (logical < HALO_BIN_COUNT) {{
+            let global_bin = halo_global_bin(logical, tile_origin);
+            count = bin_offsets[global_bin + 1u] - bin_offsets[global_bin];
+        }}
+        halo_prefix[physical_index(logical)] = count;
+    }}
+    workgroupBarrier();
+
+    var stride = 1u;
+    loop {{
+        let node_count = SCAN_ELEMENTS / (2u * stride);
+        for (var node = lid.x; node < node_count; node = node + WORKGROUP_SIZE) {{
+            let left = stride * (2u * node + 1u) - 1u;
+            let right = stride * (2u * node + 2u) - 1u;
+            halo_prefix[physical_index(right)] =
+                halo_prefix[physical_index(right)] + halo_prefix[physical_index(left)];
+        }}
+        workgroupBarrier();
+        if (stride == SCAN_ELEMENTS / 2u) {{ break; }}
+        stride = stride * 2u;
+    }}
+
+    if (lid.x == 0u) {{
+        halo_prefix[physical_index(SCAN_ELEMENTS - 1u)] = 0u;
+    }}
+    workgroupBarrier();
+
+    stride = SCAN_ELEMENTS / 2u;
+    loop {{
+        let node_count = SCAN_ELEMENTS / (2u * stride);
+        for (var node = lid.x; node < node_count; node = node + WORKGROUP_SIZE) {{
+            let left = stride * (2u * node + 1u) - 1u;
+            let right = stride * (2u * node + 2u) - 1u;
+            let temporary = halo_prefix[physical_index(left)];
+            halo_prefix[physical_index(left)] = halo_prefix[physical_index(right)];
+            halo_prefix[physical_index(right)] =
+                halo_prefix[physical_index(right)] + temporary;
+        }}
+        workgroupBarrier();
+        if (stride == 1u) {{ break; }}
+        stride = stride / 2u;
+    }}
+
+    let halo_total = workgroupUniformLoad(
+        &halo_prefix[physical_index(HALO_BIN_COUNT)],
+    );
+    var sum = vec2<f32>(0.0, 0.0);
+    var batch_start = 0u;
+    loop {{
+        if (batch_start >= halo_total) {{ break; }}
+        let batch_length = min(CACHE_CAPACITY, halo_total - batch_start);
+        let batch_end = batch_start + batch_length;
+
+        for (var load_round = 0u; load_round < CACHE_LOAD_ROUNDS;
+             load_round = load_round + 1u) {{
+            let cache_slot = load_round * WORKGROUP_SIZE + lid.x;
+            if (cache_slot < batch_length) {{
+                let record = batch_start + cache_slot;
+                let halo_bin = halo_bin_for_record(record);
+                let global_bin = halo_global_bin(halo_bin, tile_origin);
+                let in_bin = record - halo_prefix[physical_index(halo_bin)];
+                let point_slot = bin_offsets[global_bin] + in_bin;
+                let point_index = sorted_indices[point_slot];
+                let point_base = point_index * 2u;
+                let position_0 = fold_position_0(points[point_base]);
+                let position_1 = fold_position_1(points[point_base + 1u]);
+                let start_0 = ceil_df64_to_i32(
+                    df64_sub(position_0, Df64(HALF_WIDTH, 0.0)),
+                );
+                let start_1 = ceil_df64_to_i32(
+                    df64_sub(position_1, Df64(HALF_WIDTH, 0.0)),
+                );
+                cached_starts[cache_slot] = vec2<i32>(start_0, start_1);
+                cached_strengths[cache_slot] = strengths[point_index];
+                for (var support = 0u; support < WIDTH; support = support + 1u) {{
+                    let support_0 = start_0 + i32(support);
+                    let support_1 = start_1 + i32(support);
+                    let distance_0 = df64_sub(
+                        Df64(f32(support_0), 0.0),
+                        position_0,
+                    );
+                    let distance_1 = df64_sub(
+                        Df64(f32(support_1), 0.0),
+                        position_1,
+                    );
+                    let weight_slot = cache_slot * WIDTH + support;
+                    cached_weights_0[weight_slot] =
+                        es_weight(distance_0.hi + distance_0.lo);
+                    cached_weights_1[weight_slot] =
+                        es_weight(distance_1.hi + distance_1.lo);
+                }}
+            }}
+        }}
+        workgroupBarrier();
+
+        if (cell_in_bounds) {{
+            for (var bin_offset_1 = -BIN_RADIUS; bin_offset_1 < BIN_RADIUS;
+                 bin_offset_1 = bin_offset_1 + 1) {{
+                let halo_1 = u32(i32(local_cell.y) + bin_offset_1 + BIN_RADIUS);
+                for (var bin_offset_0 = -BIN_RADIUS; bin_offset_0 < BIN_RADIUS;
+                     bin_offset_0 = bin_offset_0 + 1) {{
+                    let halo_0 = u32(i32(local_cell.x) + bin_offset_0 + BIN_RADIUS);
+                    let halo_bin = halo_0 + HALO_SIDE * halo_1;
+                    let begin = max(
+                        halo_prefix[physical_index(halo_bin)],
+                        batch_start,
+                    );
+                    let end = min(
+                        halo_prefix[physical_index(halo_bin + 1u)],
+                        batch_end,
+                    );
+                    for (var record = begin; record < end; record = record + 1u) {{
+                        let cache_slot = record - batch_start;
+                        let start = cached_starts[cache_slot];
+                        let unwrapped_0 = support_cell(cell.x, start.x, FINE_0_I32);
+                        let unwrapped_1 = support_cell(cell.y, start.y, FINE_1_I32);
+                        if (unwrapped_0 >= start.x && unwrapped_0 < start.x + WIDTH_I32 &&
+                            unwrapped_1 >= start.y && unwrapped_1 < start.y + WIDTH_I32) {{
+                            let support_0 = u32(unwrapped_0 - start.x);
+                            let support_1 = u32(unwrapped_1 - start.y);
+                            let weight = cached_weights_0[cache_slot * WIDTH + support_0] *
+                                cached_weights_1[cache_slot * WIDTH + support_1];
+                            sum = sum + cached_strengths[cache_slot] * weight;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+        workgroupBarrier();
+        batch_start = batch_end;
+    }}
+
+    if (cell_in_bounds) {{
+        fine_grid[cell.x + FINE_0 * cell.y] = sum;
+    }}
+}}
+"#,
+        workgroup_size = TILED_GATHER_WORKGROUP_SIZE,
+        tile_side = TILED_GATHER_TILE_SIDE,
+        tile_count_0 = tile_count_0,
+        tile_count = tile_count,
+        width = width,
+        half_width = format_wgsl_f32(kernel.half_width() as f32),
+        beta = format_wgsl_f32(kernel.beta() as f32),
+        bin_radius = bin_radius,
+        halo_side = halo_side,
+        halo_bin_count = halo_bin_count,
+        scan_elements = TILED_GATHER_SCAN_ELEMENTS,
+        scan_items_per_invocation =
+            TILED_GATHER_SCAN_ELEMENTS / TILED_GATHER_WORKGROUP_SIZE as usize,
+        cache_capacity = cache_capacity,
+        cache_load_rounds = cache_load_rounds,
+        padded_scan_elements = TILED_GATHER_PADDED_SCAN_ELEMENTS,
+        cache_weight_count = cache_weight_count,
+    );
+    Ok(format!(
+        "{}\n{position}\n{entry}",
+        wgpu_fft::kernels::DF64_WGSL
+    ))
+}
+
 fn generate_deconvolution_wgsl(config: &NufftConfig, fine_shape: [usize; DIMENSIONS]) -> String {
     let mode_shape = config.n_modes();
     debug_assert_eq!(mode_shape.len(), DIMENSIONS);
@@ -1093,6 +1434,115 @@ fn format_wgsl_f32(value: f32) -> String {
         formatted.push_str(".0");
     }
     formatted
+}
+
+fn tiled_gather_halo_side(width: usize) -> Result<usize> {
+    let radius = width.div_ceil(2);
+    let halo_side = TILED_GATHER_TILE_SIDE
+        .checked_add(radius.checked_mul(2).ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather halo radius",
+        })?)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather halo side",
+        })?;
+    let halo_entries = halo_side
+        .checked_mul(halo_side)
+        .and_then(|bins| bins.checked_add(1))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather halo prefix",
+        })?;
+    if halo_entries > TILED_GATHER_SCAN_ELEMENTS {
+        return Err(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather scan capacity",
+        });
+    }
+    Ok(halo_side)
+}
+
+fn tiled_gather_cache_capacity(width: usize) -> Result<usize> {
+    let prefix_bytes = TILED_GATHER_PADDED_SCAN_ELEMENTS
+        .checked_mul(size_of::<u32>())
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather prefix storage",
+        })?;
+    let weight_bytes = width
+        .checked_mul(2)
+        .and_then(|weights| weights.checked_mul(size_of::<f32>()))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather per-point weight storage",
+        })?;
+    let per_point_bytes = size_of::<[i32; 2]>()
+        .checked_add(size_of::<[f32; 2]>())
+        .and_then(|bytes| bytes.checked_add(weight_bytes))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather per-point storage",
+        })?;
+    let available = TILED_GATHER_STORAGE_BUDGET_BYTES
+        .checked_sub(prefix_bytes)
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather storage budget",
+        })?;
+    let capacity = available / per_point_bytes;
+    if capacity == 0 {
+        return Err(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather cache capacity",
+        });
+    }
+    Ok(capacity)
+}
+
+fn tiled_gather_storage_bytes(width: usize, cache_capacity: usize) -> Result<u32> {
+    let prefix_bytes = TILED_GATHER_PADDED_SCAN_ELEMENTS
+        .checked_mul(size_of::<u32>())
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather prefix storage bytes",
+        })?;
+    let per_point_bytes = width
+        .checked_mul(2)
+        .and_then(|weights| weights.checked_mul(size_of::<f32>()))
+        .and_then(|weights| weights.checked_add(size_of::<[i32; 2]>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<[f32; 2]>()))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather point-cache storage bytes",
+        })?;
+    let bytes = cache_capacity
+        .checked_mul(per_point_bytes)
+        .and_then(|cache| cache.checked_add(prefix_bytes))
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather workgroup storage bytes",
+        })?;
+    u32::try_from(bytes).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 2D tiled gather workgroup storage size",
+    })
+}
+
+fn tiled_gather_tile_counts(fine_shape: [usize; DIMENSIONS]) -> Result<(u32, u32, u32)> {
+    let tiles_0 = fine_shape[0].div_ceil(TILED_GATHER_TILE_SIDE);
+    let tiles_1 = fine_shape[1].div_ceil(TILED_GATHER_TILE_SIDE);
+    let tile_count = tiles_0
+        .checked_mul(tiles_1)
+        .ok_or(NufftError::LengthOverflow {
+            context: "type-1 2D tiled gather tile count",
+        })?;
+    let tiles_0 = u32::try_from(tiles_0).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 2D tiled gather axis-0 tile count",
+    })?;
+    let tiles_1 = u32::try_from(tiles_1).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 2D tiled gather axis-1 tile count",
+    })?;
+    let tile_count = u32::try_from(tile_count).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 2D tiled gather shader tile count",
+    })?;
+    Ok((tiles_0, tiles_1, tile_count))
+}
+
+fn tiled_gather_dispatch(
+    fine_shape: [usize; DIMENSIONS],
+    max_workgroups_per_dimension: u32,
+) -> Result<(u32, u32, u32)> {
+    let (_, _, tile_count) = tiled_gather_tile_counts(fine_shape)?;
+    split_workgroups(tile_count, max_workgroups_per_dimension)
 }
 
 fn dispatch_for_elements(
@@ -1227,6 +1677,56 @@ mod tests {
     }
 
     #[test]
+    fn tiled_gather_width_seven_storage_stays_below_fifteen_kibibytes() {
+        let capacity = tiled_gather_cache_capacity(7).unwrap();
+        assert_eq!(capacity, 154);
+        assert_eq!(TILED_GATHER_PADDED_SCAN_ELEMENTS, 1_056);
+        assert_eq!(tiled_gather_storage_bytes(7, capacity).unwrap(), 15_312);
+        assert!(
+            tiled_gather_storage_bytes(7, capacity).unwrap()
+                <= TILED_GATHER_STORAGE_BUDGET_BYTES as u32
+        );
+    }
+
+    #[test]
+    fn tiled_gather_batches_hoisted_weights_behind_uniform_barriers() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let capacity = tiled_gather_cache_capacity(kernel.width()).unwrap();
+        let source = generate_tiled_gather_wgsl(kernel, [64, 96], capacity).unwrap();
+        assert!(source.contains("@compute @workgroup_size(256)"));
+        assert!(source.contains("const HALO_SIDE: u32 = 23u;"));
+        assert!(source.contains("const HALO_BIN_COUNT: u32 = 529u;"));
+        assert!(source.contains("var<workgroup> halo_prefix: array<u32, 1056>;"));
+        assert!(source.contains("var<workgroup> cached_starts: array<vec2<i32>, 154>;"));
+        assert!(source.contains("var<workgroup> cached_weights_0: array<f32, 1078>;"));
+        assert!(source.contains("let halo_total = workgroupUniformLoad("));
+        assert!(source.contains("if (batch_start >= halo_total) { break; }"));
+        assert!(
+            source.contains("let batch_length = min(CACHE_CAPACITY, halo_total - batch_start);")
+        );
+        assert!(source.contains("cached_weights_0[weight_slot] ="));
+        assert!(source.contains("cached_weights_1[weight_slot] ="));
+        assert!(source.contains("for (var bin_offset_1 = -BIN_RADIUS"));
+        assert!(source.contains("for (var bin_offset_0 = -BIN_RADIUS"));
+        assert!(source.contains("fine_grid[cell.x + FINE_0 * cell.y] = sum;"));
+        assert!(!source.contains("atomicAdd"));
+    }
+
+    #[test]
+    fn tiled_gather_dispatches_one_workgroup_per_sixteen_by_sixteen_tile() {
+        assert_eq!(tiled_gather_halo_side(7).unwrap(), 23);
+        assert_eq!(
+            tiled_gather_tile_counts([2_048, 2_048]).unwrap(),
+            (128, 128, 16_384)
+        );
+        assert_eq!(
+            tiled_gather_dispatch([2_048, 2_048], 65_535).unwrap(),
+            (16_384, 1, 1)
+        );
+        assert_eq!(tiled_gather_tile_counts([30, 36]).unwrap(), (2, 3, 6));
+    }
+
+    #[test]
     fn each_flattened_bin_is_sorted_by_original_point_index() {
         let source = generate_sort_wgsl();
         assert!(source.contains("fn heap_sort(start: u32, end: u32)"));
@@ -1320,6 +1820,7 @@ mod tests {
                 kernel,
                 fine_shape,
                 [&coefficients_0, &coefficients_1],
+                Type1Gather2d::Global,
             )
             .unwrap();
 

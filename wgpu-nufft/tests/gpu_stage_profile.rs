@@ -238,6 +238,10 @@ fn run_type1_case_2d(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32],
 
     assert_eq!(points.len(), POINT_COUNT_2D * MODE_SHAPE_2D.len());
     let config = test_config_2d();
+    #[cfg(feature = "type1-2d-tile-prototype")]
+    let plan =
+        NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(device, queue, config).unwrap();
+    #[cfg(not(feature = "type1-2d-tile-prototype"))]
     let plan = NufftPlan::type1_gpu(device, queue, config).unwrap();
     assert_eq!(plan.gpu_profile_query_count(), 8);
     let strengths = test_complex_values(POINT_COUNT_2D, 0.17, 0.29);
@@ -464,8 +468,8 @@ fn finish_case(
         let delta = end - start;
         assert!(
             delta > 0,
-            "{kind} stage {} must have a positive timestamp delta",
-            stage.stage()
+            "{kind} stage {} must have a positive timestamp delta: {start} -> {end}; resolved timestamps={timestamps:?}",
+            stage.stage(),
         );
         eprintln!(
             "GPU_STAGE_PROFILE kind={kind} stage={} ticks={delta} ms={:.9}",

@@ -13,6 +13,7 @@ use wgpu_nufft::{
 type BenchResult<T> = Result<T, Box<dyn Error>>;
 
 const CASE_SIZES: [usize; 2] = [262_144, 1_048_576];
+const CASE_SHAPE_2D: [usize; 2] = [1_024, 1_024];
 const DEFAULT_RUNS: usize = 3;
 const DEFAULT_SAMPLES: usize = 10;
 const TYPE2_TRANSFORMS_PER_SAMPLE: usize = 32;
@@ -22,6 +23,7 @@ const QUERY_SIZE_BYTES: u64 = size_of::<u64>() as u64;
 
 const DATA_SEED: u32 = 0x4E55_4646;
 const POINT_SEED_MASK: u32 = 0xA341_316C;
+const POINT_Y_SEED_MASK: u32 = 0xB7E1_5162;
 const STRENGTH_REAL_SEED_MASK: u32 = 0xC801_3EA4;
 const STRENGTH_IMAG_SEED_MASK: u32 = 0xAD90_777D;
 const MODE_REAL_SEED_MASK: u32 = 0x7E95_761E;
@@ -32,6 +34,7 @@ struct Options {
     adapter_selector: Option<String>,
     runs: usize,
     samples: usize,
+    two_dimensional: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,19 +171,35 @@ fn main() {
 
 async fn run() -> BenchResult<()> {
     let options = parse_options()?;
-    println!("wgpu-nufft 1D GPU per-stage timestamp profile");
-    println!(
-        "configuration: sizes={CASE_SIZES:?} N_equals_M=true runs={} samples_per_run={} warmups_per_run=1 type1_transforms_per_sample=1 type2_transforms_per_sample={} seed={DATA_SEED:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={}",
-        options.runs,
-        options.samples,
-        TYPE2_TRANSFORMS_PER_SAMPLE,
-        DEFAULT_EPS,
-        DEFAULT_SIGMA,
-        options
-            .adapter_selector
-            .as_deref()
-            .unwrap_or("auto-single-hardware"),
-    );
+    if options.two_dimensional {
+        println!("wgpu-nufft 2D GPU per-stage timestamp profile");
+        println!(
+            "configuration: shape={CASE_SHAPE_2D:?} point_count_equals_total_mode_count=true axis_zero_fastest=true point_layout=point-major-[x,y] runs={} samples_per_run={} warmups_per_run=1 type1_transforms_per_sample=1 type2_transforms_per_sample={} seed={DATA_SEED:#010x} point_y_seed_mask={POINT_Y_SEED_MASK:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={}",
+            options.runs,
+            options.samples,
+            TYPE2_TRANSFORMS_PER_SAMPLE,
+            DEFAULT_EPS,
+            DEFAULT_SIGMA,
+            options
+                .adapter_selector
+                .as_deref()
+                .unwrap_or("auto-single-hardware"),
+        );
+    } else {
+        println!("wgpu-nufft 1D GPU per-stage timestamp profile");
+        println!(
+            "configuration: sizes={CASE_SIZES:?} N_equals_M=true runs={} samples_per_run={} warmups_per_run=1 type1_transforms_per_sample=1 type2_transforms_per_sample={} seed={DATA_SEED:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={}",
+            options.runs,
+            options.samples,
+            TYPE2_TRANSFORMS_PER_SAMPLE,
+            DEFAULT_EPS,
+            DEFAULT_SIGMA,
+            options
+                .adapter_selector
+                .as_deref()
+                .unwrap_or("auto-single-hardware"),
+        );
+    }
     println!(
         "method: GPU timestamp-query stage intervals only; query resolve, copy, map, command encoding, plan creation, upload, and readback are outside every decoded interval; this diagnostic harness reports no submit-to-wait headline timing"
     );
@@ -252,27 +271,69 @@ async fn run_cases(
     timestamp_period_ns: f32,
     options: &Options,
 ) -> BenchResult<()> {
-    for &size in &CASE_SIZES {
-        let config = benchmark_config(size);
-        let buffers = create_case_buffers(device, size)?;
-        println!("\n=== case N={size} M={size} ===");
-        for kind in TransformKind::ALL {
-            run_kind(
-                device,
-                queue,
-                &buffers,
-                &config,
-                size,
-                kind,
-                timestamp_period_ns,
-                options,
-            )
-            .await?;
-        }
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| contextual_error("polling after profile case", error))?;
+    if options.two_dimensional {
+        let point_count = CASE_SHAPE_2D
+            .into_iter()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or_else(|| input_error("2D profile mode-count overflow"))?;
+        run_case(
+            device,
+            queue,
+            timestamp_period_ns,
+            options,
+            &CASE_SHAPE_2D,
+            point_count,
+        )
+        .await?;
+        return Ok(());
     }
+
+    for &size in &CASE_SIZES {
+        run_case(device, queue, timestamp_period_ns, options, &[size], size).await?;
+    }
+    Ok(())
+}
+
+async fn run_case(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    timestamp_period_ns: f32,
+    options: &Options,
+    mode_shape: &[usize],
+    point_count: usize,
+) -> BenchResult<()> {
+    let mode_count = mode_shape
+        .iter()
+        .copied()
+        .try_fold(1usize, usize::checked_mul)
+        .ok_or_else(|| input_error("profile mode-count overflow"))?;
+    let config = benchmark_config(mode_shape);
+    let buffers = create_case_buffers(device, mode_shape.len(), mode_count, point_count)?;
+    if mode_shape.len() == 1 {
+        println!("\n=== case N={} M={point_count} ===", mode_shape[0]);
+    } else {
+        println!(
+            "\n=== case dimensions=2 N0={} N1={} N_total={mode_count} M={point_count} ===",
+            mode_shape[0], mode_shape[1]
+        );
+    }
+    for kind in TransformKind::ALL {
+        run_kind(
+            device,
+            queue,
+            &buffers,
+            &config,
+            mode_shape,
+            point_count,
+            kind,
+            timestamp_period_ns,
+            options,
+        )
+        .await?;
+    }
+    device
+        .poll(wgpu::PollType::Poll)
+        .map_err(|error| contextual_error("polling after profile case", error))?;
     Ok(())
 }
 
@@ -282,6 +343,7 @@ async fn run_kind(
     queue: &wgpu::Queue,
     buffers: &CaseBuffers,
     config: &NufftConfig,
+    mode_shape: &[usize],
     point_count: usize,
     kind: TransformKind,
     timestamp_period_ns: f32,
@@ -305,7 +367,14 @@ async fn run_kind(
         let plan_start = Instant::now();
         let plan = kind.create_plan(device, queue, config.clone())?;
         let plan_create_ms = plan_start.elapsed().as_secs_f64() * 1_000.0;
-        let fine_length = plan.fine_grid_shape()[0];
+        let fine_shape = plan.fine_grid_shape().to_vec();
+        if fine_shape.len() != mode_shape.len() {
+            return Err(input_error(format!(
+                "{} plan reported {} fine-grid dimensions for mode shape {mode_shape:?}",
+                kind.name(),
+                fine_shape.len(),
+            )));
+        }
         let diagnostics = plan.gpu_fft_diagnostics().ok_or_else(|| {
             input_error(format!(
                 "{} plan did not expose embedded FFT diagnostics",
@@ -320,7 +389,7 @@ async fn run_kind(
                 )));
             }
         } else {
-            print_fft_diagnostics(kind, point_count, fine_length, &diagnostics);
+            print_fft_diagnostics(kind, mode_shape, point_count, &fine_shape, &diagnostics);
             expected_fft_diagnostics = Some(diagnostics.clone());
         }
 
@@ -340,12 +409,22 @@ async fn run_kind(
             timestamp_period_ns,
         )
         .await?;
-        println!(
-            "run {}/{} plan_create_ms={plan_create_ms:.6} fine_grid_length={fine_length} queries_per_transform={queries_per_transform} total_queries={}",
-            run_index + 1,
-            options.runs,
-            profile_resources.query_count,
-        );
+        if fine_shape.len() == 1 {
+            println!(
+                "run {}/{} plan_create_ms={plan_create_ms:.6} fine_grid_length={} queries_per_transform={queries_per_transform} total_queries={}",
+                run_index + 1,
+                options.runs,
+                fine_shape[0],
+                profile_resources.query_count,
+            );
+        } else {
+            println!(
+                "run {}/{} plan_create_ms={plan_create_ms:.6} fine_grid_shape={fine_shape:?} queries_per_transform={queries_per_transform} total_queries={}",
+                run_index + 1,
+                options.runs,
+                profile_resources.query_count,
+            );
+        }
 
         let mut run_stage_samples: Vec<Vec<f64>> = Vec::new();
         let mut run_envelope_samples = Vec::with_capacity(options.samples);
@@ -403,11 +482,11 @@ async fn run_kind(
             run_submit_call_samples.push(sample.host.submit_call_ms);
             run_poll_wait_samples.push(sample.host.poll_wait_ms);
             run_submit_wait_total_samples.push(sample.host.submit_wait_total_ms);
+            let fields = case_fields(mode_shape, point_count);
             println!(
-                "PROFILE_SAMPLE kind={} N={} M={} run={} sample={} transforms={} envelope_ms={:.9} host_submit_call_ms_per_transform={:.9} host_poll_wait_ms_per_transform={:.9} host_submit_wait_total_ms_per_transform={:.9} stages={}",
+                "PROFILE_SAMPLE kind={} {} run={} sample={} transforms={} envelope_ms={:.9} host_submit_call_ms_per_transform={:.9} host_poll_wait_ms_per_transform={:.9} host_submit_wait_total_ms_per_transform={:.9} stages={}",
                 kind.name(),
-                point_count,
-                point_count,
+                fields,
                 run_index + 1,
                 sample_index + 1,
                 transforms,
@@ -435,11 +514,11 @@ async fn run_kind(
             series.run_means_ms.push(mean);
             run_stage_summary.push((series.stage, mean));
         }
+        let fields = case_fields(mode_shape, point_count);
         println!(
-            "PROFILE_RUN kind={} N={} M={} run={} envelope_mean_ms={:.9} host_submit_call_mean_ms_per_transform={:.9} host_poll_wait_mean_ms_per_transform={:.9} host_submit_wait_total_mean_ms_per_transform={:.9} stages={}",
+            "PROFILE_RUN kind={} {} run={} envelope_mean_ms={:.9} host_submit_call_mean_ms_per_transform={:.9} host_poll_wait_mean_ms_per_transform={:.9} host_submit_wait_total_mean_ms_per_transform={:.9} stages={}",
             kind.name(),
-            point_count,
-            point_count,
+            fields,
             run_index + 1,
             envelope_run_mean,
             submit_call_run_mean,
@@ -451,6 +530,7 @@ async fn run_kind(
 
     print_final_results(
         kind,
+        mode_shape,
         point_count,
         options,
         transforms,
@@ -708,26 +788,40 @@ fn timestamp_delta_ms(
 
 fn print_fft_diagnostics(
     kind: TransformKind,
+    mode_shape: &[usize],
     point_count: usize,
-    fine_length: usize,
+    fine_shape: &[usize],
     diagnostics: &wgpu_fft::FftDiagnostics,
 ) {
-    println!(
-        "FFT_DIAGNOSTICS kind={} N={} M={} fine_grid_length={} route={:?} stage_count={} blockers={} workspace_requirements={:?}",
-        kind.name(),
-        point_count,
-        point_count,
-        fine_length,
-        diagnostics.route(),
-        diagnostics.stages().len(),
-        diagnostics.blockers().len(),
-        diagnostics.buffer_requirements(),
-    );
+    let fields = case_fields(mode_shape, point_count);
+    if fine_shape.len() == 1 {
+        println!(
+            "FFT_DIAGNOSTICS kind={} {} fine_grid_length={} route={:?} stage_count={} blockers={} workspace_requirements={:?}",
+            kind.name(),
+            fields,
+            fine_shape[0],
+            diagnostics.route(),
+            diagnostics.stages().len(),
+            diagnostics.blockers().len(),
+            diagnostics.buffer_requirements(),
+        );
+    } else {
+        println!(
+            "FFT_DIAGNOSTICS kind={} {} fine_grid_shape={fine_shape:?} route={:?} stage_count={} blockers={} workspace_requirements={:?}",
+            kind.name(),
+            fields,
+            diagnostics.route(),
+            diagnostics.stages().len(),
+            diagnostics.blockers().len(),
+            diagnostics.buffer_requirements(),
+        );
+    }
+    let mode_fields = mode_fields(mode_shape);
     for (stage_index, stage) in diagnostics.stages().iter().enumerate() {
         println!(
-            "FFT_STAGE kind={} N={} index={} label={} stage_kind={} route={} required_bytes={:?}",
+            "FFT_STAGE kind={} {} index={} label={} stage_kind={} route={} required_bytes={:?}",
             kind.name(),
-            point_count,
+            mode_fields,
             stage_index,
             stage.label,
             stage.kind,
@@ -740,6 +834,7 @@ fn print_fft_diagnostics(
 #[allow(clippy::too_many_arguments)]
 fn print_final_results(
     kind: TransformKind,
+    mode_shape: &[usize],
     point_count: usize,
     options: &Options,
     transforms: usize,
@@ -767,11 +862,11 @@ fn print_final_results(
     } else {
         residual_ms / envelope_stats.mean * 100.0
     };
+    let fields = case_fields(mode_shape, point_count);
     println!(
-        "PROFILE_ENVELOPE kind={} N={} M={} runs={} samples_per_run={} transforms_per_sample={} timestamp_period_ns={:.9} raw_sample_mean_ms={:?} run_mean_ms={:?} avg_ms={:.9} stderr_ms={} stderr_basis=plan-recreated-run-means min_raw_ms={:.9} component_sum_ms={:.9} residual_ms={:.9} residual_percent={:.6}",
+        "PROFILE_ENVELOPE kind={} {} runs={} samples_per_run={} transforms_per_sample={} timestamp_period_ns={:.9} raw_sample_mean_ms={:?} run_mean_ms={:?} avg_ms={:.9} stderr_ms={} stderr_basis=plan-recreated-run-means min_raw_ms={:.9} component_sum_ms={:.9} residual_ms={:.9} residual_percent={:.6}",
         kind.name(),
-        point_count,
-        point_count,
+        fields,
         options.runs,
         options.samples,
         transforms,
@@ -793,10 +888,9 @@ fn print_final_results(
             stats.mean / envelope_stats.mean * 100.0
         };
         println!(
-            "PROFILE_STAGE kind={} N={} M={} stage={} runs={} samples_per_run={} transforms_per_sample={} raw_sample_mean_ms={:?} run_mean_ms={:?} avg_ms={:.9} stderr_ms={} stderr_basis=plan-recreated-run-means min_raw_ms={:.9} percent_of_pipeline_envelope={:.6}",
+            "PROFILE_STAGE kind={} {} stage={} runs={} samples_per_run={} transforms_per_sample={} raw_sample_mean_ms={:?} run_mean_ms={:?} avg_ms={:.9} stderr_ms={} stderr_basis=plan-recreated-run-means min_raw_ms={:.9} percent_of_pipeline_envelope={:.6}",
             kind.name(),
-            point_count,
-            point_count,
+            fields,
             series.stage.label(),
             options.runs,
             options.samples,
@@ -811,6 +905,7 @@ fn print_final_results(
     }
     print_host_timing_result(
         kind,
+        mode_shape,
         point_count,
         options,
         transforms,
@@ -819,6 +914,7 @@ fn print_final_results(
     )?;
     print_host_timing_result(
         kind,
+        mode_shape,
         point_count,
         options,
         transforms,
@@ -827,6 +923,7 @@ fn print_final_results(
     )?;
     print_host_timing_result(
         kind,
+        mode_shape,
         point_count,
         options,
         transforms,
@@ -838,6 +935,7 @@ fn print_final_results(
 
 fn print_host_timing_result(
     kind: TransformKind,
+    mode_shape: &[usize],
     point_count: usize,
     options: &Options,
     transforms: usize,
@@ -846,11 +944,11 @@ fn print_host_timing_result(
 ) -> BenchResult<()> {
     let stats = statistics(&series.run_means_ms)?;
     let raw_stats = statistics(&series.raw_sample_means_ms)?;
+    let fields = case_fields(mode_shape, point_count);
     println!(
-        "PROFILE_HOST kind={} N={} M={} span={} runs={} samples_per_run={} transforms_per_sample={} raw_sample_ms_per_transform={:?} run_mean_ms_per_transform={:?} avg_ms_per_transform={:.9} stderr_ms_per_transform={} stderr_basis=plan-recreated-run-means min_raw_ms_per_transform={:.9} scope=profiled-submission-with-query-resolve-copy-readback",
+        "PROFILE_HOST kind={} {} span={} runs={} samples_per_run={} transforms_per_sample={} raw_sample_ms_per_transform={:?} run_mean_ms_per_transform={:?} avg_ms_per_transform={:.9} stderr_ms_per_transform={} stderr_basis=plan-recreated-run-means min_raw_ms_per_transform={:.9} scope=profiled-submission-with-query-resolve-copy-readback",
         kind.name(),
-        point_count,
-        point_count,
+        fields,
         span,
         options.runs,
         options.samples,
@@ -895,15 +993,45 @@ fn format_optional(value: Option<f64>) -> String {
     value.map_or_else(|| "undefined".to_owned(), |value| format!("{value:.9}"))
 }
 
-fn benchmark_config(size: usize) -> NufftConfig {
-    NufftConfig::new([size], DEFAULT_EPS)
+fn case_fields(mode_shape: &[usize], point_count: usize) -> String {
+    match mode_shape {
+        [length] => format!("N={length} M={point_count}"),
+        [n0, n1] => {
+            let mode_count = n0.saturating_mul(*n1);
+            format!("dimensions=2 N0={n0} N1={n1} N_total={mode_count} M={point_count}")
+        }
+        _ => format!(
+            "dimensions={} mode_shape={mode_shape:?} M={point_count}",
+            mode_shape.len()
+        ),
+    }
+}
+
+fn mode_fields(mode_shape: &[usize]) -> String {
+    match mode_shape {
+        [length] => format!("N={length}"),
+        [n0, n1] => format!(
+            "dimensions=2 N0={n0} N1={n1} N_total={}",
+            n0.saturating_mul(*n1)
+        ),
+        _ => format!("dimensions={} mode_shape={mode_shape:?}", mode_shape.len()),
+    }
+}
+
+fn benchmark_config(mode_shape: &[usize]) -> NufftConfig {
+    NufftConfig::new(mode_shape.to_vec(), DEFAULT_EPS)
         .with_sigma(DEFAULT_SIGMA)
         .with_sign(NufftSign::Positive)
         .with_mode_order(ModeOrder::Centered)
 }
 
-fn create_case_buffers(device: &wgpu::Device, size: usize) -> BenchResult<CaseBuffers> {
-    let (points, strengths, modes) = generate_case_data(size)?;
+fn create_case_buffers(
+    device: &wgpu::Device,
+    dimensions: usize,
+    mode_count: usize,
+    point_count: usize,
+) -> BenchResult<CaseBuffers> {
+    let (points, strengths, modes) = generate_case_data(dimensions, mode_count, point_count)?;
     let usage = wgpu::BufferUsages::STORAGE;
     let points = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("wgpu_nufft.stage_profile.points"),
@@ -920,16 +1048,17 @@ fn create_case_buffers(device: &wgpu::Device, size: usize) -> BenchResult<CaseBu
         contents: bytemuck::cast_slice(&modes),
         usage,
     });
-    let complex_bytes = NufftPlan::required_type1_strength_buffer_size_bytes(size)?;
+    let type1_output_bytes = NufftPlan::required_type1_strength_buffer_size_bytes(mode_count)?;
+    let type2_output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count)?;
     let type1_output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.stage_profile.type1_output"),
-        size: complex_bytes,
+        size: type1_output_bytes,
         usage,
         mapped_at_creation: false,
     });
     let type2_output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.stage_profile.type2_output"),
-        size: complex_bytes,
+        size: type2_output_bytes,
         usage,
         mapped_at_creation: false,
     });
@@ -942,28 +1071,50 @@ fn create_case_buffers(device: &wgpu::Device, size: usize) -> BenchResult<CaseBu
     })
 }
 
-fn generate_case_data(size: usize) -> BenchResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let complex_values = size
+fn generate_case_data(
+    dimensions: usize,
+    mode_count: usize,
+    point_count: usize,
+) -> BenchResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    if !(1..=2).contains(&dimensions) {
+        return Err(input_error(format!(
+            "stage profiler supports one or two dimensions, got {dimensions}"
+        )));
+    }
+    let point_values = point_count
+        .checked_mul(dimensions)
+        .ok_or_else(|| input_error("benchmark point-coordinate count overflow"))?;
+    let strength_values = point_count
         .checked_mul(2)
-        .ok_or_else(|| input_error("benchmark complex value count overflow"))?;
+        .ok_or_else(|| input_error("benchmark strength value count overflow"))?;
+    let mode_values = mode_count
+        .checked_mul(2)
+        .ok_or_else(|| input_error("benchmark mode value count overflow"))?;
     let mut point_rng = Lcg32::new(DATA_SEED ^ POINT_SEED_MASK);
+    let mut point_y_rng = Lcg32::new(DATA_SEED ^ POINT_Y_SEED_MASK);
     let mut strength_real_rng = Lcg32::new(DATA_SEED ^ STRENGTH_REAL_SEED_MASK);
     let mut strength_imag_rng = Lcg32::new(DATA_SEED ^ STRENGTH_IMAG_SEED_MASK);
     let mut mode_real_rng = Lcg32::new(DATA_SEED ^ MODE_REAL_SEED_MASK);
     let mut mode_imag_rng = Lcg32::new(DATA_SEED ^ MODE_IMAG_SEED_MASK);
-    let mut points = Vec::with_capacity(size);
-    for _ in 0..size {
+    let mut points = Vec::with_capacity(point_values);
+    for _ in 0..point_count {
         points.push(
             -std::f32::consts::PI + std::f32::consts::TAU * point_rng.next_unit_interval_f32(),
         );
+        if dimensions == 2 {
+            points.push(
+                -std::f32::consts::PI
+                    + std::f32::consts::TAU * point_y_rng.next_unit_interval_f32(),
+            );
+        }
     }
-    let mut strengths = Vec::with_capacity(complex_values);
-    for _ in 0..size {
+    let mut strengths = Vec::with_capacity(strength_values);
+    for _ in 0..point_count {
         strengths.push(-1.0 + 2.0 * strength_real_rng.next_unit_interval_f32());
         strengths.push(-1.0 + 2.0 * strength_imag_rng.next_unit_interval_f32());
     }
-    let mut modes = Vec::with_capacity(complex_values);
-    for _ in 0..size {
+    let mut modes = Vec::with_capacity(mode_values);
+    for _ in 0..mode_count {
         modes.push(-1.0 + 2.0 * mode_real_rng.next_unit_interval_f32());
         modes.push(-1.0 + 2.0 * mode_imag_rng.next_unit_interval_f32());
     }
@@ -1125,6 +1276,7 @@ fn parse_options() -> BenchResult<Options> {
     let mut adapter_selector = None;
     let mut runs = DEFAULT_RUNS;
     let mut samples = DEFAULT_SAMPLES;
+    let mut two_dimensional = false;
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1136,6 +1288,7 @@ fn parse_options() -> BenchResult<Options> {
                 samples =
                     parse_positive_usize(&next_value(&mut arguments, "--samples")?, "samples")?;
             }
+            "--2d" => two_dimensional = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -1147,6 +1300,7 @@ fn parse_options() -> BenchResult<Options> {
         adapter_selector,
         runs,
         samples,
+        two_dimensional,
     })
 }
 
@@ -1175,10 +1329,12 @@ Options:
   --adapter <index-or-name>  Select a Vulkan hardware adapter.
   --runs <count>             Plan recreations per case (default: 3).
   --samples <count>          Timestamp-query submissions per plan (default: 10).
+  --2d                       Profile only N0=N1=1024 with M=1048576.
   --help                     Show this help.
 
-Fixed cases use N=M=262144 and 1048576, f32, eps=1e-6, sigma=2,
-positive sign, and centered mode order."#
+Default fixed cases use N=M=262144 and 1048576. --2d selects the single
+1024x1024 case. All cases use f32, eps=1e-6, sigma=2, positive sign, and
+centered mode order."#
     );
 }
 

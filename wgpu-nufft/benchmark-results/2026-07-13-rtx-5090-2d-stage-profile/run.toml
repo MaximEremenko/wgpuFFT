@@ -1,0 +1,91 @@
+date = "2026-07-13"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0 (59807616e 2026-04-14)"
+cargo = "1.95.0 (f2d3ce0bd 2026-03-21)"
+wgpu = "29.0.3"
+wgpu_nufft_base_commit = "52594238a8b286b5728e105e440026fde86166e8"
+control_wall_seconds = 5.0
+profile_wall_seconds = 6.5
+gpu_canary_wall_seconds = 1.6
+
+[method]
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+mode_order = "centered / FINUFFT modeord=0"
+axis_zero_fastest = true
+point_layout = "point-major [x,y]"
+seed = "0x4E554646"
+point_y_seed_mask = "0xB7E15162"
+mode_shape = [1024, 1024]
+point_count = 1048576
+fine_grid_shape = [2048, 2048]
+runs = 3
+warmups_per_run = 1
+samples_per_run = 10
+type1_transforms_per_sample = 1
+type2_transforms_per_sample = 32
+gpu_intervals = "adjacent ComputePassTimestampWrites boundaries; exact pipeline command envelope"
+profile_host_scope = "queue.submit call plus exact-submission device.poll; encoder.finish and map registration excluded"
+ordinary_scope = "queue.submit through exact-submission device.poll"
+query_resolve_copy_in_profiled_host_span = true
+input_output_transfers_in_timed_region = false
+outputs_preallocated = true
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+driver = "NVIDIA 610.47"
+backend = "Vulkan"
+timestamp_query = true
+timestamp_period_ns = 1.0
+max_query_count = 4096
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[comparison]
+cuda_results_archive = "../2026-07-13-rtx-5090-scratch-reuse"
+type1_cuda_paired_ms = 0.481210
+type2_cuda_paired_ms = 0.179344
+type1_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+type2_pair = "wgpu submit-to-wait versus cuFINUFFT execute"
+cuda_rerun = false
+finufft_cpu_rerun = false
+vkfft_rerun = false
+
+[commands]
+control = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_2d_bench -- --adapter "RTX 5090"
+'''
+profile = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --features gpu-profiling --bench nufft_stage_profile -- --2d --adapter "RTX 5090"
+'''
+gpu_canary = '''
+$env:WGPU_FFT_RUN_GPU_TESTS='1'
+$env:WGPU_BACKEND='vulkan'
+cargo test --locked -p wgpu-nufft --features gpu-profiling --test gpu_stage_profile --release -- --nocapture
+'''
+
+[artifacts]
+stage_profile_harness_sha256 = "431877DC6D56A49C263F6E72EE0F0322F27E79CAA5E6BA907AB988E9E3D3C909"
+ordinary_2d_harness_sha256 = "0598F472FE69FB1A8BCB05C0A310FCD83A9A84D2CB5D3F73A2D40D40F3060AC4"
+gpu_profile_test_sha256 = "D6BAE4EA1FF446632DCA3B73F357E9042EC41A52137270E7A31EFE112C01A353"
+gpu_profile_source_sha256 = "878A7B1DBCB91D91EB2603E182B2FA531C4B480EF52D5D23C7D07AE2306F01C4"
+gpu_type1_2d_source_sha256 = "61F4C3B19B09332B265D02FA1BC23FC19C643912164A23AE6F59163999EB5D95"
+gpu_type2_2d_source_sha256 = "3391B0DBBF8AA37606F6F7EBF4CAE099FC6969FB369B1C786E2802681549B9D8"
+cargo_lock_sha256 = "24EFF885C10262A26639BB801365D251E6A43EF0CBC59C3AF73587A4D6596B29"
+stage_profile_executable_sha256 = "8FB5C23DC57801B6CCF3FEF5BC5C859DA97C903F358013A6885E509B8DA38C02"
+ordinary_2d_executable_sha256 = "27DEDBFE4CC5EC49195C78188CCBEBE03D89EC5A53B2FF6A2456F5F1C67DF204"
+gpu_profile_test_executable_sha256 = "03EE7F3A7E969A4CB8BD309F4523D154D28C7BDC6B715979BD0C6292B29C5C1B"
+stage_profile_results_sha256 = "3EF73E625A9BF1853EB5E0632BF928AB23EF6C9653A1BF678140E9CDB59E75EC"
+ordinary_2d_results_sha256 = "EF31FA22473F4AE3BA456A7C151AE8C7F3DFB9BD7C9FA5E325431E529C566A98"
+gpu_profile_test_results_sha256 = "26C6E23E140AD4DB5DB2E7034B735A96B47693D417D5A8530621D683D2EB3714"

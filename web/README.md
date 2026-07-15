@@ -17,11 +17,12 @@ the WebGPU-related Chrome flags. The wrapper forces ChromeDriver rather than
 allowing `wasm-bindgen-test-runner` to select another WebDriver found on `PATH`
 first.
 
-The wrapper runs the smoke test, browser-default correctness matrix, exact df64
-canaries, and the natural four-step and segmented-volume cases. The latter
-allocates roughly 1 GiB of transient GPU resources and is therefore enabled by
-the wrapper's `WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1` setting instead of ordinary
-workspace test commands.
+The wrapper runs the FFT smoke test, browser-default FFT correctness matrix,
+exact df64 canaries, natural four-step and segmented-volume cases, the complete
+browser NUFFT matrix, and a website-wrapper NUFFT smoke test. The large FFT
+cases allocate roughly 1 GiB of transient GPU resources and are therefore
+enabled by the wrapper's `WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1` setting instead
+of ordinary workspace test commands.
 
 ## Pipeline-cache demo and Rust/Wasm vs JavaScript comparison
 
@@ -60,3 +61,21 @@ The cache demo creates a plan, exports the versioned JSON snapshot to
 `localStorage` under `wgpu-fft.pipeline-cache.v1`, reads it from a fresh
 same-origin document, imports it into a fresh WebGPU context, recreates the
 plan, executes it, and validates an impulse transform.
+
+## Browser NUFFT matrix
+
+The Phase D runner tests the JavaScript-facing type-1, type-2, and type-3
+surface in one through three dimensions, with batched F32 and Df64 data, at
+exact WebGPU default limits:
+
+```powershell
+web\run_phase_d_browser.cmd --headed-only `
+  --output benchmark-results/2026-07-15-browser/phase-d-result.json
+```
+
+It rebuilds `wgpu-web`, generates the browser module with `wasm-bindgen`, and
+launches Chrome directly. The page compares every result with an independent
+JavaScript f64 NDFT, verifies all 96 df64 canary words, checks the inclusive
+df64 type-3 phase bound at 1024 and structured rejection at 1025, and confirms
+that browser native F64 remains unavailable. Omit `--headed-only` to try a
+bounded 30-second headless probe before the headed fallback.

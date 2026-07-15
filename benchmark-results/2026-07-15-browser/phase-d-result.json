@@ -1,0 +1,205 @@
+{
+  "adapter": {
+    "device": 0,
+    "deviceType": "Other",
+    "name": "",
+    "vendor": 0
+  },
+  "backend": "BrowserWebGpu",
+  "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "df64Canary": {
+    "available": true,
+    "cases": 4,
+    "exactWords": 96
+  },
+  "environment": {
+    "browserMode": "headed",
+    "chromeFlags": [
+      "--no-sandbox",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-breakpad",
+      "--disable-crash-reporter",
+      "--enable-unsafe-webgpu",
+      "--disable-gpu-sandbox"
+    ],
+    "chromeProductVersion": "150.0.7871.116",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "skipBuild": false,
+    "wasmBindgen": "wasm-bindgen 0.2.120",
+    "wasmSha256": "1acc9b983a886e20f7fee2a47819d0dd4153eff9f1bc2062501d6d2ce8ab3269",
+    "wgpuFftRevision": "0a40f5e5b6ed215d77e70b35becf166cb5c11cf5",
+    "wgpuFftWorkingTreeDirty": true
+  },
+  "f64Rejection": "type-2 NUFFT plan creation failed: NUFFT precision f64 is unsupported for type-2 GPU plan: the device was not created with wgpu Features::SHADER_F64",
+  "limits": {
+    "maxBufferSize": 268435456,
+    "maxComputeInvocationsPerWorkgroup": 256,
+    "maxComputeWorkgroupStorageSize": 16384,
+    "maxStorageBufferBindingSize": 134217728
+  },
+  "matrix": {
+    "batch": 2,
+    "cases": [
+      {
+        "dimensions": 1,
+        "isign": 1,
+        "kind": "type-1",
+        "precision": "F32",
+        "relativeL2": 4.965197353411928e-06,
+        "tolerance": 4e-05
+      },
+      {
+        "dimensions": 1,
+        "isign": 1,
+        "kind": "type-2",
+        "precision": "F32",
+        "relativeL2": 2.818466271780718e-06,
+        "tolerance": 4e-05
+      },
+      {
+        "dimensions": 2,
+        "isign": -1,
+        "kind": "type-1",
+        "precision": "F32",
+        "relativeL2": 1.4529608476786519e-05,
+        "tolerance": 0.0002
+      },
+      {
+        "dimensions": 2,
+        "isign": -1,
+        "kind": "type-2",
+        "precision": "F32",
+        "relativeL2": 3.101172407970859e-05,
+        "tolerance": 0.0002
+      },
+      {
+        "dimensions": 3,
+        "isign": 1,
+        "kind": "type-1",
+        "precision": "F32",
+        "relativeL2": 1.3651582741562284e-05,
+        "tolerance": 0.00032
+      },
+      {
+        "dimensions": 3,
+        "isign": 1,
+        "kind": "type-2",
+        "precision": "F32",
+        "relativeL2": 3.471780369835662e-05,
+        "tolerance": 0.00032
+      },
+      {
+        "dimensions": 1,
+        "isign": -1,
+        "kind": "type-3",
+        "precision": "F32",
+        "relativeL2": 9.29726403277341e-06,
+        "tolerance": 0.001
+      },
+      {
+        "dimensions": 2,
+        "isign": 1,
+        "kind": "type-3",
+        "precision": "F32",
+        "relativeL2": 1.577315791027238e-05,
+        "tolerance": 0.001
+      },
+      {
+        "dimensions": 3,
+        "isign": -1,
+        "kind": "type-3",
+        "precision": "F32",
+        "relativeL2": 2.473220286819327e-05,
+        "tolerance": 0.001
+      },
+      {
+        "dimensions": 1,
+        "isign": 1,
+        "kind": "type-1",
+        "precision": "Df64",
+        "relativeL2": 4.2044320765212596e-09,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 1,
+        "isign": 1,
+        "kind": "type-2",
+        "precision": "Df64",
+        "relativeL2": 1.7504508866002384e-09,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 2,
+        "isign": -1,
+        "kind": "type-1",
+        "precision": "Df64",
+        "relativeL2": 1.69122160614839e-08,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 2,
+        "isign": -1,
+        "kind": "type-2",
+        "precision": "Df64",
+        "relativeL2": 3.985032041135277e-08,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 3,
+        "isign": 1,
+        "kind": "type-1",
+        "precision": "Df64",
+        "relativeL2": 6.8344971091160215e-09,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 3,
+        "isign": 1,
+        "kind": "type-2",
+        "precision": "Df64",
+        "relativeL2": 1.3093880099400464e-08,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 1,
+        "isign": -1,
+        "kind": "type-3",
+        "precision": "Df64",
+        "relativeL2": 1.7793542990167404e-08,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 2,
+        "isign": 1,
+        "kind": "type-3",
+        "precision": "Df64",
+        "relativeL2": 2.126204978230368e-08,
+        "tolerance": 2.4000000000000003e-07
+      },
+      {
+        "dimensions": 3,
+        "isign": -1,
+        "kind": "type-3",
+        "precision": "Df64",
+        "relativeL2": 4.08914114678246e-08,
+        "tolerance": 2.4000000000000003e-07
+      }
+    ],
+    "passCount": 18,
+    "worstDf64": 4.08914114678246e-08,
+    "worstF32": 3.471780369835662e-05
+  },
+  "ok": true,
+  "phaseBoundary": {
+    "acceptedBound": 1024,
+    "rejectedBound": 1025,
+    "rejection": "type-3 NUFFT plan creation failed: type-3 source pre-phase on axis 0 is unsupported (1025): the conservative phase bound exceeds the portable-df64 accuracy range",
+    "relativeL2": 3.498171785391485e-08,
+    "tolerance": 2.4000000000000003e-07
+  },
+  "rustRevision": "0a40f5e5b6ed215d77e70b35becf166cb5c11cf5",
+  "rustWorkingTreeDirty": true
+}

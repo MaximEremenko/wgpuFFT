@@ -18,5 +18,11 @@ if not defined CHROMEDRIVER (
 set "WASM_BINDGEN_TEST_WEBDRIVER_JSON=%~dp0..\webdriver.json"
 set "WASM_BINDGEN_TEST_TIMEOUT=300"
 set "WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1"
-cargo test --target wasm32-unknown-unknown --test wasm_smoke --test wasm_browser_matrix --test wasm_large_routes -- --nocapture
+cargo test -p wgpu-fft --target wasm32-unknown-unknown --test wasm_smoke --test wasm_browser_matrix --test wasm_large_routes -- --nocapture
+if errorlevel 1 exit /b %ERRORLEVEL%
+
+cargo test -p wgpu-nufft --target wasm32-unknown-unknown --test wasm_browser -- --nocapture
+if errorlevel 1 exit /b %ERRORLEVEL%
+
+cargo test -p wgpu-web --target wasm32-unknown-unknown --test wasm_nufft -- --nocapture
 exit /b %ERRORLEVEL%

@@ -150,3 +150,63 @@ headed Chrome and records Wasm SHA-256
 `e8019094c6edd2ef2026d8ee62ed5a5665ce4ba5e31aa4ae0a9c74e05b8521fb`.
 
 The full machine-readable record is [phase-c-result.json](phase-c-result.json).
+
+## Phase D — in-browser GPU NUFFT
+
+### Method
+
+The browser requested a featureless device at exact WebGPU default limits and
+ran batched NUFFT types 1, 2, and 3 in one through three dimensions through
+Chrome/Tint. Mode shapes were `[17]`, `[8,12]`, and `[4,6,8]`; every case used
+two transform-major vectors and deterministic boundary and duplicate points;
+the type-3 fixtures also included a distinct near-clustered point.
+Type-1/type-2 signs were `+,-,+` by dimension and type-3 used `-,+,-`, so both
+exponential signs were exercised.
+
+F32 used `eps=1e-5`; Df64 used `eps=1e-8`. The oracle was a direct f64 NDFT
+built from the values actually represented by the uploaded F32 or Df64 words.
+The Rust `wasm-bindgen-test` matrix and the public `wgpu-web` JavaScript surface
+ran independently. The Rust matrix passed in 73.60 s. The archive-grade public
+surface run rebuilt Wasm, launched headed Chrome directly, and completed in
+85.1 s including build and browser startup. No native or CUDA reference was run.
+
+The active limits were exactly:
+
+| Limit | Value |
+|---|---:|
+| `maxStorageBufferBindingSize` | 134,217,728 B (128 MiB) |
+| `maxBufferSize` | 268,435,456 B (256 MiB) |
+| `maxComputeWorkgroupStorageSize` | 16,384 B (16 KiB) |
+| `maxComputeInvocationsPerWorkgroup` | 256 |
+
+### Correctness
+
+Values below are relative L2 errors from the public JavaScript surface. The
+independent Rust browser matrix produced the same rounded values.
+
+| Precision | Type 1: 1D / 2D / 3D | Type 2: 1D / 2D / 3D | Type 3: 1D / 2D / 3D |
+|---|---|---|---|
+| F32 | `4.965e-6` / `1.453e-5` / `1.365e-5` | `2.818e-6` / `3.101e-5` / `3.472e-5` | `9.297e-6` / `1.577e-5` / `2.473e-5` |
+| Df64 | `4.204e-9` / `1.691e-8` / `6.834e-9` | `1.750e-9` / `3.985e-8` / `1.309e-8` | `1.779e-8` / `2.126e-8` / `4.089e-8` |
+
+Tint preserved all four adversarial df64 cases, exactly 96 of 96 storage words.
+The df64 type-3 source-prephase bound of 1024 executed with relative L2
+`3.498e-8`; a bound of 1025 returned the structured `source pre-phase`
+accuracy-range error. A native-F64 NUFFT plan returned the expected structured
+missing-`SHADER_F64` precision error.
+
+### Verdict and scope
+
+The complete `wgpu-nufft` transform surface now runs inside Chrome using the
+browser's WebGPU implementation: types 1/2/3, 1D-3D, batched F32 and portable
+Df64, with GPU-resident plans and caller buffers. This is the first in-browser
+GPU NUFFT implementation known to this project. The result is specific to
+Chrome 150.0.7871.116 and its Tint/backend compiler, which is why df64 remains
+guarded by the runtime exact-word canary rather than a permanent browser claim.
+
+The persisted pipeline snapshot covers the embedded `wgpu-fft` fine-grid
+pipelines, not NUFFT-specific spread/interpolation shaders. Browser packaging
+polish for npm/crates.io and IndexedDB storage beyond the localStorage demo are
+optional follow-ups, not transform-surface gaps. The final Wasm SHA-256 was
+`1acc9b983a886e20f7fee2a47819d0dd4153eff9f1bc2062501d6d2ce8ab3269`.
+The machine-readable record is [phase-d-result.json](phase-d-result.json).

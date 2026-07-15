@@ -120,7 +120,15 @@ tested on the RTX 5090. Metal remains the riskiest untested backend because its
 shader compiler enables fast-math transformations by default. Plan-aware
 byte-size helpers account for 8-byte coordinates and 16-byte complex values in
 both high-precision formats; legacy static helpers retain their documented
-one-dimensional f32 ABI. WASM packaging is deferred.
+one-dimensional f32 ABI.
+
+Both the crate and the `wgpu-web` JavaScript surface run on browser WebGPU.
+Chrome/Tint testing at exact WebGPU defaults covers batched type 1/2/3 in one
+through three dimensions for F32 and Df64. The browser compiler must first pass
+all 96 exact df64 arithmetic words; otherwise only Df64 is disabled. Native F64
+remains structurally unsupported in browsers because `SHADER_F64` is absent.
+The browser wrapper keeps plans and caller buffers GPU-resident and exposes
+explicit upload, awaited execution, and download operations.
 
 ## Mathematical conventions
 

@@ -231,6 +231,73 @@ fn approximate_type2_2d(
         .collect()
 }
 
+fn approximate_type2_3d(
+    plan: &NufftPlan,
+    coordinates: &[f64],
+    input: &[Complex64],
+) -> Vec<Complex64> {
+    let fine = plan.fine_grid_shape();
+    let modes = plan.config().n_modes();
+    let kernel = plan.kernel();
+    let coefficient0 = plan.centered_kernel_fourier_coefficients(0).unwrap();
+    let coefficient1 = plan.centered_kernel_fourier_coefficients(1).unwrap();
+    let coefficient2 = plan.centered_kernel_fourier_coefficients(2).unwrap();
+    let mut grid = vec![Complex64::default(); fine[0] * fine[1] * fine[2]];
+    for index2 in 0..modes[2] {
+        let mode2 = mode_for_index(plan.config().mode_order(), index2, modes[2]);
+        for index1 in 0..modes[1] {
+            let mode1 = mode_for_index(plan.config().mode_order(), index1, modes[1]);
+            for index0 in 0..modes[0] {
+                let mode0 = mode_for_index(plan.config().mode_order(), index0, modes[0]);
+                let divisor = coefficient0[mode0.unsigned_abs()]
+                    * coefficient1[mode1.unsigned_abs()]
+                    * coefficient2[mode2.unsigned_abs()];
+                let value = input[index0 + modes[0] * (index1 + modes[1] * index2)];
+                let fine_index = grid_index(mode0, fine[0])
+                    + fine[0] * (grid_index(mode1, fine[1]) + fine[1] * grid_index(mode2, fine[2]));
+                grid[fine_index] = Complex64::new(value.re / divisor, value.im / divisor);
+            }
+        }
+    }
+    let transformed = fft_nd_for_sign(&grid, fine, plan.config().sign());
+    coordinates
+        .chunks_exact(3)
+        .map(|point| {
+            let position = [
+                fold_to_grid(point[0], fine[0]),
+                fold_to_grid(point[1], fine[1]),
+                fold_to_grid(point[2], fine[2]),
+            ];
+            let start = [
+                (position[0] - kernel.half_width()).ceil() as isize,
+                (position[1] - kernel.half_width()).ceil() as isize,
+                (position[2] - kernel.half_width()).ceil() as isize,
+            ];
+            let mut sum = Complex64::default();
+            for offset2 in 0..kernel.width() {
+                let unwrapped2 = start[2] + offset2 as isize;
+                let weight2 = kernel.evaluate(unwrapped2 as f64 - position[2]);
+                let grid2 = unwrapped2.rem_euclid(fine[2] as isize) as usize;
+                for offset1 in 0..kernel.width() {
+                    let unwrapped1 = start[1] + offset1 as isize;
+                    let weight1 = kernel.evaluate(unwrapped1 as f64 - position[1]);
+                    let grid1 = unwrapped1.rem_euclid(fine[1] as isize) as usize;
+                    for offset0 in 0..kernel.width() {
+                        let unwrapped0 = start[0] + offset0 as isize;
+                        let weight0 = kernel.evaluate(unwrapped0 as f64 - position[0]);
+                        let grid0 = unwrapped0.rem_euclid(fine[0] as isize) as usize;
+                        let value = transformed[grid0 + fine[0] * (grid1 + fine[1] * grid2)];
+                        let weight = weight0 * weight1 * weight2;
+                        sum.re += value.re * weight;
+                        sum.im += value.im * weight;
+                    }
+                }
+            }
+            sum
+        })
+        .collect()
+}
+
 fn relative_l2(actual: &[Complex64], reference: &[Complex64]) -> f64 {
     let error = actual
         .iter()
@@ -354,6 +421,36 @@ fn direct_type2_supports_three_dimensions_with_axis_zero_fastest() {
         Complex64::new(0.75 * cos + 0.5 * sin, 0.75 * sin - 0.5 * cos),
         1.0e-14,
     );
+}
+
+#[test]
+fn direct_type1_supports_three_dimensions_with_axis_zero_fastest() {
+    let config = NufftConfig::new([2, 3, 2], 1.0e-6);
+    let point = [0.2, -0.3, 0.4];
+    let strength = Complex64::new(0.75, -0.5);
+    let output = reference_type1_f64(&config, &point, &[strength]).unwrap();
+    assert_eq!(output.len(), 12);
+    for index2 in 0..2 {
+        let mode2 = index2 as i64 - 1;
+        for index1 in 0..3 {
+            let mode1 = index1 as i64 - 1;
+            for index0 in 0..2 {
+                let mode0 = index0 as i64 - 1;
+                let linear = index0 + 2 * (index1 + 3 * index2);
+                let phase =
+                    mode0 as f64 * point[0] + mode1 as f64 * point[1] + mode2 as f64 * point[2];
+                close(output[linear], rotate_complex(strength, phase), 1.0e-14);
+            }
+        }
+    }
+}
+
+fn rotate_complex(value: Complex64, phase: f64) -> Complex64 {
+    let (sin, cos) = phase.sin_cos();
+    Complex64::new(
+        value.re * cos - value.im * sin,
+        value.re * sin + value.im * cos,
+    )
 }
 
 #[test]
@@ -642,6 +739,36 @@ fn tensor_product_es_host_path_meets_finufft_acceptance_in_two_dimensions() {
             assert!(
                 error2 <= 8.0 * eps,
                 "2D type2 eps={eps} sign={sign:?}: relative l2={error2}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tensor_product_es_host_type2_meets_finufft_acceptance_in_three_dimensions() {
+    let coordinates = [
+        -PI, PI, 0.0, -2.71, -1.93, 2.37, -0.37, 0.11, -0.29, 0.0, 0.0, 0.0, 0.43, -0.82, 1.17,
+        2.63, 2.91, -2.45,
+    ];
+    let mode_shape = [6, 8, 10];
+    let coefficients = (0..mode_shape.iter().product())
+        .map(|index| {
+            let x = index as f64 + 0.5;
+            Complex64::new((0.071 * x).cos(), 0.5 * (0.047 * x).sin())
+        })
+        .collect::<Vec<_>>();
+
+    for eps in [1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6] {
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new(mode_shape, eps).with_sign(sign);
+            let type2 = NufftPlan::type2(config.clone()).unwrap();
+            assert_eq!(type2.fine_grid_shape().len(), 3);
+            let actual = approximate_type2_3d(&type2, &coordinates, &coefficients);
+            let reference = reference_type2_f64(&config, &coordinates, &coefficients).unwrap();
+            let error = relative_l2(&actual, &reference);
+            assert!(
+                error <= 32.0 * eps,
+                "3D type2 eps={eps} sign={sign:?}: relative l2={error}"
             );
         }
     }

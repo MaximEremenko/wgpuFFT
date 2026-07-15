@@ -3,6 +3,7 @@ use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
 use crate::gpu::Type2GpuPlan;
 use crate::gpu_2d::Type2GpuPlan2d;
+use crate::gpu_3d::Type2GpuPlan3d;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_type1::Type1GpuPlan;
@@ -89,8 +90,9 @@ impl Type1GpuExecution {
 }
 
 enum Type2GpuExecution {
-    OneDimensional(Type2GpuPlan),
-    TwoDimensional(Type2GpuPlan2d),
+    OneD(Type2GpuPlan),
+    TwoD(Type2GpuPlan2d),
+    ThreeD(Type2GpuPlan3d),
 }
 
 impl Type2GpuExecution {
@@ -104,10 +106,13 @@ impl Type2GpuExecution {
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneDimensional(plan) => {
+            Self::OneD(plan) => {
                 plan.encode(device, encoder, point_count, points, coefficients, output)
             }
-            Self::TwoDimensional(plan) => {
+            Self::TwoD(plan) => {
+                plan.encode(device, encoder, point_count, points, coefficients, output)
+            }
+            Self::ThreeD(plan) => {
                 plan.encode(device, encoder, point_count, points, coefficients, output)
             }
         }
@@ -127,7 +132,7 @@ impl Type2GpuExecution {
         first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
         match self {
-            Self::OneDimensional(plan) => plan.encode_profiled(
+            Self::OneD(plan) => plan.encode_profiled(
                 device,
                 encoder,
                 point_count,
@@ -137,7 +142,17 @@ impl Type2GpuExecution {
                 query_set,
                 first_query,
             ),
-            Self::TwoDimensional(plan) => plan.encode_profiled(
+            Self::TwoD(plan) => plan.encode_profiled(
+                device,
+                encoder,
+                point_count,
+                points,
+                coefficients,
+                output,
+                query_set,
+                first_query,
+            ),
+            Self::ThreeD(plan) => plan.encode_profiled(
                 device,
                 encoder,
                 point_count,
@@ -153,8 +168,9 @@ impl Type2GpuExecution {
     #[cfg(feature = "gpu-profiling")]
     fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         match self {
-            Self::OneDimensional(plan) => plan.fft_diagnostics(),
-            Self::TwoDimensional(plan) => plan.fft_diagnostics(),
+            Self::OneD(plan) => plan.fft_diagnostics(),
+            Self::TwoD(plan) => plan.fft_diagnostics(),
+            Self::ThreeD(plan) => plan.fft_diagnostics(),
         }
     }
 }
@@ -293,7 +309,7 @@ impl NufftPlan {
         Ok(plan)
     }
 
-    /// Builds a reusable one- or two-dimensional type-2 GPU plan.
+    /// Builds a reusable one-, two-, or three-dimensional type-2 GPU plan.
     ///
     /// Execution is entirely GPU-resident and records commands into a caller
     /// supplied encoder. The plan is device-specific and may be reused with
@@ -305,16 +321,16 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
-        if config.dimensions() > 2 {
+        if config.dimensions() > 3 {
             return Err(NufftError::GpuDimensionsUnsupported {
                 kind: "type-2",
                 actual: config.dimensions(),
-                supported: 2,
+                supported: 3,
             });
         }
         let mut plan = Self::new(NufftKind::Type2, config)?;
         let gpu = match plan.config.dimensions() {
-            1 => Type2GpuExecution::OneDimensional(Type2GpuPlan::new(
+            1 => Type2GpuExecution::OneD(Type2GpuPlan::new(
                 device,
                 queue,
                 &plan.config,
@@ -322,7 +338,15 @@ impl NufftPlan {
                 plan.fine_grid_shape[0],
                 &plan.centered_kernel_fourier_coefficients[0],
             )?),
-            2 => Type2GpuExecution::TwoDimensional(Type2GpuPlan2d::new(
+            2 => Type2GpuExecution::TwoD(Type2GpuPlan2d::new(
+                device,
+                queue,
+                &plan.config,
+                plan.kernel,
+                &plan.fine_grid_shape,
+                &plan.centered_kernel_fourier_coefficients,
+            )?),
+            3 => Type2GpuExecution::ThreeD(Type2GpuPlan3d::new(
                 device,
                 queue,
                 &plan.config,
@@ -405,8 +429,8 @@ impl NufftPlan {
 
     /// Required bytes for this plan's point-major `f32` coordinate buffer.
     ///
-    /// A point occupies one scalar per configured dimension, so a 2D plan
-    /// expects `[x0, y0, x1, y1, ...]`.
+    /// A point occupies one scalar per configured dimension, so a 3D plan
+    /// expects `[x0, y0, z0, x1, y1, z1, ...]`.
     pub fn required_point_buffer_size_bytes(&self, point_count: usize) -> Result<u64> {
         let coordinate_count = point_count.checked_mul(self.config.dimensions()).ok_or(
             NufftError::LengthOverflow {
@@ -536,7 +560,7 @@ impl NufftPlan {
         Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", point_count)
     }
 
-    /// Records a one- or two-dimensional type-2 NUFFT into `encoder` without
+    /// Records a one-, two-, or three-dimensional type-2 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
     /// `points` stores point-major `f32` coordinates (one scalar per configured

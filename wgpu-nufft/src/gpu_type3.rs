@@ -27,6 +27,7 @@ const MAX_GPU_PHASE_MAGNITUDE: f64 = f32::MAX as f64 * 0.5;
 /// GPU buffers. Executions on one plan must retain queue order.
 pub(crate) struct GpuType3Plan {
     dimensions: usize,
+    batch_capacity: usize,
     raw_spread: RawSpreadPlan,
     inner_type2: NufftPlan,
     source_pipeline: wgpu::ComputePipeline,
@@ -71,7 +72,8 @@ impl GpuType3Plan {
         let outer_config = NufftConfig::new(outer_modes, metadata.config().eps())
             .with_sign(metadata.config().sign())
             .with_mode_order(ModeOrder::Centered)
-            .with_sigma(metadata.config().sigma());
+            .with_sigma(metadata.config().sigma())
+            .with_batch(metadata.config().batch());
         let kernel = metadata.kernel();
         let outer_coefficients = outer_shape
             .iter()
@@ -130,7 +132,8 @@ impl GpuType3Plan {
         let inner_config = NufftConfig::new(outer_shape, metadata.config().eps())
             .with_sign(metadata.config().sign())
             .with_mode_order(ModeOrder::Centered)
-            .with_sigma(metadata.config().sigma());
+            .with_sigma(metadata.config().sigma())
+            .with_batch(metadata.config().batch());
         let inner_type2 = NufftPlan::type2_gpu(device, queue, inner_config)?;
 
         let source_pipeline = create_compute_pipeline(
@@ -154,6 +157,7 @@ impl GpuType3Plan {
 
         Ok(Self {
             dimensions,
+            batch_capacity: metadata.config().batch(),
             raw_spread,
             inner_type2,
             source_pipeline,
@@ -180,11 +184,12 @@ impl GpuType3Plan {
         coordinate_buffer_size("type-3 source point", source_count, self.dimensions)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn required_source_strength_buffer_size_bytes(
         &self,
         source_count: usize,
     ) -> Result<u64> {
-        complex_buffer_size("type-3 source strength", source_count)
+        self.required_source_strength_buffer_size_bytes_for_batch(source_count, self.batch_capacity)
     }
 
     pub(crate) fn required_target_point_buffer_size_bytes(
@@ -194,11 +199,39 @@ impl GpuType3Plan {
         coordinate_buffer_size("type-3 target point", target_count, self.dimensions)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn required_output_buffer_size_bytes(&self, target_count: usize) -> Result<u64> {
-        complex_buffer_size("type-3 output", target_count)
+        self.required_output_buffer_size_bytes_for_batch(target_count, self.batch_capacity)
+    }
+
+    fn required_source_strength_buffer_size_bytes_for_batch(
+        &self,
+        source_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        let count = source_count
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 batched source strength count",
+            })?;
+        complex_buffer_size("type-3 source strength", count)
+    }
+
+    fn required_output_buffer_size_bytes_for_batch(
+        &self,
+        target_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        let count = target_count
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 batched output count",
+            })?;
+        complex_buffer_size("type-3 output", count)
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -210,14 +243,49 @@ impl GpuType3Plan {
         target_points: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_batch(
+            device,
+            encoder,
+            self.batch_capacity,
+            source_count,
+            source_points,
+            strengths,
+            target_count,
+            target_points,
+            output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        source_count: usize,
+        source_points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        target_count: usize,
+        target_points: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        if active_batch == 0 || active_batch > self.batch_capacity {
+            return Err(NufftError::InvalidBatch {
+                actual: active_batch,
+                maximum: self.batch_capacity,
+            });
+        }
         if target_count == 0 {
             return Ok(());
         }
 
         let source_point_bytes = self.required_source_point_buffer_size_bytes(source_count)?;
-        let strength_bytes = self.required_source_strength_buffer_size_bytes(source_count)?;
+        let strength_bytes =
+            self.required_source_strength_buffer_size_bytes_for_batch(source_count, active_batch)?;
         let target_point_bytes = self.required_target_point_buffer_size_bytes(target_count)?;
-        let output_bytes = self.required_output_buffer_size_bytes(target_count)?;
+        let target_factor_bytes = complex_buffer_size("type-3 target factor", target_count)?;
+        let output_bytes =
+            self.required_output_buffer_size_bytes_for_batch(target_count, active_batch)?;
         if source_count != 0 {
             validate_external_storage_buffer(
                 "type-3 source point",
@@ -245,10 +313,6 @@ impl GpuType3Plan {
             self.max_storage_binding_bytes,
         )?;
 
-        let source_count_u32 =
-            u32::try_from(source_count).map_err(|_| NufftError::LengthOverflow {
-                context: "type-3 source count shader index space",
-            })?;
         let target_count_u32 =
             u32::try_from(target_count).map_err(|_| NufftError::LengthOverflow {
                 context: "type-3 target count shader index space",
@@ -276,14 +340,21 @@ impl GpuType3Plan {
             source_point_bytes,
             strength_bytes,
             target_point_bytes,
+            target_factor_bytes,
             output_bytes,
             self.max_storage_binding_bytes,
             self.max_buffer_bytes,
         )?;
 
         if source_count != 0 {
+            let source_values = source_count
+                .checked_mul(active_batch)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(NufftError::LengthOverflow {
+                    context: "type-3 batched source dispatch",
+                })?;
             let source_dispatch =
-                dispatch_for_elements(source_count_u32, self.max_workgroups_per_dimension)?;
+                dispatch_for_elements(source_values, self.max_workgroups_per_dimension)?;
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("wgpu_nufft.type3.source_rescale_prephase.bind_group"),
                 layout: &self.source_layout,
@@ -303,9 +374,10 @@ impl GpuType3Plan {
             pass.dispatch_workgroups(source_dispatch.0, source_dispatch.1, source_dispatch.2);
         }
 
-        self.raw_spread.encode_spread(
+        self.raw_spread.encode_spread_batch(
             device,
             encoder,
+            active_batch,
             source_count,
             &scratch.rescaled_sources,
             &scratch.prephased_strengths,
@@ -319,7 +391,7 @@ impl GpuType3Plan {
             entries: &[
                 binding_entry(0, target_points, target_point_bytes),
                 binding_entry(1, &scratch.rescaled_targets, target_point_bytes),
-                binding_entry(2, &scratch.target_factors, output_bytes),
+                binding_entry(2, &scratch.target_factors, target_factor_bytes),
             ],
         });
         {
@@ -332,21 +404,30 @@ impl GpuType3Plan {
             pass.dispatch_workgroups(target_dispatch.0, target_dispatch.1, target_dispatch.2);
         }
 
-        self.inner_type2.encode_type2_gpu(
+        self.inner_type2.encode_type2_gpu_batch(
             device,
             encoder,
             target_count,
+            active_batch,
             &scratch.rescaled_targets,
             self.raw_spread.fine_grid_buffer(),
             &scratch.interpolated,
         )?;
 
+        let final_values = target_count
+            .checked_mul(active_batch)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-3 batched final-correction dispatch",
+            })?;
+        let final_dispatch =
+            dispatch_for_elements(final_values, self.max_workgroups_per_dimension)?;
         let final_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type3.final_correction.bind_group"),
             layout: &self.final_layout,
             entries: &[
                 binding_entry(0, &scratch.interpolated, output_bytes),
-                binding_entry(1, &scratch.target_factors, output_bytes),
+                binding_entry(1, &scratch.target_factors, target_factor_bytes),
                 binding_entry(2, output, output_bytes),
             ],
         });
@@ -357,7 +438,7 @@ impl GpuType3Plan {
             });
             pass.set_pipeline(&self.final_pipeline);
             pass.set_bind_group(0, &final_bind_group, &[]);
-            pass.dispatch_workgroups(target_dispatch.0, target_dispatch.1, target_dispatch.2);
+            pass.dispatch_workgroups(final_dispatch.0, final_dispatch.1, final_dispatch.2);
         }
         Ok(())
     }
@@ -376,6 +457,7 @@ enum RawSpreadPlan {
 }
 
 impl RawSpreadPlan {
+    #[allow(dead_code)]
     fn encode_spread(
         &self,
         device: &wgpu::Device,
@@ -384,12 +466,43 @@ impl RawSpreadPlan {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_spread_batch(device, encoder, 1, point_count, points, strengths)
+    }
+
+    fn encode_spread_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+    ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.encode_spread(device, encoder, point_count, points, strengths),
-            Self::TwoD(plan) => plan.encode_spread(device, encoder, point_count, points, strengths),
-            Self::ThreeD(plan) => {
-                plan.encode_spread(device, encoder, point_count, points, strengths)
-            }
+            Self::OneD(plan) => plan.encode_spread_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+            ),
+            Self::TwoD(plan) => plan.encode_spread_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+            ),
+            Self::ThreeD(plan) => plan.encode_spread_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+            ),
         }
     }
 
@@ -466,6 +579,7 @@ impl Type3ScratchBuffers {
         source_point_bytes: u64,
         strength_bytes: u64,
         target_point_bytes: u64,
+        target_factor_bytes: u64,
         target_value_bytes: u64,
         max_storage_binding_bytes: u64,
         max_buffer_bytes: u64,
@@ -474,7 +588,7 @@ impl Type3ScratchBuffers {
             ("type-3 rescaled source scratch", source_point_bytes),
             ("type-3 prephased strength scratch", strength_bytes),
             ("type-3 rescaled target scratch", target_point_bytes),
-            ("type-3 target factor scratch", target_value_bytes),
+            ("type-3 target factor scratch", target_factor_bytes),
             ("type-3 interpolated value scratch", target_value_bytes),
         ] {
             validate_internal_buffer_limits(
@@ -509,7 +623,7 @@ impl Type3ScratchBuffers {
         grow_scratch_buffer(
             device,
             "wgpu_nufft.type3.target_factors",
-            target_value_bytes,
+            target_factor_bytes,
             &mut self.target_factors,
             &mut self.target_factor_capacity,
         );
@@ -631,7 +745,9 @@ fn generate_source_wgsl(metadata: &NufftType3Plan) -> Result<String> {
     let source_{axis} = source_points[coordinate_offset + {axis}u];
     let centered_{axis} = df64_sub(Df64(source_{axis}, 0.0), SOURCE_CENTER_{axis});
     let rescaled_{axis} = df64_mul(centered_{axis}, SOURCE_INV_SCALE_{axis});
-    rescaled_sources[coordinate_offset + {axis}u] = rescaled_{axis}.hi + rescaled_{axis}.lo;
+    if (value_index < source_count) {{
+        rescaled_sources[coordinate_offset + {axis}u] = rescaled_{axis}.hi + rescaled_{axis}.lo;
+    }}
     phase = df64_add(phase, df64_mul(Df64(source_{axis}, 0.0), TARGET_CENTER_{axis}));
 "#,
         ));
@@ -656,16 +772,18 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let workgroup_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    let source_index = workgroup_flat * WORKGROUP_SIZE + lid.x;
-    if (source_index >= arrayLength(&strengths)) {{ return; }}
+    let value_index = workgroup_flat * WORKGROUP_SIZE + lid.x;
+    if (value_index >= arrayLength(&strengths)) {{ return; }}
+    let source_count = arrayLength(&rescaled_sources) / DIMENSIONS;
+    let source_index = value_index % source_count;
     let coordinate_offset = source_index * DIMENSIONS;
     var phase = Df64(0.0, 0.0);
 {body}
     let angle = reduce_phase_df64(df64_mul(phase, ISIGN));
     let sine = sin(angle);
     let cosine = cos(angle);
-    let value = strengths[source_index];
-    prephased_strengths[source_index] = vec2<f32>(
+    let value = strengths[value_index];
+    prephased_strengths[value_index] = vec2<f32>(
         value.x * cosine - value.y * sine,
         value.x * sine + value.y * cosine,
     );
@@ -773,7 +891,7 @@ fn main(
     let index = workgroup_flat * WORKGROUP_SIZE + lid.x;
     if (index >= arrayLength(&output_values)) {{ return; }}
     let value = interpolated[index];
-    let factor = target_factors[index];
+    let factor = target_factors[index % arrayLength(&target_factors)];
     output_values[index] = vec2<f32>(
         value.x * factor.x - value.y * factor.y,
         value.x * factor.y + value.y * factor.x,

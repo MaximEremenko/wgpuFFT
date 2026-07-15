@@ -58,6 +58,7 @@ impl ModeOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NufftConfig {
     n_modes: Vec<usize>,
+    batch: usize,
     eps: f64,
     sign: NufftSign,
     mode_order: ModeOrder,
@@ -69,6 +70,7 @@ impl NufftConfig {
     pub fn new(n_modes: impl Into<Vec<usize>>, eps: f64) -> Self {
         Self {
             n_modes: n_modes.into(),
+            batch: 1,
             eps,
             sign: NufftSign::Positive,
             mode_order: ModeOrder::Centered,
@@ -101,12 +103,26 @@ impl NufftConfig {
         self
     }
 
+    /// Sets the maximum number of transforms encoded together by this plan.
+    ///
+    /// All transforms share the same nonuniform points. Complex input and
+    /// output vectors are stored transform-major: the complete first vector,
+    /// followed by the complete second vector, and so on.
+    pub fn with_batch(mut self, batch: usize) -> Self {
+        self.batch = batch;
+        self
+    }
+
     pub fn dimensions(&self) -> usize {
         self.n_modes.len()
     }
 
     pub fn n_modes(&self) -> &[usize] {
         &self.n_modes
+    }
+
+    pub fn batch(&self) -> usize {
+        self.batch
     }
 
     pub fn eps(&self) -> f64 {
@@ -142,6 +158,12 @@ impl NufftConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.batch == 0 {
+            return Err(NufftError::InvalidBatch {
+                actual: self.batch,
+                maximum: usize::MAX,
+            });
+        }
         let dimensions = self.dimensions();
         if !(1..=3).contains(&dimensions) {
             return Err(NufftError::InvalidDimensions {
@@ -155,7 +177,12 @@ impl NufftConfig {
                 return Err(NufftError::ZeroMode { axis });
             }
         }
-        self.mode_count()?;
+        let mode_count = self.mode_count()?;
+        mode_count
+            .checked_mul(self.batch)
+            .ok_or(NufftError::LengthOverflow {
+                context: "batched Fourier mode count",
+            })?;
         // A singleton NUFFT axis is mathematically meaningful, but wgpu-fft
         // rejects selecting a length-one FFT axis in a nontrivial transform.
         // Use only nontrivial axes here to reuse its checked u32 index-space
@@ -170,6 +197,7 @@ impl NufftConfig {
             fft_shape.push(1);
         }
         wgpu_fft::FftConfig::new_nd(fft_shape)
+            .with_batch(self.batch)
             .validate()
             .map_err(|source| NufftError::FftShapeUnsupported {
                 stage: "requested NUFFT mode shape",
@@ -183,5 +211,36 @@ impl NufftConfig {
 impl Default for NufftConfig {
     fn default() -> Self {
         Self::new([1], DEFAULT_EPS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_defaults_to_one_and_rejects_zero() {
+        let default = NufftConfig::new([8], DEFAULT_EPS);
+        assert_eq!(default.batch(), 1);
+        assert_eq!(default.clone().with_batch(4).batch(), 4);
+        assert_eq!(
+            default.with_batch(0).validate(),
+            Err(NufftError::InvalidBatch {
+                actual: 0,
+                maximum: usize::MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn batched_mode_count_overflow_is_structured() {
+        assert_eq!(
+            NufftConfig::new([2], DEFAULT_EPS)
+                .with_batch(usize::MAX)
+                .validate(),
+            Err(NufftError::LengthOverflow {
+                context: "batched Fourier mode count",
+            })
+        );
     }
 }

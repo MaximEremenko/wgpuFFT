@@ -26,25 +26,45 @@ enum Type1GpuExecution {
 }
 
 impl Type1GpuExecution {
-    fn encode(
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batch(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => {
-                plan.encode(device, encoder, point_count, points, strengths, output)
-            }
-            Self::TwoD(plan) => {
-                plan.encode(device, encoder, point_count, points, strengths, output)
-            }
-            Self::ThreeD(plan) => {
-                plan.encode(device, encoder, point_count, points, strengths, output)
-            }
+            Self::OneD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+            Self::TwoD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+            Self::ThreeD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
         }
     }
 
@@ -112,25 +132,45 @@ enum Type2GpuExecution {
 }
 
 impl Type2GpuExecution {
-    fn encode(
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batch(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => {
-                plan.encode(device, encoder, point_count, points, coefficients, output)
-            }
-            Self::TwoD(plan) => {
-                plan.encode(device, encoder, point_count, points, coefficients, output)
-            }
-            Self::ThreeD(plan) => {
-                plan.encode(device, encoder, point_count, points, coefficients, output)
-            }
+            Self::OneD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::TwoD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::ThreeD(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
         }
     }
 
@@ -472,6 +512,7 @@ impl NufftPlan {
             .map(|&length| select_fine_grid_size(length, config.sigma(), kernel.width()))
             .collect::<Result<Vec<_>>>()?;
         wgpu_fft::FftConfig::new_nd(fine_grid_shape.clone())
+            .with_batch(config.batch())
             .validate()
             .map_err(|source| NufftError::FftShapeUnsupported {
                 stage: "oversampled NUFFT fine-grid shape",
@@ -548,25 +589,57 @@ impl NufftPlan {
             })
     }
 
-    /// Required bytes for `point_count` interleaved-complex `f32` strengths.
+    /// Required bytes for one vector of `point_count` interleaved-complex
+    /// `f32` strengths.
+    ///
+    /// This legacy helper intentionally retains its single-vector behavior.
+    /// Batched callers should use
+    /// [`Self::required_type1_strength_buffer_size_bytes_for_batch`].
     pub fn required_type1_strength_buffer_size_bytes(point_count: usize) -> Result<u64> {
         Type1GpuPlan::strength_buffer_size_bytes(point_count)
     }
 
-    /// Required bytes for this plan's interleaved-complex `f32` type-1 output.
+    /// Required bytes for `active_batch` transform-major type-1 strength vectors.
+    pub fn required_type1_strength_buffer_size_bytes_for_batch(
+        &self,
+        point_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        self.validate_active_batch(active_batch)?;
+        let element_count = checked_batched_element_count(
+            point_count,
+            active_batch,
+            "batched type-1 strength count",
+        )?;
+        Type1GpuPlan::complex_buffer_size_bytes("type-1 strength buffer", element_count)
+    }
+
+    /// Required bytes for this plan's configured number of transform-major
+    /// interleaved-complex `f32` type-1 output vectors.
     pub fn required_type1_output_buffer_size_bytes(&self) -> Result<u64> {
-        Type1GpuPlan::complex_buffer_size_bytes(
-            "type-1 Fourier mode output buffer",
+        self.required_type1_output_buffer_size_bytes_for_batch(self.config.batch())
+    }
+
+    /// Required bytes for `active_batch` transform-major type-1 output vectors.
+    pub fn required_type1_output_buffer_size_bytes_for_batch(
+        &self,
+        active_batch: usize,
+    ) -> Result<u64> {
+        self.validate_active_batch(active_batch)?;
+        let element_count = checked_batched_element_count(
             self.config.mode_count()?,
-        )
+            active_batch,
+            "batched type-1 Fourier mode output count",
+        )?;
+        Type1GpuPlan::complex_buffer_size_bytes("type-1 Fourier mode output buffer", element_count)
     }
 
     /// Records a one-, two-, or three-dimensional type-1 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
     /// `points` stores point-major `f32` coordinates (one scalar per configured
-    /// dimension). `strengths` and
-    /// `output` store interleaved complex values as `(re, im)` `f32` pairs. All
+    /// dimension). `strengths` and `output` store the configured number of
+    /// transform-major vectors as interleaved complex `(re, im)` `f32` pairs. All
     /// buffers used by a nonempty transform require `STORAGE` usage and must
     /// belong to the plan's device. Coordinates must be finite and lie in
     /// FINUFFT's documented `[-3*pi, 3*pi]` interval. For zero points, the
@@ -581,12 +654,40 @@ impl NufftPlan {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_type1_gpu_batch(
+            device,
+            encoder,
+            point_count,
+            self.config.batch(),
+            points,
+            strengths,
+            output,
+        )
+    }
+
+    /// Records `active_batch` type-1 transforms sharing one point set.
+    ///
+    /// Strength and output buffers are transform-major. `active_batch` may be
+    /// smaller than the capacity selected with [`NufftConfig::with_batch`],
+    /// but it must be at least one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_type1_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        active_batch: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
         if self.kind != NufftKind::Type1 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-1",
                 reason: "the plan was built for type-2 execution",
             });
         }
+        self.validate_active_batch(active_batch)?;
         let gpu = self
             .gpu_type1
             .as_deref()
@@ -594,7 +695,15 @@ impl NufftPlan {
                 kind: "type-1",
                 reason: "construct the plan with NufftPlan::type1_gpu",
             })?;
-        gpu.encode(device, encoder, point_count, points, strengths, output)
+        gpu.encode_batch(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+            output,
+        )
     }
 
     /// Records a type-1 execution with GPU timestamp queries around its
@@ -607,6 +716,7 @@ impl NufftPlan {
     /// available starting at `first_query`. No query resolve or readback is
     /// recorded by this method.
     #[cfg(feature = "gpu-profiling")]
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_type1_gpu_profiled(
         &self,
         device: &wgpu::Device,
@@ -650,26 +760,58 @@ impl NufftPlan {
         Type2GpuPlan::point_buffer_size_bytes(point_count)
     }
 
-    /// Required bytes for this plan's interleaved-complex `f32` coefficients.
+    /// Required bytes for this plan's configured number of transform-major
+    /// interleaved-complex `f32` coefficient vectors.
     pub fn required_type2_coefficient_buffer_size_bytes(&self) -> Result<u64> {
-        Type2GpuPlan::complex_buffer_size_bytes(
-            "type-2 Fourier coefficient buffer",
-            self.config.mode_count()?,
-        )
+        self.required_type2_coefficient_buffer_size_bytes_for_batch(self.config.batch())
     }
 
-    /// Required bytes for `point_count` interleaved-complex `f32` outputs.
+    /// Required bytes for `active_batch` transform-major type-2 coefficient vectors.
+    pub fn required_type2_coefficient_buffer_size_bytes_for_batch(
+        &self,
+        active_batch: usize,
+    ) -> Result<u64> {
+        self.validate_active_batch(active_batch)?;
+        let element_count = checked_batched_element_count(
+            self.config.mode_count()?,
+            active_batch,
+            "batched type-2 Fourier coefficient count",
+        )?;
+        Type2GpuPlan::complex_buffer_size_bytes("type-2 Fourier coefficient buffer", element_count)
+    }
+
+    /// Required bytes for one vector of `point_count` interleaved-complex
+    /// `f32` outputs.
+    ///
+    /// This legacy helper intentionally retains its single-vector behavior.
+    /// Batched callers should use
+    /// [`Self::required_type2_output_buffer_size_bytes_for_batch`].
     pub fn required_type2_output_buffer_size_bytes(point_count: usize) -> Result<u64> {
         Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", point_count)
+    }
+
+    /// Required bytes for `active_batch` transform-major type-2 output vectors.
+    pub fn required_type2_output_buffer_size_bytes_for_batch(
+        &self,
+        point_count: usize,
+        active_batch: usize,
+    ) -> Result<u64> {
+        self.validate_active_batch(active_batch)?;
+        let element_count = checked_batched_element_count(
+            point_count,
+            active_batch,
+            "batched type-2 output count",
+        )?;
+        Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", element_count)
     }
 
     /// Records a one-, two-, or three-dimensional type-2 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
     /// `points` stores point-major `f32` coordinates (one scalar per configured
-    /// dimension). `coefficients`
-    /// and `output` store interleaved complex values as `(re, im)` `f32`
-    /// pairs. All three buffers require `STORAGE` usage and must belong to the
+    /// dimension). `coefficients` and `output` store the configured number of
+    /// transform-major vectors as interleaved complex `(re, im)` `f32` pairs.
+    /// All three buffers require `STORAGE` usage and must belong to the
     /// same device used to construct the plan. Coordinates must be finite and
     /// lie in FINUFFT's documented `[-3*pi, 3*pi]` interval.
     pub fn encode_type2_gpu(
@@ -681,12 +823,39 @@ impl NufftPlan {
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_type2_gpu_batch(
+            device,
+            encoder,
+            point_count,
+            self.config.batch(),
+            points,
+            coefficients,
+            output,
+        )
+    }
+
+    /// Records `active_batch` type-2 transforms sharing one point set.
+    ///
+    /// Coefficient and output buffers are transform-major. `active_batch` may
+    /// be smaller than the configured batch capacity, but it must be nonzero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_type2_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        active_batch: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
         if self.kind != NufftKind::Type2 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-2",
                 reason: "the plan was built for type-1 execution",
             });
         }
+        self.validate_active_batch(active_batch)?;
         let gpu = self
             .gpu_type2
             .as_deref()
@@ -694,13 +863,22 @@ impl NufftPlan {
                 kind: "type-2",
                 reason: "construct the plan with NufftPlan::type2_gpu",
             })?;
-        gpu.encode(device, encoder, point_count, points, coefficients, output)
+        gpu.encode_batch(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            coefficients,
+            output,
+        )
     }
 
     /// Records a type-2 execution with GPU timestamp queries around its
     /// logical stages. See [`Self::encode_type1_gpu_profiled`] for query-set
     /// requirements.
     #[cfg(feature = "gpu-profiling")]
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_type2_gpu_profiled(
         &self,
         device: &wgpu::Device,
@@ -778,6 +956,16 @@ impl NufftPlan {
         }
     }
 
+    fn validate_active_batch(&self, active_batch: usize) -> Result<()> {
+        if active_batch == 0 || active_batch > self.config.batch() {
+            return Err(NufftError::InvalidBatch {
+                actual: active_batch,
+                maximum: self.config.batch(),
+            });
+        }
+        Ok(())
+    }
+
     /// Executes the exact direct CPU fallback for this plan's transform kind.
     pub fn execute_direct_f64(
         &self,
@@ -789,4 +977,14 @@ impl NufftPlan {
             NufftKind::Type2 => reference_type2_f64(&self.config, coordinates, input),
         }
     }
+}
+
+fn checked_batched_element_count(
+    elements_per_transform: usize,
+    active_batch: usize,
+    context: &'static str,
+) -> Result<usize> {
+    elements_per_transform
+        .checked_mul(active_batch)
+        .ok_or(NufftError::LengthOverflow { context })
 }

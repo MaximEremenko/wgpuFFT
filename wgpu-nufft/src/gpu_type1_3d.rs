@@ -16,6 +16,7 @@ use crate::kernel::EsKernel;
 
 const DIMENSIONS: usize = 3;
 const WORKGROUP_SIZE: u32 = 64;
+const VECTOR_BLOCK_SIZE: usize = 4;
 const TILED_GATHER_TILE_SHAPE: [usize; DIMENSIONS] = [8, 8, 4];
 const TILED_GATHER_WORKGROUP_SIZE: u32 = 256;
 const TILED_GATHER_SCAN_ELEMENTS: usize = 4096;
@@ -61,11 +62,11 @@ pub(crate) struct Type1GpuPlan3d {
     deconvolution_pipeline: wgpu::ComputePipeline,
     deconvolution_layout: wgpu::BindGroupLayout,
     sort_dispatch: (u32, u32, u32),
-    gather_dispatch: (u32, u32, u32),
-    deconvolution_dispatch: (u32, u32, u32),
+    gather_workgroups_per_vector_block: u32,
     max_workgroups_per_dimension: u32,
     mode_count: usize,
     fine_count: usize,
+    batch_capacity: usize,
     max_storage_binding_bytes: u64,
     max_buffer_bytes: u64,
 }
@@ -139,12 +140,20 @@ impl Type1GpuPlan3d {
         u32::try_from(fine_count).map_err(|_| NufftError::LengthOverflow {
             context: "type-1 3D fine-grid shader index space",
         })?;
+        let batch_capacity = config.batch();
+        let fft_config = fft_config.with_batch(batch_capacity);
         let mode_count = config.mode_count()?;
         u32::try_from(mode_count).map_err(|_| NufftError::LengthOverflow {
             context: "type-1 3D mode shader index space",
         })?;
 
-        let fine_bytes = Self::complex_buffer_size_bytes("type-1 3D fine grid", fine_count)?;
+        let total_fine_count =
+            fine_count
+                .checked_mul(batch_capacity)
+                .ok_or(NufftError::LengthOverflow {
+                    context: "batched type-1 3D fine-grid element count",
+                })?;
+        let fine_bytes = Self::complex_buffer_size_bytes("type-1 3D fine grid", total_fine_count)?;
         let amplitude_bytes =
             checked_buffer_size("type-1 3D deconvolution amplitudes", mode_count, F32_BYTES)?;
         let count_bytes = checked_buffer_size("type-1 3D bin counts", fine_count, U32_BYTES)?;
@@ -223,11 +232,11 @@ impl Type1GpuPlan3d {
         );
         let sort_layout = sort_pipeline.get_bind_group_layout(0);
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let (gather_label, gather_source, gather_dispatch) = match gather {
+        let (gather_label, gather_source, gather_workgroups_per_vector_block) = match gather {
             Type1Gather3d::Global => (
                 "wgpu_nufft.type1_3d.spread_gather",
                 generate_gather_wgsl(kernel, fine_shape),
-                dispatch_for_elements(fine_count, max_workgroups_per_dimension)?,
+                workgroups_for_elements(fine_count)?,
             ),
             Type1Gather3d::Tiled8x8x4 => {
                 let configuration =
@@ -249,13 +258,13 @@ impl Type1GpuPlan3d {
                         (
                             "wgpu_nufft.type1_3d.spread_gather_tiled8x8x4",
                             generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
-                            tiled_gather_dispatch(fine_shape, max_workgroups_per_dimension)?,
+                            tiled_gather_workgroups(fine_shape)?,
                         )
                     }
                     _ => (
                         "wgpu_nufft.type1_3d.spread_gather",
                         generate_gather_wgsl(kernel, fine_shape),
-                        dispatch_for_elements(fine_count, max_workgroups_per_dimension)?,
+                        workgroups_for_elements(fine_count)?,
                     ),
                 }
             }
@@ -270,9 +279,6 @@ impl Type1GpuPlan3d {
         let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
 
         let sort_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
-        let deconvolution_dispatch =
-            dispatch_for_elements(mode_count, max_workgroups_per_dimension)?;
-
         Ok(Self {
             fft,
             amplitudes,
@@ -293,11 +299,11 @@ impl Type1GpuPlan3d {
             deconvolution_pipeline,
             deconvolution_layout,
             sort_dispatch,
-            gather_dispatch,
-            deconvolution_dispatch,
+            gather_workgroups_per_vector_block,
             max_workgroups_per_dimension,
             mode_count,
             fine_count,
+            batch_capacity,
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
             max_buffer_bytes: limits.max_buffer_size,
         })
@@ -321,6 +327,7 @@ impl Type1GpuPlan3d {
     /// Records only the deterministic point spreading stages into the
     /// oversampled fine grid. The grid remains owned by this plan and is
     /// overwritten on every call, including the zero-point case.
+    #[allow(dead_code)]
     pub(crate) fn encode_spread(
         &self,
         device: &wgpu::Device,
@@ -329,9 +336,23 @@ impl Type1GpuPlan3d {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_spread_batch(device, encoder, 1, point_count, points, strengths)
+    }
+
+    pub(crate) fn encode_spread_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.validate_active_batch(active_batch)?;
         self.encode_spread_impl(
             device,
             encoder,
+            active_batch,
             point_count,
             points,
             strengths,
@@ -349,6 +370,7 @@ impl Type1GpuPlan3d {
         self.fine_count
     }
 
+    #[allow(dead_code)]
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -358,9 +380,33 @@ impl Type1GpuPlan3d {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.encode_batch(
+            device,
+            encoder,
+            self.batch_capacity,
+            point_count,
+            points,
+            strengths,
+            output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.validate_active_batch(active_batch)?;
         self.encode_impl(
             device,
             encoder,
+            active_batch,
             point_count,
             points,
             strengths,
@@ -396,6 +442,7 @@ impl Type1GpuPlan3d {
         self.encode_impl(
             device,
             encoder,
+            self.batch_capacity,
             point_count,
             points,
             strengths,
@@ -410,14 +457,21 @@ impl Type1GpuPlan3d {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
+        let output_elements =
+            self.mode_count
+                .checked_mul(active_batch)
+                .ok_or(NufftError::LengthOverflow {
+                    context: "batched type-1 3D Fourier output element count",
+                })?;
         let output_bytes =
-            Self::complex_buffer_size_bytes("type-1 3D Fourier output buffer", self.mode_count)?;
+            Self::complex_buffer_size_bytes("type-1 3D Fourier output buffer", output_elements)?;
         validate_external_storage_buffer(
             "type-1 3D Fourier output",
             output,
@@ -442,30 +496,57 @@ impl Type1GpuPlan3d {
         });
 
         #[cfg(not(feature = "gpu-profiling"))]
-        self.encode_spread(device, encoder, point_count, points, strengths)?;
+        self.encode_spread_batch(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+        )?;
         #[cfg(feature = "gpu-profiling")]
         match profile {
             GpuProfileQueryWriter::Disabled => {
-                self.encode_spread(device, encoder, point_count, points, strengths)?;
+                self.encode_spread_batch(
+                    device,
+                    encoder,
+                    active_batch,
+                    point_count,
+                    points,
+                    strengths,
+                )?;
             }
             GpuProfileQueryWriter::Enabled { .. } => {
-                self.encode_spread_impl(device, encoder, point_count, points, strengths, profile)?;
+                self.encode_spread_impl(
+                    device,
+                    encoder,
+                    active_batch,
+                    point_count,
+                    points,
+                    strengths,
+                    profile,
+                )?;
             }
         }
         self.encode_fft(device, encoder)?;
+        let deconvolution_dispatch =
+            dispatch_for_elements(output_elements, self.max_workgroups_per_dimension)?;
         self.encode_deconvolution(
             encoder,
             &output_bind_group,
+            deconvolution_dispatch,
             #[cfg(feature = "gpu-profiling")]
             profile,
         );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_spread_impl(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
@@ -482,7 +563,13 @@ impl Type1GpuPlan3d {
             })?;
         validate_point_coordinate_shader_index(point_count)?;
         let point_bytes = Self::point_buffer_size_bytes(point_count)?;
-        let strength_bytes = Self::strength_buffer_size_bytes(point_count)?;
+        let strength_elements =
+            point_count
+                .checked_mul(active_batch)
+                .ok_or(NufftError::LengthOverflow {
+                    context: "batched type-1 3D strength element count",
+                })?;
+        let strength_bytes = Self::strength_buffer_size_bytes(strength_elements)?;
         validate_external_storage_buffer(
             "type-1 3D point",
             points,
@@ -573,6 +660,15 @@ impl Type1GpuPlan3d {
                 binding_entry(1, &sorted_indices, index_bytes),
             ],
         });
+        let active_fine_elements = fine_grid_element_count.checked_mul(active_batch).ok_or(
+            NufftError::LengthOverflow {
+                context: "active batched type-1 3D fine-grid element count",
+            },
+        )?;
+        let active_fine_bytes = Self::complex_buffer_size_bytes(
+            "active batched type-1 3D fine grid",
+            active_fine_elements,
+        )?;
         let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_3d.spread_gather.bind_group"),
             layout: &self.gather_layout,
@@ -584,12 +680,19 @@ impl Type1GpuPlan3d {
                     resource: bin_offsets.as_entire_binding(),
                 },
                 binding_entry(3, &sorted_indices, index_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.fine_input.as_entire_binding(),
-                },
+                binding_entry(4, &self.fine_input, active_fine_bytes),
             ],
         });
+        let vector_blocks = active_batch.div_ceil(VECTOR_BLOCK_SIZE);
+        let gather_workgroups = usize::try_from(self.gather_workgroups_per_vector_block)
+            .ok()
+            .and_then(|count| count.checked_mul(vector_blocks))
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(NufftError::LengthOverflow {
+                context: "batched type-1 3D gather workgroup count",
+            })?;
+        let gather_dispatch =
+            split_workgroups(gather_workgroups, self.max_workgroups_per_dimension)?;
 
         #[cfg(feature = "gpu-profiling")]
         profile.encode_type1_start_marker(encoder);
@@ -638,10 +741,17 @@ impl Type1GpuPlan3d {
             "wgpu_nufft.type1_3d.spread_gather.pass",
             &self.gather_pipeline,
             &gather_bind_group,
-            self.gather_dispatch,
+            gather_dispatch,
             #[cfg(feature = "gpu-profiling")]
             profile.timestamp_writes(None, Some(5)),
         );
+        if active_batch < self.batch_capacity {
+            encoder.clear_buffer(
+                &self.fine_input,
+                active_fine_bytes,
+                Some(self.fine_input.size() - active_fine_bytes),
+            );
+        }
         Ok(())
     }
 
@@ -663,6 +773,7 @@ impl Type1GpuPlan3d {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
+        dispatch: (u32, u32, u32),
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) {
         encode_pass(
@@ -670,7 +781,7 @@ impl Type1GpuPlan3d {
             "wgpu_nufft.type1_3d.deconvolution.pass",
             &self.deconvolution_pipeline,
             bind_group,
-            self.deconvolution_dispatch,
+            dispatch,
             #[cfg(feature = "gpu-profiling")]
             profile.timestamp_writes(Some(6), Some(7)),
         );
@@ -679,6 +790,17 @@ impl Type1GpuPlan3d {
     #[cfg(feature = "gpu-profiling")]
     pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         self.fft.diagnostics()
+    }
+
+    fn validate_active_batch(&self, active_batch: usize) -> Result<()> {
+        if active_batch == 0 || active_batch > self.batch_capacity {
+            Err(NufftError::InvalidBatch {
+                actual: active_batch,
+                maximum: self.batch_capacity,
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1070,6 +1192,7 @@ const WIDTH_F32: f32 = {width}.0;
 const HALF_WIDTH: f32 = {half_width};
 const BETA: f32 = {beta};
 const BIN_RADIUS: i32 = {bin_radius}i;
+const VECTOR_BLOCK_SIZE: u32 = {VECTOR_BLOCK_SIZE}u;
 
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read> strengths: array<vec2<f32>>;
@@ -1115,14 +1238,24 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    if (wg_flat > (FINE_COUNT - 1u) / WORKGROUP_SIZE) {{ return; }}
-    let cell = wg_flat * WORKGROUP_SIZE + lid.x;
-    if (cell >= FINE_COUNT) {{ return; }}
+    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
+    let vector_blocks = (total_vectors + VECTOR_BLOCK_SIZE - 1u) / VECTOR_BLOCK_SIZE;
+    let total_work = FINE_COUNT * vector_blocks;
+    if (wg_flat > (total_work - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let work_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (work_index >= total_work) {{ return; }}
+    let vector_block = work_index / FINE_COUNT;
+    let cell = work_index - vector_block * FINE_COUNT;
+    let first_vector = vector_block * VECTOR_BLOCK_SIZE;
 
     let cell_0 = cell % FINE_0;
     let cell_1 = (cell / FINE_0) % FINE_1;
     let cell_2 = cell / FINE_01;
-    var sum = vec2<f32>(0.0, 0.0);
+    var sums: array<vec2<f32>, {VECTOR_BLOCK_SIZE}>;
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        sums[vector_local] = vec2<f32>(0.0, 0.0);
+    }}
     for (var bin_offset_2 = -BIN_RADIUS; bin_offset_2 < BIN_RADIUS;
          bin_offset_2 = bin_offset_2 + 1) {{
         let bin_2 = wrap_bin(i32(cell_2) + bin_offset_2, FINE_2_I32);
@@ -1159,13 +1292,29 @@ fn main(
                         let weight_0 = es_weight(distance_0.hi + distance_0.lo);
                         let weight_1 = es_weight(distance_1.hi + distance_1.lo);
                         let weight_2 = es_weight(distance_2.hi + distance_2.lo);
-                        sum = sum + strengths[point_index] * ((weight_0 * weight_1) * weight_2);
+                        let weight = (weight_0 * weight_1) * weight_2;
+                        for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+                             vector_local = vector_local + 1u) {{
+                            let vector_index = first_vector + vector_local;
+                            if (vector_index < total_vectors) {{
+                                let strength_index = vector_index *
+                                    (arrayLength(&points) / 3u) + point_index;
+                                sums[vector_local] = sums[vector_local] +
+                                    strengths[strength_index] * weight;
+                            }}
+                        }}
                     }}
                 }}
             }}
         }}
     }}
-    fine_grid[cell] = sum;
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        let vector_index = first_vector + vector_local;
+        if (vector_index < total_vectors) {{
+            fine_grid[vector_index * FINE_COUNT + cell] = sums[vector_local];
+        }}
+    }}
 }}
 "#,
         half_width = format_wgsl_f32(kernel.half_width() as f32),
@@ -1221,6 +1370,7 @@ const SCAN_ELEMENTS: u32 = {scan_elements}u;
 const SCAN_ITEMS_PER_INVOCATION: u32 = {scan_items_per_invocation}u;
 const CACHE_CAPACITY: u32 = {cache_capacity}u;
 const CACHE_LOAD_ROUNDS: u32 = {cache_load_rounds}u;
+const VECTOR_BLOCK_SIZE: u32 = {VECTOR_BLOCK_SIZE}u;
 
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read> strengths: array<vec2<f32>>;
@@ -1232,7 +1382,7 @@ var<workgroup> halo_prefix: array<u32, {padded_scan_elements}>;
 var<workgroup> cached_starts_0: array<i32, {cache_capacity}>;
 var<workgroup> cached_starts_1: array<i32, {cache_capacity}>;
 var<workgroup> cached_starts_2: array<i32, {cache_capacity}>;
-var<workgroup> cached_strengths: array<vec2<f32>, {cache_capacity}>;
+var<workgroup> cached_point_indices: array<u32, {cache_capacity}>;
 var<workgroup> cached_weights_0: array<f32, {cache_weight_count}>;
 var<workgroup> cached_weights_1: array<f32, {cache_weight_count}>;
 var<workgroup> cached_weights_2: array<f32, {cache_weight_count}>;
@@ -1306,10 +1456,15 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    if (wg_flat >= TILE_COUNT) {{ return; }}
+    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
+    let vector_blocks = (total_vectors + VECTOR_BLOCK_SIZE - 1u) / VECTOR_BLOCK_SIZE;
+    if (wg_flat >= TILE_COUNT * vector_blocks) {{ return; }}
 
-    let tile_0 = wg_flat % TILE_COUNT_0;
-    let remaining_tile = wg_flat / TILE_COUNT_0;
+    let vector_block = wg_flat / TILE_COUNT;
+    let first_vector = vector_block * VECTOR_BLOCK_SIZE;
+    let tile_flat = wg_flat - vector_block * TILE_COUNT;
+    let tile_0 = tile_flat % TILE_COUNT_0;
+    let remaining_tile = tile_flat / TILE_COUNT_0;
     let tile_1 = remaining_tile % TILE_COUNT_1;
     let tile_2 = remaining_tile / TILE_COUNT_1;
     let tile_origin = vec3<u32>(tile_0 * TILE_0, tile_1 * TILE_1, tile_2 * TILE_2);
@@ -1371,7 +1526,11 @@ fn main(
     let halo_total = workgroupUniformLoad(
         &halo_prefix[physical_index(HALO_BIN_COUNT)],
     );
-    var sum = vec2<f32>(0.0, 0.0);
+    var sums: array<vec2<f32>, {VECTOR_BLOCK_SIZE}>;
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        sums[vector_local] = vec2<f32>(0.0, 0.0);
+    }}
     var batch_start = 0u;
     loop {{
         if (batch_start >= halo_total) {{ break; }}
@@ -1401,7 +1560,7 @@ fn main(
                 cached_starts_0[cache_slot] = start_0;
                 cached_starts_1[cache_slot] = start_1;
                 cached_starts_2[cache_slot] = start_2;
-                cached_strengths[cache_slot] = strengths[point_index];
+                cached_point_indices[cache_slot] = point_index;
                 for (var support = 0u; support < WIDTH; support = support + 1u) {{
                     let support_0 = start_0 + i32(support);
                     let support_1 = start_1 + i32(support);
@@ -1457,8 +1616,19 @@ fn main(
                                 let weight_0 = cached_weights_0[cache_slot * WIDTH + support_0];
                                 let weight_1 = cached_weights_1[cache_slot * WIDTH + support_1];
                                 let weight_2 = cached_weights_2[cache_slot * WIDTH + support_2];
-                                sum = sum + cached_strengths[cache_slot] *
-                                    ((weight_0 * weight_1) * weight_2);
+                                let weight = (weight_0 * weight_1) * weight_2;
+                                let point_index = cached_point_indices[cache_slot];
+                                for (var vector_local = 0u;
+                                     vector_local < VECTOR_BLOCK_SIZE;
+                                     vector_local = vector_local + 1u) {{
+                                    let vector_index = first_vector + vector_local;
+                                    if (vector_index < total_vectors) {{
+                                        let strength_index = vector_index *
+                                            (arrayLength(&points) / 3u) + point_index;
+                                        sums[vector_local] = sums[vector_local] +
+                                            strengths[strength_index] * weight;
+                                    }}
+                                }}
                             }}
                         }}
                     }}
@@ -1470,7 +1640,14 @@ fn main(
     }}
 
     if (cell_in_bounds) {{
-        fine_grid[cell.x + FINE_0 * (cell.y + FINE_1 * cell.z)] = sum;
+        let cell_index = cell.x + FINE_0 * (cell.y + FINE_1 * cell.z);
+        for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+             vector_local = vector_local + 1u) {{
+            let vector_index = first_vector + vector_local;
+            if (vector_index < total_vectors) {{
+                fine_grid[vector_index * FINE_COUNT + cell_index] = sums[vector_local];
+            }}
+        }}
     }}
 }}
 "#,
@@ -1518,6 +1695,7 @@ const MODE_COUNT: u32 = {mode_count}u;
 const FINE_0: u32 = {fine_0}u;
 const FINE_1: u32 = {fine_1}u;
 const FINE_2: u32 = {fine_2}u;
+const FINE_COUNT: u32 = {fine_count}u;
 const CENTERED_ORDER: bool = {centered};
 
 @group(0) @binding(0) var<storage, read> fine_grid: array<vec2<f32>>;
@@ -1546,9 +1724,12 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    if (wg_flat > (MODE_COUNT - 1u) / WORKGROUP_SIZE) {{ return; }}
-    let output_index = wg_flat * WORKGROUP_SIZE + lid.x;
-    if (output_index >= MODE_COUNT) {{ return; }}
+    let total = arrayLength(&output_values);
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let linear_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (linear_index >= total) {{ return; }}
+    let vector_index = linear_index / MODE_COUNT;
+    let output_index = linear_index - vector_index * MODE_COUNT;
     let storage_0 = output_index % MODE_0;
     let storage_1 = (output_index / MODE_0) % MODE_1;
     let storage_2 = output_index / MODE_01;
@@ -1556,7 +1737,8 @@ fn main(
     let fine_1 = fine_axis_index(storage_1, MODE_1, FINE_1);
     let fine_2 = fine_axis_index(storage_2, MODE_2, FINE_2);
     let fine_index = fine_0 + FINE_0 * (fine_1 + FINE_1 * fine_2);
-    output_values[output_index] = fine_grid[fine_index] * amplitudes[output_index];
+    output_values[linear_index] = fine_grid[vector_index * FINE_COUNT + fine_index] *
+        amplitudes[output_index];
 }}
 "#,
         mode_0 = mode_shape[0],
@@ -1566,6 +1748,7 @@ fn main(
         fine_0 = fine_shape[0],
         fine_1 = fine_shape[1],
         fine_2 = fine_shape[2],
+        fine_count = fine_shape[0] * fine_shape[1] * fine_shape[2],
     )
 }
 
@@ -1619,7 +1802,7 @@ fn tiled_gather_storage_bytes(width: usize, cache_capacity: usize) -> Result<u32
     // Separate scalar start arrays avoid the 16-byte array stride of vec3<i32>.
     let per_point_bytes = DIMENSIONS
         .checked_mul(size_of::<i32>())
-        .and_then(|starts| starts.checked_add(size_of::<[f32; 2]>()))
+        .and_then(|starts| starts.checked_add(size_of::<u32>()))
         .and_then(|base| {
             width
                 .checked_mul(DIMENSIONS)
@@ -1668,12 +1851,25 @@ fn tiled_gather_tile_counts(fine_shape: [usize; DIMENSIONS]) -> Result<([u32; DI
     Ok((tile_counts, tile_count))
 }
 
+#[cfg(test)]
 fn tiled_gather_dispatch(
     fine_shape: [usize; DIMENSIONS],
     max_workgroups_per_dimension: u32,
 ) -> Result<(u32, u32, u32)> {
     let (_, tile_count) = tiled_gather_tile_counts(fine_shape)?;
     split_workgroups(tile_count, max_workgroups_per_dimension)
+}
+
+fn tiled_gather_workgroups(fine_shape: [usize; DIMENSIONS]) -> Result<u32> {
+    let (_, tile_count) = tiled_gather_tile_counts(fine_shape)?;
+    Ok(tile_count)
+}
+
+fn workgroups_for_elements(element_count: usize) -> Result<u32> {
+    let elements = u32::try_from(element_count).map_err(|_| NufftError::LengthOverflow {
+        context: "type-1 3D GPU dispatch element count",
+    })?;
+    Ok(elements.div_ceil(WORKGROUP_SIZE))
 }
 
 fn format_wgsl_f32(value: f32) -> String {
@@ -1808,8 +2004,10 @@ mod tests {
         assert!(source.contains("for (var bin_offset_1 = -BIN_RADIUS"));
         assert!(source.contains("for (var bin_offset_0 = -BIN_RADIUS"));
         assert!(source.contains("let cell_2 = cell / FINE_01;"));
-        assert!(source.contains("((weight_0 * weight_1) * weight_2)"));
-        assert!(source.contains("fine_grid[cell] = sum;"));
+        assert!(source.contains("let weight = (weight_0 * weight_1) * weight_2;"));
+        assert!(
+            source.contains("fine_grid[vector_index * FINE_COUNT + cell] = sums[vector_local];")
+        );
         assert!(!source.contains("fine_grid[cell] = fine_grid[cell] + sum"));
     }
 
@@ -1822,7 +2020,7 @@ mod tests {
         let capacity = tiled_gather_cache_capacity(7).unwrap();
         assert_eq!(capacity, 300);
         let storage_bytes = tiled_gather_storage_bytes(7, capacity).unwrap();
-        assert_eq!(storage_bytes, 48_096);
+        assert_eq!(storage_bytes, 46_896);
         assert!(storage_bytes > 16 * 1024);
         assert!(storage_bytes <= 48 * 1024);
         assert!(storage_bytes <= TILED_GATHER_STORAGE_BUDGET_BYTES as u32);
@@ -1849,8 +2047,10 @@ mod tests {
         assert!(source.contains("for (var bin_offset_2 = -BIN_RADIUS"));
         assert!(source.contains("for (var bin_offset_1 = -BIN_RADIUS"));
         assert!(source.contains("for (var bin_offset_0 = -BIN_RADIUS"));
-        assert!(source.contains("((weight_0 * weight_1) * weight_2)"));
-        assert!(source.contains("fine_grid[cell.x + FINE_0 * (cell.y + FINE_1 * cell.z)] = sum;"));
+        assert!(source.contains("let weight = (weight_0 * weight_1) * weight_2;"));
+        assert!(source.contains("var<workgroup> cached_point_indices: array<u32, 300>;"));
+        assert!(source
+            .contains("fine_grid[vector_index * FINE_COUNT + cell_index] = sums[vector_local];"));
         assert!(!source.contains("atomicAdd"));
         assert!(source.matches("workgroupBarrier();").count() >= 6);
     }

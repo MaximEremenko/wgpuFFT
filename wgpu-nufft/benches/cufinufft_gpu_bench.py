@@ -257,6 +257,19 @@ def make_inputs_3d(
     return tuple(coordinates(values) for values in point_streams), strengths, modes
 
 
+def stack_distinct_transforms(values: np.ndarray, n_trans: int) -> np.ndarray:
+    """Return transform-major complex64 vectors with deterministic differences."""
+
+    if n_trans == 1:
+        return values
+    factors = np.empty(n_trans, dtype=np.complex64)
+    transform = np.arange(n_trans, dtype=np.float32)
+    factors.real = np.float32(1.0) + transform * np.float32(1.0 / 32.0)
+    factors.imag = transform * np.float32(-1.0 / 64.0)
+    expanded = factors.reshape((n_trans,) + (1,) * values.ndim)
+    return np.ascontiguousarray(expanded * values[np.newaxis, ...])
+
+
 def affine_coordinates(
     values: np.ndarray, halfwidth: float, center: float
 ) -> np.ndarray:
@@ -337,10 +350,15 @@ def make_plan(
     eps: float,
     stream: cp.cuda.Stream,
     device_id: int,
+    n_trans: int = 1,
 ):
+    native_batch_options = (
+        {"gpu_maxbatchsize": min(n_trans, 8)} if n_trans > 1 else {}
+    )
     return cufinufft.Plan(
         kind,
         cufinufft_mode_shape(n_modes),
+        n_trans=n_trans,
         eps=eps,
         isign=1,
         dtype="complex64",
@@ -348,6 +366,7 @@ def make_plan(
         upsampfac=UPSAMPFAC,
         gpu_device_id=device_id,
         gpu_stream=stream.ptr,
+        **native_batch_options,
     )
 
 
@@ -821,6 +840,75 @@ def run_correctness_smoke_3d(device_id: int, eps: float, seed: int) -> None:
     stream.synchronize()
 
 
+def run_native_batch_correctness_smoke(
+    dimension: int, n_trans: int, device_id: int, eps: float, seed: int
+) -> None:
+    """Check cuFINUFFT's transform-major native many-vector interface."""
+
+    if n_trans <= 1:
+        return
+    point_count = 17
+    if dimension == 3:
+        n_modes: int | tuple[int, ...] = (5, 4, 3)
+        points, strengths, modes = make_inputs_3d(*n_modes, point_count, seed)
+        type1_reference = direct_type1_3d(points, strengths, n_modes)
+        type2_reference = direct_type2_3d(points, modes)
+    elif dimension == 2:
+        n_modes = (6, 5)
+        points, strengths, modes = make_inputs_2d(*n_modes, point_count, seed)
+        type1_reference = direct_type1_2d(points, strengths, n_modes)
+        type2_reference = direct_type2_2d(points, modes)
+    else:
+        n_modes = 30
+        points, strengths, modes = make_inputs(n_modes, point_count, seed)
+        type1_reference = direct_type1(points, strengths, n_modes)
+        type2_reference = direct_type2(points, modes)
+
+    batched_strengths = stack_distinct_transforms(strengths, n_trans)
+    batched_modes = stack_distinct_transforms(modes, n_trans)
+    batched_type1_reference = stack_distinct_transforms(type1_reference, n_trans)
+    batched_type2_reference = stack_distinct_transforms(type2_reference, n_trans)
+    gpu_points = (
+        tuple(cp.asarray(axis) for axis in points)
+        if isinstance(points, tuple)
+        else cp.asarray(points)
+    )
+    gpu_strengths = cp.asarray(batched_strengths)
+    gpu_modes = cp.asarray(batched_modes)
+    type1_output = cp.empty(
+        (n_trans, *cufinufft_mode_shape(n_modes)), dtype=cp.complex64
+    )
+    type2_output = cp.empty((n_trans, point_count), dtype=cp.complex64)
+    stream = cp.cuda.Stream(non_blocking=True)
+    type1 = make_plan(1, n_modes, eps, stream, device_id, n_trans)
+    type2 = make_plan(2, n_modes, eps, stream, device_id, n_trans)
+    set_plan_points(type1, gpu_points)
+    set_plan_points(type2, gpu_points)
+    type1.execute(gpu_strengths, out=type1_output)
+    type2.execute(gpu_modes, out=type2_output)
+    stream.synchronize()
+
+    type1_error = relative_l2(cp.asnumpy(type1_output), batched_type1_reference)
+    type2_error = relative_l2(cp.asnumpy(type2_output), batched_type2_reference)
+    threshold = (30.0 if dimension == 3 else 20.0) * eps
+    print(
+        "CUFINUFFT_NATIVE_BATCH_SMOKE "
+        f"dimensions={dimension} ntrans={n_trans} M={point_count} "
+        f"eps={eps:.9g} type1_relative_l2={type1_error:.9e} "
+        f"type2_relative_l2={type2_error:.9e} threshold={threshold:.9e}"
+    )
+    errors = (type1_error, type2_error)
+    if any(not math.isfinite(error) for error in errors) or max(errors) > threshold:
+        raise RuntimeError(
+            "cuFINUFFT native-batch correctness smoke failed: "
+            f"worst relative L2 {max(errors)}"
+        )
+
+    del type1, type2
+    gc.collect()
+    stream.synchronize()
+
+
 def run_correctness_smoke_type3(
     dimension: int,
     device_id: int,
@@ -925,11 +1013,19 @@ def benchmark_kind(
     samples: int,
     warmups: int,
     type2_batch: int,
+    n_trans: int,
     device_id: int,
 ) -> None:
     kind_name = f"type-{kind}"
-    transforms_per_sample = 1 if kind == 1 else type2_batch
-    output_shape = cufinufft_mode_shape(n_modes) if kind == 1 else point_count
+    native_batch = n_trans > 1
+    operation_repeats = 1 if native_batch or kind == 1 else type2_batch
+    transforms_per_sample = n_trans if native_batch else operation_repeats
+    single_output_shape = (
+        cufinufft_mode_shape(n_modes) if kind == 1 else (point_count,)
+    )
+    output_shape = (
+        (n_trans, *single_output_shape) if native_batch else single_output_shape
+    )
     output = cp.empty(output_shape, dtype=cp.complex64)
     plan_samples: list[float] = []
     setpts_samples: list[list[float]] = []
@@ -943,7 +1039,7 @@ def benchmark_kind(
         stream = cp.cuda.Stream(non_blocking=True)
         cp.cuda.runtime.deviceSynchronize()
         start_ns = time.perf_counter_ns()
-        plan = make_plan(kind, n_modes, eps, stream, device_id)
+        plan = make_plan(kind, n_modes, eps, stream, device_id, n_trans)
         stream.synchronize()
         plan_ms = (time.perf_counter_ns() - start_ns) / 1_000_000.0
         plan_samples.append(plan_ms)
@@ -958,11 +1054,11 @@ def benchmark_kind(
         run_combined: list[float] = []
         for sample_index in range(samples):
             setpts_ms = elapsed_batch_ms(
-                lambda: set_plan_points(plan, points), transforms_per_sample, stream
+                lambda: set_plan_points(plan, points), operation_repeats, stream
             )
             execute_ms = elapsed_batch_ms(
                 lambda: plan.execute(input_values, out=output),
-                transforms_per_sample,
+                operation_repeats,
                 stream,
             )
 
@@ -971,7 +1067,7 @@ def benchmark_kind(
                 plan.execute(input_values, out=output)
 
             combined_ms = elapsed_batch_ms(
-                setpts_and_execute, transforms_per_sample, stream
+                setpts_and_execute, operation_repeats, stream
             )
             run_setpts.append(setpts_ms)
             run_execute.append(execute_ms)
@@ -1006,7 +1102,8 @@ def benchmark_kind(
     combined_mean = statistics.mean(combined_run_means)
     paired_span = "setpts+execute" if kind == 1 else "execute"
     paired_mean = combined_mean if kind == 1 else execute_mean
-    mpoints_per_second = point_count / (paired_mean * 1_000.0)
+    paired_per_vector = paired_mean / n_trans
+    mpoints_per_second = point_count * n_trans / (paired_mean * 1_000.0)
 
     print(f"  plan_creation_ms={format_samples(plan_samples)}")
     for run_index, values in enumerate(setpts_samples, start=1):
@@ -1033,25 +1130,31 @@ def benchmark_kind(
         "RESULT,"
         f"kind={kind_name},{shape_fields},M={point_count},eps={eps:.9g},"
         f"runs={runs},samples_per_run={samples},"
+        f"batch_mode={'native-ntrans' if native_batch else 'legacy-repeat'},"
+        f"ntrans={n_trans},"
         f"transforms_per_sample={transforms_per_sample},"
         f"plan_ms={statistics.mean(plan_samples):.6f},"
         f"plan_stderr_ms={stderr(plan_samples):.6f},"
         f"setpts_raw_ms={format_samples(flatten(setpts_samples))},"
         f"setpts_run_means_ms={format_samples(setpts_run_means)},"
         f"setpts_ms={setpts_mean:.6f},"
+        f"setpts_ms_per_vector={setpts_mean / n_trans:.6f},"
         f"setpts_stderr_ms={stderr(setpts_run_means):.6f},"
         f"setpts_min_ms={min(flatten(setpts_samples)):.6f},"
         f"execute_raw_ms={format_samples(flatten(execute_samples))},"
         f"execute_run_means_ms={format_samples(execute_run_means)},"
         f"execute_ms={execute_mean:.6f},"
+        f"execute_ms_per_vector={execute_mean / n_trans:.6f},"
         f"execute_stderr_ms={stderr(execute_run_means):.6f},"
         f"execute_min_ms={min(flatten(execute_samples)):.6f},"
         f"combined_raw_ms={format_samples(flatten(combined_samples))},"
         f"combined_run_means_ms={format_samples(combined_run_means)},"
         f"combined_ms={combined_mean:.6f},"
+        f"combined_ms_per_vector={combined_mean / n_trans:.6f},"
         f"combined_stderr_ms={stderr(combined_run_means):.6f},"
         f"combined_min_ms={min(flatten(combined_samples)):.6f},"
         f"paired_span={paired_span},paired_ms={paired_mean:.6f},"
+        f"paired_ms_per_vector={paired_per_vector:.6f},"
         f"paired_million_points_per_second={mpoints_per_second:.6f},"
         "timing=host-wall-clock-with-explicit-stream-sync,"
         "transfers=excluded,outputs=preallocated"
@@ -1298,6 +1401,16 @@ def make_parser() -> argparse.ArgumentParser:
             "and 1 in 3D to match the corresponding Rust harness"
         ),
     )
+    parser.add_argument(
+        "--ntrans",
+        type=positive_int,
+        default=1,
+        help=(
+            "native cuFINUFFT transforms sharing one point set; values above "
+            "one use Plan(n_trans=...) and report batch-total plus per-vector "
+            "timings (default: 1, preserving legacy behavior)"
+        ),
+    )
     parser.add_argument("--eps", type=float, default=DEFAULT_EPS)
     parser.add_argument(
         "--seed", type=lambda value: int(value, 0), default=DEFAULT_SEED
@@ -1312,8 +1425,12 @@ def main() -> int:
     if not math.isfinite(args.eps) or args.eps <= 0.0:
         raise SystemExit("--eps must be finite and positive")
     dimension = 3 if args.three_d else 2 if args.two_d else 1
+    if args.ntrans > 1 and args.type2_batch is not None:
+        raise SystemExit("--type2-batch cannot be combined with native --ntrans")
     if args.type3 and args.type2_batch is not None:
         raise SystemExit("--type2-batch does not apply to --type3")
+    if args.type3 and args.ntrans != 1:
+        raise SystemExit("native --ntrans currently covers type-1/type-2, not --type3")
     if args.type2_batch is None:
         args.type2_batch = 1 if dimension == 3 else DEFAULT_TYPE2_BATCH
     if args.type3:
@@ -1398,13 +1515,22 @@ def main() -> int:
             f"warmups={args.warmups}, type3_batch=1, preallocated outputs"
         )
     else:
+        native_batch_method = (
+            f"native_ntrans={args.ntrans}, gpu_maxbatchsize={min(args.ntrans, 8)}, "
+            "one setpts and one execute per timed sample"
+            if args.ntrans > 1
+            else (
+                "native_ntrans=1, legacy repeat timing, "
+                f"type2_batch={args.type2_batch}"
+            )
+        )
         print(
             "method=complex64, eps="
             f"{args.eps:.9g}, sigma={UPSAMPFAC:.1f}, isign=+1, modeord=0 "
             f"{dimension_method}"
             f"(centered/CMCL), runs={args.runs}, samples={args.samples}, "
-            f"warmups={args.warmups}, type1_batch=1, "
-            f"type2_batch={args.type2_batch}, preallocated outputs"
+            f"warmups={args.warmups}, {native_batch_method}, "
+            "transform-major inputs, preallocated outputs"
         )
     print(
         "timing=GPU-resident host wall clock around plan/setpts/execute spans; "
@@ -1487,6 +1613,10 @@ def main() -> int:
         run_correctness_smoke_2d(args.device, args.eps, args.seed)
     else:
         run_correctness_smoke(args.device, args.eps, args.seed)
+    if not args.type3:
+        run_native_batch_correctness_smoke(
+            dimension, args.ntrans, args.device, args.eps, args.seed
+        )
     if args.smoke_only:
         return 0
 
@@ -1573,8 +1703,12 @@ def main() -> int:
             gpu_points = cp.asarray(points)
         print()
         print(f"case {case_label}")
-        gpu_strengths = cp.asarray(strengths)
-        gpu_modes = cp.asarray(modes)
+        transform_strengths = stack_distinct_transforms(
+            strengths, args.ntrans
+        )
+        transform_modes = stack_distinct_transforms(modes, args.ntrans)
+        gpu_strengths = cp.asarray(transform_strengths)
+        gpu_modes = cp.asarray(transform_modes)
         cp.cuda.runtime.deviceSynchronize()
         point_bytes = (
             sum(axis.nbytes for axis in gpu_points)
@@ -1583,7 +1717,8 @@ def main() -> int:
         )
         print(
             f"device_inputs points_bytes={point_bytes} "
-            f"strengths_bytes={gpu_strengths.nbytes} modes_bytes={gpu_modes.nbytes}"
+            f"strengths_bytes={gpu_strengths.nbytes} modes_bytes={gpu_modes.nbytes} "
+            f"ntrans={args.ntrans} layout=transform-major"
         )
         benchmark_kind(
             1,
@@ -1596,6 +1731,7 @@ def main() -> int:
             samples=args.samples,
             warmups=args.warmups,
             type2_batch=args.type2_batch,
+            n_trans=args.ntrans,
             device_id=args.device,
         )
         benchmark_kind(
@@ -1609,6 +1745,7 @@ def main() -> int:
             samples=args.samples,
             warmups=args.warmups,
             type2_batch=args.type2_batch,
+            n_trans=args.ntrans,
             device_id=args.device,
         )
         cp.cuda.runtime.deviceSynchronize()

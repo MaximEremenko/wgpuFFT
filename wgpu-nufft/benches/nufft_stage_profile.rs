@@ -14,6 +14,7 @@ type BenchResult<T> = Result<T, Box<dyn Error>>;
 
 const CASE_SIZES: [usize; 2] = [262_144, 1_048_576];
 const DEFAULT_CASE_SIZE_2D: usize = 1_024;
+const DEFAULT_CASE_SIZE_3D: usize = 64;
 const DEFAULT_RUNS: usize = 3;
 const DEFAULT_SAMPLES: usize = 10;
 const TYPE2_TRANSFORMS_PER_SAMPLE: usize = 32;
@@ -24,6 +25,7 @@ const QUERY_SIZE_BYTES: u64 = size_of::<u64>() as u64;
 const DATA_SEED: u32 = 0x4E55_4646;
 const POINT_SEED_MASK: u32 = 0xA341_316C;
 const POINT_Y_SEED_MASK: u32 = 0xB7E1_5162;
+const POINT_Z_SEED_MASK: u32 = 0x9E37_79B9;
 const STRENGTH_REAL_SEED_MASK: u32 = 0xC801_3EA4;
 const STRENGTH_IMAG_SEED_MASK: u32 = 0xAD90_777D;
 const MODE_REAL_SEED_MASK: u32 = 0x7E95_761E;
@@ -36,6 +38,8 @@ struct Options {
     samples: usize,
     two_dimensional: bool,
     two_dimensional_size: usize,
+    three_dimensional: bool,
+    three_dimensional_size: usize,
     type1_gather: Type1Gather,
 }
 
@@ -43,6 +47,7 @@ struct Options {
 enum Type1Gather {
     Global,
     Tiled16,
+    Tiled8x8x4,
 }
 
 impl Type1Gather {
@@ -50,6 +55,7 @@ impl Type1Gather {
         match self {
             Self::Global => "global",
             Self::Tiled16 => "tiled16",
+            Self::Tiled8x8x4 => "tiled8x8x4",
         }
     }
 
@@ -59,42 +65,70 @@ impl Type1Gather {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> BenchResult<NufftPlan> {
-        match self {
-            Self::Global => {
+        match (config.dimensions(), self) {
+            (1, _) => Ok(NufftPlan::type1_gpu(device, queue, config)?),
+            (2, Self::Global) => {
                 #[cfg(feature = "type1-2d-tile-prototype")]
                 {
-                    if config.dimensions() == 2 {
-                        Ok(NufftPlan::type1_gpu_with_global_2d_gather_for_testing(
-                            device, queue, config,
-                        )?)
-                    } else {
-                        Ok(NufftPlan::type1_gpu(device, queue, config)?)
-                    }
+                    Ok(NufftPlan::type1_gpu_with_global_2d_gather_for_testing(
+                        device, queue, config,
+                    )?)
                 }
                 #[cfg(not(feature = "type1-2d-tile-prototype"))]
                 {
                     let _ = (device, queue, config);
                     Err(input_error(
-                        "--type1-gather global requires feature type1-2d-tile-prototype",
+                        "2D --type1-gather global requires feature type1-2d-tile-prototype",
                     ))
                 }
             }
-            Self::Tiled16 => {
+            (2, Self::Tiled16) => {
                 #[cfg(feature = "type1-2d-tile-prototype")]
                 {
-                    if config.dimensions() == 2 {
-                        Ok(NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(
-                            device, queue, config,
-                        )?)
-                    } else {
-                        Ok(NufftPlan::type1_gpu(device, queue, config)?)
-                    }
+                    Ok(NufftPlan::type1_gpu_with_tiled_2d_gather_for_testing(
+                        device, queue, config,
+                    )?)
                 }
                 #[cfg(not(feature = "type1-2d-tile-prototype"))]
                 {
                     Ok(NufftPlan::type1_gpu(device, queue, config)?)
                 }
             }
+            (3, Self::Global) => {
+                #[cfg(feature = "type1-3d-tile-prototype")]
+                {
+                    Ok(NufftPlan::type1_gpu_with_global_3d_gather_for_testing(
+                        device, queue, config,
+                    )?)
+                }
+                #[cfg(not(feature = "type1-3d-tile-prototype"))]
+                {
+                    let _ = (device, queue, config);
+                    Err(input_error(
+                        "3D --type1-gather global requires feature type1-3d-tile-prototype",
+                    ))
+                }
+            }
+            (3, Self::Tiled8x8x4) => {
+                #[cfg(feature = "type1-3d-tile-prototype")]
+                {
+                    Ok(NufftPlan::type1_gpu_with_tiled_3d_gather_for_testing(
+                        device, queue, config,
+                    )?)
+                }
+                #[cfg(not(feature = "type1-3d-tile-prototype"))]
+                {
+                    Ok(NufftPlan::type1_gpu(device, queue, config)?)
+                }
+            }
+            (2, Self::Tiled8x8x4) | (3, Self::Tiled16) => Err(input_error(format!(
+                "type-1 gather {} does not match {}D execution",
+                self.name(),
+                config.dimensions()
+            ))),
+            (dimensions, _) => Err(input_error(format!(
+                "stage profiler does not support {dimensions}D type-1 execution"
+            ))),
         }
     }
 }
@@ -115,10 +149,11 @@ impl TransformKind {
         }
     }
 
-    const fn transforms_per_sample(self) -> usize {
+    const fn transforms_per_sample(self, dimensions: usize) -> usize {
         match self {
             Self::Type1 => 1,
-            Self::Type2 => TYPE2_TRANSFORMS_PER_SAMPLE,
+            Self::Type2 if dimensions < 3 => TYPE2_TRANSFORMS_PER_SAMPLE,
+            Self::Type2 => 1,
         }
     }
 
@@ -234,7 +269,23 @@ fn main() {
 
 async fn run() -> BenchResult<()> {
     let options = parse_options()?;
-    if options.two_dimensional {
+    if options.three_dimensional {
+        let shape = [options.three_dimensional_size; 3];
+        println!("wgpu-nufft 3D GPU per-stage timestamp profile");
+        println!(
+            "configuration: shape={shape:?} point_count_equals_total_mode_count=true axis_zero_fastest=true point_layout=point-major-[x,y,z] runs={} samples_per_run={} warmups_per_run=1 type1_transforms_per_sample=1 type2_transforms_per_sample={} type1_gather={} seed={DATA_SEED:#010x} point_y_seed_mask={POINT_Y_SEED_MASK:#010x} point_z_seed_mask={POINT_Z_SEED_MASK:#010x} eps={} sigma={} sign=positive mode_order=centered adapter_selector={}",
+            options.runs,
+            options.samples,
+            1,
+            options.type1_gather.name(),
+            DEFAULT_EPS,
+            DEFAULT_SIGMA,
+            options
+                .adapter_selector
+                .as_deref()
+                .unwrap_or("auto-single-hardware"),
+        );
+    } else if options.two_dimensional {
         let shape = [options.two_dimensional_size; 2];
         println!("wgpu-nufft 2D GPU per-stage timestamp profile");
         println!(
@@ -336,6 +387,23 @@ async fn run_cases(
     timestamp_period_ns: f32,
     options: &Options,
 ) -> BenchResult<()> {
+    if options.three_dimensional {
+        let shape = [options.three_dimensional_size; 3];
+        let point_count = shape
+            .into_iter()
+            .try_fold(1usize, usize::checked_mul)
+            .ok_or_else(|| input_error("3D profile mode-count overflow"))?;
+        run_case(
+            device,
+            queue,
+            timestamp_period_ns,
+            options,
+            &shape,
+            point_count,
+        )
+        .await?;
+        return Ok(());
+    }
     if options.two_dimensional {
         let shape = [options.two_dimensional_size; 2];
         let point_count = shape
@@ -378,10 +446,7 @@ async fn run_case(
     if mode_shape.len() == 1 {
         println!("\n=== case N={} M={point_count} ===", mode_shape[0]);
     } else {
-        println!(
-            "\n=== case dimensions=2 N0={} N1={} N_total={mode_count} M={point_count} ===",
-            mode_shape[0], mode_shape[1]
-        );
+        println!("\n=== case {} ===", case_fields(mode_shape, point_count));
     }
     for kind in TransformKind::ALL {
         run_kind(
@@ -415,7 +480,7 @@ async fn run_kind(
     timestamp_period_ns: f32,
     options: &Options,
 ) -> BenchResult<()> {
-    let transforms = kind.transforms_per_sample();
+    let transforms = kind.transforms_per_sample(mode_shape.len());
     println!(
         "\n{}: starting transforms_per_sample={transforms}",
         kind.name()
@@ -1066,6 +1131,10 @@ fn case_fields(mode_shape: &[usize], point_count: usize) -> String {
             let mode_count = n0.saturating_mul(*n1);
             format!("dimensions=2 N0={n0} N1={n1} N_total={mode_count} M={point_count}")
         }
+        [n0, n1, n2] => {
+            let mode_count = n0.saturating_mul(*n1).saturating_mul(*n2);
+            format!("dimensions=3 N0={n0} N1={n1} N2={n2} N_total={mode_count} M={point_count}")
+        }
         _ => format!(
             "dimensions={} mode_shape={mode_shape:?} M={point_count}",
             mode_shape.len()
@@ -1079,6 +1148,10 @@ fn mode_fields(mode_shape: &[usize]) -> String {
         [n0, n1] => format!(
             "dimensions=2 N0={n0} N1={n1} N_total={}",
             n0.saturating_mul(*n1)
+        ),
+        [n0, n1, n2] => format!(
+            "dimensions=3 N0={n0} N1={n1} N2={n2} N_total={}",
+            n0.saturating_mul(*n1).saturating_mul(*n2)
         ),
         _ => format!("dimensions={} mode_shape={mode_shape:?}", mode_shape.len()),
     }
@@ -1142,9 +1215,9 @@ fn generate_case_data(
     mode_count: usize,
     point_count: usize,
 ) -> BenchResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    if !(1..=2).contains(&dimensions) {
+    if !(1..=3).contains(&dimensions) {
         return Err(input_error(format!(
-            "stage profiler supports one or two dimensions, got {dimensions}"
+            "stage profiler supports one, two, or three dimensions, got {dimensions}"
         )));
     }
     let point_values = point_count
@@ -1158,6 +1231,7 @@ fn generate_case_data(
         .ok_or_else(|| input_error("benchmark mode value count overflow"))?;
     let mut point_rng = Lcg32::new(DATA_SEED ^ POINT_SEED_MASK);
     let mut point_y_rng = Lcg32::new(DATA_SEED ^ POINT_Y_SEED_MASK);
+    let mut point_z_rng = Lcg32::new(DATA_SEED ^ POINT_Z_SEED_MASK);
     let mut strength_real_rng = Lcg32::new(DATA_SEED ^ STRENGTH_REAL_SEED_MASK);
     let mut strength_imag_rng = Lcg32::new(DATA_SEED ^ STRENGTH_IMAG_SEED_MASK);
     let mut mode_real_rng = Lcg32::new(DATA_SEED ^ MODE_REAL_SEED_MASK);
@@ -1167,10 +1241,16 @@ fn generate_case_data(
         points.push(
             -std::f32::consts::PI + std::f32::consts::TAU * point_rng.next_unit_interval_f32(),
         );
-        if dimensions == 2 {
+        if dimensions >= 2 {
             points.push(
                 -std::f32::consts::PI
                     + std::f32::consts::TAU * point_y_rng.next_unit_interval_f32(),
+            );
+        }
+        if dimensions == 3 {
+            points.push(
+                -std::f32::consts::PI
+                    + std::f32::consts::TAU * point_z_rng.next_unit_interval_f32(),
             );
         }
     }
@@ -1344,7 +1424,9 @@ fn parse_options() -> BenchResult<Options> {
     let mut samples = DEFAULT_SAMPLES;
     let mut two_dimensional = false;
     let mut two_dimensional_size = DEFAULT_CASE_SIZE_2D;
-    let mut type1_gather = Type1Gather::Tiled16;
+    let mut three_dimensional = false;
+    let mut three_dimensional_size = DEFAULT_CASE_SIZE_3D;
+    let mut type1_gather = None;
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1362,16 +1444,25 @@ fn parse_options() -> BenchResult<Options> {
                 two_dimensional_size =
                     parse_positive_usize(&next_value(&mut arguments, "--2d-size")?, "2D size")?;
             }
+            "--3d" => three_dimensional = true,
+            "--3d-size" => {
+                three_dimensional = true;
+                three_dimensional_size =
+                    parse_positive_usize(&next_value(&mut arguments, "--3d-size")?, "3D size")?;
+            }
             "--type1-gather" => {
-                type1_gather = match next_value(&mut arguments, "--type1-gather")?.as_str() {
-                    "global" => Type1Gather::Global,
-                    "tiled16" => Type1Gather::Tiled16,
-                    value => {
-                        return Err(input_error(format!(
-                            "unknown type-1 gather {value:?}; expected global or tiled16"
+                type1_gather = Some(
+                    match next_value(&mut arguments, "--type1-gather")?.as_str() {
+                        "global" => Type1Gather::Global,
+                        "tiled16" => Type1Gather::Tiled16,
+                        "tiled8x8x4" => Type1Gather::Tiled8x8x4,
+                        value => {
+                            return Err(input_error(format!(
+                            "unknown type-1 gather {value:?}; expected global, tiled16, or tiled8x8x4"
                         )));
-                    }
-                };
+                        }
+                    },
+                );
             }
             "--help" | "-h" => {
                 print_usage();
@@ -1380,12 +1471,22 @@ fn parse_options() -> BenchResult<Options> {
             _ => return Err(input_error(format!("unknown argument {argument:?}"))),
         }
     }
+    if two_dimensional && three_dimensional {
+        return Err(input_error("--2d and --3d are mutually exclusive"));
+    }
+    let type1_gather = type1_gather.unwrap_or(if three_dimensional {
+        Type1Gather::Tiled8x8x4
+    } else {
+        Type1Gather::Tiled16
+    });
     Ok(Options {
         adapter_selector,
         runs,
         samples,
         two_dimensional,
         two_dimensional_size,
+        three_dimensional,
+        three_dimensional_size,
         type1_gather,
     })
 }
@@ -1409,7 +1510,7 @@ fn parse_positive_usize(value: &str, label: &str) -> BenchResult<usize> {
 fn print_usage() {
     println!(
         r#"Usage:
-  cargo bench -p wgpu-nufft --features gpu-profiling --bench nufft_stage_profile -- [options]
+  cargo bench -p wgpu-nufft --features gpu-profiling,type1-3d-tile-prototype --bench nufft_stage_profile -- [options]
 
 Options:
   --adapter <index-or-name>  Select a Vulkan hardware adapter.
@@ -1417,12 +1518,15 @@ Options:
   --samples <count>          Timestamp-query submissions per plan (default: 10).
   --2d                       Profile only N0=N1=1024 with M=1048576.
   --2d-size <length>         Profile only N0=N1=length with M=length^2.
-  --type1-gather <route>     Select global or tiled16 (default: tiled16).
+  --3d                       Profile only N0=N1=N2=64 with M=262144.
+  --3d-size <length>         Profile only a cubic 3D case with M=length^3.
+  --type1-gather <route>     Select global, tiled16, or tiled8x8x4.
   --help                     Show this help.
 
 Default fixed cases use N=M=262144 and 1048576. --2d selects 1024x1024;
---2d-size selects another square case. All cases use f32, eps=1e-6, sigma=2,
-positive sign, and centered mode order."#
+--3d selects 64x64x64. The default gather is tiled16 for 1D/2D and tiled8x8x4
+for 3D. All cases use f32, eps=1e-6, sigma=2, positive sign, and centered mode
+order."#
     );
 }
 

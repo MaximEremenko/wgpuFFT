@@ -1,0 +1,101 @@
+{
+  "benchmark": {
+    "activeLimits": {
+      "maxBufferSize": 2147483648,
+      "maxComputeWorkgroupStorageSize": 32768,
+      "maxStorageBufferBindingSize": 2147483644
+    },
+    "adapterIdentity": {
+      "match": null,
+      "note": "Chrome privacy omitted at least one adapter vendor/device identifier",
+      "observable": false
+    },
+    "aliasRejected": true,
+    "case": {
+      "batch": 1024,
+      "iterations": 20,
+      "n": 4096,
+      "runs": 3,
+      "warmups": 5
+    },
+    "js": {
+      "avgMs": 3.3183333332339924,
+      "name": "WebGPU-FFT JavaScript",
+      "samplesMs": [
+        3.2399999998509883,
+        3.225,
+        3.4899999998509883
+      ],
+      "stderrMs": 0.08594248720205384
+    },
+    "jsAdapter": {
+      "architecture": "blackwell",
+      "description": "",
+      "device": "",
+      "vendor": "nvidia"
+    },
+    "jsWorstAbs": 0,
+    "limitsRequestMode": "adapter-max",
+    "rust": {
+      "avgMs": 3.2366666667163373,
+      "name": "wgpu-fft Rust/Wasm",
+      "samplesMs": [
+        3.2950000002980233,
+        3.2299999997019766,
+        3.1850000001490115
+      ],
+      "stderrMs": 0.03192874016204377
+    },
+    "rustAdapter": {
+      "device": 0,
+      "deviceType": "Other",
+      "driver": "",
+      "driverInfo": "",
+      "name": "",
+      "vendor": 0
+    },
+    "rustBackend": "BrowserWebGpu",
+    "rustOverJs": 0.9753892516765144,
+    "rustRoute": "mixed-radix",
+    "rustWorstAbs": 0
+  },
+  "chrome": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "environment": {
+    "browserMode": "headed",
+    "chromeFlags": [
+      "--no-sandbox",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-component-update",
+      "--disable-breakpad",
+      "--disable-crash-reporter",
+      "--enable-unsafe-webgpu",
+      "--disable-gpu-sandbox"
+    ],
+    "chromeProductVersion": "150.0.7871.116",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "skipBuild": false,
+    "wasmBindgen": "wasm-bindgen 0.2.120",
+    "wasmSha256": "e8019094c6edd2ef2026d8ee62ed5a5665ce4ba5e31aa4ae0a9c74e05b8521fb",
+    "webGpuFftRevision": "fa45c93f524a69a96c9f55acfad865226bfccd29",
+    "wgpuFftRevision": "c0140108d6857a77b6c37e3733175a1b6a8a0af1",
+    "wgpuFftWorkingTreeDirty": true
+  },
+  "jsRevision": "fa45c93f524a69a96c9f55acfad865226bfccd29",
+  "ok": true,
+  "rustRevision": "c0140108d6857a77b6c37e3733175a1b6a8a0af1",
+  "rustWorkingTreeDirty": true,
+  "snapshot": {
+    "adapter": "",
+    "backend": "BrowserWebGpu",
+    "coldPlanMs": 56.1000000089407,
+    "importMs": 2.8999999910593033,
+    "jsonBytes": 34002,
+    "key": "wgpu-fft.pipeline-cache.v1",
+    "persistenceProbe": "fresh-same-origin-document",
+    "restoredPlanMs": 0.5,
+    "storage": "localStorage",
+    "worstAbs": 0
+  }
+}

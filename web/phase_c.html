@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wgpuFFT WebAssembly persistence and benchmark</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #0b0f17;
+        color: #e5e7eb;
+      }
+      body { margin: 0; }
+      main { max-width: 960px; margin: 0 auto; padding: 20px; display: grid; gap: 12px; }
+      section { background: #111827; border: 1px solid #263244; border-radius: 10px; padding: 14px; }
+      h1 { margin: 0 0 6px; font-size: 20px; }
+      p { color: #aeb8c7; margin: 6px 0; }
+      button { margin: 4px 6px 4px 0; padding: 8px 12px; border: 1px solid #334155;
+        border-radius: 7px; background: #1f2937; color: inherit; cursor: pointer; }
+      button:disabled { opacity: 0.55; cursor: wait; }
+      #status, #log { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+      #status { min-height: 1.4em; }
+      #log { min-height: 260px; max-height: 56vh; overflow: auto; background: #08101e;
+        border: 1px solid #263244; border-radius: 7px; padding: 10px; font-size: 12px; }
+      .pass { color: #34d399; }
+      .fail { color: #fb7185; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>wgpuFFT WebAssembly: cache persistence and browser comparison</h1>
+        <p>
+          The cache demo persists the versioned pipeline snapshot in localStorage.
+          The benchmark compares Rust/Wasm and WebGPU-FFT JS in this Chrome session;
+          plans, allocation, upload, and download are excluded from timing.
+        </p>
+        <button id="init">Initialize</button>
+        <button id="snapshot" disabled>Snapshot round trip</button>
+        <button id="bench" disabled>Run short comparison</button>
+      </section>
+      <section><div id="status">idle</div></section>
+      <section><div id="log"></div></section>
+    </main>
+    <script type="module" src="./phase_c.js"></script>
+  </body>
+</html>

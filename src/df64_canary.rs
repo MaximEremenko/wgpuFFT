@@ -257,9 +257,12 @@ impl CanaryErrorScopes {
     async fn pop_error(self) -> Option<(&'static str, String)> {
         // Error scopes are a stack. Pop every scope in strict reverse order so
         // no compiler, allocation, or validation failure escapes uncaptured.
-        let validation_error = self.validation.pop().await;
-        let internal_error = self.internal.pop().await;
-        let out_of_memory_error = self.out_of_memory.pop().await;
+        let validation_pop = self.validation.pop();
+        let internal_pop = self.internal.pop();
+        let out_of_memory_pop = self.out_of_memory.pop();
+        let validation_error = validation_pop.await;
+        let internal_error = internal_pop.await;
+        let out_of_memory_error = out_of_memory_pop.await;
         if let Some(error) = validation_error {
             Some(("validation", error.to_string()))
         } else if let Some(error) = internal_error {

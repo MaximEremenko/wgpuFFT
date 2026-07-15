@@ -92,3 +92,61 @@ complete release GPU workspace command passed in 321.8 s on the RTX 5090 using
 Vulkan and driver 610.47; adapter lines were emitted by the FFT and NUFFT
 suites. The public df64 canary also remained bit-exact on native Vulkan and
 DX12.
+
+## Phase C — persistence and JavaScript surface
+
+### Method
+
+The `wgpu-web` wrapper keeps plans and caller-owned buffers GPU-resident and
+exposes initialization, plan creation, upload, execution, download, and cache
+persistence to JavaScript. Initialization runs the complete 96-word df64
+canary; a failure disables browser df64 without disabling f32. Native f64 is
+forwarded to the core planner and retains its structured browser-unsupported
+error.
+
+The optional `wgpu-fft/serde` feature serializes typed shader and pipeline keys
+as schema-versioned JSON. Import regenerates every WGSL source from its typed
+key and rejects altered source, forged stable-key projections, missing or
+duplicate entries, and layout or entry-point mismatches. This is a validated
+source/pipeline prewarm cache, not a browser driver-binary cache.
+
+The browser demo stored the snapshot in `localStorage`, read it back from a
+fresh same-origin document, imported it into a fresh WebGPU context, recreated
+the plan, and executed an impulse transform.
+The comparison used one f32 forward C2C case, N=4096 and batch=1024. Plans,
+allocation, upload, and download were excluded. Each timed iteration included
+command encoding, one submit, and queue completion. Both implementations ran
+in Chrome 150/Tint with adapter-max limits, five warmups, and three alternating
+20-iteration blocks. The JavaScript reference was the clean `WebGPU-FFT`
+revision `fa45c93f524a69a96c9f55acfad865226bfccd29`.
+
+### Results
+
+| Check | Result |
+|---|---:|
+| Snapshot JSON size | 34,002 B |
+| Cold plan creation | 56.10 ms |
+| Snapshot import | 2.90 ms |
+| Restored plan creation | 0.50 ms |
+| Restored impulse output | bit-exact |
+| wgpu-fft Rust/Wasm | 3.2367 ± 0.0319 ms |
+| WebGPU-FFT JavaScript | 3.3183 ± 0.0859 ms |
+| Rust/Wasm ÷ JavaScript | 0.975x |
+
+An immediate repeat reversed the small lead: Rust/Wasm measured 3.3433 ms and
+JavaScript 3.2350 ms, a 1.033x ratio. The defensible conclusion is parity
+within roughly 3% session noise, not a directional host-language win. Both
+recorded impulse outputs were exact. The active device exposed 2,147,483,648 B
+`maxBufferSize`, 2,147,483,644 B `maxStorageBufferBindingSize`, and 32,768 B of
+workgroup storage; the Rust plan reported the mixed-radix route.
+
+Chrome's JavaScript adapter info reported vendor `NVIDIA` and architecture
+`blackwell`, but the wgpu browser adapter exposed empty name and zero numeric
+vendor/device IDs. The two requests used the same high-performance preference
+and produced identical active limits, but browser privacy prevents an exact
+device-ID equality proof; the machine-level RTX 5090 evidence remains the
+native adapter log and `nvidia-smi`. The archived run used a fresh build in
+headed Chrome and records Wasm SHA-256
+`e8019094c6edd2ef2026d8ee62ed5a5665ce4ba5e31aa4ae0a9c74e05b8521fb`.
+
+The full machine-readable record is [phase-c-result.json](phase-c-result.json).

@@ -1,6 +1,10 @@
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+#[cfg(feature = "serde")]
+use std::collections::HashSet;
+#[cfg(feature = "serde")]
+use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::config::FftDirection;
@@ -24,11 +28,75 @@ pub struct PipelineCacheSnapshot {
     pipeline_entries: Vec<ComputePipelineCacheKey>,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotShaderEntry {
     key: ShaderCacheKey,
     code: String,
 }
+
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineCacheSnapshotJson {
+    schema: String,
+    version: u32,
+    shader_codes: Vec<String>,
+    pipeline_keys: Vec<String>,
+    shader_entries: Vec<SnapshotShaderEntry>,
+    pipeline_entries: Vec<ComputePipelineCacheKey>,
+}
+
+/// Failure while encoding or decoding a persistent pipeline-cache snapshot.
+///
+/// Snapshots are versioned, typed descriptions of WGSL and pipeline keys. They
+/// are not backend driver binaries. Decoding rejects stale or modified source
+/// rather than compiling a shader that no longer matches its typed key.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PipelineCacheSnapshotError {
+    Json {
+        message: String,
+    },
+    SchemaMismatch {
+        expected: &'static str,
+        actual: String,
+    },
+    VersionMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    Integrity {
+        reason: String,
+    },
+}
+
+#[cfg(feature = "serde")]
+impl fmt::Display for PipelineCacheSnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json { message } => write!(f, "invalid pipeline-cache snapshot JSON: {message}"),
+            Self::SchemaMismatch { expected, actual } => write!(
+                f,
+                "pipeline-cache snapshot schema mismatch: expected {expected:?}, got {actual:?}"
+            ),
+            Self::VersionMismatch { expected, actual } => write!(
+                f,
+                "pipeline-cache snapshot version mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Integrity { reason } => {
+                write!(
+                    f,
+                    "pipeline-cache snapshot integrity check failed: {reason}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl std::error::Error for PipelineCacheSnapshotError {}
 
 impl PipelineCacheSnapshot {
     pub fn empty() -> Self {
@@ -53,6 +121,131 @@ impl PipelineCacheSnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.shader_codes.is_empty() && self.pipeline_keys.is_empty()
+    }
+
+    /// Serializes this snapshot as versioned JSON.
+    ///
+    /// The snapshot is validated before serialization, including regeneration
+    /// of every WGSL source from its typed key.
+    #[cfg(feature = "serde")]
+    pub fn to_json(&self) -> Result<String, PipelineCacheSnapshotError> {
+        let canonical = Self::validated_json_parts(PipelineCacheSnapshotJson {
+            schema: self.schema.to_owned(),
+            version: self.version,
+            shader_codes: self.shader_codes.clone(),
+            pipeline_keys: self.pipeline_keys.clone(),
+            shader_entries: self.shader_entries.clone(),
+            pipeline_entries: self.pipeline_entries.clone(),
+        })?;
+        serde_json::to_string(&canonical).map_err(|error| PipelineCacheSnapshotError::Json {
+            message: error.to_string(),
+        })
+    }
+
+    /// Decodes and validates a versioned JSON pipeline-cache snapshot.
+    ///
+    /// Stable key projections, pipeline layouts, entry points, and WGSL source
+    /// must all agree with the deserialized typed keys.
+    #[cfg(feature = "serde")]
+    pub fn from_json(json: &str) -> Result<Self, PipelineCacheSnapshotError> {
+        let parts =
+            serde_json::from_str(json).map_err(|error| PipelineCacheSnapshotError::Json {
+                message: error.to_string(),
+            })?;
+        let canonical = Self::validated_json_parts(parts)?;
+        Ok(Self::from_entries(
+            canonical.shader_entries,
+            canonical.pipeline_entries,
+        ))
+    }
+
+    #[cfg(feature = "serde")]
+    fn validated_json_parts(
+        parts: PipelineCacheSnapshotJson,
+    ) -> Result<PipelineCacheSnapshotJson, PipelineCacheSnapshotError> {
+        if parts.schema != PIPELINE_CACHE_SNAPSHOT_SCHEMA {
+            return Err(PipelineCacheSnapshotError::SchemaMismatch {
+                expected: PIPELINE_CACHE_SNAPSHOT_SCHEMA,
+                actual: parts.schema,
+            });
+        }
+        if parts.version != PIPELINE_CACHE_SNAPSHOT_VERSION {
+            return Err(PipelineCacheSnapshotError::VersionMismatch {
+                expected: PIPELINE_CACHE_SNAPSHOT_VERSION,
+                actual: parts.version,
+            });
+        }
+
+        let mut shader_keys = HashSet::with_capacity(parts.shader_entries.len());
+        for entry in &parts.shader_entries {
+            entry.key.validate_snapshot_shape()?;
+            if !shader_keys.insert(entry.key.clone()) {
+                return Err(PipelineCacheSnapshotError::Integrity {
+                    reason: format!("duplicate shader key {}", entry.key.stable_key()),
+                });
+            }
+            let expected_source = entry.key.fallback_source();
+            if entry.code != expected_source {
+                return Err(PipelineCacheSnapshotError::Integrity {
+                    reason: format!(
+                        "WGSL source does not match typed shader key {}",
+                        entry.key.stable_key()
+                    ),
+                });
+            }
+        }
+
+        let mut pipeline_keys = HashSet::with_capacity(parts.pipeline_entries.len());
+        for pipeline in &parts.pipeline_entries {
+            let expected = ComputePipelineCacheKey::from_shader_key(pipeline.shader.clone());
+            if pipeline != &expected {
+                return Err(PipelineCacheSnapshotError::Integrity {
+                    reason: format!(
+                        "pipeline layout or entry point does not match typed shader key {}",
+                        pipeline.shader.stable_key()
+                    ),
+                });
+            }
+            if !pipeline_keys.insert(pipeline.clone()) {
+                return Err(PipelineCacheSnapshotError::Integrity {
+                    reason: format!("duplicate pipeline key {}", pipeline.stable_key()),
+                });
+            }
+            if !shader_keys.contains(&pipeline.shader) {
+                return Err(PipelineCacheSnapshotError::Integrity {
+                    reason: format!(
+                        "pipeline {} has no matching WGSL source entry",
+                        pipeline.stable_key()
+                    ),
+                });
+            }
+        }
+
+        let canonical =
+            Self::from_entries(parts.shader_entries.clone(), parts.pipeline_entries.clone());
+        if parts.shader_codes != canonical.shader_codes {
+            return Err(PipelineCacheSnapshotError::Integrity {
+                reason: String::from(
+                    "shader_codes do not match the canonical typed shader entries",
+                ),
+            });
+        }
+        if parts.pipeline_keys != canonical.pipeline_keys {
+            return Err(PipelineCacheSnapshotError::Integrity {
+                reason: String::from(
+                    "pipeline_keys do not match the canonical typed pipeline entries",
+                ),
+            });
+        }
+
+        Ok(PipelineCacheSnapshotJson {
+            schema: PIPELINE_CACHE_SNAPSHOT_SCHEMA.to_owned(),
+            version: PIPELINE_CACHE_SNAPSHOT_VERSION,
+            shader_codes: canonical.shader_codes,
+            pipeline_keys: canonical.pipeline_keys,
+            shader_entries: canonical.shader_entries,
+            pipeline_entries: canonical.pipeline_entries,
+        })
     }
 
     fn from_entries(
@@ -136,6 +329,7 @@ pub fn import_pipeline_cache_snapshot(
     })
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PipelineLayoutCacheKey {
     AxisPlanInterleavedF32Lut,
@@ -388,6 +582,7 @@ impl PipelineCache {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ShaderCacheKey {
     StockhamStage(StockhamStageKey),
@@ -553,8 +748,318 @@ impl ShaderCacheKey {
             _ => None,
         }
     }
+
+    #[cfg(feature = "serde")]
+    fn validate_snapshot_shape(&self) -> Result<(), PipelineCacheSnapshotError> {
+        match self {
+            Self::StockhamStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                if !is_supported_snapshot_radix(key.radix)
+                    || key.ns == 0
+                    || key.ns > key.axis_length
+                    || key.ns % key.radix != 0
+                    || key.axis_length % key.ns != 0
+                {
+                    return snapshot_integrity("invalid Stockham radix/stage geometry");
+                }
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::FusedPow2Stage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                if key.axis_length < 2 || !key.axis_length.is_power_of_two() {
+                    return snapshot_integrity("invalid fused power-of-two axis length");
+                }
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::FusedSmoothStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                if key.axis_length < 2
+                    || key.axis_length.is_power_of_two()
+                    || !validate_snapshot_factors(&key.factors, key.axis_length)
+                {
+                    return snapshot_integrity("invalid fused smooth-radix geometry");
+                }
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::FusedPrimeStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                validate_snapshot_convolution(key.kind, key.axis_length, key.convolution_length)?;
+                if !validate_snapshot_factors(&key.factors, key.convolution_length) {
+                    return snapshot_integrity("invalid fused-prime convolution factors");
+                }
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::FourStepStage(key) => {
+                if key.workgroup_size == 0
+                    || (key.kind == FourStepKernelKind::StripeTranspose
+                        && key.workgroup_size != 256)
+                {
+                    return snapshot_integrity("invalid four-step workgroup geometry");
+                }
+                Ok(())
+            }
+            Self::BridgeStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                let kind = match key.kind {
+                    BridgeKernelKind::RaderSumInit
+                    | BridgeKernelKind::RaderSumAccumulate
+                    | BridgeKernelKind::RaderPack
+                    | BridgeKernelKind::RaderMul
+                    | BridgeKernelKind::RaderWriteY0
+                    | BridgeKernelKind::RaderPost => FusedPrimeKind::Rader,
+                    BridgeKernelKind::BluesteinPack
+                    | BridgeKernelKind::BluesteinMul
+                    | BridgeKernelKind::BluesteinPost => FusedPrimeKind::Bluestein,
+                };
+                validate_snapshot_convolution(kind, key.axis_length, key.convolution_length)?;
+                validate_snapshot_f32_scale(key.apply_scale, key.scale_bits)
+            }
+            Self::RaderStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                validate_snapshot_convolution(
+                    FusedPrimeKind::Rader,
+                    key.axis_length,
+                    key.convolution_length,
+                )?;
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::BluesteinStage(key) => {
+                validate_snapshot_axis_shape(
+                    key.rank,
+                    key.axis,
+                    &key.dims,
+                    key.axis_length,
+                    key.stride_complex,
+                    key.workgroup_size,
+                )?;
+                validate_snapshot_convolution(
+                    FusedPrimeKind::Bluestein,
+                    key.axis_length,
+                    key.convolution_length,
+                )?;
+                validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
+            }
+            Self::RealStage(key) => {
+                if key.rank != key.dims.len() {
+                    return snapshot_integrity("real shader key rank does not match dimensions");
+                }
+                if key.workgroup_size == 0 {
+                    return snapshot_integrity("real-stage workgroup size must be nonzero");
+                }
+                match key.kind {
+                    RealKernelKind::PackR2c
+                    | RealKernelKind::PackR2cWindowed
+                    | RealKernelKind::UnpackC2r
+                    | RealKernelKind::UnpackC2rWindowed => {
+                        validate_snapshot_dims(key.rank, &key.dims)
+                    }
+                    RealKernelKind::PackRealStrided
+                    | RealKernelKind::UnpackRealStrided
+                    | RealKernelKind::PackComplexStrided
+                    | RealKernelKind::UnpackComplexStrided => {
+                        if key.rank == 0 && key.dims.is_empty() {
+                            Ok(())
+                        } else {
+                            snapshot_integrity(
+                                "real strided shader key must not carry transform dimensions",
+                            )
+                        }
+                    }
+                    RealKernelKind::RealToComplex
+                    | RealKernelKind::RealToComplexWindowed
+                    | RealKernelKind::ComplexToReal
+                    | RealKernelKind::ComplexToRealWindowed => {
+                        if key.dims.is_empty() {
+                            Ok(())
+                        } else {
+                            validate_snapshot_dims(key.rank, &key.dims)
+                        }
+                    }
+                }
+            }
+            Self::C2cSmoothStage(key) => {
+                if key.workgroup_size == 0 {
+                    return snapshot_integrity("smooth-stage workgroup size must be nonzero");
+                }
+                Ok(())
+            }
+            Self::C2cStridedStage(key) => {
+                if key.workgroup_size == 0 {
+                    return snapshot_integrity("strided-stage workgroup size must be nonzero");
+                }
+                Ok(())
+            }
+            Self::DirectDftC2cLut(_) => Ok(()),
+        }
+    }
 }
 
+#[cfg(feature = "serde")]
+fn snapshot_integrity<T>(reason: impl Into<String>) -> Result<T, PipelineCacheSnapshotError> {
+    Err(PipelineCacheSnapshotError::Integrity {
+        reason: reason.into(),
+    })
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_dims(rank: usize, dims: &[usize]) -> Result<(), PipelineCacheSnapshotError> {
+    if rank == 0 || rank != dims.len() || dims.contains(&0) {
+        return snapshot_integrity("rank and dimensions are inconsistent");
+    }
+    let Some(total) = dims
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim))
+    else {
+        return snapshot_integrity("dimension product overflows usize");
+    };
+    if total > u32::MAX as usize || dims.iter().any(|&dim| dim > u32::MAX as usize) {
+        return snapshot_integrity("shader dimensions exceed the WGSL u32 index domain");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_axis_shape(
+    rank: usize,
+    axis: usize,
+    dims: &[usize],
+    axis_length: usize,
+    stride_complex: usize,
+    workgroup_size: u32,
+) -> Result<(), PipelineCacheSnapshotError> {
+    validate_snapshot_dims(rank, dims)?;
+    if axis >= rank
+        || dims[axis] != axis_length
+        || axis_length > u32::MAX as usize
+        || stride_complex == 0
+        || stride_complex > u32::MAX as usize
+        || workgroup_size == 0
+    {
+        return snapshot_integrity("axis-stage geometry is inconsistent");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_scale(scale: f64) -> Result<(), PipelineCacheSnapshotError> {
+    if !scale.is_finite() {
+        return snapshot_integrity("shader scale is not finite");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_axis_scale(
+    precision: AxisPrecision,
+    apply_scale: bool,
+    bits: u64,
+) -> Result<(), PipelineCacheSnapshotError> {
+    let scale = axis_scale_factor(precision, bits);
+    validate_snapshot_scale(scale)?;
+    if bits != axis_scale_bits(precision, apply_scale, scale) {
+        return snapshot_integrity("shader scale bits are not canonically encoded");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_f32_scale(
+    apply_scale: bool,
+    bits: u32,
+) -> Result<(), PipelineCacheSnapshotError> {
+    let scale = f32::from_bits(bits);
+    validate_snapshot_scale(f64::from(scale))?;
+    let expected = if apply_scale { scale } else { 1.0 };
+    if bits != expected.to_bits() {
+        return snapshot_integrity("shader f32 scale bits are not canonically encoded");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serde")]
+fn is_supported_snapshot_radix(radix: usize) -> bool {
+    matches!(radix, 2 | 3 | 4 | 5 | 7 | 8 | 11 | 13)
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_factors(factors: &[usize], expected: usize) -> bool {
+    !factors.is_empty()
+        && factors.iter().copied().all(is_supported_snapshot_radix)
+        && factors
+            .iter()
+            .try_fold(1usize, |product, &factor| product.checked_mul(factor))
+            == Some(expected)
+}
+
+#[cfg(feature = "serde")]
+fn validate_snapshot_convolution(
+    kind: FusedPrimeKind,
+    axis_length: usize,
+    convolution_length: usize,
+) -> Result<(), PipelineCacheSnapshotError> {
+    if axis_length < 2 || convolution_length == 0 || convolution_length > u32::MAX as usize {
+        return snapshot_integrity("invalid prime-axis convolution length");
+    }
+    let minimum = match kind {
+        FusedPrimeKind::Rader => axis_length
+            .checked_sub(1)
+            .and_then(|length| length.checked_mul(2))
+            .and_then(|length| length.checked_sub(1)),
+        FusedPrimeKind::Bluestein => axis_length
+            .checked_mul(2)
+            .and_then(|length| length.checked_sub(1)),
+    };
+    if minimum.is_none_or(|minimum| convolution_length < minimum)
+        || (kind == FusedPrimeKind::Rader && convolution_length < axis_length)
+    {
+        return snapshot_integrity("prime-axis convolution is too short");
+    }
+    Ok(())
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ComputePipelineCacheKey {
     pub(crate) layout: PipelineLayoutCacheKey,
@@ -563,6 +1068,24 @@ pub(crate) struct ComputePipelineCacheKey {
 }
 
 impl ComputePipelineCacheKey {
+    #[cfg(feature = "serde")]
+    fn from_shader_key(shader: ShaderCacheKey) -> Self {
+        match shader {
+            ShaderCacheKey::StockhamStage(key) => Self::stockham_stage(key),
+            ShaderCacheKey::FusedPow2Stage(key) => Self::fused_pow2_stage(key),
+            ShaderCacheKey::FusedSmoothStage(key) => Self::fused_smooth_stage(key),
+            ShaderCacheKey::FusedPrimeStage(key) => Self::fused_prime_stage(key),
+            ShaderCacheKey::FourStepStage(key) => Self::four_step_stage(key),
+            ShaderCacheKey::BridgeStage(key) => Self::bridge_stage(key),
+            ShaderCacheKey::RaderStage(key) => Self::rader_stage(key),
+            ShaderCacheKey::BluesteinStage(key) => Self::bluestein_stage(key),
+            ShaderCacheKey::RealStage(key) => Self::real_stage(key),
+            ShaderCacheKey::C2cSmoothStage(key) => Self::c2c_smooth_stage(key),
+            ShaderCacheKey::C2cStridedStage(key) => Self::c2c_strided_stage(key),
+            ShaderCacheKey::DirectDftC2cLut(precision) => Self::direct_dft_c2c(precision),
+        }
+    }
+
     pub(crate) fn stockham_stage(shader: StockhamStageKey) -> Self {
         let layout = axis_plan_layout_for_precision(shader.precision);
         Self {
@@ -812,6 +1335,7 @@ fn axis_plan_layout_for_precision(precision: AxisPrecision) -> PipelineLayoutCac
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RaderKernelKind {
     Sum,
@@ -821,6 +1345,7 @@ pub(crate) enum RaderKernelKind {
     Post,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BluesteinKernelKind {
     Pack,
@@ -838,12 +1363,14 @@ impl BluesteinKernelKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FusedPrimeKind {
     Rader,
     Bluestein,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum FourStepKernelKind {
     StripeTranspose,
@@ -868,6 +1395,7 @@ impl FusedPrimeKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BridgeKernelKind {
     RaderSumInit,
@@ -909,6 +1437,7 @@ impl RaderKernelKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RealKernelKind {
     RealToComplex,
@@ -944,6 +1473,7 @@ impl RealKernelKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum C2cStridedKernelKind {
     Pack,
@@ -959,6 +1489,7 @@ impl C2cStridedKernelKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum C2cSmoothKernelKind {
     TwiddleTranspose,
@@ -980,12 +1511,14 @@ impl C2cSmoothKernelKind {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct C2cSmoothStageKey {
     pub(crate) kind: C2cSmoothKernelKind,
     pub(crate) workgroup_size: u32,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FourStepStageKey {
     pub(crate) kind: FourStepKernelKind,
@@ -1033,6 +1566,7 @@ impl C2cSmoothStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct C2cStridedStageKey {
     pub(crate) kind: C2cStridedKernelKind,
@@ -1063,6 +1597,7 @@ impl C2cStridedStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RealStageKey {
     pub(crate) kind: RealKernelKind,
@@ -1092,6 +1627,7 @@ impl RealStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BridgeStageKey {
     pub(crate) kind: BridgeKernelKind,
@@ -1166,6 +1702,7 @@ impl BridgeStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RaderStageKey {
     pub(crate) precision: AxisPrecision,
@@ -1240,6 +1777,7 @@ impl RaderStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BluesteinStageKey {
     pub(crate) kind: BluesteinKernelKind,
@@ -1311,6 +1849,7 @@ impl BluesteinStageKey {
     }
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct StockhamStageKey {
     pub(crate) precision: AxisPrecision,
@@ -1327,6 +1866,7 @@ pub(crate) struct StockhamStageKey {
     scale_bits: u64,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FusedPow2StageKey {
     pub(crate) precision: AxisPrecision,
@@ -1341,6 +1881,7 @@ pub(crate) struct FusedPow2StageKey {
     scale_bits: u64,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FusedSmoothStageKey {
     pub(crate) precision: AxisPrecision,
@@ -1356,6 +1897,7 @@ pub(crate) struct FusedSmoothStageKey {
     scale_bits: u64,
 }
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FusedPrimeStageKey {
     pub(crate) kind: FusedPrimeKind,
@@ -2683,5 +3225,153 @@ mod tests {
         assert!(snapshot.shader_codes().is_empty());
         assert!(snapshot.pipeline_keys().is_empty());
         assert!(snapshot.is_empty());
+    }
+
+    #[cfg(feature = "serde")]
+    fn serializable_stockham_snapshot() -> PipelineCacheSnapshot {
+        let shader = ShaderCacheKey::StockhamStage(StockhamStageKey::new(
+            2,
+            1,
+            &[3, 8],
+            8,
+            3,
+            8,
+            8,
+            FftDirection::Inverse,
+            64,
+            true,
+            1.0 / 24.0,
+            AxisPrecision::F32,
+        ));
+        let pipeline = ComputePipelineCacheKey::from_shader_key(shader.clone());
+        PipelineCacheSnapshot::from_entries(
+            vec![SnapshotShaderEntry {
+                code: shader.fallback_source(),
+                key: shader,
+            }],
+            vec![pipeline],
+        )
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_json_round_trip_preserves_typed_entries() {
+        let snapshot = serializable_stockham_snapshot();
+        let json = snapshot.to_json().expect("snapshot should serialize");
+        let decoded = PipelineCacheSnapshot::from_json(&json).expect("snapshot should decode");
+
+        assert_eq!(decoded, snapshot);
+        assert!(json.contains(PIPELINE_CACHE_SNAPSHOT_SCHEMA));
+        assert!(json.contains("StockhamStage"));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_json_round_trip_accepts_dimensionless_real_strided_keys() {
+        let shader =
+            ShaderCacheKey::RealStage(RealStageKey::new(RealKernelKind::PackRealStrided, &[], 64));
+        let snapshot = PipelineCacheSnapshot::from_entries(
+            vec![SnapshotShaderEntry {
+                code: shader.fallback_source(),
+                key: shader.clone(),
+            }],
+            vec![ComputePipelineCacheKey::from_shader_key(shader)],
+        );
+
+        let json = snapshot.to_json().expect("snapshot should serialize");
+        let decoded = PipelineCacheSnapshot::from_json(&json).expect("snapshot should decode");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_json_rejects_schema_and_version_drift() {
+        let json = serializable_stockham_snapshot()
+            .to_json()
+            .expect("snapshot should serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["schema"] = serde_json::Value::String(String::from("other.pipeline-cache"));
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("wrong schema must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::SchemaMismatch { .. }
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["version"] = serde_json::Value::from(PIPELINE_CACHE_SNAPSHOT_VERSION + 1);
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("wrong version must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::VersionMismatch { .. }
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_json_rejects_modified_wgsl_and_stable_keys() {
+        let json = serializable_stockham_snapshot()
+            .to_json()
+            .expect("snapshot should serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["shader_entries"][0]["code"] =
+            serde_json::Value::String(String::from("@compute @workgroup_size(1) fn main() {}"));
+        value["shader_codes"][0] = value["shader_entries"][0]["code"].clone();
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("modified WGSL must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::Integrity { .. }
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let forged_bits = (1u64 << 32) | u64::from((1.0f32 / 24.0).to_bits());
+        value["shader_entries"][0]["key"]["StockhamStage"]["scale_bits"] =
+            serde_json::Value::from(forged_bits);
+        value["pipeline_entries"][0]["shader"]["StockhamStage"]["scale_bits"] =
+            serde_json::Value::from(forged_bits);
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("noncanonical high f32 scale bits must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::Integrity { .. }
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["pipeline_keys"][0] = serde_json::Value::String(String::from("forged-key"));
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("modified stable key must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::Integrity { .. }
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_json_rejects_pipeline_layout_mismatch_and_missing_source() {
+        let json = serializable_stockham_snapshot()
+            .to_json()
+            .expect("snapshot should serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["pipeline_entries"][0]["layout"] =
+            serde_json::Value::String(String::from("RealBinaryF32"));
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("layout mismatch must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::Integrity { .. }
+        ));
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["shader_entries"] = serde_json::Value::Array(Vec::new());
+        value["shader_codes"] = serde_json::Value::Array(Vec::new());
+        let error = PipelineCacheSnapshot::from_json(&serde_json::to_string(&value).unwrap())
+            .expect_err("missing shader source must fail");
+        assert!(matches!(
+            error,
+            PipelineCacheSnapshotError::Integrity { .. }
+        ));
     }
 }

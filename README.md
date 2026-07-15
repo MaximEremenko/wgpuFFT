@@ -156,8 +156,10 @@ pass.
 - Four-step C2C endpoints currently require input `COPY_SRC` and output
   `COPY_SRC | COPY_DST`; `STORAGE` enables direct bind windows but is optional
   because unaligned and segmented windows use GPU-copy staging.
-- Segmented full-volume C2C endpoints currently require one zero-offset
-  contiguous input buffer with `COPY_SRC` and output buffer with `COPY_DST`.
+- Segmented full-volume C2C endpoints accept zero-offset views made exclusively
+  from distinct whole physical buffers. Inputs require `COPY_SRC`; outputs
+  require `COPY_DST`. Partial, aliased, offset, or strided endpoints remain
+  structured errors.
 - Public `FftIoView`/`BufferLayout` compatibility views for strided logical I/O.
 - Fallible `FftPlan::*_with_diagnostics` constructors, `execute_checked`,
   `execute_views`, `execute_io_views`, `execute_logical_views`,
@@ -192,11 +194,10 @@ pass.
   of A/B window pairs, with one segmented normalization pass and no host or
   disk staging. The measured burst depth defaults to 2.
   On hardware where the logical volume itself exceeds the real device
-  `maxBufferSize`, caller-segmented endpoints are still required and remain
-  deferred; the implemented route is directly executable when an
-  internal/tuning cap is below the real endpoint limit. Prime axes inside a
-  segmented volume, segmented/strided caller views, and caller-workspace reuse
-  remain structured-unsupported.
+  `maxBufferSize`, callers provide the volume as distinct whole physical
+  buffers through `BufferView`. Prime axes inside a segmented volume,
+  partial/strided caller views, and caller-workspace reuse remain
+  structured-unsupported.
 - Large-chunk, GPU-resident four-step, and segmented full-volume execution are
   currently `f32` routes. Native-`f64` or `df64` plans that require one of
   those routes, and all real extended-precision transforms, return structured
@@ -205,17 +206,20 @@ pass.
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.
 - Typed in-memory pipeline cache snapshots expose WGSL shader code and stable
-  pipeline key strings.
+  pipeline key strings. The optional `serde` feature adds schema-versioned JSON
+  persistence with source/key integrity validation.
 - Route policy executes mixed-radix, Rader, Bluestein, and mixed algorithm
   sequences.
 - R2C requires forward direction; C2R requires inverse direction. Real
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
-- In-place execution, `f16`, DCT/DST, public convolution, NUFFT, and the WASM
-  wrapper are out of scope.
-- No serde/JSON cache snapshot persistence yet.
-- Native `wgpu` first; WASM is planned later. `wgpuFFT` stays `wgpu`-only; use
-  `WGPU_BACKEND=vulkan` for Vulkan/native validation where available.
+- In-place execution, `f16`, DCT/DST, and public convolution remain out of
+  scope. NUFFT types 1/2/3 live in the `wgpu-nufft` workspace member.
+- The `wgpu-web` workspace member provides a minimal `wasm-bindgen` C2C surface
+  with GPU-resident plan/buffer handles, df64 compiler canary gating, and a
+  `localStorage` cache demo. Core FFT browser tests also cover real and large
+  routes directly. Use `WGPU_BACKEND=vulkan` for Vulkan/native validation where
+  available.
 - The native test/example device helper requests the selected adapter's active
   limits so planner diagnostics and huge-route scheduling see the real storage
   binding and buffer-size limits exposed by that adapter.

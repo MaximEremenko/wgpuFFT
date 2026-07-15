@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wgpu-fft WASM demo</title>
+    <style>
+      body { max-width: 56rem; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; }
+      button { padding: 0.55rem 0.9rem; }
+      pre { padding: 1rem; overflow: auto; background: #111; color: #d8ffd8; }
+    </style>
+  </head>
+  <body>
+    <h1>wgpu-fft in Chrome WebGPU</h1>
+    <p>The wrapper keeps plans and buffers GPU-resident until download.</p>
+    <button id="run">Initialize and run N=4</button>
+    <pre id="output">Idle</pre>
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>
+

@@ -1,0 +1,19 @@
+[package]
+name = "wgpu-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+description = "Minimal wasm-bindgen browser surface for wgpu-fft"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = "1.22"
+futures-channel = "0.3"
+js-sys = "0.3.97"
+wasm-bindgen = "0.2.120"
+wasm-bindgen-futures = "0.4.70"
+wgpu = "29.0.1"
+wgpu-fft = { path = "..", features = ["serde"] }

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::mpsc;
 
 use wgpu_fft::math::{reference_c2r_from_packed_interleaved, reference_r2c_packed_interleaved};

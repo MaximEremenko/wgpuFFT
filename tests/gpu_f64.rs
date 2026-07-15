@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in native-f64 GPU correctness, routing, and capability coverage.
 
 use std::mem::ManuallyDrop;

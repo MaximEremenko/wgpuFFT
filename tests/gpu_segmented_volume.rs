@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in GPU coverage for the internally segmented full-volume C2C route.
 //!
 //! Caller-owned input and output buffers intentionally remain contiguous. Only

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in backend canaries for the portable double-float error-free transforms.
 
 use std::mem::ManuallyDrop;

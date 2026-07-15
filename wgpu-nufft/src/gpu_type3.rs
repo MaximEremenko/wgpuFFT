@@ -1906,6 +1906,7 @@ fn binding_entry(binding: u32, buffer: &wgpu::Buffer, size: u64) -> wgpu::BindGr
 }
 
 #[cfg(test)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod tests {
     use super::*;
     use crate::type3::{es_kernel_fourier_transform, NufftInterval, NufftType3Config};
@@ -2045,6 +2046,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn gpu_df64_type3_source_and_target_arithmetic_stages_are_finite() {
         if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
             eprintln!("skipping GPU test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");

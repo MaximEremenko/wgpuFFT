@@ -1,3 +1,8 @@
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}
+
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -190,6 +195,7 @@ struct Statistics {
     plan_create_ms: Vec<f64>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     if let Err(error) = pollster::block_on(run()) {
         eprintln!("wgpu-nufft precision benchmark failed: {error}");

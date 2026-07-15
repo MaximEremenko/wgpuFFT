@@ -1,4 +1,5 @@
 #![cfg(feature = "gpu-profiling")]
+#![cfg(not(target_arch = "wasm32"))]
 
 //! Opt-in validation for the timestamped NUFFT diagnostic paths.
 

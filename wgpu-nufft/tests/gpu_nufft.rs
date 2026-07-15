@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in 1D GPU validation against the direct f64 NDFT oracle.
 
 use std::f64::consts::PI;

@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Regression coverage for dispatches that exceed
 //! `max_compute_workgroups_per_dimension` (65535 on most devices). Before the
 //! 3D dispatch-grid split these cases issued invalid `dispatch_workgroups`

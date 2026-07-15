@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in GPU accuracy measurements against an f64 host reference.
 
 use std::sync::mpsc;

@@ -1290,17 +1290,20 @@ mod tests {
         assert_eq!(blocker.required_bytes, Some(1));
         assert_eq!(blocker.actual_bytes, Some(0));
 
-        let too_large = FftError::LengthTooLarge {
-            len: (u32::MAX as usize) + 1,
+        #[cfg(target_pointer_width = "64")]
+        {
+            let too_large = FftError::LengthTooLarge {
+                len: (u32::MAX as usize) + 1,
+            }
+            .diagnostics();
+            let blocker = &too_large.blockers()[0];
+            assert_eq!(too_large.route().route, "plan-config");
+            assert_eq!(blocker.kind, FftBlockerKind::DeviceLimit);
+            assert_eq!(blocker.stage.as_deref(), Some("dispatch-dimensions"));
+            assert_eq!(blocker.layout.as_deref(), Some("workgroup grid"));
+            assert_eq!(blocker.required_bytes, Some((u32::MAX as u64) + 1));
+            assert_eq!(blocker.limit_bytes, Some(u32::MAX as u64));
         }
-        .diagnostics();
-        let blocker = &too_large.blockers()[0];
-        assert_eq!(too_large.route().route, "plan-config");
-        assert_eq!(blocker.kind, FftBlockerKind::DeviceLimit);
-        assert_eq!(blocker.stage.as_deref(), Some("dispatch-dimensions"));
-        assert_eq!(blocker.layout.as_deref(), Some("workgroup grid"));
-        assert_eq!(blocker.required_bytes, Some((u32::MAX as u64) + 1));
-        assert_eq!(blocker.limit_bytes, Some(u32::MAX as u64));
 
         let empty_axes = FftError::EmptyAxes.diagnostics();
         let blocker = &empty_axes.blockers()[0];

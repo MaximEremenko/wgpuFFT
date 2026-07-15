@@ -1,3 +1,5 @@
+#![cfg(not(target_arch = "wasm32"))]
+
 //! Opt-in native-f64 NUFFT correctness, layout, and capability coverage.
 
 use std::f64::consts::PI;

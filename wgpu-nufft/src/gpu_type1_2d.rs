@@ -100,7 +100,9 @@ impl Type1GpuPlan2d {
         let precision = config.precision();
         let exact_integer_limit = match precision {
             FftPrecision::F32 | FftPrecision::Df64 => 1usize << f32::MANTISSA_DIGITS,
-            FftPrecision::F64 => 1usize << f64::MANTISSA_DIGITS,
+            FftPrecision::F64 => {
+                usize::try_from(1u64 << f64::MANTISSA_DIGITS).unwrap_or(usize::MAX)
+            }
         };
         let maximum_signed_length = exact_integer_limit
             .saturating_sub(kernel.width())
@@ -2874,6 +2876,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn gpu_pipeline_matches_the_direct_oracle_when_requested() {
         if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
             return;

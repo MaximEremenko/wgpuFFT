@@ -22,8 +22,10 @@ mod gpu_type1;
 mod gpu_type1_2d;
 mod gpu_type1_3d;
 mod gpu_type1_scratch;
+mod gpu_type3;
 mod kernel;
 mod plan;
+mod type3;
 
 pub use config::{ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
 pub use direct::{reference_type1_f64, reference_type2_f64};
@@ -32,4 +34,8 @@ pub use error::{NufftError, Result};
 pub use gpu_profile::{NufftGpuProfileLayout, NufftGpuStage, NufftGpuStageQuery};
 pub use kernel::{select_fine_grid_size, EsKernel, MAX_ES_KERNEL_WIDTH, MIN_ES_KERNEL_WIDTH};
 pub use plan::{NufftKind, NufftPlan};
+pub use type3::{
+    es_kernel_fourier_transform, reference_type3_f64, NufftInterval, NufftType3AxisMetadata,
+    NufftType3Config, NufftType3Plan,
+};
 pub use wgpu_fft::math::Complex64;

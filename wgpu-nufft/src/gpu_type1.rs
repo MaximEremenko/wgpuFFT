@@ -237,6 +237,37 @@ impl Type1GpuPlan {
         checked_buffer_size(buffer, element_count, COMPLEX_F32_BYTES)
     }
 
+    /// Records only the deterministic point spreading stages into the
+    /// oversampled fine grid. The grid remains owned by this plan and is
+    /// overwritten on every call, including the zero-point case.
+    pub(crate) fn encode_spread(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.encode_spread_impl(
+            device,
+            encoder,
+            point_count,
+            points,
+            strengths,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    /// Returns the plan-owned fine grid populated by [`Self::encode_spread`].
+    pub(crate) fn fine_grid_buffer(&self) -> &wgpu::Buffer {
+        &self.fine_input
+    }
+
+    pub(crate) const fn fine_grid_element_count(&self) -> usize {
+        self.fine_length
+    }
+
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -327,17 +358,40 @@ impl Type1GpuPlan {
             ],
         });
 
+        #[cfg(not(feature = "gpu-profiling"))]
+        self.encode_spread(device, encoder, point_count, points, strengths)?;
+        #[cfg(feature = "gpu-profiling")]
+        match profile {
+            GpuProfileQueryWriter::Disabled => {
+                self.encode_spread(device, encoder, point_count, points, strengths)?;
+            }
+            GpuProfileQueryWriter::Enabled { .. } => {
+                self.encode_spread_impl(device, encoder, point_count, points, strengths, profile)?;
+            }
+        }
+        self.encode_fft(device, encoder)?;
+        self.encode_deconvolution(
+            encoder,
+            &output_bind_group,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
+        );
+        Ok(())
+    }
+
+    fn encode_spread_impl(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
         if point_count == 0 {
             // Type-1 with no sources has a nonempty, all-zero mode output. Do
             // not leave stale plan scratch or return early as type-2 may.
-            encoder.clear_buffer(&self.fine_input, 0, None);
-            self.encode_fft(device, encoder)?;
-            self.encode_deconvolution(
-                encoder,
-                &output_bind_group,
-                #[cfg(feature = "gpu-profiling")]
-                profile,
-            );
+            encoder.clear_buffer(self.fine_grid_buffer(), 0, None);
             return Ok(());
         }
 
@@ -360,13 +414,15 @@ impl Type1GpuPlan {
             self.max_storage_binding_bytes,
         )?;
 
-        let count_bytes = checked_buffer_size("type-1 bin counts", self.fine_length, U32_BYTES)?;
-        let offset_count = self
-            .fine_length
-            .checked_add(1)
-            .ok_or(NufftError::LengthOverflow {
-                context: "type-1 bin offset count",
-            })?;
+        let fine_grid_element_count = self.fine_grid_element_count();
+        let count_bytes =
+            checked_buffer_size("type-1 bin counts", fine_grid_element_count, U32_BYTES)?;
+        let offset_count =
+            self.fine_grid_element_count()
+                .checked_add(1)
+                .ok_or(NufftError::LengthOverflow {
+                    context: "type-1 bin offset count",
+                })?;
         let offset_bytes = checked_buffer_size("type-1 bin offsets", offset_count, U32_BYTES)?;
         let index_bytes =
             checked_buffer_size("type-1 sorted point indices", point_count, U32_BYTES)?;
@@ -504,13 +560,6 @@ impl Type1GpuPlan {
             #[cfg(feature = "gpu-profiling")]
             profile.timestamp_writes(None, Some(5)),
         );
-        self.encode_fft(device, encoder)?;
-        self.encode_deconvolution(
-            encoder,
-            &output_bind_group,
-            #[cfg(feature = "gpu-profiling")]
-            profile,
-        );
         Ok(())
     }
 
@@ -519,7 +568,7 @@ impl Type1GpuPlan {
             .execute_views(
                 device,
                 encoder,
-                BufferView::whole(&self.fine_input),
+                BufferView::whole(self.fine_grid_buffer()),
                 BufferView::whole(&self.fine_output),
             )
             .map_err(|source| NufftError::FftExecutionFailed {

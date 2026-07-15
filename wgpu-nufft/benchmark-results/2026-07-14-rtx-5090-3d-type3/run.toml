@@ -1,0 +1,266 @@
+date = "2026-07-14"
+timezone = "America/New_York"
+os = "Windows 11 Pro 25H2 build 26200.8737"
+rustc = "1.95.0"
+wgpu = "29.0.3"
+measured_code_commit = "45a1d12ea4ef825b34feeacfa41bc6e95ce14738"
+
+[method]
+precision = "f32 / complex64"
+eps = 1.0e-6
+sigma = 2.0
+isign = 1
+regular_mode_order = "centered / FINUFFT modeord=0"
+type3_mode_order = "not applicable"
+logical_axis_order = "axis 0 fastest"
+seed = "0x4E554646"
+regular_3d_cases = ["64x64x64:M=262144", "128x128x128:M=2097152"]
+type3_dimensions = [1, 2, 3]
+type3_source_count = 65536
+type3_target_count = 65536
+type3_source_center = 0.7853981633974483
+type3_source_halfwidth = 3.141592653589793
+type3_target_center = 4.0
+type3_target_halfwidth = 16.0
+runs = 2
+warmups_per_run = 1
+samples_per_run = 5
+transforms_per_sample = 1
+stderr_basis = "standard error across independently recreated-plan means"
+inputs = "matched field-specific u32 LCG streams, high 24 bits converted to f32"
+transfers_in_timed_region = false
+readback_in_timed_region = false
+outputs_preallocated = true
+
+[timing]
+wgpu = "host wall clock from immediately before queue.submit through exact device.poll(Wait)"
+cuda = "host wall clock with explicit nonblocking-stream synchronization before and after each span"
+wgpu_plan_excluded = true
+wgpu_command_encoding_excluded = true
+cuda_plan_excluded = true
+uploads_excluded = true
+readbacks_excluded = true
+type1_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+type2_pair = "wgpu submit-to-wait versus cuFINUFFT execute"
+type3_pair = "wgpu submit-to-wait versus cuFINUFFT setpts+execute"
+note = "CUDA setpts, execute, and combined are independently sampled and need not sum exactly"
+
+[gpu]
+name = "NVIDIA GeForce RTX 5090"
+vendor_id = "0x10de"
+device_id = "0x2b85"
+pci_bus = "0000:01:00.0"
+compute_capability = "12.0 / sm_120"
+driver = "NVIDIA 610.47"
+wgpu_backend = "Vulkan"
+cuda_driver_api = 13030
+cuda_driver_api_version = "13.3"
+cupy_linked_runtime = 12090
+cupy_linked_runtime_version = "12.9"
+max_storage_buffer_binding_size = 2147483644
+max_buffer_size = 1099511627776
+max_compute_workgroup_storage_size = 49152
+max_compute_invocations_per_workgroup = 1024
+max_compute_workgroups_per_dimension = 65535
+
+[cuda_toolkit]
+path = "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+nvcc = "12.8.93"
+
+[cufinufft]
+version = "2.5.1"
+artifact = "installed official Python wheel; local source checkout not used for timing"
+python = "3.12.3"
+numpy = "2.4.0"
+cupy_cuda12x = "14.1.1"
+library_sha256 = "DEA7281755EEB8A0E090822F14E2A3E09742F5CAEFCAF4C4FBFB0E0E717FDD53"
+
+[finufft_references]
+local_checkout_commit = "d919b19bae518b858a2504c01867333488d40935"
+local_checkout_used_for_timing = false
+mathematical_semantics_commit = "704cbfee"
+note = "type-3 bounds, rescaling, phase factors, and tolerance semantics were reviewed against the pinned mathematical reference"
+
+[[results.regular_3d]]
+edge = 64
+mode_count = 262144
+point_count = 262144
+kind = "type-1"
+wgpu_submit_wait_ms = 4.893430
+wgpu_stderr_ms = 0.036830
+cuda_setpts_ms = 0.202950
+cuda_setpts_stderr_ms = 0.004810
+cuda_execute_ms = 0.572840
+cuda_execute_stderr_ms = 0.009400
+cuda_combined_ms = 1.025770
+cuda_combined_stderr_ms = 0.218110
+paired_cuda_span = "setpts+execute"
+cuda_speedup = 4.77
+
+[[results.regular_3d]]
+edge = 64
+mode_count = 262144
+point_count = 262144
+kind = "type-2"
+wgpu_submit_wait_ms = 1.058960
+wgpu_stderr_ms = 0.024420
+cuda_setpts_ms = 0.078500
+cuda_setpts_stderr_ms = 0.010380
+cuda_execute_ms = 0.248390
+cuda_execute_stderr_ms = 0.021770
+cuda_combined_ms = 0.288770
+cuda_combined_stderr_ms = 0.002490
+paired_cuda_span = "execute"
+cuda_speedup = 4.26
+
+[[results.regular_3d]]
+edge = 128
+mode_count = 2097152
+point_count = 2097152
+kind = "type-1"
+wgpu_submit_wait_ms = 37.843860
+wgpu_stderr_ms = 0.049820
+cuda_setpts_ms = 0.575730
+cuda_setpts_stderr_ms = 0.346670
+cuda_execute_ms = 9.142800
+cuda_execute_stderr_ms = 4.785900
+cuda_combined_ms = 9.661620
+cuda_combined_stderr_ms = 5.133920
+cuda_second_run_combined_ms = 4.5277
+paired_cuda_span = "setpts+execute"
+cuda_speedup = 3.92
+qualification = "major CUDA cold outliers; prescribed two-run mean retained"
+
+[[results.regular_3d]]
+edge = 128
+mode_count = 2097152
+point_count = 2097152
+kind = "type-2"
+wgpu_submit_wait_ms = 7.500650
+wgpu_stderr_ms = 0.038430
+cuda_setpts_ms = 0.146880
+cuda_setpts_stderr_ms = 0.001680
+cuda_execute_ms = 1.949350
+cuda_execute_stderr_ms = 0.080190
+cuda_combined_ms = 2.023930
+cuda_combined_stderr_ms = 0.013010
+paired_cuda_span = "execute"
+cuda_speedup = 3.85
+
+[[results.type3]]
+dimensions = 1
+source_count = 65536
+target_count = 65536
+wgpu_submit_wait_ms = 10.240430
+wgpu_stderr_ms = 0.033290
+cuda_setpts_ms = 25.668210
+cuda_setpts_stderr_ms = 0.074770
+cuda_execute_ms = 0.176490
+cuda_execute_stderr_ms = 0.002450
+cuda_combined_ms = 25.963770
+cuda_combined_stderr_ms = 0.184930
+paired_cuda_span = "setpts+execute"
+wgpu_speedup = 2.54
+
+[[results.type3]]
+dimensions = 2
+source_count = 65536
+target_count = 65536
+wgpu_submit_wait_ms = 2.459750
+wgpu_stderr_ms = 0.038930
+cuda_setpts_ms = 49.720340
+cuda_setpts_stderr_ms = 0.106540
+cuda_execute_ms = 0.223790
+cuda_execute_stderr_ms = 0.002930
+cuda_combined_ms = 50.114760
+cuda_combined_stderr_ms = 0.099680
+paired_cuda_span = "setpts+execute"
+wgpu_speedup = 20.37
+
+[[results.type3]]
+dimensions = 3
+source_count = 65536
+target_count = 65536
+wgpu_submit_wait_ms = 2.762990
+wgpu_stderr_ms = 0.561670
+cuda_setpts_ms = 74.935990
+cuda_setpts_stderr_ms = 0.154890
+cuda_execute_ms = 0.542270
+cuda_execute_stderr_ms = 0.036190
+cuda_combined_ms = 75.182290
+cuda_combined_stderr_ms = 0.217170
+paired_cuda_span = "setpts+execute"
+wgpu_speedup = 27.21
+
+[correctness.cuda_regular_3d_smoke]
+type1_relative_l2 = 1.0796e-6
+type2_relative_l2 = 1.1839e-6
+threshold = 3.0e-5
+
+[correctness.cuda_type3_smoke_1d]
+positive_relative_l2 = 3.63e-6
+negative_relative_l2 = 8.16e-6
+threshold = 1.0e-4
+
+[correctness.cuda_type3_smoke_2d]
+positive_relative_l2 = 7.68e-6
+negative_relative_l2 = 8.89e-6
+threshold = 1.0e-4
+
+[correctness.cuda_type3_smoke_3d]
+positive_relative_l2 = 1.215e-5
+negative_relative_l2 = 1.083e-5
+threshold = 1.0e-4
+
+[correctness.wgpu_large_3d]
+requested_mode_shape = "256x256x256"
+fine_grid_shape = "512x512x512"
+fine_grid_complex_bytes = 1073741824
+fft_route = "normal mixed-radix ND"
+relative_l2 = 1.1234621e-6
+
+[prototype_gate]
+tile_shape = "8x8x4"
+gather_speedup_64_cubed = 7.45
+gather_speedup_128_cubed = 6.98
+retained = true
+
+[artifacts]
+rust_harness = "../../benches/nufft_bench.rs"
+rust_harness_sha256 = "9F0B934179213BF696F7F500A0D982BD3C2ACC5F0CBE01184366995007F60E32"
+python_harness = "../../benches/cufinufft_gpu_bench.py"
+python_harness_sha256 = "233A437239849262E36F5D46C90C8F392C42DD546DD984A1BF76ED55D9CFE8C2"
+raw_files = [
+  "wgpu-3d-results.txt",
+  "cufinufft-3d-results.txt",
+  "wgpu-type3-results.txt",
+  "cufinufft-type3-results.txt",
+]
+
+[commands]
+wgpu_3d = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_bench -- --3d --adapter "NVIDIA GeForce RTX 5090" --runs 2 --samples 5 --wait-timeout-secs 120
+'''
+cufinufft_3d = '''
+python -B wgpu-nufft/benches/cufinufft_gpu_bench.py --3d --case-3d 64x64x64 --case-3d 128x128x128 --runs 2 --samples 5 --warmups 1 --type2-batch 1 --eps 1e-6 --seed 0x4E554646 --device 0
+'''
+wgpu_type3 = '''
+$env:WGPU_BACKEND='vulkan'
+cargo bench --locked -p wgpu-nufft --bench nufft_bench -- --type3 --adapter "NVIDIA GeForce RTX 5090" --runs 2 --samples 5 --wait-timeout-secs 120
+'''
+cufinufft_type3_1d = '''
+python -B wgpu-nufft/benches/cufinufft_gpu_bench.py --type3 --case-type3 65536:65536 --type3-source-halfwidth 3.141592653589793 --type3-source-center 0.7853981633974483 --type3-target-halfwidth 16 --type3-target-center 4 --runs 2 --samples 5 --warmups 1 --eps 1e-6 --seed 0x4E554646 --device 0
+'''
+cufinufft_type3_2d = '''
+python -B wgpu-nufft/benches/cufinufft_gpu_bench.py --2d --type3 --case-type3 65536:65536 --type3-source-halfwidth 3.141592653589793 --type3-source-center 0.7853981633974483 --type3-target-halfwidth 16 --type3-target-center 4 --runs 2 --samples 5 --warmups 1 --eps 1e-6 --seed 0x4E554646 --device 0
+'''
+cufinufft_type3_3d = '''
+python -B wgpu-nufft/benches/cufinufft_gpu_bench.py --3d --type3 --case-type3 65536:65536 --type3-source-halfwidth 3.141592653589793 --type3-source-center 0.7853981633974483 --type3-target-halfwidth 16 --type3-target-center 4 --runs 2 --samples 5 --warmups 1 --eps 1e-6 --seed 0x4E554646 --device 0
+'''
+
+[comparison]
+regular_3d_verdict = "cuFINUFFT paired spans are 3.85-4.77x faster; 128^3 type-1 is highly noisy"
+type3_verdict = "wgpu paired spans are 2.54-27.21x faster because cuFINUFFT setpts dominates; this is not an FFT-core claim"
+finufft_cpu_rerun = false
+vkfft_rerun = false

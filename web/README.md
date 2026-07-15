@@ -8,7 +8,7 @@ matching the installed Chrome build:
 
 ```powershell
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.120 --locked
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
 $env:CHROMEDRIVER = 'C:\path\to\chromedriver.exe'
 web\run_browser_tests.cmd
 ```

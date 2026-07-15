@@ -1452,7 +1452,10 @@ fn create_uniform_buffer(device: &wgpu::Device, label: &'static str, bytes: &[u8
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        let mut mapped = buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("uniform buffer is mapped at creation");
         mapped.copy_from_slice(bytes);
     }
     buffer.unmap();

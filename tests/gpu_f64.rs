@@ -758,7 +758,9 @@ fn read_f64_buffer(device: &wgpu::Device, readback: &wgpu::Buffer) -> Vec<f64> {
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .expect("readback buffer should be mapped");
     let values = bytemuck::cast_slice(&mapped).to_vec();
     drop(mapped);
     readback.unmap();

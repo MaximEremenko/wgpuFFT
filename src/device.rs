@@ -45,6 +45,7 @@ pub async fn request_default_device() -> Option<GpuContext> {
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: force_fallback_from_env(),
+            apply_limit_buckets: false,
             compatible_surface: None,
         })
         .await

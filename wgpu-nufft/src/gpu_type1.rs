@@ -1,7 +1,9 @@
 use std::num::NonZeroU64;
 
 use wgpu::util::DeviceExt;
-use wgpu_fft::{BufferView, FftConfig, FftDirection, FftPlan, FftPrecision, Normalization};
+use wgpu_fft::{
+    math::DoubleFloat, BufferView, FftConfig, FftDirection, FftPlan, FftPrecision, Normalization,
+};
 
 use crate::config::{NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
@@ -69,13 +71,6 @@ impl Type1GpuPlan {
                 kind: "type-1",
                 actual: config.dimensions(),
                 supported: 1,
-            });
-        }
-        if config.precision() == FftPrecision::Df64 {
-            return Err(NufftError::PrecisionUnsupported {
-                requested: FftPrecision::Df64,
-                stage: "type-1 GPU plan",
-                reason: "portable df64 NUFFT kernels are not implemented",
             });
         }
         // Support indices and bin keys must remain exact in the selected
@@ -836,7 +831,14 @@ fn mode_amplitude_bytes(
         FftPrecision::F64 => {
             Ok(bytemuck::cast_slice(&mode_amplitudes_f64(config, coefficients)?).to_vec())
         }
-        FftPrecision::F32 | FftPrecision::Df64 => {
+        FftPrecision::Df64 => {
+            let values = mode_amplitudes_f64(config, coefficients)?
+                .into_iter()
+                .map(DoubleFloat::from_f64)
+                .collect::<Vec<_>>();
+            Ok(bytemuck::cast_slice(&values).to_vec())
+        }
+        FftPrecision::F32 => {
             Ok(bytemuck::cast_slice(&mode_amplitudes(config, coefficients)?).to_vec())
         }
     }
@@ -960,6 +962,15 @@ fn floor_df64_to_i32(value: Df64) -> i32 {{
     )
 }
 
+fn generate_position_wgsl_df64(fine_length: usize) -> String {
+    generate_position_wgsl(fine_length)
+        .replace(
+            "fn fold_position(point: f32) -> Df64",
+            "fn fold_position(point: Df64) -> Df64",
+        )
+        .replace("Df64(point, 0.0),", "point,")
+}
+
 fn generate_position_wgsl_f64(fine_length: usize) -> String {
     let position_scale = fine_length as f64 / std::f64::consts::TAU;
     format!(
@@ -987,8 +998,38 @@ fn fold_position(point: f64) -> f64 {{
 fn generate_count_wgsl_for_precision(fine_length: usize, precision: FftPrecision) -> String {
     match precision {
         FftPrecision::F64 => generate_count_wgsl_f64(fine_length),
-        FftPrecision::F32 | FftPrecision::Df64 => generate_count_wgsl(fine_length),
+        FftPrecision::Df64 => generate_count_wgsl_df64(fine_length),
+        FftPrecision::F32 => generate_count_wgsl(fine_length),
     }
+}
+
+fn generate_count_wgsl_df64(fine_length: usize) -> String {
+    let position = generate_position_wgsl_df64(fine_length);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<Df64>;
+@group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points);
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+
+    let position = fold_position(points[point_index]);
+    let bin = u32(floor_df64_to_i32(position));
+    atomicAdd(&bin_counts[bin], 1u);
+}}
+"#,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
 fn generate_count_wgsl_f64(fine_length: usize) -> String {
@@ -1097,8 +1138,41 @@ fn main(
 fn generate_scatter_wgsl_for_precision(fine_length: usize, precision: FftPrecision) -> String {
     match precision {
         FftPrecision::F64 => generate_scatter_wgsl_f64(fine_length),
-        FftPrecision::F32 | FftPrecision::Df64 => generate_scatter_wgsl(fine_length),
+        FftPrecision::Df64 => generate_scatter_wgsl_df64(fine_length),
+        FftPrecision::F32 => generate_scatter_wgsl(fine_length),
     }
+}
+
+fn generate_scatter_wgsl_df64(fine_length: usize) -> String {
+    let position = generate_position_wgsl_df64(fine_length);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<Df64>;
+@group(0) @binding(1) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read_write> bin_cursors: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> sorted_indices: array<u32>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let total = arrayLength(&points);
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (point_index >= total) {{ return; }}
+
+    let position = fold_position(points[point_index]);
+    let bin = u32(floor_df64_to_i32(position));
+    let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
+    sorted_indices[slot] = point_index;
+}}
+"#,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
 fn generate_scatter_wgsl_f64(fine_length: usize) -> String {
@@ -1315,8 +1389,111 @@ fn generate_gather_wgsl_for_precision(
 ) -> String {
     match precision {
         FftPrecision::F64 => generate_gather_wgsl_f64(kernel, fine_length),
-        FftPrecision::F32 | FftPrecision::Df64 => generate_gather_wgsl(kernel, fine_length),
+        FftPrecision::Df64 => generate_gather_wgsl_df64(kernel, fine_length),
+        FftPrecision::F32 => generate_gather_wgsl(kernel, fine_length),
     }
+}
+
+fn generate_gather_wgsl_df64(kernel: EsKernel, fine_length: usize) -> String {
+    let position = generate_position_wgsl_df64(fine_length);
+    let horner = generate_horner_wgsl_df64(kernel);
+    let width = kernel.width();
+    let bin_radius = width.div_ceil(2);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const WIDTH: u32 = {width}u;
+const WIDTH_I32: i32 = {width}i;
+const BIN_RADIUS: i32 = {bin_radius}i;
+const VECTOR_BLOCK_SIZE: u32 = {VECTOR_BLOCK_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> points: array<Df64>;
+@group(0) @binding(1) var<storage, read> strengths: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(4) var<storage, read_write> fine_grid: array<vec4<f32>>;
+
+fn ceil_df64_to_i32(value: Df64) -> i32 {{
+    let base = floor(value.hi);
+    let remainder = df64_sub(value, Df64(base, 0.0));
+    let has_positive_remainder = remainder.hi > 0.0 ||
+        (remainder.hi == 0.0 && remainder.lo > 0.0);
+    return i32(base) + select(0, 1, has_positive_remainder);
+}}
+
+fn wrap_bin(index: i32) -> u32 {{
+    var wrapped = index;
+    if (wrapped < 0) {{ wrapped = wrapped + FINE_LENGTH_I32; }}
+    if (wrapped >= FINE_LENGTH_I32) {{ wrapped = wrapped - FINE_LENGTH_I32; }}
+    return u32(wrapped);
+}}
+
+{horner}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let total_vectors = arrayLength(&fine_grid) / FINE_LENGTH;
+    let vector_blocks = (total_vectors + VECTOR_BLOCK_SIZE - 1u) / VECTOR_BLOCK_SIZE;
+    let total_work = FINE_LENGTH * vector_blocks;
+    if (wg_flat > (total_work - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let work_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (work_index >= total_work) {{ return; }}
+    let vector_block = work_index / FINE_LENGTH;
+    let cell = work_index - vector_block * FINE_LENGTH;
+    let first_vector = vector_block * VECTOR_BLOCK_SIZE;
+
+    var sums: array<vec4<f32>, {VECTOR_BLOCK_SIZE}>;
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        sums[vector_local] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }}
+    for (var bin_offset = -BIN_RADIUS; bin_offset < BIN_RADIUS;
+         bin_offset = bin_offset + 1) {{
+        let bin = wrap_bin(i32(cell) + bin_offset);
+        let begin = bin_offsets[bin];
+        let end = bin_offsets[bin + 1u];
+        for (var slot = begin; slot < end; slot = slot + 1u) {{
+            let point_index = sorted_indices[slot];
+            let point_position = fold_position(points[point_index]);
+            let shifted = df64_sub(point_position, DF64_HALF_WIDTH);
+            let start = ceil_df64_to_i32(shifted);
+            var unwrapped = i32(cell);
+            if (unwrapped < start) {{ unwrapped = unwrapped + FINE_LENGTH_I32; }}
+            if (unwrapped >= start + WIDTH_I32) {{
+                unwrapped = unwrapped - FINE_LENGTH_I32;
+            }}
+            if (unwrapped >= start && unwrapped < start + WIDTH_I32) {{
+                let distance = df64_sub(Df64(f32(unwrapped), 0.0), point_position);
+                let weight = es_weight(distance);
+                for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+                     vector_local = vector_local + 1u) {{
+                    let vector_index = first_vector + vector_local;
+                    if (vector_index < total_vectors) {{
+                        let strength_index = vector_index * arrayLength(&points) + point_index;
+                        sums[vector_local] = df64_complex_add(
+                            sums[vector_local],
+                            df64_complex_scale(strengths[strength_index], weight),
+                        );
+                    }}
+                }}
+            }}
+        }}
+    }}
+    for (var vector_local = 0u; vector_local < VECTOR_BLOCK_SIZE;
+         vector_local = vector_local + 1u) {{
+        let vector_index = first_vector + vector_local;
+        if (vector_index < total_vectors) {{
+            fine_grid[vector_index * FINE_LENGTH + cell] = sums[vector_local];
+        }}
+    }}
+}}
+"#,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
 fn generate_gather_wgsl_f64(kernel: EsKernel, fine_length: usize) -> String {
@@ -1468,8 +1645,62 @@ fn generate_deconvolution_wgsl_for_precision(
 ) -> String {
     match precision {
         FftPrecision::F64 => generate_deconvolution_wgsl_f64(config, fine_length),
-        FftPrecision::F32 | FftPrecision::Df64 => generate_deconvolution_wgsl(config, fine_length),
+        FftPrecision::Df64 => generate_deconvolution_wgsl_df64(config, fine_length),
+        FftPrecision::F32 => generate_deconvolution_wgsl(config, fine_length),
     }
+}
+
+fn generate_deconvolution_wgsl_df64(config: &NufftConfig, fine_length: usize) -> String {
+    let mode_count = config.n_modes()[0];
+    let half = mode_count / 2;
+    let nonnegative_count = mode_count.div_ceil(2);
+    let centered = matches!(config.mode_order(), crate::config::ModeOrder::Centered);
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const MODE_COUNT: u32 = {mode_count}u;
+const FINE_LENGTH: u32 = {fine_length}u;
+const HALF_MODE_COUNT: u32 = {half}u;
+const NONNEGATIVE_COUNT: u32 = {nonnegative_count}u;
+const CENTERED_ORDER: bool = {centered};
+
+@group(0) @binding(0) var<storage, read> fine_grid: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> amplitudes: array<Df64>;
+@group(0) @binding(2) var<storage, read_write> output_values: array<vec4<f32>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let total = arrayLength(&output_values);
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let linear_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (linear_index >= total) {{ return; }}
+    let vector_index = linear_index / MODE_COUNT;
+    let output_index = linear_index - vector_index * MODE_COUNT;
+
+    var fine_index = 0u;
+    if (CENTERED_ORDER) {{
+        if (output_index < HALF_MODE_COUNT) {{
+            fine_index = FINE_LENGTH - (HALF_MODE_COUNT - output_index);
+        }} else {{
+            fine_index = output_index - HALF_MODE_COUNT;
+        }}
+    }} else if (output_index < NONNEGATIVE_COUNT) {{
+        fine_index = output_index;
+    }} else {{
+        fine_index = FINE_LENGTH - (MODE_COUNT - output_index);
+    }}
+    output_values[linear_index] = df64_complex_scale(
+        fine_grid[vector_index * FINE_LENGTH + fine_index],
+        amplitudes[output_index],
+    );
+}}
+"#,
+    );
+    format!("{}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
 fn generate_deconvolution_wgsl_f64(config: &NufftConfig, fine_length: usize) -> String {
@@ -1548,6 +1779,68 @@ fn es_weight(distance: f64) -> f64 {{
     }}
     return value;
 }}"#,
+    )
+}
+
+fn generate_horner_wgsl_df64(kernel: EsKernel) -> String {
+    let table = kernel.horner_table();
+    let coefficients = table
+        .coefficients()
+        .iter()
+        .map(|&value| {
+            let value = DoubleFloat::from_f64(value);
+            format!(
+                "Df64({}, {})",
+                format_wgsl_f32(value.hi),
+                format_wgsl_f32(value.lo)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let coefficient_total = table.coefficients().len();
+    let coefficient_count = table.coefficient_count();
+    let half_width = DoubleFloat::from_f64(kernel.half_width());
+    format!(
+        r#"const HORNER_COEFFICIENT_COUNT: u32 = {coefficient_count}u;
+const HORNER_COEFFICIENTS: array<Df64, {coefficient_total}> =
+    array<Df64, {coefficient_total}>({coefficients});
+const DF64_HALF_WIDTH: Df64 = Df64({half_width_hi}, {half_width_lo});
+
+fn df64_abs(value: Df64) -> Df64 {{
+    if (value.hi < 0.0 || (value.hi == 0.0 && value.lo < 0.0)) {{
+        return df64_neg(value);
+    }}
+    return value;
+}}
+
+fn df64_at_least(left: Df64, right: Df64) -> bool {{
+    return left.hi > right.hi || (left.hi == right.hi && left.lo >= right.lo);
+}}
+
+fn es_weight(distance: Df64) -> Df64 {{
+    if (df64_at_least(df64_abs(distance), DF64_HALF_WIDTH)) {{
+        return Df64(0.0, 0.0);
+    }}
+    let shifted = df64_add(distance, DF64_HALF_WIDTH);
+    let panel_i32 = clamp(ceil_df64_to_i32(shifted) - 1, 0, WIDTH_I32 - 1);
+    let panel = u32(panel_i32);
+    let centered = df64_sub(distance, Df64(f32(panel_i32), 0.0));
+    let local = df64_add(
+        df64_mul(Df64(2.0, 0.0), centered),
+        Df64(f32(WIDTH_I32 - 1), 0.0),
+    );
+    var value = Df64(0.0, 0.0);
+    for (var coefficient = 0u; coefficient < HORNER_COEFFICIENT_COUNT;
+         coefficient = coefficient + 1u) {{
+        value = df64_add(
+            df64_mul(value, local),
+            HORNER_COEFFICIENTS[coefficient * WIDTH + panel],
+        );
+    }}
+    return value;
+}}"#,
+        half_width_hi = format_wgsl_f32(half_width.hi),
+        half_width_lo = format_wgsl_f32(half_width.lo),
     )
 }
 

@@ -1102,18 +1102,20 @@ mod tests {
 
     #[test]
     fn high_precision_plans_deconvolve_the_same_horner_kernel_as_the_shader() {
-        let plan =
-            NufftPlan::type2(NufftConfig::new([32], 1.0e-12).with_precision(FftPrecision::F64))
+        for precision in [FftPrecision::F64, FftPrecision::Df64] {
+            let plan = NufftPlan::type2(NufftConfig::new([32], 1.0e-12).with_precision(precision))
                 .unwrap();
-        let table = plan.kernel.horner_table();
-        let expected = plan
-            .kernel
-            .centered_fourier_coefficients_horner(plan.fine_grid_shape[0], &table)
-            .unwrap();
-        assert_eq!(
-            plan.centered_kernel_fourier_coefficients(0).unwrap(),
-            expected
-        );
+            let table = plan.kernel.horner_table();
+            let expected = plan
+                .kernel
+                .centered_fourier_coefficients_horner(plan.fine_grid_shape[0], &table)
+                .unwrap();
+            assert_eq!(
+                plan.centered_kernel_fourier_coefficients(0).unwrap(),
+                expected,
+                "{precision:?}"
+            );
+        }
 
         let f32_plan = NufftPlan::type2(NufftConfig::new([32], 1.0e-12)).unwrap();
         assert_eq!(

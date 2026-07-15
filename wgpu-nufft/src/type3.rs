@@ -986,6 +986,17 @@ mod tests {
             32
         );
         assert_eq!(f64_plan.required_strength_buffer_size_bytes(4).unwrap(), 64);
+        let df64_plan = NufftType3Plan::new(single.with_precision(FftPrecision::Df64)).unwrap();
+        assert_eq!(
+            df64_plan
+                .required_source_point_buffer_size_bytes(4)
+                .unwrap(),
+            32
+        );
+        assert_eq!(
+            df64_plan.required_strength_buffer_size_bytes(4).unwrap(),
+            64
+        );
         assert!(matches!(
             plan.required_output_buffer_size_bytes_for_batch(3, 0),
             Err(NufftError::InvalidBatch {

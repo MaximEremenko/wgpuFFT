@@ -1,0 +1,14 @@
+RESULT kind=type-1 precision=f64 case=1d avg_submit_wait_ms=0.790950 stderr_submit_wait_ms=0.005850
+RESULT kind=type-2 precision=f64 case=1d avg_submit_wait_ms=0.335725 stderr_submit_wait_ms=0.016325
+RESULT kind=type-1 precision=f64 case=2d avg_submit_wait_ms=10.921750 stderr_submit_wait_ms=0.094150
+RESULT kind=type-2 precision=f64 case=2d avg_submit_wait_ms=0.498650 stderr_submit_wait_ms=0.002950
+RESULT kind=type-1 precision=f64 case=3d avg_submit_wait_ms=161.971925 stderr_submit_wait_ms=1.233525
+RESULT kind=type-2 precision=f64 case=3d avg_submit_wait_ms=1.463950 stderr_submit_wait_ms=0.005750
+RESULT kind=type-3 precision=f64 case=type3 avg_submit_wait_ms=16.397550 stderr_submit_wait_ms=0.003050
+RESULT kind=type-1 precision=df64 case=1d avg_submit_wait_ms=1.214875 stderr_submit_wait_ms=0.047075
+RESULT kind=type-2 precision=df64 case=1d avg_submit_wait_ms=0.800550 stderr_submit_wait_ms=0.197000
+RESULT kind=type-1 precision=df64 case=2d avg_submit_wait_ms=12.428000 stderr_submit_wait_ms=0.269050
+RESULT kind=type-2 precision=df64 case=2d avg_submit_wait_ms=0.978875 stderr_submit_wait_ms=0.136975
+RESULT kind=type-1 precision=df64 case=3d avg_submit_wait_ms=184.467875 stderr_submit_wait_ms=0.337925
+RESULT kind=type-2 precision=df64 case=3d avg_submit_wait_ms=5.223200 stderr_submit_wait_ms=0.173800
+RESULT kind=type-3 precision=df64 case=type3 avg_submit_wait_ms=28.367275 stderr_submit_wait_ms=0.042025

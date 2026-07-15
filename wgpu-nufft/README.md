@@ -15,12 +15,12 @@ The current implementation provides:
 - host-`f64` centered-grid kernel Fourier coefficients;
 - even fine-grid selection through `wgpu-fft`'s public supported-length
   factorization;
-- reusable 1D, 2D, and 3D type-2 `f32` GPU plans with caller-owned point,
+- reusable 1D, 2D, and 3D type-2 `f32` and native-`f64` GPU plans with caller-owned point,
   Fourier-coefficient, and output buffers, including FINUFFT-style many-vector
   batching;
-- reusable 1D, 2D, and 3D type-1 `f32` GPU plans with caller-owned point,
+- reusable 1D, 2D, and 3D type-1 `f32` and native-`f64` GPU plans with caller-owned point,
   strength, and Fourier-mode output buffers, including many-vector batching;
-- reusable 1D, 2D, and 3D type-3 `f32` GPU plans with caller-owned source
+- reusable 1D, 2D, and 3D type-3 `f32` and native-`f64` GPU plans with caller-owned source
   points, strengths, target frequencies, and output buffers, also with
   many-vector batching.
 
@@ -29,9 +29,9 @@ The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
 kernel at each nonuniform point. The caller records execution into its own
 command encoder and can consume the caller-owned output buffer without a
 readback. Plan-owned fine-grid buffers are reused between ordered executions.
-Points are point-major `f32` values (scalar in 1D and, for example,
+Points are point-major values in the configured precision (scalar in 1D and, for example,
 `[x0, y0, z0, x1, y1, z1, ...]` in 3D), while coefficients and outputs are
-interleaved complex `(re, im)` `f32` pairs; all require `STORAGE` buffer usage.
+interleaved complex `(re, im)` pairs; all require `STORAGE` buffer usage.
 Call `NufftPlan::required_point_buffer_size_bytes` when sizing a plan's
 coordinate buffer; the older transform-specific static helpers retain their 1D
 contract.
@@ -86,11 +86,26 @@ phase range return structured planning errors. Use the dimension-aware
 source, target, strength, and output buffer. Type-3 plans likewise reuse
 grow-only internal scratch and require ordered execution on a given plan.
 
-GPU NUFFT execution is currently `f32` only; native-`f64` and portable-df64
-NUFFT arithmetic remain deferred. WASM packaging is also deferred. The
-underlying `wgpu-fft` crate already exposes the needed precision-aware C2C
-plumbing, but those paths have not yet been threaded through the NUFFT kernels
-and buffers.
+## Precision
+
+`NufftConfig::with_precision` and `NufftType3Config::with_precision` select the
+coordinate, complex-value, kernel, and fine-grid FFT precision together. `F32`
+is the default and preserves the original shader path. `F64` uses scalar `f64`
+coordinates and `vec2<f64>` complex values and requires a device created with
+`wgpu::Features::SHADER_F64`; this is currently a Vulkan capability in wgpu.
+Plans return a structured `PrecisionUnsupported` error before shader creation
+when that feature is absent.
+
+The ES kernel cannot call `exp` in native-f64 SPIR-V. High-precision plans
+therefore fit FINUFFT-style piecewise-Horner tables on the host in `f64` and use
+the same polynomial for interpolation/spreading and Fourier deconvolution.
+Type-3 phase factors use a transcendental-free, range-reduced polynomial
+sine/cosine and conservatively reject planned phase magnitudes above `1e6`.
+Plan-aware byte-size helpers account for 8-byte coordinates and 16-byte complex
+values; legacy static helpers retain their documented one-dimensional f32 ABI.
+
+Portable double-float NUFFT arithmetic remains deferred to the next precision
+slice. WASM packaging is also deferred.
 
 ## Mathematical conventions
 

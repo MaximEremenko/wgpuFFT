@@ -407,6 +407,7 @@ impl NufftPlan {
                 supported: 3,
             });
         }
+        validate_device_precision(device, config.precision(), "type-1 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type1, config)?;
         let gpu = match plan.config.dimensions() {
             1 => Type1GpuExecution::OneD(Type1GpuPlan::new(
@@ -471,6 +472,7 @@ impl NufftPlan {
                 supported: 3,
             });
         }
+        validate_device_precision(device, config.precision(), "type-2 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type2, config)?;
         let gpu = match plan.config.dimensions() {
             1 => Type2GpuExecution::OneD(Type2GpuPlan::new(
@@ -513,14 +515,20 @@ impl NufftPlan {
             .collect::<Result<Vec<_>>>()?;
         wgpu_fft::FftConfig::new_nd(fine_grid_shape.clone())
             .with_batch(config.batch())
+            .with_precision(config.precision())
             .validate()
             .map_err(|source| NufftError::FftShapeUnsupported {
                 stage: "oversampled NUFFT fine-grid shape",
                 source,
             })?;
+        let horner_table =
+            (config.precision() != wgpu_fft::FftPrecision::F32).then(|| kernel.horner_table());
         let centered_kernel_fourier_coefficients = fine_grid_shape
             .iter()
-            .map(|&length| kernel.centered_fourier_coefficients(length))
+            .map(|&length| match &horner_table {
+                Some(table) => kernel.centered_fourier_coefficients_horner(length, table),
+                None => kernel.centered_fourier_coefficients(length),
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             kind,
@@ -571,7 +579,7 @@ impl NufftPlan {
         Type1GpuPlan::point_buffer_size_bytes(point_count)
     }
 
-    /// Required bytes for this plan's point-major `f32` coordinate buffer.
+    /// Required bytes for this plan's point-major coordinate buffer.
     ///
     /// A point occupies one scalar per configured dimension, so a 3D plan
     /// expects `[x0, y0, z0, x1, y1, z1, ...]`.
@@ -583,7 +591,7 @@ impl NufftPlan {
         )?;
         u64::try_from(coordinate_count)
             .ok()
-            .and_then(|count| count.checked_mul(4))
+            .and_then(|count| count.checked_mul(self.config.precision().scalar_size_bytes()))
             .ok_or(NufftError::LengthOverflow {
                 context: "GPU point-coordinate buffer size",
             })
@@ -611,11 +619,15 @@ impl NufftPlan {
             active_batch,
             "batched type-1 strength count",
         )?;
-        Type1GpuPlan::complex_buffer_size_bytes("type-1 strength buffer", element_count)
+        checked_precision_buffer_size(
+            "type-1 strength buffer",
+            element_count,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     /// Required bytes for this plan's configured number of transform-major
-    /// interleaved-complex `f32` type-1 output vectors.
+    /// complex type-1 output vectors in the configured precision.
     pub fn required_type1_output_buffer_size_bytes(&self) -> Result<u64> {
         self.required_type1_output_buffer_size_bytes_for_batch(self.config.batch())
     }
@@ -631,15 +643,19 @@ impl NufftPlan {
             active_batch,
             "batched type-1 Fourier mode output count",
         )?;
-        Type1GpuPlan::complex_buffer_size_bytes("type-1 Fourier mode output buffer", element_count)
+        checked_precision_buffer_size(
+            "type-1 Fourier mode output buffer",
+            element_count,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     /// Records a one-, two-, or three-dimensional type-1 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
-    /// `points` stores point-major `f32` coordinates (one scalar per configured
+    /// `points` stores point-major coordinates (one scalar per configured
     /// dimension). `strengths` and `output` store the configured number of
-    /// transform-major vectors as interleaved complex `(re, im)` `f32` pairs. All
+    /// transform-major complex vectors in the configured precision. All
     /// buffers used by a nonempty transform require `STORAGE` usage and must
     /// belong to the plan's device. Coordinates must be finite and lie in
     /// FINUFFT's documented `[-3*pi, 3*pi]` interval. For zero points, the
@@ -761,7 +777,7 @@ impl NufftPlan {
     }
 
     /// Required bytes for this plan's configured number of transform-major
-    /// interleaved-complex `f32` coefficient vectors.
+    /// complex coefficient vectors in the configured precision.
     pub fn required_type2_coefficient_buffer_size_bytes(&self) -> Result<u64> {
         self.required_type2_coefficient_buffer_size_bytes_for_batch(self.config.batch())
     }
@@ -777,7 +793,11 @@ impl NufftPlan {
             active_batch,
             "batched type-2 Fourier coefficient count",
         )?;
-        Type2GpuPlan::complex_buffer_size_bytes("type-2 Fourier coefficient buffer", element_count)
+        checked_precision_buffer_size(
+            "type-2 Fourier coefficient buffer",
+            element_count,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     /// Required bytes for one vector of `point_count` interleaved-complex
@@ -802,15 +822,19 @@ impl NufftPlan {
             active_batch,
             "batched type-2 output count",
         )?;
-        Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", element_count)
+        checked_precision_buffer_size(
+            "type-2 output buffer",
+            element_count,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     /// Records a one-, two-, or three-dimensional type-2 NUFFT into `encoder` without
     /// submitting or reading data back to the host.
     ///
-    /// `points` stores point-major `f32` coordinates (one scalar per configured
+    /// `points` stores point-major coordinates (one scalar per configured
     /// dimension). `coefficients` and `output` store the configured number of
-    /// transform-major vectors as interleaved complex `(re, im)` `f32` pairs.
+    /// transform-major complex vectors in the configured precision.
     /// All three buffers require `STORAGE` usage and must belong to the
     /// same device used to construct the plan. Coordinates must be finite and
     /// lie in FINUFFT's documented `[-3*pi, 3*pi]` interval.
@@ -987,4 +1011,117 @@ fn checked_batched_element_count(
     elements_per_transform
         .checked_mul(active_batch)
         .ok_or(NufftError::LengthOverflow { context })
+}
+
+fn checked_precision_buffer_size(
+    _buffer: &'static str,
+    element_count: usize,
+    element_size_bytes: u64,
+) -> Result<u64> {
+    u64::try_from(element_count)
+        .ok()
+        .and_then(|count| count.checked_mul(element_size_bytes))
+        .ok_or(NufftError::LengthOverflow {
+            context: "precision-aware GPU buffer size",
+        })
+}
+
+fn validate_device_precision(
+    device: &wgpu::Device,
+    precision: wgpu_fft::FftPrecision,
+    stage: &'static str,
+) -> Result<()> {
+    if wgpu_fft::device::device_supports_precision(device, precision) {
+        Ok(())
+    } else {
+        Err(NufftError::PrecisionUnsupported {
+            requested: precision,
+            stage,
+            reason: "the device was not created with wgpu Features::SHADER_F64",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu_fft::FftPrecision;
+
+    #[test]
+    fn plan_aware_buffer_sizes_follow_the_selected_precision() {
+        let f32_plan = NufftPlan::type1(NufftConfig::new([8, 6], 1.0e-6).with_batch(3)).unwrap();
+        let f64_plan = NufftPlan::type1(
+            NufftConfig::new([8, 6], 1.0e-6)
+                .with_batch(3)
+                .with_precision(FftPrecision::F64),
+        )
+        .unwrap();
+        let df64_plan = NufftPlan::type2(
+            NufftConfig::new([8, 6], 1.0e-6)
+                .with_batch(3)
+                .with_precision(FftPrecision::Df64),
+        )
+        .unwrap();
+
+        assert_eq!(f32_plan.required_point_buffer_size_bytes(5).unwrap(), 40);
+        assert_eq!(f64_plan.required_point_buffer_size_bytes(5).unwrap(), 80);
+        assert_eq!(df64_plan.required_point_buffer_size_bytes(5).unwrap(), 80);
+        assert_eq!(
+            f64_plan
+                .required_type1_strength_buffer_size_bytes_for_batch(5, 2)
+                .unwrap(),
+            160
+        );
+        assert_eq!(
+            f64_plan.required_type1_output_buffer_size_bytes().unwrap(),
+            48 * 3 * 16
+        );
+        assert_eq!(
+            df64_plan
+                .required_type2_coefficient_buffer_size_bytes_for_batch(2)
+                .unwrap(),
+            48 * 2 * 16
+        );
+        assert_eq!(
+            df64_plan
+                .required_type2_output_buffer_size_bytes_for_batch(5, 2)
+                .unwrap(),
+            5 * 2 * 16
+        );
+
+        // Legacy static helpers retain their documented f32, one-vector ABI.
+        assert_eq!(
+            NufftPlan::required_type1_point_buffer_size_bytes(5).unwrap(),
+            20
+        );
+        assert_eq!(
+            NufftPlan::required_type2_output_buffer_size_bytes(5).unwrap(),
+            40
+        );
+    }
+
+    #[test]
+    fn high_precision_plans_deconvolve_the_same_horner_kernel_as_the_shader() {
+        let plan =
+            NufftPlan::type2(NufftConfig::new([32], 1.0e-12).with_precision(FftPrecision::F64))
+                .unwrap();
+        let table = plan.kernel.horner_table();
+        let expected = plan
+            .kernel
+            .centered_fourier_coefficients_horner(plan.fine_grid_shape[0], &table)
+            .unwrap();
+        assert_eq!(
+            plan.centered_kernel_fourier_coefficients(0).unwrap(),
+            expected
+        );
+
+        let f32_plan = NufftPlan::type2(NufftConfig::new([32], 1.0e-12)).unwrap();
+        assert_eq!(
+            f32_plan.centered_kernel_fourier_coefficients(0).unwrap(),
+            f32_plan
+                .kernel
+                .centered_fourier_coefficients(f32_plan.fine_grid_shape[0])
+                .unwrap()
+        );
+    }
 }

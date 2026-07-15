@@ -8,16 +8,18 @@ use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
-use crate::kernel::EsKernel;
+use crate::kernel::{EsHornerTable, EsKernel};
 use crate::plan::NufftPlan;
 use crate::type3::NufftType3Plan;
+use wgpu_fft::FftPrecision;
 
 const WORKGROUP_SIZE: u32 = 64;
-const F32_BYTES: u64 = 4;
-const COMPLEX_F32_BYTES: u64 = 8;
 const PHASE_REDUCTION_STEPS: u32 = 8;
 const PHASE_FINAL_CORRECTIONS: usize = 4;
 const MAX_GPU_PHASE_MAGNITUDE: f64 = f32::MAX as f64 * 0.5;
+// The three-word pi/2 reduction below is verified through this range. Beyond
+// it, reliable native-f64 phase accuracy needs a wider Payne-Hanek table.
+const MAX_NATIVE_F64_PHASE_MAGNITUDE: f64 = 1.0e6;
 
 /// GPU-resident composition of FINUFFT's outer spread and inner type-2 plan.
 ///
@@ -28,6 +30,7 @@ const MAX_GPU_PHASE_MAGNITUDE: f64 = f32::MAX as f64 * 0.5;
 pub(crate) struct GpuType3Plan {
     dimensions: usize,
     batch_capacity: usize,
+    precision: FftPrecision,
     raw_spread: RawSpreadPlan,
     inner_type2: NufftPlan,
     source_pipeline: wgpu::ComputePipeline,
@@ -50,6 +53,14 @@ impl GpuType3Plan {
     ) -> Result<Self> {
         validate_gpu_metadata(metadata)?;
         let dimensions = metadata.config().dimensions();
+        let precision = metadata.config().precision();
+        if precision == FftPrecision::Df64 {
+            return Err(NufftError::PrecisionUnsupported {
+                requested: precision,
+                stage: "type-3 GPU plan",
+                reason: "double-float type-3 support is implemented in the df64 phase",
+            });
+        }
         let limits = device.limits();
         let maximum_workgroup_size = max_supported_workgroup_size(&limits);
         if maximum_workgroup_size < WORKGROUP_SIZE {
@@ -73,12 +84,21 @@ impl GpuType3Plan {
             .with_sign(metadata.config().sign())
             .with_mode_order(ModeOrder::Centered)
             .with_sigma(metadata.config().sigma())
-            .with_batch(metadata.config().batch());
+            .with_batch(metadata.config().batch())
+            .with_precision(precision);
         let kernel = metadata.kernel();
-        let outer_coefficients = outer_shape
-            .iter()
-            .map(|&length| kernel.centered_fourier_coefficients(length))
-            .collect::<Result<Vec<_>>>()?;
+        let outer_coefficients = if precision == FftPrecision::F64 {
+            let horner = kernel.horner_table();
+            outer_shape
+                .iter()
+                .map(|&length| kernel.centered_fourier_coefficients_horner(length, &horner))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            outer_shape
+                .iter()
+                .map(|&length| kernel.centered_fourier_coefficients(length))
+                .collect::<Result<Vec<_>>>()?
+        };
         let raw_spread = match dimensions {
             1 => RawSpreadPlan::OneD(Type1GpuPlan::new(
                 device,
@@ -133,7 +153,8 @@ impl GpuType3Plan {
             .with_sign(metadata.config().sign())
             .with_mode_order(ModeOrder::Centered)
             .with_sigma(metadata.config().sigma())
-            .with_batch(metadata.config().batch());
+            .with_batch(metadata.config().batch())
+            .with_precision(precision);
         let inner_type2 = NufftPlan::type2_gpu(device, queue, inner_config)?;
 
         let source_pipeline = create_compute_pipeline(
@@ -151,13 +172,14 @@ impl GpuType3Plan {
         let final_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type3.final_correction",
-            &generate_final_wgsl(),
+            &generate_final_wgsl(precision)?,
         );
         let final_layout = final_pipeline.get_bind_group_layout(0);
 
         Ok(Self {
             dimensions,
             batch_capacity: metadata.config().batch(),
+            precision,
             raw_spread,
             inner_type2,
             source_pipeline,
@@ -166,7 +188,7 @@ impl GpuType3Plan {
             target_layout,
             final_pipeline,
             final_layout,
-            scratch: Mutex::new(Type3ScratchBuffers::new(device)),
+            scratch: Mutex::new(Type3ScratchBuffers::new(device, precision)),
             max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
             max_buffer_bytes: limits.max_buffer_size,
@@ -181,7 +203,12 @@ impl GpuType3Plan {
         &self,
         source_count: usize,
     ) -> Result<u64> {
-        coordinate_buffer_size("type-3 source point", source_count, self.dimensions)
+        coordinate_buffer_size(
+            "type-3 source point",
+            source_count,
+            self.dimensions,
+            self.precision,
+        )
     }
 
     #[allow(dead_code)]
@@ -196,7 +223,12 @@ impl GpuType3Plan {
         &self,
         target_count: usize,
     ) -> Result<u64> {
-        coordinate_buffer_size("type-3 target point", target_count, self.dimensions)
+        coordinate_buffer_size(
+            "type-3 target point",
+            target_count,
+            self.dimensions,
+            self.precision,
+        )
     }
 
     #[allow(dead_code)]
@@ -214,7 +246,7 @@ impl GpuType3Plan {
             .ok_or(NufftError::LengthOverflow {
                 context: "type-3 batched source strength count",
             })?;
-        complex_buffer_size("type-3 source strength", count)
+        complex_buffer_size("type-3 source strength", count, self.precision)
     }
 
     fn required_output_buffer_size_bytes_for_batch(
@@ -227,7 +259,7 @@ impl GpuType3Plan {
             .ok_or(NufftError::LengthOverflow {
                 context: "type-3 batched output count",
             })?;
-        complex_buffer_size("type-3 output", count)
+        complex_buffer_size("type-3 output", count, self.precision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -283,7 +315,8 @@ impl GpuType3Plan {
         let strength_bytes =
             self.required_source_strength_buffer_size_bytes_for_batch(source_count, active_batch)?;
         let target_point_bytes = self.required_target_point_buffer_size_bytes(target_count)?;
-        let target_factor_bytes = complex_buffer_size("type-3 target factor", target_count)?;
+        let target_factor_bytes =
+            complex_buffer_size("type-3 target factor", target_count, self.precision)?;
         let output_bytes =
             self.required_output_buffer_size_bytes_for_batch(target_count, active_batch)?;
         if source_count != 0 {
@@ -537,38 +570,40 @@ struct Type3ScratchBuffers {
 }
 
 impl Type3ScratchBuffers {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, precision: FftPrecision) -> Self {
+        let scalar_bytes = precision.scalar_size_bytes();
+        let complex_bytes = precision.complex_size_bytes();
         Self {
             rescaled_sources: create_scratch_buffer(
                 device,
                 "wgpu_nufft.type3.rescaled_sources",
-                F32_BYTES,
+                scalar_bytes,
             ),
-            rescaled_source_capacity: F32_BYTES,
+            rescaled_source_capacity: scalar_bytes,
             prephased_strengths: create_scratch_buffer(
                 device,
                 "wgpu_nufft.type3.prephased_strengths",
-                COMPLEX_F32_BYTES,
+                complex_bytes,
             ),
-            prephased_strength_capacity: COMPLEX_F32_BYTES,
+            prephased_strength_capacity: complex_bytes,
             rescaled_targets: create_scratch_buffer(
                 device,
                 "wgpu_nufft.type3.rescaled_targets",
-                F32_BYTES,
+                scalar_bytes,
             ),
-            rescaled_target_capacity: F32_BYTES,
+            rescaled_target_capacity: scalar_bytes,
             target_factors: create_scratch_buffer(
                 device,
                 "wgpu_nufft.type3.target_factors",
-                COMPLEX_F32_BYTES,
+                complex_bytes,
             ),
-            target_factor_capacity: COMPLEX_F32_BYTES,
+            target_factor_capacity: complex_bytes,
             interpolated: create_scratch_buffer(
                 device,
                 "wgpu_nufft.type3.interpolated",
-                COMPLEX_F32_BYTES,
+                complex_bytes,
             ),
-            interpolated_capacity: COMPLEX_F32_BYTES,
+            interpolated_capacity: complex_bytes,
         }
     }
 
@@ -640,6 +675,7 @@ impl Type3ScratchBuffers {
 
 fn validate_gpu_metadata(metadata: &NufftType3Plan) -> Result<()> {
     metadata.config().validate()?;
+    let precision = metadata.config().precision();
     for (axis, (&source, &target)) in metadata
         .config()
         .source_bounds()
@@ -653,7 +689,7 @@ fn validate_gpu_metadata(metadata: &NufftType3Plan) -> Result<()> {
             ("target interval lower endpoint", target.lower()),
             ("target interval upper endpoint", target.upper()),
         ] {
-            validate_split_constant(axis, quantity, value)?;
+            validate_shader_constant(precision, axis, quantity, value)?;
         }
     }
     for (axis, metadata_axis) in metadata.axes().iter().copied().enumerate() {
@@ -666,7 +702,7 @@ fn validate_gpu_metadata(metadata: &NufftType3Plan) -> Result<()> {
                 metadata_axis.grid_spacing() * metadata_axis.source_scale(),
             ),
         ] {
-            validate_split_constant(axis, quantity, value)?;
+            validate_shader_constant(precision, axis, quantity, value)?;
         }
     }
 
@@ -678,7 +714,7 @@ fn validate_gpu_metadata(metadata: &NufftType3Plan) -> Result<()> {
             interval.lower().abs().max(interval.upper().abs()) * axis.target_center().abs()
         })
         .sum::<f64>();
-    validate_phase_bound("source pre-phase", source_phase_bound)?;
+    validate_phase_bound(precision, "source pre-phase", source_phase_bound)?;
     let target_phase_bound = metadata
         .axes()
         .iter()
@@ -690,8 +726,28 @@ fn validate_gpu_metadata(metadata: &NufftType3Plan) -> Result<()> {
                 * axis.source_center().abs()
         })
         .sum::<f64>();
-    validate_phase_bound("target post-phase", target_phase_bound)?;
+    validate_phase_bound(precision, "target post-phase", target_phase_bound)?;
     Ok(())
+}
+
+fn validate_shader_constant(
+    precision: FftPrecision,
+    axis: usize,
+    quantity: &'static str,
+    value: f64,
+) -> Result<()> {
+    if precision == FftPrecision::F64 {
+        if value.is_finite() {
+            return Ok(());
+        }
+        return Err(NufftError::Type3RescalingUnsupported {
+            axis,
+            quantity,
+            value,
+            reason: "the value is not representable as a finite f64 shader constant",
+        });
+    }
+    validate_split_constant(axis, quantity, value)
 }
 
 fn validate_split_constant(axis: usize, quantity: &'static str, value: f64) -> Result<()> {
@@ -709,20 +765,41 @@ fn validate_split_constant(axis: usize, quantity: &'static str, value: f64) -> R
     }
 }
 
-fn validate_phase_bound(quantity: &'static str, value: f64) -> Result<()> {
-    if value.is_finite() && value <= MAX_GPU_PHASE_MAGNITUDE {
+fn validate_phase_bound(precision: FftPrecision, quantity: &'static str, value: f64) -> Result<()> {
+    let maximum = if precision == FftPrecision::F64 {
+        MAX_NATIVE_F64_PHASE_MAGNITUDE
+    } else {
+        MAX_GPU_PHASE_MAGNITUDE
+    };
+    if value.is_finite() && value <= maximum {
         Ok(())
     } else {
         Err(NufftError::Type3RescalingUnsupported {
             axis: 0,
             quantity,
             value,
-            reason: "the conservative phase bound exceeds the portable df64 exponent range",
+            reason: if precision == FftPrecision::F64 {
+                "the conservative phase bound exceeds the native-f64 three-word reduction range"
+            } else {
+                "the conservative phase bound exceeds the portable df64 exponent range"
+            },
         })
     }
 }
 
 fn generate_source_wgsl(metadata: &NufftType3Plan) -> Result<String> {
+    match metadata.config().precision() {
+        FftPrecision::F32 => generate_source_wgsl_f32(metadata),
+        FftPrecision::F64 => generate_source_wgsl_f64(metadata),
+        FftPrecision::Df64 => Err(NufftError::PrecisionUnsupported {
+            requested: FftPrecision::Df64,
+            stage: "type-3 source rescaling shader",
+            reason: "double-float type-3 support is implemented in the df64 phase",
+        }),
+    }
+}
+
+fn generate_source_wgsl_f32(metadata: &NufftType3Plan) -> Result<String> {
     let dimensions = metadata.config().dimensions();
     let sign = metadata.config().sign().isign() as f64;
     let mut constants = String::new();
@@ -794,7 +871,87 @@ fn main(
     ))
 }
 
+fn generate_source_wgsl_f64(metadata: &NufftType3Plan) -> Result<String> {
+    let dimensions = metadata.config().dimensions();
+    let sign = metadata.config().sign().isign() as f64;
+    let mut constants = String::new();
+    let mut body = String::new();
+    for (axis, values) in metadata.axes().iter().copied().enumerate() {
+        constants.push_str(&format_f64_const(
+            &format!("SOURCE_CENTER_{axis}"),
+            values.source_center(),
+        )?);
+        constants.push_str(&format_f64_const(
+            &format!("SOURCE_INV_SCALE_{axis}"),
+            1.0 / values.source_scale(),
+        )?);
+        constants.push_str(&format_f64_const(
+            &format!("TARGET_CENTER_{axis}"),
+            values.target_center(),
+        )?);
+        body.push_str(&format!(
+            r#"
+    let source_{axis} = source_points[coordinate_offset + {axis}u];
+    let centered_{axis} = source_{axis} - SOURCE_CENTER_{axis};
+    let rescaled_{axis} = centered_{axis} * SOURCE_INV_SCALE_{axis};
+    if (value_index < source_count) {{
+        rescaled_sources[coordinate_offset + {axis}u] = rescaled_{axis};
+    }}
+    phase = phase + source_{axis} * TARGET_CENTER_{axis};
+"#,
+        ));
+    }
+    constants.push_str(&format_f64_const("ISIGN", sign)?);
+    Ok(format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const DIMENSIONS: u32 = {dimensions}u;
+{constants}
+{sincos}
+
+@group(0) @binding(0) var<storage, read> source_points: array<f64>;
+@group(0) @binding(1) var<storage, read> strengths: array<vec2<f64>>;
+@group(0) @binding(2) var<storage, read_write> rescaled_sources: array<f64>;
+@group(0) @binding(3) var<storage, read_write> prephased_strengths: array<vec2<f64>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let workgroup_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let value_index = workgroup_flat * WORKGROUP_SIZE + lid.x;
+    if (value_index >= arrayLength(&strengths)) {{ return; }}
+    let source_count = arrayLength(&rescaled_sources) / DIMENSIONS;
+    let source_index = value_index % source_count;
+    let coordinate_offset = source_index * DIMENSIONS;
+    var phase = 0.0lf;
+{body}
+    let factor = sincos_f64(phase * ISIGN);
+    let value = strengths[value_index];
+    prephased_strengths[value_index] = vec2<f64>(
+        value.x * factor.x - value.y * factor.y,
+        value.x * factor.y + value.y * factor.x,
+    );
+}}
+"#,
+        sincos = sincos_f64_wgsl(),
+    ))
+}
+
 fn generate_target_wgsl(metadata: &NufftType3Plan) -> Result<String> {
+    match metadata.config().precision() {
+        FftPrecision::F32 => generate_target_wgsl_f32(metadata),
+        FftPrecision::F64 => generate_target_wgsl_f64(metadata),
+        FftPrecision::Df64 => Err(NufftError::PrecisionUnsupported {
+            requested: FftPrecision::Df64,
+            stage: "type-3 target rescaling shader",
+            reason: "double-float type-3 support is implemented in the df64 phase",
+        }),
+    }
+}
+
+fn generate_target_wgsl_f32(metadata: &NufftType3Plan) -> Result<String> {
     let dimensions = metadata.config().dimensions();
     let sign = metadata.config().sign().isign() as f64;
     let mut constants = String::new();
@@ -873,7 +1030,93 @@ fn main(
     ))
 }
 
-fn generate_final_wgsl() -> String {
+fn generate_target_wgsl_f64(metadata: &NufftType3Plan) -> Result<String> {
+    let dimensions = metadata.config().dimensions();
+    let sign = metadata.config().sign().isign() as f64;
+    let mut constants = String::new();
+    let mut body = String::new();
+    for (axis, values) in metadata.axes().iter().copied().enumerate() {
+        constants.push_str(&format_f64_const(
+            &format!("SOURCE_CENTER_{axis}"),
+            values.source_center(),
+        )?);
+        constants.push_str(&format_f64_const(
+            &format!("TARGET_CENTER_{axis}"),
+            values.target_center(),
+        )?);
+        constants.push_str(&format_f64_const(
+            &format!("TARGET_SCALE_{axis}"),
+            values.grid_spacing() * values.source_scale(),
+        )?);
+        body.push_str(&format!(
+            r#"
+    let target_{axis} = target_points[coordinate_offset + {axis}u];
+    let centered_{axis} = target_{axis} - TARGET_CENTER_{axis};
+    let rescaled_{axis} = centered_{axis} * TARGET_SCALE_{axis};
+    rescaled_targets[coordinate_offset + {axis}u] = rescaled_{axis};
+    phase = phase + centered_{axis} * SOURCE_CENTER_{axis};
+    phi_hat = phi_hat * outer_kernel_ft(rescaled_{axis});
+"#,
+        ));
+    }
+    constants.push_str(&format_f64_const("ISIGN", sign)?);
+    let horner = metadata.kernel().horner_table();
+    let quadrature = quadrature_constants_wgsl_f64(metadata.kernel(), &horner)?;
+    Ok(format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const DIMENSIONS: u32 = {dimensions}u;
+{constants}
+{quadrature}
+{sincos}
+
+fn outer_kernel_ft(frequency: f64) -> f64 {{
+    var sum = 0.0lf;
+    for (var node = 0u; node < KERNEL_QUADRATURE_COUNT; node = node + 1u) {{
+        let angle = frequency * KERNEL_QUADRATURE_NODES[node];
+        let cosine = sincos_f64(angle).x;
+        sum = sum + KERNEL_QUADRATURE_WEIGHTS[node] * cosine;
+    }}
+    return sum;
+}}
+
+@group(0) @binding(0) var<storage, read> target_points: array<f64>;
+@group(0) @binding(1) var<storage, read_write> rescaled_targets: array<f64>;
+@group(0) @binding(2) var<storage, read_write> target_factors: array<vec2<f64>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let workgroup_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let target_index = workgroup_flat * WORKGROUP_SIZE + lid.x;
+    if (target_index >= arrayLength(&target_factors)) {{ return; }}
+    let coordinate_offset = target_index * DIMENSIONS;
+    var phase = 0.0lf;
+    var phi_hat = 1.0lf;
+{body}
+    let inverse_phi_hat = 1.0lf / phi_hat;
+    target_factors[target_index] = inverse_phi_hat * sincos_f64(phase * ISIGN);
+}}
+"#,
+        sincos = sincos_f64_wgsl(),
+    ))
+}
+
+fn generate_final_wgsl(precision: FftPrecision) -> Result<String> {
+    match precision {
+        FftPrecision::F32 => Ok(generate_final_wgsl_f32()),
+        FftPrecision::F64 => Ok(generate_final_wgsl_f64()),
+        FftPrecision::Df64 => Err(NufftError::PrecisionUnsupported {
+            requested: FftPrecision::Df64,
+            stage: "type-3 final correction shader",
+            reason: "double-float type-3 support is implemented in the df64 phase",
+        }),
+    }
+}
+
+fn generate_final_wgsl_f32() -> String {
     format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 
@@ -899,6 +1142,103 @@ fn main(
 }}
 "#,
     )
+}
+
+fn generate_final_wgsl_f64() -> String {
+    format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+
+@group(0) @binding(0) var<storage, read> interpolated: array<vec2<f64>>;
+@group(0) @binding(1) var<storage, read> target_factors: array<vec2<f64>>;
+@group(0) @binding(2) var<storage, read_write> output_values: array<vec2<f64>>;
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let workgroup_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let index = workgroup_flat * WORKGROUP_SIZE + lid.x;
+    if (index >= arrayLength(&output_values)) {{ return; }}
+    let value = interpolated[index];
+    let factor = target_factors[index % arrayLength(&target_factors)];
+    output_values[index] = vec2<f64>(
+        value.x * factor.x - value.y * factor.y,
+        value.x * factor.y + value.y * factor.x,
+    );
+}}
+"#,
+    )
+}
+
+/// Arithmetic-only native-f64 sine/cosine. The phase first undergoes a
+/// split-constant reduction and is then mapped by its nearest quadrant into
+/// [-pi/4, pi/4]. Degree-17/16 odd/even polynomials keep the approximation
+/// error below native-f64 rounding noise on that interval.
+fn sincos_f64_wgsl() -> String {
+    let mut sine_horner = format!(
+        "    var sine_polynomial = {};\n",
+        format_wgsl_f64(taylor_coefficient(17))
+    );
+    for degree in (3..=15).rev().step_by(2) {
+        sine_horner.push_str(&format!(
+            "    sine_polynomial = sine_polynomial * squared + {};\n",
+            format_wgsl_f64(taylor_coefficient(degree))
+        ));
+    }
+    let mut cosine_horner = format!(
+        "    var cosine_polynomial = {};\n",
+        format_wgsl_f64(taylor_coefficient(16))
+    );
+    for degree in (2..=14).rev().step_by(2) {
+        cosine_horner.push_str(&format!(
+            "    cosine_polynomial = cosine_polynomial * squared + {};\n",
+            format_wgsl_f64(taylor_coefficient(degree))
+        ));
+    }
+    format!(
+        r#"const PHASE_HALF_PI_1: f64 = {half_pi_1};
+const PHASE_HALF_PI_2: f64 = {half_pi_2};
+const PHASE_HALF_PI_3: f64 = {half_pi_3};
+const PHASE_INV_HALF_PI: f64 = {inverse_half_pi};
+
+fn sincos_f64(value: f64) -> vec2<f64> {{
+    let scaled_quadrant = value * PHASE_INV_HALF_PI;
+    var quadrant = 0i;
+    if (scaled_quadrant >= 0.0lf) {{
+        quadrant = i32(scaled_quadrant + 0.5lf);
+    }} else {{
+        quadrant = i32(scaled_quadrant - 0.5lf);
+    }}
+    let quadrant_f64 = f64(quadrant);
+    let angle = ((value - quadrant_f64 * PHASE_HALF_PI_1) -
+        quadrant_f64 * PHASE_HALF_PI_2) - quadrant_f64 * PHASE_HALF_PI_3;
+    let squared = angle * angle;
+{sine_horner}    let sine = angle + angle * squared * sine_polynomial;
+{cosine_horner}    let cosine = 1.0lf + squared * cosine_polynomial;
+
+    let lane = quadrant & 3i;
+    if (lane == 0i) {{ return vec2<f64>(cosine, sine); }}
+    if (lane == 1i) {{ return vec2<f64>(-sine, cosine); }}
+    if (lane == 2i) {{ return vec2<f64>(-cosine, -sine); }}
+    return vec2<f64>(sine, -cosine);
+}}
+"#,
+        half_pi_1 = format_wgsl_f64(1.570_796_326_734_125_6),
+        half_pi_2 = format_wgsl_f64(6.077_100_506_303_966e-11),
+        half_pi_3 = format_wgsl_f64(2.022_266_248_711_166_5e-21),
+        inverse_half_pi = format_wgsl_f64(2.0 / std::f64::consts::PI),
+    )
+}
+
+fn taylor_coefficient(degree: usize) -> f64 {
+    let sign = if (degree / 2).is_multiple_of(2) {
+        1.0
+    } else {
+        -1.0
+    };
+    sign / (1..=degree).map(|factor| factor as f64).product::<f64>()
 }
 
 fn phase_reduction_wgsl() -> Result<String> {
@@ -966,11 +1306,50 @@ const KERNEL_QUADRATURE_WEIGHTS: array<Df64, {count}> = array<Df64, {count}>(
     ))
 }
 
+fn quadrature_constants_wgsl_f64(kernel: EsKernel, horner: &EsHornerTable) -> Result<String> {
+    let count = kernel.width() + 2;
+    let (nodes, weights) = gauss_legendre(count * 2);
+    let half_width = kernel.half_width();
+    let mut node_values = Vec::with_capacity(count);
+    let mut weight_values = Vec::with_capacity(count);
+    for (&node, &weight) in nodes[count..].iter().zip(&weights[count..]) {
+        let distance = half_width * node;
+        node_values.push(format_wgsl_f64(distance));
+        weight_values.push(format_wgsl_f64(
+            2.0 * half_width * weight * horner.evaluate(distance),
+        ));
+    }
+    Ok(format!(
+        r#"const KERNEL_QUADRATURE_COUNT: u32 = {count}u;
+const KERNEL_QUADRATURE_NODES: array<f64, {count}> = array<f64, {count}>(
+    {nodes}
+);
+const KERNEL_QUADRATURE_WEIGHTS: array<f64, {count}> = array<f64, {count}>(
+    {weights}
+);
+"#,
+        nodes = node_values.join(",\n    "),
+        weights = weight_values.join(",\n    "),
+    ))
+}
+
 fn format_dd_const(name: &str, value: f64) -> Result<String> {
     Ok(format!(
         "const {name}: Df64 = {};\n",
         format_dd_value(value)?
     ))
+}
+
+fn format_f64_const(name: &str, value: f64) -> Result<String> {
+    if !value.is_finite() {
+        return Err(NufftError::Type3RescalingUnsupported {
+            axis: 0,
+            quantity: "shader constant",
+            value,
+            reason: "the value is not representable as a finite f64 shader constant",
+        });
+    }
+    Ok(format!("const {name}: f64 = {};\n", format_wgsl_f64(value)))
 }
 
 fn format_dd_value(value: f64) -> Result<String> {
@@ -997,6 +1376,16 @@ fn format_f32(value: f32) -> String {
     } else {
         format!("{value:.9e}")
     }
+}
+
+fn format_wgsl_f64(value: f64) -> String {
+    assert!(value.is_finite(), "WGSL f64 constants must be finite");
+    let mut formatted = value.to_string();
+    if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
+        formatted.push_str(".0");
+    }
+    formatted.push_str("lf");
+    formatted
 }
 
 fn gauss_legendre(order: usize) -> (Vec<f64>, Vec<f64>) {
@@ -1085,15 +1474,20 @@ fn coordinate_buffer_size(
     context: &'static str,
     point_count: usize,
     dimensions: usize,
+    precision: FftPrecision,
 ) -> Result<u64> {
     let elements = point_count
         .checked_mul(dimensions)
         .ok_or(NufftError::LengthOverflow { context })?;
-    checked_buffer_size(context, elements, F32_BYTES)
+    checked_buffer_size(context, elements, precision.scalar_size_bytes())
 }
 
-fn complex_buffer_size(context: &'static str, element_count: usize) -> Result<u64> {
-    checked_buffer_size(context, element_count, COMPLEX_F32_BYTES)
+fn complex_buffer_size(
+    context: &'static str,
+    element_count: usize,
+    precision: FftPrecision,
+) -> Result<u64> {
+    checked_buffer_size(context, element_count, precision.complex_size_bytes())
 }
 
 fn checked_buffer_size(
@@ -1181,15 +1575,22 @@ mod tests {
     use wgpu_fft::math::DoubleFloat;
 
     fn metadata(dimensions: usize) -> NufftType3Plan {
-        NufftType3Plan::new(NufftType3Config::new(
-            (0..dimensions)
-                .map(|axis| NufftInterval::new(-1.5 - axis as f64, 2.0 + axis as f64))
-                .collect::<Vec<_>>(),
-            (0..dimensions)
-                .map(|axis| NufftInterval::new(-3.0 - axis as f64, 4.0 + axis as f64))
-                .collect::<Vec<_>>(),
-            1.0e-6,
-        ))
+        metadata_with_precision(dimensions, FftPrecision::F32)
+    }
+
+    fn metadata_with_precision(dimensions: usize, precision: FftPrecision) -> NufftType3Plan {
+        NufftType3Plan::new(
+            NufftType3Config::new(
+                (0..dimensions)
+                    .map(|axis| NufftInterval::new(-1.5 - axis as f64, 2.0 + axis as f64))
+                    .collect::<Vec<_>>(),
+                (0..dimensions)
+                    .map(|axis| NufftInterval::new(-3.0 - axis as f64, 4.0 + axis as f64))
+                    .collect::<Vec<_>>(),
+                1.0e-6,
+            )
+            .with_precision(precision),
+        )
         .unwrap()
     }
 
@@ -1212,6 +1613,105 @@ mod tests {
                 assert!(shader.contains("df64_mul(Df64(integer_quotient, 0.0), PHASE_TAU)"));
             }
         }
+    }
+
+    #[test]
+    fn native_f64_type3_shaders_are_transcendental_free() {
+        for dimensions in 1..=3 {
+            let metadata = metadata_with_precision(dimensions, FftPrecision::F64);
+            let source = generate_source_wgsl(&metadata).unwrap();
+            let target = generate_target_wgsl(&metadata).unwrap();
+            let final_correction = generate_final_wgsl(FftPrecision::F64).unwrap();
+            assert!(source.contains("array<f64>"));
+            assert!(source.contains("array<vec2<f64>>"));
+            assert!(target.contains("fn outer_kernel_ft(frequency: f64) -> f64"));
+            assert!(target.contains("sincos_f64(angle).x"));
+            assert!(final_correction.contains("array<vec2<f64>>"));
+            for shader in [&source, &target, &final_correction] {
+                assert!(!shader.contains("enable f64"));
+                for forbidden in ["exp(", "log(", "pow(", "sin(", "cos("] {
+                    assert!(
+                        !shader.contains(forbidden),
+                        "native-f64 shader unexpectedly contains {forbidden}:\n{shader}",
+                    );
+                }
+            }
+        }
+        assert!(matches!(
+            generate_final_wgsl(FftPrecision::Df64),
+            Err(NufftError::PrecisionUnsupported {
+                requested: FftPrecision::Df64,
+                ..
+            })
+        ));
+    }
+
+    fn sincos_f64_host(value: f64) -> (f64, f64) {
+        let scaled_quadrant = value * (2.0 / std::f64::consts::PI);
+        let quadrant = if scaled_quadrant >= 0.0 {
+            (scaled_quadrant + 0.5) as i32
+        } else {
+            (scaled_quadrant - 0.5) as i32
+        };
+        let quadrant_f64 = f64::from(quadrant);
+        let angle = ((value - quadrant_f64 * 1.570_796_326_734_125_6)
+            - quadrant_f64 * 6.077_100_506_303_966e-11)
+            - quadrant_f64 * 2.022_266_248_711_166_5e-21;
+        let squared = angle * angle;
+        let mut sine_polynomial = taylor_coefficient(17);
+        for degree in (3..=15).rev().step_by(2) {
+            sine_polynomial = sine_polynomial * squared + taylor_coefficient(degree);
+        }
+        let sine = angle + angle * squared * sine_polynomial;
+        let mut cosine_polynomial = taylor_coefficient(16);
+        for degree in (2..=14).rev().step_by(2) {
+            cosine_polynomial = cosine_polynomial * squared + taylor_coefficient(degree);
+        }
+        let cosine = 1.0 + squared * cosine_polynomial;
+        match quadrant & 3 {
+            0 => (sine, cosine),
+            1 => (cosine, -sine),
+            2 => (-sine, -cosine),
+            _ => (-cosine, sine),
+        }
+    }
+
+    #[test]
+    fn native_f64_sincos_matches_host_transcendentals_through_validated_bound() {
+        for value in [
+            -MAX_NATIVE_F64_PHASE_MAGNITUDE,
+            -123_456.789_012_345,
+            -31.25,
+            -std::f64::consts::PI,
+            -0.25,
+            0.0,
+            0.25,
+            std::f64::consts::PI,
+            31.25,
+            123_456.789_012_345,
+            MAX_NATIVE_F64_PHASE_MAGNITUDE,
+        ] {
+            let (sine, cosine) = sincos_f64_host(value);
+            assert!(
+                (sine - value.sin()).abs() <= 5.0e-16,
+                "value={value:e} sine={sine:e} expected={:e}",
+                value.sin()
+            );
+            assert!(
+                (cosine - value.cos()).abs() <= 5.0e-16,
+                "value={value:e} cosine={cosine:e} expected={:e}",
+                value.cos()
+            );
+        }
+        assert!(
+            validate_phase_bound(FftPrecision::F64, "test", MAX_NATIVE_F64_PHASE_MAGNITUDE).is_ok()
+        );
+        assert!(validate_phase_bound(
+            FftPrecision::F64,
+            "test",
+            MAX_NATIVE_F64_PHASE_MAGNITUDE.next_up()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1289,9 +1789,23 @@ mod tests {
 
     #[test]
     fn dimension_aware_buffer_sizes_are_checked() {
-        assert_eq!(coordinate_buffer_size("test", 7, 3).unwrap(), 84);
-        assert_eq!(complex_buffer_size("test", 7).unwrap(), 56);
-        assert!(coordinate_buffer_size("test", usize::MAX, 3).is_err());
+        assert_eq!(
+            coordinate_buffer_size("test", 7, 3, FftPrecision::F32).unwrap(),
+            84
+        );
+        assert_eq!(
+            coordinate_buffer_size("test", 7, 3, FftPrecision::F64).unwrap(),
+            168
+        );
+        assert_eq!(
+            complex_buffer_size("test", 7, FftPrecision::F32).unwrap(),
+            56
+        );
+        assert_eq!(
+            complex_buffer_size("test", 7, FftPrecision::F64).unwrap(),
+            112
+        );
+        assert!(coordinate_buffer_size("test", usize::MAX, 3, FftPrecision::F64).is_err());
     }
 
     #[test]

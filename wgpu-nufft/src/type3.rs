@@ -5,6 +5,7 @@ use crate::kernel::EsKernel;
 use crate::Complex64;
 use std::f64::consts::PI;
 use std::fmt;
+use wgpu_fft::FftPrecision;
 
 const ARRAYWIDCEN_GROW_FRACTION: f64 = 0.1;
 const FINUFFT_MAX_GRID_POINTS_U64: u64 = 1_000_000_000_000;
@@ -92,6 +93,7 @@ pub struct NufftType3Config {
     sign: NufftSign,
     sigma: f64,
     batch: usize,
+    precision: FftPrecision,
 }
 
 impl NufftType3Config {
@@ -107,6 +109,7 @@ impl NufftType3Config {
             sign: NufftSign::Positive,
             sigma: DEFAULT_SIGMA,
             batch: 1,
+            precision: FftPrecision::F32,
         }
     }
 
@@ -129,6 +132,13 @@ impl NufftType3Config {
     /// strength vectors sharing one source and target point set.
     pub fn with_batch(mut self, batch: usize) -> Self {
         self.batch = batch;
+        self
+    }
+
+    /// Selects the scalar precision used by GPU coordinates, complex values,
+    /// kernel evaluation, and the embedded fine-grid FFT.
+    pub fn with_precision(mut self, precision: FftPrecision) -> Self {
+        self.precision = precision;
         self
     }
 
@@ -162,6 +172,10 @@ impl NufftType3Config {
 
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    pub fn precision(&self) -> FftPrecision {
+        self.precision
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -325,7 +339,7 @@ impl NufftType3Plan {
         })
     }
 
-    /// Builds reusable GPU resources for a portable `f32` type-3 NUFFT.
+    /// Builds reusable GPU resources for a precision-configured type-3 NUFFT.
     ///
     /// Source and target coordinates remain caller-owned and GPU-resident.
     /// Their values must stay within the conservative intervals supplied in
@@ -336,6 +350,13 @@ impl NufftType3Plan {
         queue: &wgpu::Queue,
         config: NufftType3Config,
     ) -> Result<Self> {
+        if !wgpu_fft::device::device_supports_precision(device, config.precision()) {
+            return Err(NufftError::PrecisionUnsupported {
+                requested: config.precision(),
+                stage: "type-3 GPU plan",
+                reason: "the device was not created with wgpu Features::SHADER_F64",
+            });
+        }
         let mut plan = Self::new(config)?;
         let gpu = GpuType3Plan::new(device, queue, &plan)?;
         debug_assert_eq!(gpu.dimensions(), plan.config.dimensions());
@@ -375,6 +396,7 @@ impl NufftType3Plan {
             "type-3 source point buffer",
             source_count,
             self.config.dimensions(),
+            self.config.precision().scalar_size_bytes(),
         )
     }
 
@@ -383,6 +405,7 @@ impl NufftType3Plan {
             "type-3 target point buffer",
             target_count,
             self.config.dimensions(),
+            self.config.precision().scalar_size_bytes(),
         )
     }
 
@@ -405,7 +428,11 @@ impl NufftType3Plan {
             .ok_or(NufftError::LengthOverflow {
                 context: "type-3 batched source strength count",
             })?;
-        complex_buffer_size_bytes("type-3 source strength buffer", values)
+        complex_buffer_size_bytes(
+            "type-3 source strength buffer",
+            values,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     pub fn required_output_buffer_size_bytes_for_batch(
@@ -419,14 +446,19 @@ impl NufftType3Plan {
             .ok_or(NufftError::LengthOverflow {
                 context: "type-3 batched output count",
             })?;
-        complex_buffer_size_bytes("type-3 output buffer", values)
+        complex_buffer_size_bytes(
+            "type-3 output buffer",
+            values,
+            self.config.precision().complex_size_bytes(),
+        )
     }
 
     /// Records a 1D, 2D, or 3D type-3 NUFFT into `encoder` without submission
     /// or host readback.
     ///
-    /// Coordinates are point-major `f32`; strengths and output are complex
-    /// `f32` pairs. Every buffer must include `STORAGE` usage. Ordered
+    /// Coordinates are point-major scalars and strengths/output are complex
+    /// values in the configured precision. Every buffer must include `STORAGE`
+    /// usage. Ordered
     /// executions may reuse this plan; its grow-only scratch is overwritten on
     /// each call.
     #[allow(clippy::too_many_arguments)]
@@ -796,15 +828,20 @@ fn coordinate_buffer_size_bytes(
     context: &'static str,
     point_count: usize,
     dimensions: usize,
+    scalar_size_bytes: u64,
 ) -> Result<u64> {
     let scalar_count = point_count
         .checked_mul(dimensions)
         .ok_or(NufftError::LengthOverflow { context })?;
-    checked_type3_buffer_size(context, scalar_count, 4)
+    checked_type3_buffer_size(context, scalar_count, scalar_size_bytes)
 }
 
-fn complex_buffer_size_bytes(context: &'static str, count: usize) -> Result<u64> {
-    checked_type3_buffer_size(context, count, 8)
+fn complex_buffer_size_bytes(
+    context: &'static str,
+    count: usize,
+    complex_size_bytes: u64,
+) -> Result<u64> {
+    checked_type3_buffer_size(context, count, complex_size_bytes)
 }
 
 fn checked_type3_buffer_size(
@@ -939,8 +976,16 @@ mod tests {
 
         let plan = NufftType3Plan::new(batched).unwrap();
         assert_eq!(plan.config().batch(), 2);
+        assert_eq!(plan.config().precision(), FftPrecision::F32);
         assert_eq!(plan.required_strength_buffer_size_bytes(4).unwrap(), 64);
         assert_eq!(plan.required_output_buffer_size_bytes(3).unwrap(), 48);
+        let f64_plan =
+            NufftType3Plan::new(single.clone().with_precision(FftPrecision::F64)).unwrap();
+        assert_eq!(
+            f64_plan.required_source_point_buffer_size_bytes(4).unwrap(),
+            32
+        );
+        assert_eq!(f64_plan.required_strength_buffer_size_bytes(4).unwrap(), 64);
         assert!(matches!(
             plan.required_output_buffer_size_bytes_for_batch(3, 0),
             Err(NufftError::InvalidBatch {

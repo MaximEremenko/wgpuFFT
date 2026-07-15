@@ -1,5 +1,6 @@
 use crate::error::{NufftError, Result};
 use crate::kernel::EsKernel;
+use wgpu_fft::FftPrecision;
 
 pub const DEFAULT_EPS: f64 = 1.0e-6;
 pub const DEFAULT_SIGMA: f64 = 2.0;
@@ -63,6 +64,7 @@ pub struct NufftConfig {
     sign: NufftSign,
     mode_order: ModeOrder,
     sigma: f64,
+    precision: FftPrecision,
 }
 
 impl NufftConfig {
@@ -75,6 +77,7 @@ impl NufftConfig {
             sign: NufftSign::Positive,
             mode_order: ModeOrder::Centered,
             sigma: DEFAULT_SIGMA,
+            precision: FftPrecision::F32,
         }
     }
 
@@ -113,6 +116,13 @@ impl NufftConfig {
         self
     }
 
+    /// Selects the scalar precision used by GPU coordinates, complex values,
+    /// kernel evaluation, and the embedded fine-grid FFT.
+    pub fn with_precision(mut self, precision: FftPrecision) -> Self {
+        self.precision = precision;
+        self
+    }
+
     pub fn dimensions(&self) -> usize {
         self.n_modes.len()
     }
@@ -147,6 +157,10 @@ impl NufftConfig {
 
     pub fn sigma(&self) -> f64 {
         self.sigma
+    }
+
+    pub fn precision(&self) -> FftPrecision {
+        self.precision
     }
 
     pub fn mode_count(&self) -> Result<usize> {
@@ -198,6 +212,7 @@ impl NufftConfig {
         }
         wgpu_fft::FftConfig::new_nd(fft_shape)
             .with_batch(self.batch)
+            .with_precision(self.precision)
             .validate()
             .map_err(|source| NufftError::FftShapeUnsupported {
                 stage: "requested NUFFT mode shape",
@@ -222,7 +237,15 @@ mod tests {
     fn batch_defaults_to_one_and_rejects_zero() {
         let default = NufftConfig::new([8], DEFAULT_EPS);
         assert_eq!(default.batch(), 1);
+        assert_eq!(default.precision(), FftPrecision::F32);
         assert_eq!(default.clone().with_batch(4).batch(), 4);
+        assert_eq!(
+            default
+                .clone()
+                .with_precision(FftPrecision::F64)
+                .precision(),
+            FftPrecision::F64
+        );
         assert_eq!(
             default.with_batch(0).validate(),
             Err(NufftError::InvalidBatch {

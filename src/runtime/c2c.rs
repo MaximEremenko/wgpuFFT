@@ -1509,7 +1509,7 @@ impl C2cPlan {
         if matches!(&self.execution, C2cExecution::SegmentedVolume(_)) {
             return Err(FftError::LargeGraphStageUnsupported {
                 stage: "segmented-volume-logical-io",
-                reason: "segmented full-volume execution requires a single zero-offset contiguous endpoint buffer",
+                reason: "segmented full-volume execution does not support strided logical I/O",
             });
         }
         if matches!(&self.execution, C2cExecution::FourStep(_)) {

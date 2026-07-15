@@ -77,6 +77,7 @@ pub(crate) struct BoundLogicalIo<'a> {
     pub(crate) physical_ranges: Vec<BufferRange<'a>>,
     pub(crate) storage_aligned: bool,
     pub(crate) copy_aligned: bool,
+    pub(crate) covers_whole_buffers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +230,7 @@ impl<'a> BoundLogicalIo<'a> {
         storage_alignment: u64,
     ) -> Result<Self> {
         let (view, layout) = logical.into_parts();
+        let covers_whole_buffers = view.covers_whole_buffers();
         let segmented = !view.is_single_segment();
         let single_segment_offset = if segmented { None } else { Some(view.offset()) };
         let shape = logical_io_shape(
@@ -262,6 +264,7 @@ impl<'a> BoundLogicalIo<'a> {
             physical_ranges,
             storage_aligned,
             copy_aligned,
+            covers_whole_buffers,
         })
     }
 

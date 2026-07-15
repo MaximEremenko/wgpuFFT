@@ -1,0 +1,94 @@
+# Chrome WebGPU / WASM results — 2026-07-15
+
+This archive records browser execution of `wgpu-fft` and, in later sections,
+`wgpu-nufft`. Chrome compiles the WGSL through its WebGPU implementation and
+Tint; the tests do not exercise naga's native shader-compilation path.
+
+## Environment
+
+- GPU: NVIDIA GeForce RTX 5090
+- NVIDIA driver: 610.47
+- OS: Microsoft Windows 10.0.26200.8737
+- Chrome: 150.0.7871.116
+- ChromeDriver: 150.0.7871.124, branch-heads/7871 revision 3359
+- Rust: rustc 1.95.0 (59807616e, 2026-04-14)
+- `wasm-bindgen`: 0.2.120
+- `wgpu`: 29.0.3
+- Phase A base commit: `d1b589928b467336f331f991916e0d562de6ffe9`
+
+The checked-in `webdriver.json` requested Chrome with
+`--enable-unsafe-webgpu`, `--disable-gpu-sandbox`, `--no-first-run`,
+`--no-default-browser-check`, `--disable-background-networking`,
+`--disable-component-update`, `--disable-breakpad`, and
+`--disable-crash-reporter`. The runner was headless Chrome through
+`wasm-bindgen-test-runner` and ChromeDriver.
+
+## Phase A — build and smoke
+
+The full workspace compiled for `wasm32-unknown-unknown`. An adapter-max browser
+device executed a four-element C2C transform and matched the baked-in expected
+values. Native workspace tests and the complete RTX 5090 Vulkan release GPU
+matrix also remained green.
+
+## Phase B — browser-default correctness
+
+### Method
+
+The correctness matrix deliberately requested a separate featureless device
+with `required_limits: wgpu::Limits::default()`. The device reported exactly:
+
+| Limit | Value |
+|---|---:|
+| `maxStorageBufferBindingSize` | 134,217,728 B (128 MiB) |
+| `maxBufferSize` | 268,435,456 B (256 MiB) |
+| `maxComputeWorkgroupStorageSize` | 16,384 B (16 KiB) |
+| `maxComputeInvocationsPerWorkgroup` | 256 |
+
+Small transforms were read back in full and compared with the Rust CPU
+references. Large routes used a unit impulse and sampled outputs, including
+samples immediately before and after physical segment boundaries. A forward,
+unnormalized transform of that impulse is exactly `(1, 0)` at every output.
+
+### Results
+
+| Suite | Browser-default evidence | Result |
+|---|---|---:|
+| Smooth C2C | N=330, forward and inverse, mixed-radix route | PASS |
+| Rader C2C | N=101, forward and inverse | PASS |
+| Bluestein C2C | N=85, forward and inverse | PASS |
+| Fused boundary | N=2048: one fused stage, zero workspace; relative L2 `1.342e-7` vs f64 oracle | PASS |
+| Fused fallback | N=4096: Stockham multipass, nonzero workspace; relative L2 `1.365e-7` vs f64 oracle | PASS |
+| Real transforms | R2C and C2R, N=34 Bluestein route | PASS |
+| Native f64 gate | `PrecisionUnsupported { reason: "device-missing-shader-f64" }` | PASS |
+| Df64 Tint canary | 4 adversarial cases, all 96 u32 words bit-exact | PASS |
+| Natural four-step | shape `[4096, 4116]`, 134,873,088 B > 128 MiB binding | PASS |
+| Natural segmented volume | shape `[4096, 8232]`, 269,746,176 B > 256 MiB buffer | PASS |
+
+Browser-reported test times were 2.53 s for the core matrix, 0.82 s for the two
+large-route cases, and 0.13 s for the smoke test. These are test-suite timings,
+not benchmark results.
+
+The segmented case used three whole physical buffers for each endpoint and
+sampled across both the 128 MiB and 256 MiB logical boundaries. Enabling this
+real browser use case required a bounded endpoint relaxation: segmented
+full-volume execution now accepts zero-offset views composed exclusively of
+distinct whole physical buffers. Partial or aliased buffers, nonzero logical
+offsets, and strided logical I/O remain structured errors.
+
+### Df64 verdict
+
+Tint preserved every error-free-transform invariant exactly on this Chrome
+build. Browser Df64 therefore remains enabled. This result is compiler- and
+browser-version-specific, which is why the public canary API is retained for
+the website wrapper instead of treating this one pass as a permanent compiler
+guarantee. Browser F64 remains unavailable and fails through the existing
+structured precision error.
+
+### Native parity
+
+After the browser changes, `cargo test --workspace` passed 300 `wgpu-fft` unit
+tests, 90 `wgpu-nufft` unit tests, and 19 CPU-foundation integration tests. The
+complete release GPU workspace command passed in 321.8 s on the RTX 5090 using
+Vulkan and driver 610.47; adapter lines were emitted by the FFT and NUFFT
+suites. The public df64 canary also remained bit-exact on native Vulkan and
+DX12.

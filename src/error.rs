@@ -87,6 +87,12 @@ pub enum FftError {
         required: u64,
         actual: u64,
     },
+    /// A host slice passed to a CPU plan has the wrong number of scalar words.
+    HostBufferLength {
+        buffer: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     BufferViewEmptySegments,
     BufferSegmentZeroSize {
         index: usize,
@@ -341,6 +347,14 @@ impl fmt::Display for FftError {
             Self::BufferViewTooSmall { required, actual } => write!(
                 f,
                 "FFT buffer view is too small: required {required} bytes, got {actual} bytes"
+            ),
+            Self::HostBufferLength {
+                buffer,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "FFT host {buffer} buffer has {actual} scalar words, expected {expected}"
             ),
             Self::BufferViewEmptySegments => {
                 write!(f, "FFT buffer view must contain at least one segment")
@@ -620,6 +634,12 @@ impl FftError {
                     .with_layout("logical view")
                     .with_required_bytes(*required)
                     .with_actual_bytes(*actual)
+            }
+            Self::HostBufferLength { buffer, .. } => {
+                FftBlocker::new(FftBlockerKind::Validation, self.to_string())
+                    .with_route("cpu")
+                    .with_stage("host-buffer")
+                    .with_layout(*buffer)
             }
             Self::BufferViewEmptySegments => {
                 FftBlocker::new(FftBlockerKind::Layout, self.to_string())

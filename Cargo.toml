@@ -19,11 +19,15 @@ name = "wgpu_fft"
 path = "src/lib.rs"
 
 [features]
-default = []
+default = ["cpu"]
+cpu = ["dep:num-complex", "dep:realfft", "dep:rustfft"]
 serde = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 bytemuck = { version = "1.22", features = ["derive"] }
+num-complex = { version = "0.4", features = ["bytemuck"], optional = true }
+realfft = { version = "3.5", optional = true }
+rustfft = { version = "6.4", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 wgpu = "30.0.1"

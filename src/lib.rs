@@ -37,8 +37,13 @@
 //! the optional `serde` feature adds validated, versioned JSON persistence.
 //! Long-running shape sweeps can explicitly clear thread-local per-device cache
 //! entries.
+//!
+//! With the default `cpu` feature, [`CpuFftPlan`] runs the same transforms on
+//! host memory, for machines without a usable GPU adapter.
 
 pub mod config;
+#[cfg(feature = "cpu")]
+pub mod cpu;
 pub mod device;
 pub mod df64_canary;
 pub mod diagnostics;
@@ -50,6 +55,8 @@ pub mod runtime;
 pub mod tuning;
 
 pub use config::{FftConfig, FftDirection, FftPrecision, Normalization};
+#[cfg(feature = "cpu")]
+pub use cpu::CpuFftPlan;
 pub use df64_canary::{
     validate_df64_invariants, Df64CanaryError, Df64CanaryReport, DF64_CANARY_CASE_COUNT,
     DF64_CANARY_WORD_COUNT,

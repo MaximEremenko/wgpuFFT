@@ -1470,6 +1470,10 @@ mod tests {
         let wgsl = generate_fused_bluestein_wgsl_for_key(&key);
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 441>"));
         assert!(wgsl.contains("c_mul(input[base + t * STRIDE], chirp[t])"));
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
+        // The convolution padding must be zeroed in-kernel: pipelines skip
+        // wgpu's workgroup zero fill.
+        assert!(wgsl.contains("scratch[t] = vec2<f32>(0.0, 0.0);"));
         assert!(wgsl.contains("scratch[t] = c_mul(scratch[t], bfft[t])"));
         assert!(wgsl.contains("c_mul(convolution, chirp[t])"));
         assert!(wgsl.contains("fn twiddle_forward"));

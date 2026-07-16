@@ -1955,6 +1955,7 @@ mod tests {
         let barrier = wgsl.find("workgroupBarrier();").unwrap();
         let store_guard = wgsl.find("if (output_x <").unwrap();
         assert!(load_guard < barrier && barrier < store_guard);
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "tile_data");
     }
 
     #[test]

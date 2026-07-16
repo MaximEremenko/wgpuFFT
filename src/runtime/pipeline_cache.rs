@@ -521,7 +521,16 @@ impl PipelineCache {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some(&key.entry_point),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                // Every generated kernel writes the workgroup memory it reads
+                // before its first barrier (Bluestein and Rader store explicit
+                // zeros in their padding), so wgpu's zero fill is redundant.
+                // naga lowers that fill to a serial store loop on one
+                // invocation, which made FXC take minutes per fused kernel and
+                // DXC seconds. Browsers always zero-fill regardless.
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
             cache: None,
         });
         self.compute_pipelines.insert(key.clone(), pipeline.clone());

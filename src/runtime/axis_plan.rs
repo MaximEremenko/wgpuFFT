@@ -2753,6 +2753,7 @@ mod tests {
         assert!(wgsl.contains("@compute @workgroup_size(256, 1, 1)"));
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 4096>;"));
         assert!(wgsl.contains("scratch[bit_reverse(p)] = src[srcIdx];"));
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
         assert!(wgsl.contains("dst[dstIdx] = value;"));
         assert!(wgsl.contains("@binding(3) var<storage, read> axisTwiddles"));
         assert!(wgsl.contains("let z8: vec2<f32> = twiddle(j *"));
@@ -2858,6 +2859,7 @@ mod tests {
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 3000>;"));
         assert!(wgsl.contains("const LINE_SLOT_COUNT: u32 = 12u;"));
         assert!(wgsl.contains("scratch[p] = src[srcIdx];"));
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
         assert!(wgsl.contains("var stageOut_1_7: vec2<f32>"));
         assert!(wgsl.contains("if (unit_1 < 375u)"));
         assert!(wgsl.contains("scratch[block_1 * 8u + 7u * 1u + j_1] = stageOut_1_7;"));

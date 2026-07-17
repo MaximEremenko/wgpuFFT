@@ -491,7 +491,7 @@ impl PipelineCache {
         }
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
+            label: Some(&shader_module_label(label)),
             source: wgpu::ShaderSource::Wgsl({
                 let source = source();
                 self.shader_sources.insert(key.clone(), source.clone());
@@ -2284,6 +2284,15 @@ fn device_cache_id(device: &wgpu::Device) -> u64 {
     hasher.finish()
 }
 
+/// Debug label passed to wgpu for a shader module.
+///
+/// wgpu hands the label to DXC as the source file name, and DXC fails to
+/// "read" names with some colon patterns (such as `a:b=c`), which stable
+/// cache keys contain. Cache keys themselves are unchanged.
+fn shader_module_label(label: &str) -> String {
+    label.replace(':', ".")
+}
+
 fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroupLayoutEntry> {
     match key {
         PipelineLayoutCacheKey::C2cSmoothBinaryF32
@@ -2441,6 +2450,16 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shader_module_labels_have_no_colons() {
+        assert_eq!(
+            shader_module_label(
+                "wgpu_fft.c2c.strided.shader.shader:v2:c2c-strided:precision=f32:workgroup=64"
+            ),
+            "wgpu_fft.c2c.strided.shader.shader.v2.c2c-strided.precision=f32.workgroup=64"
+        );
+    }
 
     #[test]
     fn stockham_shader_key_is_stable_and_includes_stage_constants() {

@@ -1,0 +1,16 @@
+[package]
+name = "nd-nufft-gpu-experiment"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone scratch crate — deliberately NOT a member of the wgpuFFT workspace.
+[workspace]
+
+[dependencies]
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1.22", features = ["derive"] }
+
+[profile.release]
+opt-level = 3

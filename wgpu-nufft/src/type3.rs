@@ -186,11 +186,11 @@ impl NufftType3Config {
             });
         }
         let dimensions = self.dimensions();
-        if !(1..=3).contains(&dimensions) {
+        if !(1..=crate::config::MAX_NUFFT_DIMENSIONS).contains(&dimensions) {
             return Err(NufftError::InvalidDimensions {
                 actual: dimensions,
                 minimum: 1,
-                maximum: 3,
+                maximum: crate::config::MAX_NUFFT_DIMENSIONS,
             });
         }
         if self.target_bounds.len() != dimensions {
@@ -917,9 +917,9 @@ mod tests {
 
     #[test]
     fn direct_type3_oracle_matches_one_source_analytic_cases_in_all_dimensions() {
-        for dimensions in 1..=3 {
-            let source = [0.37, -0.21, 0.49][..dimensions].to_vec();
-            let target = [-1.3, 0.72, 1.11][..dimensions].to_vec();
+        for dimensions in 1..=4 {
+            let source = [0.37, -0.21, 0.49, -0.58][..dimensions].to_vec();
+            let target = [-1.3, 0.72, 1.11, 0.63][..dimensions].to_vec();
             let source_bounds = source
                 .iter()
                 .map(|&value| NufftInterval::new(value - 0.5, value + 0.5))
@@ -1008,22 +1008,22 @@ mod tests {
 
     #[test]
     fn direct_type3_oracle_obeys_the_opposite_sign_adjoint_identity() {
-        for dimensions in 1..=3 {
+        for dimensions in 1..=4 {
             let source_coordinates = [
-                -0.71, 0.23, 0.41, //
-                0.13, -0.57, 0.82, //
-                0.64, 0.38, -0.29,
+                -0.71, 0.23, 0.41, -0.36, //
+                0.13, -0.57, 0.82, 0.61, //
+                0.64, 0.38, -0.29, -0.87,
             ]
-            .chunks_exact(3)
+            .chunks_exact(4)
             .flat_map(|point| point[..dimensions].iter().copied())
             .collect::<Vec<_>>();
             let target_frequencies = [
-                -1.31, 0.47, 0.93, //
-                0.22, -0.76, 1.17, //
-                1.09, 0.31, -0.58, //
-                -0.43, 0.88, 0.14,
+                -1.31, 0.47, 0.93, 1.21, //
+                0.22, -0.76, 1.17, -0.94, //
+                1.09, 0.31, -0.58, 0.42, //
+                -0.43, 0.88, 0.14, -1.37,
             ]
-            .chunks_exact(3)
+            .chunks_exact(4)
             .flat_map(|point| point[..dimensions].iter().copied())
             .collect::<Vec<_>>();
             let source_bounds = (0..dimensions)

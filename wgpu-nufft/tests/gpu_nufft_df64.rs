@@ -74,7 +74,7 @@ async fn run_df64_cases() {
         ] {
             validate_type1_and_type2(&primary.0, &primary.1, &shape, sign);
         }
-        for dimensions in 1..=3 {
+        for dimensions in 1..=4 {
             validate_type12_adjoint(&primary.0, &primary.1, dimensions);
             for sign in [NufftSign::Positive, NufftSign::Negative] {
                 validate_type3_oracle(&primary.0, &primary.1, dimensions, sign);
@@ -165,6 +165,7 @@ fn validate_type12_adjoint(device: &wgpu::Device, queue: &wgpu::Queue, dimension
         1 => vec![15],
         2 => vec![5, 7],
         3 => vec![3, 4, 5],
+        4 => vec![3, 4, 3, 4],
         _ => unreachable!(),
     };
     let point_count = 9;

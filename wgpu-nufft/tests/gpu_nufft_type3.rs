@@ -42,7 +42,7 @@ async fn run_gpu_type3_cases() {
 }
 
 fn validate_accuracy_matrix(device: &wgpu::Device, queue: &wgpu::Queue) {
-    for dimensions in 1..=3 {
+    for dimensions in 1..=4 {
         let (source_bounds, target_bounds) = planned_bounds(dimensions);
         for eps in [1.0e-2, 1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6] {
             for sign in [NufftSign::Positive, NufftSign::Negative] {
@@ -192,7 +192,7 @@ fn validate_zero_source_and_target_counts(device: &wgpu::Device, queue: &wgpu::Q
 }
 
 fn validate_adjoint_consistency(device: &wgpu::Device, queue: &wgpu::Queue) {
-    for dimensions in 1..=3 {
+    for dimensions in 1..=4 {
         let (source_bounds, target_bounds) = planned_bounds(dimensions);
         let source =
             PointClass::Random.coordinates(&source_bounds, 9, 0xa341_316c ^ dimensions as u32);
@@ -320,10 +320,10 @@ impl PointClass {
 }
 
 fn planned_bounds(dimensions: usize) -> (Vec<NufftInterval>, Vec<NufftInterval>) {
-    let source_centers = [0.35f32, -0.45, 0.7];
-    let source_half_widths = [1.0f32, 1.2, 0.8];
-    let target_centers = [0.8f32, -1.1, 0.55];
-    let target_half_widths = [2.2f32, 1.7, 2.5];
+    let source_centers = [0.35f32, -0.45, 0.7, 0.15];
+    let source_half_widths = [1.0f32, 1.2, 0.8, 1.1];
+    let target_centers = [0.8f32, -1.1, 0.55, -0.35];
+    let target_half_widths = [2.2f32, 1.7, 2.5, 1.9];
     let source = (0..dimensions)
         .map(|axis| {
             NufftInterval::new(

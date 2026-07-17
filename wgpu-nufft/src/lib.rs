@@ -23,6 +23,7 @@ mod gpu_scan;
 mod gpu_type1;
 mod gpu_type1_2d;
 mod gpu_type1_3d;
+mod gpu_type1_nd;
 mod gpu_type1_scratch;
 mod gpu_type3;
 mod kernel;

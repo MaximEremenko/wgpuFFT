@@ -673,19 +673,25 @@ fn validate_structured_gpu_errors(device: &wgpu::Device, queue: &wgpu::Queue) {
         NufftPlan::type2_gpu(
             device,
             queue,
-            NufftConfig::new([4, 4, 4, 4], 1.0e-6)
-                .with_precision(wgpu_fft::FftPrecision::Df64),
+            NufftConfig::new([4, 4, 4, 4], 1.0e-6).with_precision(wgpu_fft::FftPrecision::Df64),
         ),
         Err(NufftError::PrecisionUnsupported {
             stage: "rank-generic type-2 GPU plan",
             ..
         })
     ));
+    assert!(
+        NufftPlan::type1_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)).is_ok(),
+        "rank-generic d=4 type-1 plan creation must succeed"
+    );
     assert!(matches!(
-        NufftPlan::type1_gpu(device, queue, NufftConfig::new([4, 4, 4, 4], 1.0e-6)),
-        Err(NufftError::GpuDimensionsUnsupported {
-            actual: 4,
-            supported: 3,
+        NufftPlan::type1_gpu(
+            device,
+            queue,
+            NufftConfig::new([4, 4, 4, 4], 1.0e-6).with_precision(wgpu_fft::FftPrecision::Df64),
+        ),
+        Err(NufftError::PrecisionUnsupported {
+            stage: "rank-generic type-1 GPU plan",
             ..
         })
     ));

@@ -9,7 +9,10 @@ use std::f64::consts::PI;
 use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
-use wgpu_nufft::{reference_type2_f64, Complex64, ModeOrder, NufftConfig, NufftPlan, NufftSign};
+use wgpu_nufft::{
+    reference_type1_f64, reference_type2_f64, Complex64, ModeOrder, NufftConfig, NufftPlan,
+    NufftSign,
+};
 
 #[test]
 fn gpu_type2_nd_matches_oracle() {
@@ -110,8 +113,91 @@ async fn run_cases() {
         .await;
     }
 
+    adjoint_case(&context).await;
+
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+/// <y, A x> == <A^H y, x>: type-2 with one sign is adjoint to type-1 with the
+/// opposite sign under complex inner products.
+async fn adjoint_case(context: &wgpu_fft::device::GpuContext) {
+    let n_modes = vec![6usize, 5, 4, 4];
+    let eps = 1.0e-6;
+    let config_t2 = NufftConfig::new(n_modes.clone(), eps).with_sign(NufftSign::Negative);
+    let config_t1 = NufftConfig::new(n_modes.clone(), eps).with_sign(NufftSign::Positive);
+    let mode_count: usize = n_modes.iter().product();
+    let dims = n_modes.len();
+    let point_count = 29;
+
+    let mut state = 0xfeed_beef_dead_c0deu64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    let points: Vec<f32> = (0..point_count * dims)
+        .map(|_| ((next() * 2.0 - 1.0) * PI) as f32)
+        .collect();
+    let fhat: Vec<f32> = (0..mode_count * 2)
+        .map(|_| (next() * 2.0 - 1.0) as f32)
+        .collect();
+    let y: Vec<f32> = (0..point_count * 2)
+        .map(|_| (next() * 2.0 - 1.0) as f32)
+        .collect();
+
+    let scope = context
+        .device
+        .push_error_scope(wgpu::ErrorFilter::Validation);
+    let plan_t2 = NufftPlan::type2_gpu(&context.device, &context.queue, config_t2).unwrap();
+    let plan_t1 = NufftPlan::type1_gpu(&context.device, &context.queue, config_t1).unwrap();
+    let t2_out = execute_type2(
+        &context.device,
+        &context.queue,
+        &plan_t2,
+        point_count,
+        1,
+        &points,
+        &fhat,
+    );
+    let t1_out = execute_type1(
+        &context.device,
+        &context.queue,
+        &plan_t1,
+        point_count,
+        1,
+        mode_count,
+        &points,
+        &y,
+    );
+    if let Some(error) = scope.pop().await {
+        panic!("adjoint case: validation error: {error}");
+    }
+
+    let vdot = |a: &[f32], b: &[f32]| -> (f64, f64) {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for (pa, pb) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+            let (ar, ai) = (f64::from(pa[0]), -f64::from(pa[1]));
+            let (br, bi) = (f64::from(pb[0]), f64::from(pb[1]));
+            re += ar * br - ai * bi;
+            im += ar * bi + ai * br;
+        }
+        (re, im)
+    };
+    let lhs = vdot(&y, &t2_out);
+    let rhs = vdot(&t1_out, &fhat);
+    let difference = ((lhs.0 - rhs.0).powi(2) + (lhs.1 - rhs.1).powi(2)).sqrt();
+    let scale = (lhs.0 * lhs.0 + lhs.1 * lhs.1)
+        .sqrt()
+        .max(f64::MIN_POSITIVE);
+    let residual = difference / scale;
+    eprintln!("NUFFT_ND_ADJOINT 4d: residual={residual:.9e}");
+    assert!(
+        residual <= 2.0e-5,
+        "4d adjoint residual {residual} exceeds 2.0e-5"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,10 +280,47 @@ async fn run_case(
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let error = relative_l2(&actual_complex, &reference);
-        eprintln!("NUFFT_ND_ACCURACY {label}: relative_l2={error:.9e}");
+        eprintln!("NUFFT_ND_ACCURACY {label} type-2: relative_l2={error:.9e}");
         assert!(
             error <= tolerance_factor * eps,
-            "{label}: relative l2 {error} exceeds {} * {eps}",
+            "{label}: type-2 relative l2 {error} exceeds {} * {eps}",
+            tolerance_factor
+        );
+
+        // type-1 on the same points: strengths are transform-major complex
+        let strengths: Vec<f32> = (0..point_count * batch * 2)
+            .map(|index| ((index as f64 * 0.37).sin() * 0.9) as f32)
+            .collect();
+        let plan_t1 = NufftPlan::type1_gpu(&context.device, &context.queue, config.clone())
+            .unwrap_or_else(|error| panic!("{label}: type-1 plan creation failed: {error}"));
+        let t1_actual = execute_type1(
+            &context.device,
+            &context.queue,
+            &plan_t1,
+            point_count,
+            batch,
+            mode_count,
+            &points,
+            &strengths,
+        );
+        let t1_reference = reference_type1_f64(
+            &config,
+            &points.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
+            &strengths
+                .chunks_exact(2)
+                .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let t1_actual_complex = t1_actual
+            .chunks_exact(2)
+            .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
+            .collect::<Vec<_>>();
+        let t1_error = relative_l2(&t1_actual_complex, &t1_reference);
+        eprintln!("NUFFT_ND_ACCURACY {label} type-1: relative_l2={t1_error:.9e}");
+        assert!(
+            t1_error <= tolerance_factor * eps,
+            "{label}: type-1 relative l2 {t1_error} exceeds {} * {eps}",
             tolerance_factor
         );
         scope
@@ -249,6 +372,70 @@ fn execute_type2(
         batch,
         &point_buffer,
         &coefficient_buffer,
+        &output,
+    )
+    .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = slice.get_mapped_range();
+    let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+    drop(mapped);
+    readback.unmap();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_type1(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    point_count: usize,
+    batch: usize,
+    mode_count: usize,
+    points: &[f32],
+    strengths: &[f32],
+) -> Vec<f32> {
+    let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.t1_points"),
+        contents: bytemuck::cast_slice(points),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let strength_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.t1_strengths"),
+        contents: bytemuck::cast_slice(strengths),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes = (mode_count * batch * 8) as u64;
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.t1_output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.t1_readback"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test_nd.t1_encoder"),
+    });
+    plan.encode_type1_gpu_batch(
+        device,
+        &mut encoder,
+        point_count,
+        batch,
+        &point_buffer,
+        &strength_buffer,
         &output,
     )
     .unwrap();

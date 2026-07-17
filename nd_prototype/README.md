@@ -33,8 +33,21 @@ residuals are at machine precision (<= 7e-12), confirming the type-1/type-2
 composition is exactly consistent. This empirically answers the design note's
 open question 10.1: spread and RT placements compose without error inflation.
 
+## Stage-2 verdict (2026-07-17)
+
+`python cost.py` — analytic update counters match instrumented execution
+exactly on every placement mix. Two corrections fed back into the design note:
+(1) RT multiplicity K multiplies spreading work (per-point updates =
+prod(w_spread) * prod(K_rt)), so per-point work is placement-invariant — the
+"rank budget" is paid identically everywhere; placement chooses only where
+memory and FFT passes go. (2) Interpolation-based K is ~10 at eps=1e-6 vs the
+SVD floor of 7 (stage-3 optimization: SVD-derived factors).
+Placement policy (`choose_placements`): sigma=2 for d<=3, sigma=1.25 for d>=4,
+RT only under hard memory walls — it is exactly what fits 64^4 into a 256 MiB
+browser budget (250 MiB); >=96^4 in browsers needs streaming/segmented
+execution (wgpu-fft's large-route machinery, if adopted).
+
 ## Next stages (per the design note)
 
-2. Cost-model calibration (update/byte counters vs the note's tables).
 3. WGSL tensor-contraction tile kernel experiment (separate scratch crate).
 4. Adoption decision for wgpu-nufft.

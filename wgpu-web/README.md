@@ -62,3 +62,8 @@ low word. Thus point coordinates become `[x_hi, x_lo, ...]`, and interleaved
 complex `[re, im]` values become
 `[re_hi, re_lo, im_hi, im_lo]`. Df64 plan creation is available only after the
 browser compiler passes all 96 arithmetic canary words.
+
+## License
+
+Licensed under the Apache License, Version 2.0 ([LICENSE](../LICENSE) or
+<http://www.apache.org/licenses/LICENSE-2.0>).

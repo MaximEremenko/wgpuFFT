@@ -22,12 +22,29 @@ pub fn device_supports_precision(device: &wgpu::Device, precision: FftPrecision)
     }
 }
 
+/// `WGPU_FFT_FORCE_FALLBACK=1` routes the whole stack onto the platform's
+/// software adapter (WARP on Windows, lavapipe on Linux): the same WGSL
+/// pipelines execute on the CPU. Native builds only; ignored in wasm.
+fn force_fallback_from_env() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        matches!(
+            std::env::var("WGPU_FFT_FORCE_FALLBACK").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        )
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
 pub async fn request_default_device() -> Option<GpuContext> {
     let instance = wgpu::Instance::new(default_instance_descriptor());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
+            force_fallback_adapter: force_fallback_from_env(),
             compatible_surface: None,
         })
         .await

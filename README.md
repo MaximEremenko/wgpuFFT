@@ -2,27 +2,50 @@
 
 Rust `wgpu` FFT library. The package name is `wgpu-fft`; the library target is
 imported as `wgpu_fft`. This is the Rust counterpart of the JavaScript
-[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The upper
-`wgpuNUFFT` repository builds nonuniform transforms on this FFT crate.
-
-In a `wgpuNUFFT` checkout, this repository is pinned as the `wgpuFFT/` Git
-submodule. Clone the upper repository with `--recurse-submodules`, or run
-`git submodule update --init --recursive` there, so its NUFFT implementation
-uses the exact FFT revision recorded by the upper repository. This crate also
-remains usable as the standalone FFT repository.
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The
+[wgpuNUFFT](https://github.com/MaximEremenko/wgpuNUFFT) project builds
+nonuniform transforms on this crate and pins it as a Git submodule.
 
 ## Installation
 
-This crate is intentionally kept local/GitHub-only and is not published on
-crates.io. For standalone use, depend on it directly from GitHub:
+This crate is intentionally kept GitHub-only and is not published on
+crates.io. Depend on a tagged release, together with the matching `wgpu`
+major version, because the public API takes `wgpu` types such as
+`&wgpu::Device` and `&wgpu::Buffer`:
 
 ```toml
 [dependencies]
-wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT" }
+wgpu = "30"
+wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT", tag = "v0.1.0" }
 ```
 
+The default `cpu` feature adds the host-memory [CPU backend](#cpu-backend).
 The optional `serde` feature adds schema-versioned JSON persistence for
 pipeline-cache snapshots. The minimum supported Rust version is 1.92.
+
+## Quick start
+
+[`examples/quickstart.rs`](examples/quickstart.rs) runs a forward FFT on the
+default GPU and falls back to the CPU backend when no adapter is available:
+
+```bash
+cargo run --example quickstart
+```
+
+A plan records its transform into your own command encoder, reading and
+writing caller-owned buffers of `plan.required_buffer_size_bytes()` bytes (input
+`STORAGE | COPY_DST`, output `STORAGE | COPY_SRC` to read results back):
+
+```rust
+let gpu = wgpu_fft::device::request_default_device().await.expect("GPU adapter");
+let plan = FftPlan::c2c(&gpu.device, &gpu.queue, FftConfig::new(1024))?;
+let mut encoder = gpu.device.create_command_encoder(&Default::default());
+plan.execute_checked(&gpu.device, &mut encoder, &input, &output)?;
+gpu.queue.submit([encoder.finish()]);
+```
+
+`execute_checked` returns a structured error for undersized buffers or missing
+buffer usages; `execute` panics in those cases.
 
 This crate exposes a native Rust API for out-of-place complex-to-complex `f32`,
 native `f64`, and portable double-float (`df64`) transforms, plus
@@ -260,11 +283,28 @@ pass.
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
 - In-place execution, `f16`, DCT/DST, public convolution, and nonuniform
-  transforms remain out of scope. NUFFT functionality lives in the downstream
-  `wgpuNUFFT` library.
+  transforms remain out of scope. Nonuniform FFTs live in
+  [wgpuNUFFT](https://github.com/MaximEremenko/wgpuNUFFT).
 - The native test/example device helper requests the selected adapter's active
   limits so planner diagnostics and huge-route scheduling see the real storage
   binding and buffer-size limits exposed by that adapter.
+
+## Backends and platforms
+
+`request_default_device()` asks wgpu for a high-performance adapter from
+Vulkan, Metal, or DX12 (the browser WebGPU backend on wasm). When several
+backends expose the same GPU, Vulkan is listed first.
+
+On DX12, wgpu compiles shaders with DXC when it is available: statically linked
+through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual Studio 2022
+17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to the
+executable or on `PATH`. Otherwise it falls back to the legacy FXC compiler.
+Every route works with both, but FXC is much slower to create plans: the GPU
+test suite takes 271 s with FXC and 118 s with DXC, and `df64`
+plans are the slowest. Ship DXC with DX12 applications, or prefer Vulkan.
+
+Tested under Windows 11 with Vulkan, DX12 (FXC and DXC), and Chrome 153's
+WebGPU. Metal and Linux have not been tested.
 
 ## Commands
 
@@ -285,19 +325,18 @@ $env:WGPU_BACKEND = 'dx12'; $env:WGPU_FFT_RUN_GPU_TESTS = '1'
 cargo test --test gpu_df64_canary --release -- --nocapture
 ```
 
-FFT browser (Wasm) tests are maintained by the upper `wgpuNUFFT` repository,
-whose harness pins this submodule revision and needs a ChromeDriver matching the
-installed Chrome build (set `CHROMEDRIVER` or put `chromedriver.exe` on
-`PATH`). From the root of a recursive `wgpuNUFFT` checkout, run:
+Browser (Wasm) tests run in Chrome's WebGPU implementation through
+`wasm-bindgen-test-runner` and a ChromeDriver matching the installed Chrome
+build (set `CHROMEDRIVER` or put `chromedriver.exe` on `PATH`):
 
 ```bat
 web\run_browser_tests.cmd
 ```
 
-The FFT portion covers this crate's smoke, correctness-matrix, and large-route
-tests. See `web/README.md` in the upper repository for browser prerequisites and
-the complete cross-library test matrix. A standalone `wgpuFFT` checkout does
-not contain that runner.
+The runner covers the smoke, correctness-matrix, and large-route tests; see
+[web/README.md](web/README.md) for prerequisites. The installed
+`wasm-bindgen-cli` version must exactly match the `wasm-bindgen` version in
+`Cargo.lock` (currently 0.2.129).
 
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
 is set. The native test helper excludes the GL backend by default because EGL

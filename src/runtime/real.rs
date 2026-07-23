@@ -23,6 +23,7 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, PipelineLayoutCacheKey, RealKernelKind,
     RealStageKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::WindowScheduler;
 use crate::tuning::{FftLargeRoute, FftTuningErrorKind};
@@ -957,6 +958,18 @@ impl R2cPlan {
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
+        self.execute_views_recorded(device, &mut CommandRecorder::new(encoder), input, output)
+    }
+
+    /// [`Self::execute_views`] for plans nested in another execution, which
+    /// share the caller's compute pass.
+    pub(crate) fn execute_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
         self.validate_execution_graph(device)?;
         match &self.execution {
             R2cExecution::Normal(plan) => {
@@ -987,7 +1000,13 @@ impl R2cPlan {
         input: FftLogicalView<'_>,
         output: FftLogicalView<'_>,
     ) -> Result<()> {
-        execute_r2c_logical_views(device, encoder, self, input, output)
+        execute_r2c_logical_views(
+            device,
+            &mut CommandRecorder::new(encoder),
+            self,
+            input,
+            output,
+        )
     }
 
     fn validate_execution_graph(&self, device: &wgpu::Device) -> Result<()> {
@@ -1238,6 +1257,18 @@ impl C2rPlan {
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
+        self.execute_views_recorded(device, &mut CommandRecorder::new(encoder), input, output)
+    }
+
+    /// [`Self::execute_views`] for plans nested in another execution, which
+    /// share the caller's compute pass.
+    pub(crate) fn execute_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
         self.validate_execution_graph(device)?;
         match &self.execution {
             C2rExecution::Normal(plan) => {
@@ -1268,7 +1299,13 @@ impl C2rPlan {
         input: FftLogicalView<'_>,
         output: FftLogicalView<'_>,
     ) -> Result<()> {
-        execute_c2r_logical_views(device, encoder, self, input, output)
+        execute_c2r_logical_views(
+            device,
+            &mut CommandRecorder::new(encoder),
+            self,
+            input,
+            output,
+        )
     }
 
     fn validate_execution_graph(&self, device: &wgpu::Device) -> Result<()> {
@@ -1280,7 +1317,7 @@ impl C2rPlan {
 
 fn execute_r2c_logical_views(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     plan: &R2cPlan,
     input: FftLogicalView<'_>,
     output: FftLogicalView<'_>,
@@ -1308,13 +1345,15 @@ fn execute_r2c_logical_views(
         plan.sizes.real_bytes,
         plan.sizes.packed_bytes,
         plan.config.tuning().workgroup_size(),
-        |device, encoder, input, output| plan.execute_views(device, encoder, input, output),
+        |device, encoder, input, output| {
+            plan.execute_views_recorded(device, encoder, input, output)
+        },
     )
 }
 
 fn execute_c2r_logical_views(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     plan: &C2rPlan,
     input: FftLogicalView<'_>,
     output: FftLogicalView<'_>,
@@ -1342,13 +1381,15 @@ fn execute_c2r_logical_views(
         plan.sizes.packed_bytes,
         plan.sizes.real_bytes,
         plan.config.tuning().workgroup_size(),
-        |device, encoder, input, output| plan.execute_views(device, encoder, input, output),
+        |device, encoder, input, output| {
+            plan.execute_views_recorded(device, encoder, input, output)
+        },
     )
 }
 
 fn execute_real_logical_views(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     input: &BoundLogicalIo<'_>,
     output: &BoundLogicalIo<'_>,
     required_input_bytes: u64,
@@ -1356,7 +1397,7 @@ fn execute_real_logical_views(
     workgroup_size: u32,
     execute: impl for<'i, 'o> FnOnce(
         &wgpu::Device,
-        &mut wgpu::CommandEncoder,
+        &mut CommandRecorder<'_>,
         BufferView<'i>,
         BufferView<'o>,
     ) -> Result<()>,
@@ -1673,7 +1714,7 @@ impl R2cNormalPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         sizes: &RealPlanSizes,
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -1722,7 +1763,7 @@ impl R2cNormalPlan {
         self.real_to_complex
             .execute(device, encoder, real_input, full_input.clone())?;
         self.c2c
-            .execute_views(device, encoder, full_input, full_output.clone())?;
+            .execute_views_recorded(device, encoder, full_input, full_output.clone())?;
         self.pack
             .execute(device, encoder, full_output, packed_output)?;
 
@@ -1735,7 +1776,7 @@ impl R2cNormalPlan {
     fn execute_views_large_decomposition(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         sizes: &RealPlanSizes,
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -1793,7 +1834,7 @@ impl R2cNormalPlan {
             workgroup_size,
         )?;
         self.c2c
-            .execute_views(device, encoder, full_input, full_output.clone())?;
+            .execute_views_recorded(device, encoder, full_input, full_output.clone())?;
         dispatch_pack_r2c_windowed(
             device,
             encoder,
@@ -1880,7 +1921,7 @@ impl R2cLargeChunkPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -1902,8 +1943,12 @@ impl R2cLargeChunkPlan {
                 0,
                 range.real_size,
             )?;
-            self.child
-                .execute_views(device, encoder, child_input.clone(), child_output.clone())?;
+            self.child.execute_views_recorded(
+                device,
+                encoder,
+                child_input.clone(),
+                child_output.clone(),
+            )?;
             copy_buffer_to_view_range(
                 device,
                 encoder,
@@ -1991,7 +2036,7 @@ impl C2rNormalPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         sizes: &RealPlanSizes,
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -2040,7 +2085,7 @@ impl C2rNormalPlan {
         self.unpack
             .execute(device, encoder, packed_input, full_input.clone())?;
         self.c2c
-            .execute_views(device, encoder, full_input, full_output.clone())?;
+            .execute_views_recorded(device, encoder, full_input, full_output.clone())?;
         self.complex_to_real
             .execute(device, encoder, full_output, real_output)?;
 
@@ -2053,7 +2098,7 @@ impl C2rNormalPlan {
     fn execute_views_large_decomposition(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         sizes: &RealPlanSizes,
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -2119,7 +2164,7 @@ impl C2rNormalPlan {
             config.tuning().workgroup_size(),
         )?;
         self.c2c
-            .execute_views(device, encoder, full_input, full_output.clone())?;
+            .execute_views_recorded(device, encoder, full_input, full_output.clone())?;
         dispatch_complex_to_real_windowed(
             device,
             encoder,
@@ -2197,7 +2242,7 @@ impl C2rLargeChunkPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -2219,8 +2264,12 @@ impl C2rLargeChunkPlan {
                 0,
                 range.packed_size,
             )?;
-            self.child
-                .execute_views(device, encoder, child_input.clone(), child_output.clone())?;
+            self.child.execute_views_recorded(
+                device,
+                encoder,
+                child_input.clone(),
+                child_output.clone(),
+            )?;
             copy_buffer_to_view_range(
                 device,
                 encoder,
@@ -2291,7 +2340,7 @@ impl RealKernel {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -2322,11 +2371,7 @@ impl RealKernel {
             ],
         });
 
-        let pass_label = format!("wgpu_fft.real.pass.cache{}", self.pipeline_key.stable_key());
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(&pass_label),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(self.workgroups_x, max_workgroups_per_dimension(device))?;
@@ -2359,7 +2404,7 @@ fn real_kernel_storage_formats(kind: RealKernelKind) -> (ElementFormat, ElementF
 
 fn dispatch_real_to_complex_windowed(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     input: BufferView<'_>,
     output: BufferView<'_>,
     workgroup_size: u32,
@@ -2379,7 +2424,7 @@ fn dispatch_real_to_complex_windowed(
 
 fn dispatch_complex_to_real_windowed(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     input: BufferView<'_>,
     output: BufferView<'_>,
     workgroup_size: u32,
@@ -2399,7 +2444,7 @@ fn dispatch_complex_to_real_windowed(
 
 fn dispatch_linear_real_windowed(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: RealKernelKind,
     shape: &[usize],
     input: BufferView<'_>,
@@ -2454,7 +2499,7 @@ fn dispatch_linear_real_windowed(
 
 fn dispatch_pack_r2c_windowed(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     shape: &[usize],
     batch: usize,
     input: BufferView<'_>,
@@ -2512,7 +2557,7 @@ fn dispatch_pack_r2c_windowed(
 
 fn dispatch_unpack_c2r_windowed(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     shape: &[usize],
     batch: usize,
     input: BufferView<'_>,
@@ -2585,7 +2630,7 @@ fn dispatch_unpack_c2r_windowed(
 
 fn dispatch_real_windowed_pair(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: RealKernelKind,
     shape: &[usize],
     input: &BufferView<'_>,
@@ -2665,7 +2710,7 @@ fn choose_real_window_count(
 
 fn dispatch_real_windowed_kernel(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: RealKernelKind,
     shape: &[usize],
     input: &BufferView<'_>,
@@ -2718,11 +2763,7 @@ fn dispatch_real_windowed_kernel(
             },
         ],
     });
-    let pass_label = format!("wgpu_fft.real.windowed.pass.{}", pipeline_key.stable_key());
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(&pass_label),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -2735,7 +2776,7 @@ fn dispatch_real_windowed_kernel(
 
 fn dispatch_real_strided_copy(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: RealKernelKind,
     format: FftEndpointFormat,
     input: &BufferView<'_>,
@@ -2804,15 +2845,7 @@ fn dispatch_real_strided_copy(
             },
         ],
     });
-    let pass_label = format!(
-        "wgpu_fft.real.strided.pass.{}.{}",
-        format.as_str(),
-        pipeline_key.stable_key()
-    );
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(&pass_label),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -3212,7 +3245,7 @@ fn create_internal_buffer(
 
 fn copy_view_range_to_buffer(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     view: &BufferView<'_>,
     view_offset: u64,
     dst: &wgpu::Buffer,
@@ -3232,7 +3265,7 @@ fn copy_view_range_to_buffer(
 
 fn copy_buffer_to_view_range(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     src: &wgpu::Buffer,
     src_offset: u64,
     view: &BufferView<'_>,

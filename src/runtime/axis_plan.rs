@@ -13,6 +13,7 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, FusedSmoothStageKey,
     PipelineLayoutCacheKey, StockhamStageKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 #[cfg(test)]
 use crate::runtime::twiddle::twiddle_lut_f32;
@@ -738,7 +739,7 @@ impl AxisPlan {
     pub(crate) fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
@@ -753,7 +754,7 @@ impl AxisPlan {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -766,7 +767,7 @@ impl AxisPlan {
     pub(crate) fn execute_views_with_workspace(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: BufferView<'_>,
@@ -781,7 +782,7 @@ impl AxisPlan {
     fn execute_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: Option<BufferView<'_>>,
@@ -850,19 +851,8 @@ impl AxisPlan {
                 ],
             });
 
-            let pass_label = format!(
-                "wgpu_fft.axis_plan.pass.axis{}.{}.stride{}.scale{}.cache{}",
-                stage.axis,
-                stage_detail,
-                stage.stride_complex,
-                stage.apply_scale,
-                stage.pipeline_key.stable_key()
-            );
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some(&pass_label),
-                    timestamp_writes: None,
-                });
+                let pass = encoder.pass();
                 pass.set_pipeline(&stage.pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 let (x, y, z) = split_workgroups(stage.workgroups_x, max_workgroups_per_dimension)?;

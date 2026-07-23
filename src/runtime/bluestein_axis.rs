@@ -19,6 +19,7 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, BluesteinKernelKind, BluesteinStageKey, ComputePipelineCacheKey,
     FusedPrimeKind, FusedPrimeStageKey, ShaderCacheKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
@@ -522,7 +523,7 @@ impl BluesteinAxis {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -558,7 +559,7 @@ impl BluesteinAxis {
     fn dispatch_fused(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         execution: &FusedBluesteinExecution,
@@ -577,10 +578,7 @@ impl BluesteinAxis {
                 bind_uniform_entry(5, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.bluestein.fused.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) =
@@ -592,7 +590,7 @@ impl BluesteinAxis {
     fn dispatch_pack(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
@@ -608,10 +606,7 @@ impl BluesteinAxis {
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.bluestein.pack.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -625,7 +620,7 @@ impl BluesteinAxis {
     fn dispatch_mul(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
@@ -639,10 +634,7 @@ impl BluesteinAxis {
                 bind_uniform_entry(2, &execution.total_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.bluestein.mul.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -656,7 +648,7 @@ impl BluesteinAxis {
     fn dispatch_post(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: BufferView<'_>,
         execution: &MultiPassBluesteinExecution,
     ) -> Result<()> {
@@ -672,10 +664,7 @@ impl BluesteinAxis {
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.bluestein.post.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(

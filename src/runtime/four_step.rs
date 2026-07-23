@@ -23,6 +23,7 @@ use crate::runtime::large_policy::{
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FourStepKernelKind, FourStepStageKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::{SchedulerLimits, WindowScheduler};
 
@@ -432,7 +433,7 @@ impl FourStepC2cPlan {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -819,7 +820,7 @@ impl AxisWindowPlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         scheduler: &WindowScheduler,
         executor: &StageExecutor<'_>,
         input: &BufferView<'_>,
@@ -888,13 +889,13 @@ impl AxisWindowExecutor {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
         match self {
             Self::Mixed(plan) => plan.execute_views(device, encoder, input, output),
-            Self::Prime(plan) => plan.execute_views(device, encoder, input, output),
+            Self::Prime(plan) => plan.execute_views_recorded(device, encoder, input, output),
             Self::Bridge(plan) => plan.execute_views(device, encoder, input, output),
         }
     }
@@ -1085,7 +1086,7 @@ impl TiledTransposePlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         scheduler: &WindowScheduler,
         executor: &StageExecutor<'_>,
         input: &BufferView<'_>,
@@ -1166,10 +1167,7 @@ impl TiledTransposePlan {
                             },
                         ],
                     });
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("wgpu_fft.four_step.tiled_transpose.pass"),
-                        timestamp_writes: None,
-                    });
+                    let pass = encoder.pass();
                     pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &bind_group, &[]);
                     let tiles_x = (width as u32).div_ceil(TRANSPOSE_TILE);
@@ -1183,7 +1181,6 @@ impl TiledTransposePlan {
                     let (x, y, z) =
                         split_workgroups(workgroups, max_workgroups_per_dimension(device))?;
                     pass.dispatch_workgroups(x, y, z);
-                    drop(pass);
 
                     if y0 == 0 && height == self.ny {
                         let destination_element = matrix_base
@@ -1309,7 +1306,7 @@ impl ScaleWindowPlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         scheduler: &WindowScheduler,
         executor: &StageExecutor<'_>,
         data: &BufferView<'_>,
@@ -1359,10 +1356,7 @@ impl ScaleWindowPlan {
                     },
                 ],
             });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_fft.four_step.scale.pass"),
-                timestamp_writes: None,
-            });
+            let pass = encoder.pass();
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = u32::try_from(dispatch.window.line_count)
@@ -1370,7 +1364,6 @@ impl ScaleWindowPlan {
                 .div_ceil(SCALE_WORKGROUP_SIZE);
             let (x, y, z) = split_workgroups(workgroups, max_workgroups_per_dimension(device))?;
             pass.dispatch_workgroups(x, y, z);
-            drop(pass);
             if copied {
                 executor.copy_buffer_to_view_range(
                     encoder,

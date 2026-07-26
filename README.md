@@ -179,6 +179,7 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 | `max_storage_buffer_binding_size` | `None` | Optional planning cap, clamped to the device and effective buffer-size limit. |
 | `max_buffer_size` | `None` | Optional planning cap, clamped to the device limit. |
 | `fused_min_convolution_length` | `128` | Minimum Rader/Bluestein convolution length eligible for fused-prime execution. |
+| `split_long_axes` | `true` | Runs an axis too long for one fused workgroup as two fused passes (`N = N1 * N2`); `false` keeps one Stockham pass per radix. |
 
 The four-step swap thresholds change sequential window sizing; they do not
 create concurrent window rings or add FFT stages. There is no public

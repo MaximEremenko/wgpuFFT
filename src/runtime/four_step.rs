@@ -734,6 +734,9 @@ impl AxisWindowPlan {
                                 precision: AxisPrecision::F32,
                                 workgroup_size: config.tuning().workgroup_size(),
                                 fused_workgroup_size: config.tuning().fused_workgroup_size(),
+                                // Windowed large routes keep one pass per radix: split passes store
+                                // transposed across a whole line, which a window may not cover.
+                                split_long_axes: false,
                             },
                             twiddle_lut_pool,
                         )?)

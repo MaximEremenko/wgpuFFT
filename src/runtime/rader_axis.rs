@@ -67,6 +67,7 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) workgroup_size: u32,
     pub(crate) fused_workgroup_size: u32,
     pub(crate) fused_min_convolution_length: usize,
+    pub(crate) split_long_axes: bool,
 }
 
 pub(crate) struct RaderAxis {
@@ -345,6 +346,7 @@ impl RaderAxis {
                     precision: config.precision,
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
+                    split_long_axes: config.split_long_axes,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -362,6 +364,7 @@ impl RaderAxis {
                     precision: config.precision,
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
+                    split_long_axes: config.split_long_axes,
                 },
                 &mut twiddle_lut_pool,
             )?;

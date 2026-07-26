@@ -410,10 +410,12 @@ fn run_fused_and_multipass_cases(
     }
 
     if let Some(low_storage) = low_storage {
+        // Stockham coverage: keep the long axis unsplit on the low-storage device.
+        let unsplit_tuning = config_2048.tuning().clone().with_split_long_axes(false);
         let (multipass_2048, multipass_plan) = execute_c2c_f64(
             &low_storage.0,
             &low_storage.1,
-            config_2048,
+            config_2048.with_tuning(unsplit_tuning),
             &input_2048,
             "pow2-forward-n2048-forced-multipass",
         );
@@ -528,8 +530,10 @@ fn run_prime_cases(
         assert!(
             kernel_labels(&rader_multipass)
                 .iter()
-                .any(|stage| stage.contains("stockham")),
-            "Rader N=1601 should also use multipass child FFTs at this storage limit"
+                .filter(|stage| stage.starts_with("rader-forward-") && stage.ends_with("-stage"))
+                .count()
+                >= 2,
+            "Rader N=1601 should also run its child FFTs in several passes at this storage limit"
         );
     } else {
         assert_fused_prime_plan(
@@ -555,8 +559,10 @@ fn run_prime_cases(
         assert!(
             kernel_labels(&bluestein_multipass)
                 .iter()
-                .any(|stage| stage.contains("stockham")),
-            "Bluestein N=1544 should also use multipass child FFTs at this storage limit"
+                .filter(|stage| stage.starts_with("bluestein-forward-") && stage.ends_with("-stage"))
+                .count()
+                >= 2,
+            "Bluestein N=1544 should also run its child FFTs in several passes at this storage limit"
         );
     } else {
         assert_fused_prime_plan(
@@ -872,7 +878,7 @@ fn assert_pow2_stage_selection(plan: &FftPlan, len: usize, storage_limit: u32, l
     if len * 16 <= storage_limit as usize {
         assert_fused_pow2_plan(plan, label);
     } else {
-        assert_stockham_plan(plan, len, label);
+        assert_split_plan(plan, len, FUSED_POW2_LABEL, label);
     }
 }
 
@@ -886,7 +892,7 @@ fn assert_smooth_stage_selection(plan: &FftPlan, len: usize, storage_limit: u32,
         );
         assert_eq!(plan.workspace_size_bytes(), 0, "{label}: fused workspace");
     } else {
-        assert_stockham_plan(plan, len, label);
+        assert_split_plan(plan, len, FUSED_SMOOTH_LABEL, label);
     }
 }
 
@@ -898,6 +904,20 @@ fn assert_fused_pow2_plan(plan: &FftPlan, label: &str) {
         "{label}: expected one native-f64 fused pow2 stage"
     );
     assert_eq!(plan.workspace_size_bytes(), 0, "{label}: fused workspace");
+}
+
+/// Axes too long for one workgroup run as two fused passes (`N = N1 * N2`).
+fn assert_split_plan(plan: &FftPlan, len: usize, fused_label: &str, label: &str) {
+    assert_eq!(
+        kernel_labels(plan),
+        vec![fused_label; 2],
+        "{label}: N={len} should split into two fused passes"
+    );
+    assert_eq!(
+        plan.workspace_size_bytes(),
+        (len * 16) as u64,
+        "{label}: split workspace"
+    );
 }
 
 fn assert_stockham_plan(plan: &FftPlan, len: usize, label: &str) {

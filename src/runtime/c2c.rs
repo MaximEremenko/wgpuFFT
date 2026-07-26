@@ -3470,6 +3470,9 @@ impl SmoothDecompositionC2cPlan {
                             precision: AxisPrecision::F32,
                             workgroup_size: config.tuning().workgroup_size(),
                             fused_workgroup_size: config.tuning().fused_workgroup_size(),
+                            // Windowed large routes keep one pass per radix: split passes store
+                            // transposed across a whole line, which a window may not cover.
+                            split_long_axes: false,
                         },
                         &mut twiddle_lut_pool,
                     )?;
@@ -3504,6 +3507,9 @@ impl SmoothDecompositionC2cPlan {
                         precision: AxisPrecision::F32,
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
+                        // Windowed large routes keep one pass per radix: split passes store
+                        // transposed across a whole line, which a window may not cover.
+                        split_long_axes: false,
                     };
                     let phase1 = build_smooth_phase_execution(
                         device,
@@ -3524,6 +3530,9 @@ impl SmoothDecompositionC2cPlan {
                         precision: AxisPrecision::F32,
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
+                        // Windowed large routes keep one pass per radix: split passes store
+                        // transposed across a whole line, which a window may not cover.
+                        split_long_axes: false,
                     };
                     let phase2 = build_smooth_phase_execution(
                         device,
@@ -7439,6 +7448,7 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
         precision: config.precision().into(),
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
+        split_long_axes: config.tuning().split_long_axes(),
     }
 }
 
@@ -7457,6 +7467,7 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
+        split_long_axes: config.tuning().split_long_axes(),
     }
 }
 
@@ -7479,6 +7490,7 @@ fn bluestein_config_for_axis(
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
+        split_long_axes: config.tuning().split_long_axes(),
     }
 }
 

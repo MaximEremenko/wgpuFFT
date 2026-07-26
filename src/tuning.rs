@@ -44,6 +44,7 @@ pub struct FftTuning {
     max_storage_buffer_binding_size: Option<u64>,
     max_buffer_size: Option<u64>,
     fused_min_convolution_length: usize,
+    split_long_axes: bool,
 }
 
 impl Default for FftTuning {
@@ -63,6 +64,7 @@ impl Default for FftTuning {
             max_storage_buffer_binding_size: None,
             max_buffer_size: None,
             fused_min_convolution_length: 128,
+            split_long_axes: true,
         }
     }
 }
@@ -126,6 +128,12 @@ impl FftTuning {
 
     pub const fn fused_min_convolution_length(&self) -> usize {
         self.fused_min_convolution_length
+    }
+
+    /// Whether axes too long for one fused workgroup run as two fused passes
+    /// (`N = N1 * N2`) instead of one multi-pass Stockham stage per radix.
+    pub const fn split_long_axes(&self) -> bool {
+        self.split_long_axes
     }
 
     pub fn with_workgroup_size(mut self, value: u32) -> Self {
@@ -195,6 +203,13 @@ impl FftTuning {
 
     pub fn with_fused_min_convolution_length(mut self, value: usize) -> Self {
         self.fused_min_convolution_length = value;
+        self
+    }
+
+    /// See [`Self::split_long_axes`]. Disabling it keeps multi-pass Stockham
+    /// stages for long axes.
+    pub fn with_split_long_axes(mut self, value: bool) -> Self {
+        self.split_long_axes = value;
         self
     }
 
@@ -487,6 +502,7 @@ mod tests {
         assert_eq!(defaults.large_route(), FftLargeRoute::Auto);
         assert_eq!(defaults.segmented_burst_depth(), 2);
         assert_eq!(defaults.fused_min_convolution_length(), 128);
+        assert!(defaults.split_long_axes());
 
         let tuned = FftTuning::new()
             .with_workgroup_size(128)
@@ -502,8 +518,10 @@ mod tests {
             .with_segmented_burst_depth(3)
             .with_max_storage_buffer_binding_size(Some(1 << 20))
             .with_max_buffer_size(Some(1 << 24))
-            .with_fused_min_convolution_length(64);
+            .with_fused_min_convolution_length(64)
+            .with_split_long_axes(false);
         assert_eq!(tuned.workgroup_size(), 128);
+        assert!(!tuned.split_long_axes());
         assert_eq!(tuned.force_rader_axes(), &[1]);
         assert_eq!(tuned.force_bluestein_axes(), &[0]);
         assert_eq!(tuned.large_chunk_max_batches(), Some(3));
@@ -527,13 +545,15 @@ mod tests {
             .with_force_rader_axes([1])
             .with_force_bluestein_axes([2])
             .with_large_route(FftLargeRoute::ForceSegmented)
-            .with_grouped_batch(Some(4));
+            .with_grouped_batch(Some(4))
+            .with_split_long_axes(false);
         let child = parent.for_internal_child();
         assert!(child.force_rader_axes().is_empty());
         assert!(child.force_bluestein_axes().is_empty());
         assert_eq!(child.large_route(), FftLargeRoute::Auto);
         assert_eq!(child.workgroup_size(), 128);
         assert_eq!(child.grouped_batch(), Some(4));
+        assert!(!child.split_long_axes());
     }
 
     #[test]

@@ -168,7 +168,8 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         let expected = reference_f64(&input, &config);
         let (fused, fused_plan) =
             execute_c2c(&context.device, &context.queue, config.clone(), &input);
-        let (fallback, fallback_plan) = execute_c2c(&low_device, &low_queue, config, &input);
+        let (fallback, fallback_plan) =
+            execute_c2c(&low_device, &low_queue, config.clone(), &input);
 
         assert_fused_prime_plan(
             &fused_plan,
@@ -180,9 +181,17 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         let fallback_kernels = kernel_labels(&fallback_plan);
         assert_eq!(
             fallback_kernels.len(),
-            17,
-            "forced 16 KiB N=2999 should use five bridge kernels and twelve Stockham stages: {fallback_kernels:?}"
+            9,
+            "forced 16 KiB N=2999 should use five bridge kernels and two split fused passes per inner FFT: {fallback_kernels:?}"
         );
+        let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
+        assert_eq!(
+            unsplit.1.len(),
+            17,
+            "unsplit forced 16 KiB N=2999 should use five bridge kernels and twelve Stockham stages: {:?}",
+            unsplit.1
+        );
+        assert_matches_reference(&unsplit.0, &expected, "Rader N=2999 unsplit fallback");
 
         let label = format!("Rader N=2999 inverse={inverse}");
         let (fused_max, fused_rms) = relative_error_metrics(&fused, &expected);
@@ -211,7 +220,8 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         let expected = reference_f64(&input, &config);
         let (fused, fused_plan) =
             execute_c2c(&context.device, &context.queue, config.clone(), &input);
-        let (fallback, fallback_plan) = execute_c2c(&low_device, &low_queue, config, &input);
+        let (fallback, fallback_plan) =
+            execute_c2c(&low_device, &low_queue, config.clone(), &input);
 
         assert_fused_prime_plan(
             &fused_plan,
@@ -223,9 +233,17 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         let fallback_kernels = kernel_labels(&fallback_plan);
         assert_eq!(
             fallback_kernels.len(),
-            11,
-            "forced 16 KiB N=2026 should use three bridge kernels and eight Stockham stages: {fallback_kernels:?}"
+            7,
+            "forced 16 KiB N=2026 should use three bridge kernels and two split fused passes per inner FFT: {fallback_kernels:?}"
         );
+        let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
+        assert_eq!(
+            unsplit.1.len(),
+            11,
+            "unsplit forced 16 KiB N=2026 should use three bridge kernels and eight Stockham stages: {:?}",
+            unsplit.1
+        );
+        assert_matches_reference(&unsplit.0, &expected, "Bluestein N=2026 unsplit fallback");
 
         let label = format!("Bluestein N=2026 inverse={inverse}");
         let (fused_max, fused_rms) = relative_error_metrics(&fused, &expected);
@@ -248,6 +266,26 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         std::mem::forget(low_queue);
         std::mem::forget(low_device);
     }
+}
+
+/// Runs `config` with long inner FFTs left on Stockham stages, returning the
+/// output and kernel labels.
+fn unsplit_fallback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &FftConfig,
+    input: &[f32],
+) -> (Vec<f32>, Vec<String>) {
+    let tuning = config.tuning().clone().with_split_long_axes(false);
+    let (output, plan) = execute_c2c(device, queue, config.clone().with_tuning(tuning), input);
+    let kernels = kernel_labels(&plan);
+    assert!(
+        kernels
+            .iter()
+            .any(|kernel| kernel.ends_with("-stockham-stage")),
+        "unsplit fallback keeps Stockham stages: {kernels:?}"
+    );
+    (output, kernels)
 }
 
 fn run_fused_case(

@@ -14,6 +14,7 @@ use crate::runtime::pipeline_cache::{
     PipelineLayoutCacheKey, SplitPass, StockhamStageKey,
 };
 use crate::runtime::recorder::CommandRecorder;
+use crate::runtime::register_fft::{generate_register_fft_wgsl, register_schedule};
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 #[cfg(test)]
 use crate::runtime::twiddle::twiddle_lut_f32;
@@ -156,8 +157,50 @@ pub(crate) struct AxisPlanConfig {
     pub(crate) precision: AxisPrecision,
     pub(crate) workgroup_size: u32,
     pub(crate) fused_workgroup_size: u32,
-    /// Run axes too long for one fused workgroup as two fused passes.
-    pub(crate) split_long_axes: bool,
+    pub(crate) long_axes: LongAxisRoute,
+}
+
+/// How an axis too long for one fused workgroup runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LongAxisRoute {
+    /// One Stockham pass per radix.
+    Stockham,
+    /// A register-resident fused kernel where the device runs one, else
+    /// Stockham. Windowed large routes use this: split passes transform a
+    /// transposed view of each line, which the window geometry does not
+    /// describe.
+    Registers,
+    /// A register-resident fused kernel, else two fused passes, else
+    /// Stockham.
+    Fused,
+}
+
+impl LongAxisRoute {
+    /// The route for `FftTuning::fuse_long_axes`.
+    pub(crate) const fn new(fuse: bool) -> Self {
+        if fuse {
+            Self::Fused
+        } else {
+            Self::Stockham
+        }
+    }
+
+    /// The route for `FftTuning::fuse_long_axes` in a windowed large route.
+    pub(crate) const fn windowed(fuse: bool) -> Self {
+        if fuse {
+            Self::Registers
+        } else {
+            Self::Stockham
+        }
+    }
+
+    const fn allows_registers(self) -> bool {
+        !matches!(self, Self::Stockham)
+    }
+
+    const fn allows_split(self) -> bool {
+        matches!(self, Self::Fused)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,7 +351,7 @@ impl AxisPlanConfig {
             precision: config.precision().into(),
             workgroup_size: config.tuning().workgroup_size(),
             fused_workgroup_size: config.tuning().fused_workgroup_size(),
-            split_long_axes: config.tuning().split_long_axes(),
+            long_axes: LongAxisRoute::new(config.tuning().fuse_long_axes()),
         }
     }
 
@@ -640,8 +683,57 @@ impl AxisPlan {
                     workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
                     pipeline,
                 });
+            } else if let Some((workgroup_size, schedule)) = (stride_complex == 1
+                && config.long_axes.allows_registers())
+            .then(|| register_schedule(axis_len, config.precision, &device.limits()))
+            .flatten()
+            {
+                // Contiguous lines too long for workgroup memory stay in
+                // registers and run as one fused pass.
+                let apply_scale = apply_any_scale && final_axis;
+                let total_lines = total_complex / axis_len;
+                let shader_key = FusedPow2StageKey::new(
+                    config.shape.len(),
+                    axis,
+                    &config.shape,
+                    axis_len,
+                    stride_complex,
+                    config.direction,
+                    workgroup_size,
+                    apply_scale,
+                    scale,
+                    config.precision,
+                )
+                .with_registers(schedule);
+                let pipeline_key = ComputePipelineCacheKey::fused_pow2_stage(shader_key.clone());
+                let shader_label =
+                    format!("wgpu_fft.axis_plan.register_pow2.axis{axis}.n{axis_len}.shader");
+                let pipeline_label =
+                    format!("wgpu_fft.axis_plan.register_pow2.axis{axis}.n{axis_len}.pipeline");
+                let pipeline = with_device_pipeline_cache(device, |cache| {
+                    cache.get_compute_pipeline(
+                        device,
+                        &pipeline_key,
+                        &pipeline_label,
+                        &shader_label,
+                        || generate_fused_pow2_stage_wgsl_for_key(&shader_key),
+                    )
+                });
+                stages.push(AxisStage {
+                    axis,
+                    kind: AxisStageKind::FusedPow2 {
+                        axis_length: axis_len,
+                    },
+                    stride_complex,
+                    apply_scale,
+                    pipeline_key,
+                    twiddle_lut_index,
+                    workgroups_x: total_lines as u32,
+                    pipeline,
+                });
             } else if let Some((n1, n2)) = config
-                .split_long_axes
+                .long_axes
+                .allows_split()
                 .then(|| {
                     long_axis_split(
                         axis_len,
@@ -1599,7 +1691,9 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         scale_factor: key.scale_factor(),
         precision: key.precision,
     };
-    if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
+    if let Some(registers) = &key.registers {
+        generate_register_fft_wgsl(&config, registers)
+    } else if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
         generate_fused_pow2_multiline_stage_wgsl(
             &config,
             key.lines_per_workgroup as usize,
@@ -2400,7 +2494,7 @@ pub(crate) fn generate_stockham_radix_stage_wgsl_for_key(key: &StockhamStageKey)
     })
 }
 
-fn complex_wgsl() -> &'static str {
+pub(crate) fn complex_wgsl() -> &'static str {
     r#"fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
   return a + b;
 }
@@ -2417,7 +2511,7 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 }"#
 }
 
-fn twiddle_lookup_wgsl(direction: FftDirection, precision: AxisPrecision) -> String {
+pub(crate) fn twiddle_lookup_wgsl(direction: FftDirection, precision: AxisPrecision) -> String {
     if precision == AxisPrecision::Df64 {
         return match direction {
             FftDirection::Forward => r#"fn twiddle(index: u32) -> vec4<f32> {
@@ -2445,7 +2539,7 @@ fn twiddle_lookup_wgsl(direction: FftDirection, precision: AxisPrecision) -> Str
     }
 }
 
-fn radix_root_wgsl(
+pub(crate) fn radix_root_wgsl(
     radix: usize,
     power: usize,
     direction: FftDirection,
@@ -2525,7 +2619,7 @@ fn multiline_store(split: Option<&SplitPass>, stride_in: usize) -> MultilineStor
     }
 }
 
-fn specialize_complex_wgsl(source: String, precision: AxisPrecision) -> String {
+pub(crate) fn specialize_complex_wgsl(source: String, precision: AxisPrecision) -> String {
     if precision != AxisPrecision::Df64 {
         return precision.specialize_wgsl(source);
     }
@@ -2555,7 +2649,11 @@ fn c_mul(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
 }"#
 }
 
-fn scaled_complex_expr(value: &str, scale_factor: Option<f64>, precision: AxisPrecision) -> String {
+pub(crate) fn scaled_complex_expr(
+    value: &str,
+    scale_factor: Option<f64>,
+    precision: AxisPrecision,
+) -> String {
     let Some(scale_factor) = scale_factor else {
         return value.to_owned();
     };
@@ -2575,7 +2673,7 @@ fn scaled_complex_expr(value: &str, scale_factor: Option<f64>, precision: AxisPr
     }
 }
 
-fn wgsl_line_base_fn(rank: usize, axis: usize, dims: &[usize]) -> String {
+pub(crate) fn wgsl_line_base_fn(rank: usize, axis: usize, dims: &[usize]) -> String {
     assert!(rank >= 1, "rank must be at least one");
     assert_eq!(rank, dims.len(), "dims length must match rank");
     assert!(axis < rank, "axis must be in range");

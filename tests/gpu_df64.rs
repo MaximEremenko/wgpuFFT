@@ -426,7 +426,7 @@ async fn run_fused_and_multipass_cases(
         )
         .await;
         // Stockham coverage: keep the long axis unsplit on the low-storage device.
-        let unsplit_tuning = config_2048.tuning().clone().with_split_long_axes(false);
+        let unsplit_tuning = config_2048.tuning().clone().with_fuse_long_axes(false);
         let (multipass, multipass_plan) = execute_c2c_df64(
             &low.0,
             &low.1,

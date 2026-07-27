@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, Normalization};
 use crate::error::{FftError, Result};
 use crate::runtime::axis_plan::{
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisTwiddleLutPool,
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisTwiddleLutPool, LongAxisRoute,
 };
 use crate::runtime::buffer_view::{BufferSegment, BufferView};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -1101,9 +1101,7 @@ fn row_axis_plan_index(
             precision: AxisPrecision::F32,
             workgroup_size: config.tuning().workgroup_size(),
             fused_workgroup_size: config.tuning().fused_workgroup_size(),
-            // Windowed large routes keep one pass per radix: split passes store
-            // transposed across a whole line, which a window may not cover.
-            split_long_axes: false,
+            long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
         },
         twiddle_lut_pool,
     )?);

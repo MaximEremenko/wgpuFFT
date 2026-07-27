@@ -1,7 +1,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-//! Opt-in GPU checks for axes too long for one fused workgroup, which run as
-//! two fused passes (`N = N1 * N2`), against the f64 CPU backend.
+//! Opt-in GPU checks for axes too long for workgroup memory, which run as one
+//! register-resident fused kernel or as two fused passes (`N = N1 * N2`),
+//! against the f64 CPU backend.
 
 use std::mem::ManuallyDrop;
 use std::sync::mpsc;
@@ -13,7 +14,7 @@ const FUSED_SMOOTH_LABEL: &str = "fused-smooth-workgroup-stage";
 const STOCKHAM_LABEL: &str = "mixed-radix-stockham-stage";
 
 #[test]
-fn long_axes_split_into_two_fused_passes() {
+fn long_axes_run_as_fused_kernels() {
     if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
         eprintln!("skipping GPU test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
         return;
@@ -31,18 +32,32 @@ async fn run_split_cases() {
     let context = ManuallyDrop::new(context);
     let device = &context.device;
     let queue = &context.queue;
+    // Kernel counts below assume register-resident kernels of up to 1024
+    // invocations with at least 32 KiB of workgroup memory.
+    let limits = device.limits();
+    let full_register_support = limits.max_compute_invocations_per_workgroup >= 1024
+        && limits.max_compute_workgroup_size_x >= 1024
+        && limits.max_compute_workgroup_storage_size >= 32 * 1024;
 
-    for (label, config) in [
+    for (label, config, register_kernels) in [
         (
             "n8192",
             FftConfig::new(8192).with_normalization(Normalization::None),
+            1,
         ),
-        ("n12288-inverse", FftConfig::inverse(12288)),
+        ("n12288-inverse", FftConfig::inverse(12288), 2),
         (
             "n16384-batch2",
             FftConfig::new(16384)
                 .with_batch(2)
                 .with_normalization(Normalization::Forward),
+            1,
+        ),
+        ("n32768-inverse", FftConfig::inverse(32768), 2),
+        (
+            "n65536",
+            FftConfig::new(65536).with_normalization(Normalization::None),
+            2,
         ),
         (
             "8192x2-axis0-batch2",
@@ -50,20 +65,23 @@ async fn run_split_cases() {
                 .with_axes([0])
                 .with_batch(2)
                 .with_normalization(Normalization::None),
+            1,
         ),
         (
             "3x8192-axis1",
             FftConfig::new_nd([3, 8192])
                 .with_axes([1])
                 .with_normalization(Normalization::None),
+            2,
         ),
         (
             "3x10000x2-axis1",
             FftConfig::new_nd([3, 10000, 2])
                 .with_axes([1])
                 .with_normalization(Normalization::Orthogonal),
+            2,
         ),
-        ("8192x4-inverse", FftConfig::inverse_nd([8192, 4])),
+        ("8192x4-inverse", FftConfig::inverse_nd([8192, 4]), 2),
     ] {
         let total = config.total_complex_len().unwrap();
         let input = test_signal(total);
@@ -75,26 +93,30 @@ async fn run_split_cases() {
             kernels
                 .iter()
                 .all(|kernel| kernel == FUSED_POW2_LABEL || kernel == FUSED_SMOOTH_LABEL),
-            "{label}: split plans run only fused kernels, got {kernels:?}"
+            "{label}: long axes run only fused kernels, got {kernels:?}"
         );
+        if full_register_support {
+            assert_eq!(kernels.len(), register_kernels, "{label}: {kernels:?}");
+        }
         let (max_relative, rms_relative) = relative_errors(&split, &reference);
         eprintln!(
-            "SPLIT label={label} max_relative={max_relative:.3e} rms_relative={rms_relative:.3e}"
+            "LONG_AXIS label={label} kernels={} max_relative={max_relative:.3e} rms_relative={rms_relative:.3e}",
+            kernels.len()
         );
         assert!(
             max_relative < 2.0e-6 && rms_relative < 5.0e-7,
-            "{label}: split errors max {max_relative:.3e}, rms {rms_relative:.3e}"
+            "{label}: fused errors max {max_relative:.3e}, rms {rms_relative:.3e}"
         );
 
-        // The unsplit Stockham route must agree to the same accuracy.
-        let unsplit = config.tuning().clone().with_split_long_axes(false);
+        // The Stockham route must agree to the same accuracy.
+        let unfused = config.tuning().clone().with_fuse_long_axes(false);
         let (stockham, stockham_plan) =
-            execute_c2c(device, queue, config.clone().with_tuning(unsplit), &input);
+            execute_c2c(device, queue, config.clone().with_tuning(unfused), &input);
         assert!(
             kernel_labels(&stockham_plan)
                 .iter()
                 .any(|kernel| kernel == STOCKHAM_LABEL),
-            "{label}: disabling the split keeps Stockham stages"
+            "{label}: unfused long axes keep Stockham stages"
         );
         let (max_relative, rms_relative) = relative_errors(&stockham, &reference);
         assert!(
@@ -164,15 +186,15 @@ fn execute_c2c(
         })
     };
     let input_buffer = buffer(
-        "wgpu_fft.test.split.input",
+        "wgpu_fft.test.long_axes.input",
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     );
     let output_buffer = buffer(
-        "wgpu_fft.test.split.output",
+        "wgpu_fft.test.long_axes.output",
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
     );
     let readback = buffer(
-        "wgpu_fft.test.split.readback",
+        "wgpu_fft.test.long_axes.readback",
         wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
     );
     queue.write_buffer(&input_buffer, 0, bytemuck::cast_slice(input));

@@ -1358,18 +1358,22 @@ impl C2cPlan {
         input: FftIoView<'_>,
         output: FftIoView<'_>,
     ) -> Result<()> {
+        self.execute_io_views_recorded(device, &mut CommandRecorder::new(encoder), input, output)
+    }
+
+    fn execute_io_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: FftIoView<'_>,
+        output: FftIoView<'_>,
+    ) -> Result<()> {
         let input = self.validate_io_layout(device, input)?;
         let output = self.validate_io_layout(device, output)?;
         if input.contiguous && output.contiguous {
-            return self.execute_views(device, encoder, input.view, output.view);
+            return self.execute_views_recorded(device, encoder, input.view, output.view);
         }
-        self.execute_io_views_impl(
-            device,
-            &mut CommandRecorder::new(encoder),
-            input,
-            output,
-            None,
-        )
+        self.execute_io_views_impl(device, encoder, input, output, None)
     }
 
     pub fn execute_io_views_with_workspace(
@@ -1404,6 +1408,22 @@ impl C2cPlan {
         input: FftLogicalView<'_>,
         output: FftLogicalView<'_>,
     ) -> Result<()> {
+        self.execute_logical_views_recorded(
+            device,
+            &mut CommandRecorder::new(encoder),
+            input,
+            output,
+        )
+    }
+
+    /// [`Self::execute_logical_views`] into a shared compute pass.
+    pub(crate) fn execute_logical_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: FftLogicalView<'_>,
+        output: FftLogicalView<'_>,
+    ) -> Result<()> {
         let logical_per_batch = self.config.logical_complex_len()? as u64;
         let batch = self.config.batch() as u64;
         let scheduler = WindowScheduler::for_device(device);
@@ -1411,7 +1431,7 @@ impl C2cPlan {
         let input = scheduler.bind_logical_io(input, endpoint_format, logical_per_batch, batch)?;
         let output =
             scheduler.bind_logical_io(output, endpoint_format, logical_per_batch, batch)?;
-        self.execute_io_views(
+        self.execute_io_views_recorded(
             device,
             encoder,
             input.into_c2c_io_view()?,

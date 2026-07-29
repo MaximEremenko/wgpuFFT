@@ -1009,6 +1009,17 @@ impl R2cPlan {
         )
     }
 
+    /// [`Self::execute_logical_views`] into a shared compute pass.
+    pub(crate) fn execute_logical_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: FftLogicalView<'_>,
+        output: FftLogicalView<'_>,
+    ) -> Result<()> {
+        execute_r2c_logical_views(device, encoder, self, input, output)
+    }
+
     fn validate_execution_graph(&self, device: &wgpu::Device) -> Result<()> {
         let graph = self.execution_graph()?;
         let scheduler = WindowScheduler::for_device(device);
@@ -1306,6 +1317,17 @@ impl C2rPlan {
             input,
             output,
         )
+    }
+
+    /// [`Self::execute_logical_views`] into a shared compute pass.
+    pub(crate) fn execute_logical_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: FftLogicalView<'_>,
+        output: FftLogicalView<'_>,
+    ) -> Result<()> {
+        execute_c2r_logical_views(device, encoder, self, input, output)
     }
 
     fn validate_execution_graph(&self, device: &wgpu::Device) -> Result<()> {

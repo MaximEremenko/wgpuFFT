@@ -5,6 +5,7 @@ pub mod axis_policy;
 pub(crate) mod bluestein_axis;
 pub mod buffer_view;
 pub mod c2c;
+pub(crate) mod direct_prime;
 pub(crate) mod dispatch;
 pub(crate) mod four_step;
 pub(crate) mod large_bridge;

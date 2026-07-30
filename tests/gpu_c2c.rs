@@ -244,10 +244,11 @@ fn assert_pipeline_cache_snapshot_behavior(context: &wgpu_fft::device::GpuContex
         .pipeline_keys()
         .iter()
         .any(|key| key.contains("fused-smooth")));
+    // Short prime axes run direct DFT kernels instead of Rader's.
     assert!(snapshot
         .pipeline_keys()
         .iter()
-        .any(|key| key.contains("rader")));
+        .any(|key| key.contains("rader") || key.contains("fused-prime:direct")));
     assert!(snapshot
         .shader_codes()
         .iter()
@@ -2503,7 +2504,8 @@ fn run_one_case(
         assert_eq!(twiddle_lut_bytes, 8);
     }
     if expected_route == C2cRoute::Rader && plan.config().shape()[plan.config().axes()[0]] == 17 {
-        assert_eq!(twiddle_lut_bytes, 32 * 8);
+        // A direct DFT of N=17 reads one table of W_17^i.
+        assert_eq!(twiddle_lut_bytes, 17 * 8);
     }
     assert_eq!(plan.axis_factors().len(), plan.config().axes().len());
     let mut encoder = context

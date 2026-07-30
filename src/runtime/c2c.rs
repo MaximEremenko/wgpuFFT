@@ -4191,6 +4191,8 @@ fn work_items_for_bytes(bytes: u64, format: ElementFormat) -> u64 {
 #[derive(Debug, Clone)]
 struct ConvolutionGraphFfts {
     fused: bool,
+    /// Label of the single kernel when `fused`.
+    fused_label: &'static str,
     forward_stage_kinds: Vec<AxisStageKind>,
     forward_workspace_bytes: u64,
     inverse_stage_kinds: Vec<AxisStageKind>,
@@ -4201,6 +4203,7 @@ impl ConvolutionGraphFfts {
     fn rader(plan: &RaderAxis) -> Self {
         Self {
             fused: plan.graph_is_fused(),
+            fused_label: plan.graph_fused_label(),
             forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
             inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
@@ -4211,6 +4214,7 @@ impl ConvolutionGraphFfts {
     fn bluestein(plan: &BluesteinAxis) -> Self {
         Self {
             fused: plan.graph_is_fused(),
+            fused_label: "bluestein-fused-workgroup-stage",
             forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
             inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
@@ -4539,7 +4543,7 @@ fn build_normal_rader_c2c_graph(
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
-                label: "rader-fused-workgroup-stage",
+                label: convolution.fused_label,
                 input,
                 output,
                 work_items: work_items_for_bytes(required_bytes, element_format),
@@ -4941,7 +4945,7 @@ fn add_rader_c2c_stages(
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
-                label: "rader-fused-workgroup-stage",
+                label: convolution.fused_label,
                 input,
                 output,
                 work_items: work_items_for_bytes(required_bytes, element_format),
@@ -7483,6 +7487,7 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
         fuse_long_axes: config.tuning().fuse_long_axes(),
+        direct_max_prime: config.tuning().direct_max_prime(),
     }
 }
 
@@ -9000,6 +9005,8 @@ mod tests {
     fn test_convolution_ffts() -> ConvolutionGraphFfts {
         ConvolutionGraphFfts {
             fused: false,
+            // Bluestein graphs label their fused kernel themselves.
+            fused_label: "rader-fused-workgroup-stage",
             forward_stage_kinds: vec![
                 AxisStageKind::Stockham { radix: 8, ns: 8 },
                 AxisStageKind::Stockham { radix: 2, ns: 16 },
@@ -9016,6 +9023,8 @@ mod tests {
     fn test_fused_convolution() -> ConvolutionGraphFfts {
         ConvolutionGraphFfts {
             fused: true,
+            // Bluestein graphs label their fused kernel themselves.
+            fused_label: "rader-fused-workgroup-stage",
             forward_stage_kinds: Vec::new(),
             forward_workspace_bytes: 0,
             inverse_stage_kinds: Vec::new(),

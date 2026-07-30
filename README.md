@@ -89,7 +89,8 @@ plan. This covers mixed-radix
 lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`. Longer contiguous
 power-of-two `f32` lines keep their elements in registers within one kernel,
 other long axes run as two fused passes (`N = N1 * N2`), and the remaining
-lines use generated Stockham stages. Other prime axes route through
+lines use generated Stockham stages. Prime `f32` axes up to 127 run a direct
+DFT kernel that pairs `X[k]` with `X[p - k]`. Other prime axes route through
 Rader, unsupported composite axes route through Bluestein convolution over a
 smooth internal length, and mixed-algorithm ND plans execute typed axis-sequence
 stage graphs. The direct DFT compute kernel remains as a length-one fallback.
@@ -184,6 +185,7 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 | `workgroup_size` | `64` | Staged FFT and linear helper kernels. |
 | `fused_workgroup_size` | `256` | Fused power-of-two, smooth, and prime kernels, subject to device invocation and storage limits. |
 | `rader_max_prime` | `4096` | Largest non-smooth prime selected for Rader automatically. |
+| `direct_max_prime` | `127` | Largest prime axis transformed by a direct DFT kernel instead of Rader (`f32`); `0` keeps Rader for every prime. |
 | `force_rader_axes` | `[]` | Physical selected axes that must use Rader; infeasible requests fail instead of changing algorithm. |
 | `force_bluestein_axes` | `[]` | Physical selected axes that must use Bluestein. |
 | `large_route` | `Auto` | C2C `Auto`, `ForceChunk`, `ForceFourStep`, or `ForceSegmented`; forced real-transform routes are currently unsupported. |

@@ -648,6 +648,9 @@ impl ShaderCacheKey {
                 FusedPrimeKind::Bluestein => {
                     crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
                 }
+                FusedPrimeKind::Direct => {
+                    crate::runtime::direct_prime::generate_direct_prime_wgsl_for_key(key)
+                }
             },
             Self::FourStepStage(key) => {
                 crate::runtime::four_step::generate_four_step_wgsl_for_key(key)
@@ -826,7 +829,12 @@ impl ShaderCacheKey {
                     key.workgroup_size,
                 )?;
                 validate_snapshot_convolution(key.kind, key.axis_length, key.convolution_length)?;
-                if !validate_snapshot_factors(&key.factors, key.convolution_length) {
+                let factors_valid = if key.kind == FusedPrimeKind::Direct {
+                    key.factors == [key.axis_length]
+                } else {
+                    validate_snapshot_factors(&key.factors, key.convolution_length)
+                };
+                if !factors_valid {
                     return snapshot_integrity("invalid fused-prime convolution factors");
                 }
                 validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
@@ -1064,6 +1072,13 @@ fn validate_snapshot_convolution(
         FusedPrimeKind::Bluestein => axis_length
             .checked_mul(2)
             .and_then(|length| length.checked_sub(1)),
+        FusedPrimeKind::Direct => {
+            return if convolution_length == axis_length {
+                Ok(())
+            } else {
+                snapshot_integrity("a direct prime kernel has no convolution")
+            };
+        }
     };
     if minimum.is_none_or(|minimum| convolution_length < minimum)
         || (kind == FusedPrimeKind::Rader && convolution_length < axis_length)
@@ -1382,6 +1397,8 @@ impl BluesteinKernelKind {
 pub(crate) enum FusedPrimeKind {
     Rader,
     Bluestein,
+    /// A direct DFT of a short prime axis (see `runtime::direct_prime`).
+    Direct,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1405,6 +1422,7 @@ impl FusedPrimeKind {
         match self {
             Self::Rader => "rader",
             Self::Bluestein => "bluestein",
+            Self::Direct => "direct",
         }
     }
 }
@@ -2018,6 +2036,9 @@ pub(crate) struct FusedPrimeStageKey {
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
     scale_bits: u64,
+    /// Lines per workgroup of a direct kernel; 1 for Rader and Bluestein.
+    #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
+    pub(crate) lines_per_workgroup: u32,
 }
 
 impl FusedPrimeStageKey {
@@ -2059,7 +2080,14 @@ impl FusedPrimeStageKey {
             workgroup_size,
             apply_scale,
             scale_bits,
+            lines_per_workgroup: 1,
         }
+    }
+
+    /// Transforms `lines` lines per workgroup (direct kernels only).
+    pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
+        self.lines_per_workgroup = lines.max(1);
+        self
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {
@@ -2067,7 +2095,7 @@ impl FusedPrimeStageKey {
     }
 
     pub(crate) fn stable_key(&self) -> String {
-        format!(
+        let mut key = format!(
             "shader:v2:fused-prime:{}:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
             self.kind.as_str(),
             self.precision.as_str(),
@@ -2083,7 +2111,11 @@ impl FusedPrimeStageKey {
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
             self.precision.as_str(),
-        )
+        );
+        if self.lines_per_workgroup > 1 {
+            key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        key
     }
 
     pub(crate) fn is_supported_by_limits(
@@ -2093,12 +2125,22 @@ impl FusedPrimeStageKey {
         max_workgroup_size_x: u32,
     ) -> bool {
         let complex_bytes = self.precision.complex_size_bytes() as usize;
-        let Some(scratch_bytes) = self.convolution_length.checked_mul(complex_bytes) else {
+        let scratch_elements = match self.kind {
+            FusedPrimeKind::Direct => self
+                .axis_length
+                .checked_mul(self.lines_per_workgroup as usize),
+            _ => Some(self.convolution_length),
+        };
+        let Some(scratch_bytes) =
+            scratch_elements.and_then(|elements| elements.checked_mul(complex_bytes))
+        else {
             return false;
         };
         let extra_bytes = match self.kind {
             FusedPrimeKind::Rader => complex_bytes,
             FusedPrimeKind::Bluestein => 0usize,
+            // The roots.
+            FusedPrimeKind::Direct => self.axis_length * complex_bytes,
         };
         let Some(workgroup_storage_bytes) = scratch_bytes.checked_add(extra_bytes) else {
             return false;

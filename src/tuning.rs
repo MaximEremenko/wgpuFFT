@@ -33,6 +33,7 @@ pub struct FftTuning {
     workgroup_size: u32,
     fused_workgroup_size: u32,
     rader_max_prime: usize,
+    direct_max_prime: usize,
     force_rader_axes: Vec<usize>,
     force_bluestein_axes: Vec<usize>,
     large_route: FftLargeRoute,
@@ -53,6 +54,7 @@ impl Default for FftTuning {
             workgroup_size: 64,
             fused_workgroup_size: 256,
             rader_max_prime: 4096,
+            direct_max_prime: 127,
             force_rader_axes: Vec::new(),
             force_bluestein_axes: Vec::new(),
             large_route: FftLargeRoute::Auto,
@@ -84,6 +86,12 @@ impl FftTuning {
 
     pub const fn rader_max_prime(&self) -> usize {
         self.rader_max_prime
+    }
+
+    /// Largest prime axis transformed by a direct DFT kernel instead of
+    /// Rader's convolution (`f32` only); `0` keeps Rader for every prime.
+    pub const fn direct_max_prime(&self) -> usize {
+        self.direct_max_prime
     }
 
     pub fn force_rader_axes(&self) -> &[usize] {
@@ -150,6 +158,12 @@ impl FftTuning {
 
     pub fn with_rader_max_prime(mut self, value: usize) -> Self {
         self.rader_max_prime = value;
+        self
+    }
+
+    /// See [`Self::direct_max_prime`].
+    pub fn with_direct_max_prime(mut self, value: usize) -> Self {
+        self.direct_max_prime = value;
         self
     }
 
@@ -501,6 +515,7 @@ mod tests {
         assert_eq!(defaults.workgroup_size(), 64);
         assert_eq!(defaults.fused_workgroup_size(), 256);
         assert_eq!(defaults.rader_max_prime(), 4096);
+        assert_eq!(defaults.direct_max_prime(), 127);
         assert_eq!(defaults.large_route(), FftLargeRoute::Auto);
         assert_eq!(defaults.segmented_burst_depth(), 2);
         assert_eq!(defaults.fused_min_convolution_length(), 128);
@@ -510,6 +525,7 @@ mod tests {
             .with_workgroup_size(128)
             .with_fused_workgroup_size(64)
             .with_rader_max_prime(257)
+            .with_direct_max_prime(31)
             .with_force_rader_axes([1])
             .with_force_bluestein_axes([0])
             .with_large_route(FftLargeRoute::ForceFourStep)
@@ -523,6 +539,7 @@ mod tests {
             .with_fused_min_convolution_length(64)
             .with_fuse_long_axes(false);
         assert_eq!(tuned.workgroup_size(), 128);
+        assert_eq!(tuned.direct_max_prime(), 31);
         assert!(!tuned.fuse_long_axes());
         assert_eq!(tuned.force_rader_axes(), &[1]);
         assert_eq!(tuned.force_bluestein_axes(), &[0]);

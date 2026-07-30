@@ -11,6 +11,9 @@ use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
 };
 use crate::runtime::buffer_view::BufferView;
+use crate::runtime::direct_prime::{
+    direct_lines_per_workgroup, direct_prime_supported, generate_direct_prime_wgsl_for_key,
+};
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
 use crate::runtime::nd_wgsl::{
@@ -68,6 +71,7 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) fused_workgroup_size: u32,
     pub(crate) fused_min_convolution_length: usize,
     pub(crate) fuse_long_axes: bool,
+    pub(crate) direct_max_prime: usize,
 }
 
 pub(crate) struct RaderAxis {
@@ -82,6 +86,8 @@ pub(crate) struct RaderAxis {
 }
 
 enum RaderExecution {
+    /// A direct DFT of a short prime (see `runtime::direct_prime`).
+    Direct(FusedRaderExecution),
     Fused(FusedRaderExecution),
     MultiPass(Box<MultiPassRaderExecution>),
 }
@@ -247,7 +253,53 @@ impl RaderAxis {
             }
         }
 
-        let execution = if fused_rader_supported(
+        let execution = if n <= config.direct_max_prime
+            && direct_prime_supported(
+                n,
+                config.precision,
+                config.fused_workgroup_size,
+                &device.limits(),
+            ) {
+            let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
+                device,
+                queue,
+                "wgpu_fft.rader.direct.twiddle_lut",
+                n,
+                config.precision.as_fft_precision(),
+            )?;
+            let lines_per_workgroup = direct_lines_per_workgroup(
+                n,
+                stride_complex,
+                config.precision,
+                config.fused_workgroup_size,
+                u64::from(device.limits().max_compute_workgroup_storage_size),
+            );
+            let shader_key = FusedPrimeStageKey::new(
+                FusedPrimeKind::Direct,
+                config.shape.len(),
+                config.axis,
+                &config.shape,
+                n,
+                stride_complex,
+                n,
+                &[n],
+                config.direction,
+                config.fused_workgroup_size,
+                apply_scale,
+                scale,
+                config.precision,
+            )
+            .with_lines_per_workgroup(lines_per_workgroup);
+            let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
+            let bind_group_layout = cached_layout(device, pipeline_key.layout);
+            let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
+            RaderExecution::Direct(FusedRaderExecution {
+                workgroups: lines_u32.div_ceil(lines_per_workgroup),
+                pipeline,
+                bind_group_layout,
+                twiddle_buffer,
+            })
+        } else if fused_rader_supported(
             m,
             config.precision,
             config.fused_workgroup_size,
@@ -435,7 +487,9 @@ impl RaderAxis {
 
     pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
         match &self.execution {
-            RaderExecution::Fused(execution) => execution.twiddle_buffer.size(),
+            RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
+                execution.twiddle_buffer.size()
+            }
             RaderExecution::MultiPass(execution) => {
                 let bytes = execution.work_fft_forward.twiddle_lut_storage_bytes();
                 debug_assert_eq!(
@@ -448,19 +502,30 @@ impl RaderAxis {
     }
 
     pub(crate) fn graph_is_fused(&self) -> bool {
-        matches!(self.execution, RaderExecution::Fused(_))
+        matches!(
+            self.execution,
+            RaderExecution::Direct(_) | RaderExecution::Fused(_)
+        )
+    }
+
+    /// Graph label of the single kernel of a fused execution.
+    pub(crate) fn graph_fused_label(&self) -> &'static str {
+        match self.execution {
+            RaderExecution::Direct(_) => "rader-direct-dft-stage",
+            _ => "rader-fused-workgroup-stage",
+        }
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) => Vec::new(),
             RaderExecution::MultiPass(execution) => execution.work_fft_forward.graph_stage_kinds(),
         }
     }
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            RaderExecution::Fused(_) => 0,
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) => 0,
             RaderExecution::MultiPass(execution) => {
                 execution.work_fft_forward.workspace_size_bytes()
             }
@@ -469,14 +534,14 @@ impl RaderAxis {
 
     pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) => Vec::new(),
             RaderExecution::MultiPass(execution) => execution.work_fft_inverse.graph_stage_kinds(),
         }
     }
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            RaderExecution::Fused(_) => 0,
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) => 0,
             RaderExecution::MultiPass(execution) => {
                 execution.work_fft_inverse.workspace_size_bytes()
             }
@@ -542,7 +607,7 @@ impl RaderAxis {
         debug_assert!(self.lines > 0);
 
         match &self.execution {
-            RaderExecution::Fused(execution) => {
+            RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
                 self.dispatch_fused(device, encoder, input, output, execution)?;
             }
             RaderExecution::MultiPass(execution) => {
@@ -834,7 +899,11 @@ fn cached_fused_pipeline(
     let shader_label = format!("wgpu_fft.rader.fused.shader.{stable_key}");
     with_device_pipeline_cache(device, |cache| {
         cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
-            generate_fused_rader_wgsl_for_key(shader_key)
+            if shader_key.kind == FusedPrimeKind::Direct {
+                generate_direct_prime_wgsl_for_key(shader_key)
+            } else {
+                generate_fused_rader_wgsl_for_key(shader_key)
+            }
         })
     })
 }

@@ -5,9 +5,10 @@
 use std::sync::mpsc;
 
 use wgpu_fft::math::{reference_c2c_nd_f64, Complex64};
-use wgpu_fft::{C2cRoute, FftConfig, FftPlan, Normalization};
+use wgpu_fft::{C2cRoute, FftConfig, FftPlan, FftTuning, Normalization};
 
 const RADER_FUSED_LABEL: &str = "rader-fused-workgroup-stage";
+const DIRECT_LABEL: &str = "rader-direct-dft-stage";
 const BLUESTEIN_FUSED_LABEL: &str = "bluestein-fused-workgroup-stage";
 
 #[test]
@@ -36,12 +37,16 @@ async fn run_fused_prime_cases() {
         );
     }
 
+    run_direct_cases(&context);
+
+    // Short primes take the direct DFT kernel by default; `direct_max_prime(0)`
+    // keeps the fused Rader kernel covered for them.
     for (length, batch) in [(101, 3), (1009, 2)] {
         for inverse in [false, true] {
             run_fused_case(
                 &context.device,
                 &context.queue,
-                config_1d(length, batch, inverse),
+                config_1d(length, batch, inverse).with_tuning(rader_only()),
                 C2cRoute::Rader,
                 RADER_FUSED_LABEL,
                 &["rader-permutation-helper", "rader-bfft-helper"],
@@ -107,7 +112,8 @@ async fn run_fused_prime_cases() {
             } else {
                 FftConfig::new_nd(shape).with_normalization(Normalization::None)
             }
-            .with_batch(2);
+            .with_batch(2)
+            .with_tuning(rader_only());
             run_fused_axis_sequence_case(
                 &context.device,
                 &context.queue,
@@ -123,7 +129,9 @@ async fn run_fused_prime_cases() {
         &FftPlan::c2c(
             &context.device,
             &context.queue,
-            FftConfig::new(17).with_normalization(Normalization::None),
+            FftConfig::new(17)
+                .with_normalization(Normalization::None)
+                .with_tuning(rader_only()),
         )
         .unwrap(),
         "tiny N=17",
@@ -285,6 +293,79 @@ fn unsplit_fallback(
         "unsplit fallback keeps Stockham stages: {kernels:?}"
     );
     (output, kernels)
+}
+
+fn rader_only() -> FftTuning {
+    FftTuning::default().with_direct_max_prime(0)
+}
+
+/// Short primes transform with the direct DFT kernel: one kernel per axis,
+/// many lines per workgroup, and f32 accuracy on par with the FFT routes.
+fn run_direct_cases(context: &wgpu_fft::device::GpuContext) {
+    for (length, batch) in [(17, 5), (31, 1), (61, 3), (101, 2), (127, 7)] {
+        for inverse in [false, true] {
+            run_fused_case(
+                &context.device,
+                &context.queue,
+                config_1d(length, batch, inverse),
+                C2cRoute::Rader,
+                DIRECT_LABEL,
+                &["rader-permutation-helper", "rader-bfft-helper"],
+                &format!("direct N={length} batch={batch} inverse={inverse}"),
+            );
+        }
+    }
+    // A long batch spreads over many workgroups, and a strided prime axis
+    // loads several neighbouring lines together.
+    run_fused_case(
+        &context.device,
+        &context.queue,
+        FftConfig::new(17)
+            .with_batch(4099)
+            .with_normalization(Normalization::Forward),
+        C2cRoute::Rader,
+        DIRECT_LABEL,
+        &["rader-permutation-helper", "rader-bfft-helper"],
+        "direct N=17 batch=4099",
+    );
+    for inverse in [false, true] {
+        let config = if inverse {
+            FftConfig::inverse_nd([6, 43, 5])
+        } else {
+            FftConfig::new_nd([6, 43, 5]).with_normalization(Normalization::Orthogonal)
+        }
+        .with_axes([1])
+        .with_batch(2);
+        run_fused_case(
+            &context.device,
+            &context.queue,
+            config,
+            C2cRoute::Rader,
+            DIRECT_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            &format!("direct strided 6x43x5 axis 1 inverse={inverse}"),
+        );
+    }
+    // All-prime ND shapes run one direct kernel per axis.
+    for shape in [vec![17, 17], vec![19, 23, 29]] {
+        let config = FftConfig::new_nd(shape.clone()).with_normalization(Normalization::None);
+        let input = test_signal(config.total_complex_len().unwrap());
+        let expected = reference_f64(&input, &config);
+        let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
+        let direct_kernels = kernel_labels(&plan)
+            .iter()
+            .filter(|label| label.ends_with("direct-dft-stage"))
+            .count();
+        assert_eq!(direct_kernels, shape.len(), "direct ND {shape:?}");
+        let (max_relative, rms_relative) = relative_error_metrics(&actual, &expected);
+        eprintln!(
+            "FUSED_PRIME_ACCURACY label=\"direct ND {shape:?}\" max_relative={max_relative:.9e} rms_relative={rms_relative:.9e}"
+        );
+        assert!(
+            max_relative < 5.0e-7 && rms_relative < 5.0e-7,
+            "direct ND {shape:?}: max/rms relative error={max_relative}/{rms_relative}"
+        );
+    }
 }
 
 fn run_fused_case(

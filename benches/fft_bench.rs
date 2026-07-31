@@ -133,6 +133,7 @@ struct Options {
     segmented_burst_depth: usize,
     workgroup_size: Option<u32>,
     direct_max_prime: Option<usize>,
+    rader_max_prime: Option<usize>,
     shared_pass: bool,
 }
 
@@ -1744,6 +1745,9 @@ fn benchmark_config(
     if let Some(direct_max_prime) = options.direct_max_prime {
         tuning = tuning.with_direct_max_prime(direct_max_prime);
     }
+    if let Some(rader_max_prime) = options.rader_max_prime {
+        tuning = tuning.with_rader_max_prime(rader_max_prime);
+    }
     config.with_tuning(tuning)
 }
 
@@ -2151,6 +2155,7 @@ fn parse_options() -> BenchResult<Options> {
         workgroup_size: None,
         shared_pass: false,
         direct_max_prime: None,
+        rader_max_prime: None,
     };
     let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
@@ -2196,6 +2201,13 @@ fn parse_options() -> BenchResult<Options> {
                     next_value(&mut args, "--direct-max-prime")?
                         .parse::<usize>()
                         .map_err(|error| input_error(format!("--direct-max-prime: {error}")))?,
+                );
+            }
+            "--rader-max-prime" => {
+                options.rader_max_prime = Some(
+                    next_value(&mut args, "--rader-max-prime")?
+                        .parse::<usize>()
+                        .map_err(|error| input_error(format!("--rader-max-prime: {error}")))?,
                 );
             }
             "--shared-pass" => {

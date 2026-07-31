@@ -10,6 +10,7 @@ use crate::runtime::axis_plan::{
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
 };
+use crate::runtime::bluestein_axis::{register_bluestein_plan, BluesteinAxis, BluesteinAxisConfig};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::direct_prime::{
     direct_lines_per_workgroup, direct_prime_supported, generate_direct_prime_wgsl_for_key,
@@ -72,6 +73,9 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) fused_min_convolution_length: usize,
     pub(crate) fuse_long_axes: bool,
     pub(crate) direct_max_prime: usize,
+    /// Whether a prime whose convolution does not fit one workgroup may run
+    /// Bluestein's register-resident kernel; false when Rader is forced.
+    pub(crate) bluestein_fallback: bool,
 }
 
 pub(crate) struct RaderAxis {
@@ -89,6 +93,10 @@ enum RaderExecution {
     /// A direct DFT of a short prime (see `runtime::direct_prime`).
     Direct(FusedRaderExecution),
     Fused(FusedRaderExecution),
+    /// Bluestein's register-resident kernel, for primes whose Rader
+    /// convolution fits no workgroup: one coalesced pass instead of the
+    /// multi-pass pipeline.
+    Bluestein(Box<BluesteinAxis>),
     MultiPass(Box<MultiPassRaderExecution>),
 }
 
@@ -299,6 +307,39 @@ impl RaderAxis {
                 bind_group_layout,
                 twiddle_buffer,
             })
+        } else if !fused_rader_supported(
+            m,
+            config.precision,
+            config.fused_workgroup_size,
+            config.fused_min_convolution_length,
+            &device.limits(),
+        ) && config.bluestein_fallback
+            && register_bluestein_plan(
+                n,
+                config.precision,
+                config.fused_workgroup_size,
+                config.fused_min_convolution_length,
+                config.fuse_long_axes,
+                &device.limits(),
+            )
+            .is_some()
+        {
+            RaderExecution::Bluestein(Box::new(BluesteinAxis::new(
+                device,
+                queue,
+                BluesteinAxisConfig {
+                    shape: config.shape.clone(),
+                    axis: config.axis,
+                    batch: config.batch,
+                    direction: config.direction,
+                    normalization: config.normalization,
+                    precision: config.precision,
+                    workgroup_size: config.workgroup_size,
+                    fused_workgroup_size: config.fused_workgroup_size,
+                    fused_min_convolution_length: config.fused_min_convolution_length,
+                    fuse_long_axes: config.fuse_long_axes,
+                },
+            )?))
         } else if fused_rader_supported(
             m,
             config.precision,
@@ -490,6 +531,7 @@ impl RaderAxis {
             RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
                 execution.twiddle_buffer.size()
             }
+            RaderExecution::Bluestein(plan) => plan.twiddle_lut_storage_bytes(),
             RaderExecution::MultiPass(execution) => {
                 let bytes = execution.work_fft_forward.twiddle_lut_storage_bytes();
                 debug_assert_eq!(
@@ -504,28 +546,33 @@ impl RaderAxis {
     pub(crate) fn graph_is_fused(&self) -> bool {
         matches!(
             self.execution,
-            RaderExecution::Direct(_) | RaderExecution::Fused(_)
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) | RaderExecution::Bluestein(_)
         )
     }
 
     /// Graph label of the single kernel of a fused execution.
     pub(crate) fn graph_fused_label(&self) -> &'static str {
-        match self.execution {
+        match &self.execution {
             RaderExecution::Direct(_) => "rader-direct-dft-stage",
+            RaderExecution::Bluestein(plan) => plan.graph_fused_label(),
             _ => "rader-fused-workgroup-stage",
         }
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            RaderExecution::Direct(_) | RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) | RaderExecution::Bluestein(_) => {
+                Vec::new()
+            }
             RaderExecution::MultiPass(execution) => execution.work_fft_forward.graph_stage_kinds(),
         }
     }
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            RaderExecution::Direct(_) | RaderExecution::Fused(_) => 0,
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) | RaderExecution::Bluestein(_) => {
+                0
+            }
             RaderExecution::MultiPass(execution) => {
                 execution.work_fft_forward.workspace_size_bytes()
             }
@@ -534,14 +581,18 @@ impl RaderAxis {
 
     pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            RaderExecution::Direct(_) | RaderExecution::Fused(_) => Vec::new(),
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) | RaderExecution::Bluestein(_) => {
+                Vec::new()
+            }
             RaderExecution::MultiPass(execution) => execution.work_fft_inverse.graph_stage_kinds(),
         }
     }
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            RaderExecution::Direct(_) | RaderExecution::Fused(_) => 0,
+            RaderExecution::Direct(_) | RaderExecution::Fused(_) | RaderExecution::Bluestein(_) => {
+                0
+            }
             RaderExecution::MultiPass(execution) => {
                 execution.work_fft_inverse.workspace_size_bytes()
             }
@@ -549,6 +600,9 @@ impl RaderAxis {
     }
 
     pub(crate) fn graph_helper_buffers(&self) -> Vec<HelperBufferRange> {
+        if let RaderExecution::Bluestein(plan) = &self.execution {
+            return plan.graph_helper_buffers();
+        }
         let element_format = self.precision.element_format();
         let mut helpers = vec![
             HelperBufferRange {
@@ -609,6 +663,9 @@ impl RaderAxis {
         match &self.execution {
             RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
                 self.dispatch_fused(device, encoder, input, output, execution)?;
+            }
+            RaderExecution::Bluestein(plan) => {
+                plan.execute_views(device, encoder, input, output)?
             }
             RaderExecution::MultiPass(execution) => {
                 self.dispatch_sum(device, encoder, input.clone(), execution)?;

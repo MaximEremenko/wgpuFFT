@@ -96,7 +96,8 @@ smooth internal length, and mixed-algorithm ND plans execute typed axis-sequence
 stage graphs. When a convolution does not fit workgroup memory, Bluestein runs
 its forward and inverse FFTs over a power-of-two length of up to 16384 points
 in registers within one kernel (`f32`), and Rader primes whose convolution does
-not fit use that kernel too. The direct DFT compute kernel remains as a length-one fallback.
+not fit use that kernel too. Rader convolves cyclically over `N - 1` points
+when that length is smooth, and over a zero-padded smooth length otherwise. The direct DFT compute kernel remains as a length-one fallback.
 
 Public `FftLogicalView` and `BufferView` execution APIs normalize whole-buffer,
 offset, segmented, strided, and segmented+strided logical input/output views for

@@ -1091,8 +1091,11 @@ fn validate_snapshot_convolution(
             };
         }
     };
-    if minimum.is_none_or(|minimum| convolution_length < minimum)
-        || (kind == FusedPrimeKind::Rader && convolution_length < axis_length)
+    // Rader may also convolve cyclically over exactly axis_length - 1.
+    let cyclic = kind == FusedPrimeKind::Rader && convolution_length + 1 == axis_length;
+    if !cyclic
+        && (minimum.is_none_or(|minimum| convolution_length < minimum)
+            || (kind == FusedPrimeKind::Rader && convolution_length < axis_length))
     {
         return snapshot_integrity("prime-axis convolution is too short");
     }
@@ -2162,7 +2165,13 @@ impl FusedPrimeStageKey {
             return false;
         };
         let extra_bytes = match self.kind {
-            FusedPrimeKind::Rader => complex_bytes,
+            FusedPrimeKind::Rader => {
+                crate::runtime::rader_axis::fused_rader_extra_elements(
+                    self.axis_length,
+                    self.convolution_length,
+                    self.workgroup_size,
+                ) * complex_bytes
+            }
             FusedPrimeKind::Bluestein => 0usize,
             // The roots.
             FusedPrimeKind::Direct => self.axis_length * complex_bytes,

@@ -518,22 +518,23 @@ fn run_prime_cases(
     }
 
     // These convolution sizes fit the f32 fused gate but exceed 48 KiB
-    // after native-f64 doubles each scratch element.
+    // after native-f64 doubles each scratch element. N=1607 pads its Rader
+    // convolution to 3234 points because 1606 = 2 * 11 * 73 is not smooth.
     let (_, rader_multipass) = execute_prime_reference_case(
         &context.device,
         &context.queue,
-        "rader-n1601-native-storage-fallback",
-        prime_config_1d(1601, 1, false),
+        "rader-n1607-native-storage-fallback",
+        prime_config_1d(1607, 1, false),
     );
-    if storage_limit < 3200 * 16 + 16 {
-        assert_rader_multipass_plan(&rader_multipass, "rader-n1601-native-storage-fallback");
+    if storage_limit < 3234 * 16 + 16 {
+        assert_rader_multipass_plan(&rader_multipass, "rader-n1607-native-storage-fallback");
         assert!(
             kernel_labels(&rader_multipass)
                 .iter()
                 .filter(|stage| stage.starts_with("rader-forward-") && stage.ends_with("-stage"))
                 .count()
                 >= 2,
-            "Rader N=1601 should also run its child FFTs in several passes at this storage limit"
+            "Rader N=1607 should also run its child FFTs in several passes at this storage limit"
         );
     } else {
         assert_fused_prime_plan(
@@ -541,7 +542,7 @@ fn run_prime_cases(
             C2cRoute::Rader,
             RADER_FUSED_LABEL,
             &["rader-permutation-helper", "rader-bfft-helper"],
-            "rader-n1601-native-storage-fallback",
+            "rader-n1607-native-storage-fallback",
         );
     }
 

@@ -226,6 +226,7 @@ fn prime_binding_inventory(
             );
         let rader_fused = kind == AxisKind::Rader
             && fused_rader_supported_by_limits(
+                n,
                 rader_convolution_length(n)?,
                 axis_precision,
                 config.tuning().fused_workgroup_size(),
@@ -251,6 +252,7 @@ fn prime_binding_inventory(
             // Direct and register kernels need only small helper tables.
             _ if direct_prime || register_bluestein.is_some() => true,
             AxisKind::Rader => fused_rader_supported_by_limits(
+                n,
                 m,
                 axis_precision,
                 config.tuning().fused_workgroup_size(),
@@ -7983,14 +7985,16 @@ mod tests {
         let compute_limits = wgpu::Limits::default();
         // Short primes default to direct kernels; keep them on Rader here.
         let rader = crate::tuning::FftTuning::default().with_direct_max_prime(0);
-        let fused = FftConfig::new(101)
+        // N=257 convolves cyclically over 256 points, above the default floor.
+        let fused = FftConfig::new(257)
             .with_batch(10)
             .with_tuning(rader.clone());
         let staged = fused
             .clone()
             .with_tuning(rader.with_fused_min_convolution_length(usize::MAX));
         let kinds = [AxisKind::Rader];
-        let m = rader_convolution_length(101).unwrap();
+        let m = rader_convolution_length(257).unwrap();
+        assert_eq!(m, 256);
         assert_eq!(
             prime_max_binding_bytes(&fused, &kinds, &compute_limits).unwrap(),
             (m * 8) as u64
@@ -8173,10 +8177,13 @@ mod tests {
             );
         }
 
+        // N=47 pads its Rader convolution to 91 points (46 is not smooth), so
+        // its helpers outgrow the data; smooth N - 1 convolves cyclically in
+        // less than the data.
         for (helper_limited, binding_limit) in [
             (
-                FftConfig::new(17)
-                    .with_batch(9)
+                FftConfig::new(47)
+                    .with_batch(4)
                     .with_precision(FftPrecision::F64),
                 4096,
             ),
@@ -8187,8 +8194,8 @@ mod tests {
                 4096,
             ),
             (
-                FftConfig::new_nd([2, 17]).with_precision(FftPrecision::F64),
-                800,
+                FftConfig::new_nd([2, 47]).with_precision(FftPrecision::F64),
+                1600,
             ),
         ] {
             let route = select_route(&helper_limited);

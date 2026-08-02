@@ -2165,13 +2165,7 @@ impl FusedPrimeStageKey {
             return false;
         };
         let extra_bytes = match self.kind {
-            FusedPrimeKind::Rader => {
-                crate::runtime::rader_axis::fused_rader_extra_elements(
-                    self.axis_length,
-                    self.convolution_length,
-                    self.workgroup_size,
-                ) * complex_bytes
-            }
+            FusedPrimeKind::Rader => 0usize,
             FusedPrimeKind::Bluestein => 0usize,
             // The roots.
             FusedPrimeKind::Direct => self.axis_length * complex_bytes,
@@ -3189,10 +3183,11 @@ mod tests {
         let rader_unused_scale = key(FusedPrimeKind::Rader, false, 1.0 / 2999.0);
         assert_eq!(rader, rader_unused_scale);
         assert_eq!(rader.scale_factor(), 1.0);
-        assert!(rader.is_supported_by_limits(48_008, 256, 256));
-        assert!(!rader.is_supported_by_limits(48_007, 256, 256));
-        assert!(!rader.is_supported_by_limits(48_008, 255, 256));
-        assert!(!rader.is_supported_by_limits(48_008, 256, 255));
+        // Rader and Bluestein both need exactly the convolution.
+        assert!(rader.is_supported_by_limits(48_000, 256, 256));
+        assert!(!rader.is_supported_by_limits(47_999, 256, 256));
+        assert!(!rader.is_supported_by_limits(48_000, 255, 256));
+        assert!(!rader.is_supported_by_limits(48_000, 256, 255));
 
         let bluestein = key(FusedPrimeKind::Bluestein, false, 1.0);
         assert!(bluestein.is_supported_by_limits(48_000, 256, 256));

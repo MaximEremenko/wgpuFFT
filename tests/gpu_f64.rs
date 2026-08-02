@@ -477,14 +477,14 @@ fn run_prime_cases(
 ) {
     let storage_limit = context.device.limits().max_compute_workgroup_storage_size as usize;
 
-    // Rader N=509 uses M=1024: 16*M bytes of f64 scratch plus one
-    // complex-f64 reduction slot. It fuses at 48 KiB but not at 16 KiB.
+    // Rader N=523 uses M=1050 (522 = 2 * 3^2 * 29 is not smooth): 16*M bytes
+    // of f64 scratch. It fuses at 48 KiB but not at 16 KiB.
     for inverse in [false, true] {
-        let label = format!("rader-n509-inverse={inverse}");
-        let config = prime_config_1d(509, 1, inverse);
+        let label = format!("rader-n523-inverse={inverse}");
+        let config = prime_config_1d(523, 1, inverse);
         let (_, plan) =
             execute_prime_reference_case(&context.device, &context.queue, &label, config);
-        if storage_limit >= 16 * 1024 + 16 {
+        if storage_limit >= 1050 * 16 {
             assert_fused_prime_plan(
                 &plan,
                 C2cRoute::Rader,
@@ -605,14 +605,14 @@ fn run_prime_cases(
     }
 
     if let Some(low_storage) = low_storage {
-        if storage_limit >= 16 * 1024 + 16 {
+        if storage_limit >= 1050 * 16 {
             compare_fused_prime_with_low_storage(
                 context,
                 low_storage,
-                509,
+                523,
                 C2cRoute::Rader,
                 RADER_FUSED_LABEL,
-                "rader-n509-fused-vs-16k",
+                "rader-n523-fused-vs-16k",
             );
         }
         if storage_limit >= 1029 * 16 {

@@ -88,6 +88,8 @@ invocations are supported by default. The fused workgroup size is tunable per
 plan. This covers mixed-radix
 lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`. Longer contiguous
 power-of-two `f32` lines keep their elements in registers within one kernel,
+strided power-of-two axes interleave up to eight lines per workgroup in
+registers when workgroup memory holds fewer,
 other long axes run as two fused passes (`N = N1 * N2`), and the remaining
 lines use generated Stockham stages. Prime `f32` axes up to 127 run a direct
 DFT kernel that pairs `X[k]` with `X[p - k]`. Other prime axes route through

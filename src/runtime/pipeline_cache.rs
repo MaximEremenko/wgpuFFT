@@ -803,7 +803,11 @@ impl ShaderCacheKey {
                     return snapshot_integrity("invalid fused power-of-two axis length");
                 }
                 if key.registers.as_ref().is_some_and(|registers| {
-                    !registers.is_consistent(key.axis_length, key.workgroup_size)
+                    key.lines_per_workgroup == 0
+                        || !registers.is_consistent(
+                            key.axis_length,
+                            key.workgroup_size / key.lines_per_workgroup,
+                        )
                 }) {
                     return snapshot_integrity("invalid register-resident radix schedule");
                 }
@@ -2377,7 +2381,9 @@ impl FusedPow2StageKey {
         max_workgroup_size_x: u32,
     ) -> bool {
         let scratch_elements = match &self.registers {
-            Some(registers) => Some(registers.exchange_len),
+            Some(registers) => registers
+                .exchange_len
+                .checked_mul(self.lines_per_workgroup as usize),
             None => self
                 .axis_length
                 .checked_mul(self.lines_per_workgroup as usize),

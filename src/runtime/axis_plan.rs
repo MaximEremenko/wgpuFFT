@@ -14,7 +14,9 @@ use crate::runtime::pipeline_cache::{
     PipelineLayoutCacheKey, SplitPass, StockhamStageKey,
 };
 use crate::runtime::recorder::CommandRecorder;
-use crate::runtime::register_fft::{generate_register_fft_wgsl, register_schedule};
+use crate::runtime::register_fft::{
+    generate_register_fft_wgsl, register_schedule, register_schedule_for_lines,
+};
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 #[cfg(test)]
 use crate::runtime::twiddle::twiddle_lut_f32;
@@ -569,7 +571,59 @@ impl AxisPlan {
                 index
             };
 
-            if fused_pow2_supported(
+            let strided_registers = strided_register_plan(
+                axis_len,
+                stride_complex,
+                total_complex / axis_len,
+                &config,
+                &device.limits(),
+            );
+            if let Some((lines_per_workgroup, workgroup_size, schedule)) = strided_registers {
+                // Strided lines interleave in registers, so neighbouring
+                // invocations load neighbouring lines.
+                let apply_scale = apply_any_scale && final_axis;
+                let total_lines = total_complex / axis_len;
+                let shader_key = FusedPow2StageKey::new(
+                    config.shape.len(),
+                    axis,
+                    &config.shape,
+                    axis_len,
+                    stride_complex,
+                    config.direction,
+                    workgroup_size,
+                    apply_scale,
+                    scale,
+                    config.precision,
+                )
+                .with_lines_per_workgroup(lines_per_workgroup)
+                .with_registers(schedule);
+                let pipeline_key = ComputePipelineCacheKey::fused_pow2_stage(shader_key.clone());
+                let shader_label =
+                    format!("wgpu_fft.axis_plan.register_pow2.axis{axis}.n{axis_len}.shader");
+                let pipeline_label =
+                    format!("wgpu_fft.axis_plan.register_pow2.axis{axis}.n{axis_len}.pipeline");
+                let pipeline = with_device_pipeline_cache(device, |cache| {
+                    cache.get_compute_pipeline(
+                        device,
+                        &pipeline_key,
+                        &pipeline_label,
+                        &shader_label,
+                        || generate_fused_pow2_stage_wgsl_for_key(&shader_key),
+                    )
+                });
+                stages.push(AxisStage {
+                    axis,
+                    kind: AxisStageKind::FusedPow2 {
+                        axis_length: axis_len,
+                    },
+                    stride_complex,
+                    apply_scale,
+                    pipeline_key,
+                    twiddle_lut_index,
+                    workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
+                    pipeline,
+                });
+            } else if fused_pow2_supported(
                 axis_len,
                 config.precision,
                 config.fused_workgroup_size,
@@ -1692,7 +1746,7 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         precision: key.precision,
     };
     if let Some(registers) = &key.registers {
-        generate_register_fft_wgsl(&config, registers)
+        generate_register_fft_wgsl(&config, registers, key.lines_per_workgroup as usize)
     } else if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
         generate_fused_pow2_multiline_stage_wgsl(
             &config,
@@ -1728,6 +1782,49 @@ fn long_axis_split(
         n1 += 1;
     }
     split
+}
+
+/// Lines per workgroup, workgroup size, and schedule of a register-resident
+/// kernel for a strided power-of-two axis, when it interleaves more lines
+/// than a workgroup-memory kernel could, up to eight: neighbouring
+/// invocations then load neighbouring lines.
+fn strided_register_plan(
+    axis_length: usize,
+    stride_complex: usize,
+    total_lines: usize,
+    config: &AxisPlanConfig,
+    limits: &wgpu::Limits,
+) -> Option<(u32, u32, crate::runtime::pipeline_cache::RegisterSchedule)> {
+    const MAX_LINES: usize = 8;
+    if stride_complex == 1 || !config.long_axes.allows_registers() {
+        return None;
+    }
+    let shared_lines = if fused_pow2_supported(
+        axis_length,
+        config.precision,
+        config.fused_workgroup_size,
+        limits,
+    ) {
+        fused_lines_per_workgroup(
+            axis_length,
+            stride_complex,
+            config.precision,
+            total_lines,
+            u64::from(limits.max_compute_workgroup_storage_size),
+        ) as usize
+    } else {
+        0
+    };
+    let mut lines = MAX_LINES;
+    while lines >= 2 && lines > shared_lines {
+        if let Some((workgroup_size, schedule)) =
+            register_schedule_for_lines(axis_length, lines, config.precision, limits)
+        {
+            return Some((lines as u32, workgroup_size, schedule));
+        }
+        lines /= 2;
+    }
+    None
 }
 
 /// Lines per workgroup for a fused kernel on an axis of `axis_length`.

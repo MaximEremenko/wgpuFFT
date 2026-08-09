@@ -123,6 +123,7 @@ struct Options {
     precision: PrecisionMode,
     custom_shape: Option<Vec<usize>>,
     custom_batch: usize,
+    custom_axes: Option<Vec<usize>>,
     adapter_selector: Option<String>,
     runs: usize,
     iter_cap: u64,
@@ -1732,10 +1733,13 @@ fn benchmark_config(
     } else {
         FftConfig::new_nd(case.shape.clone())
     };
-    let config = config
+    let mut config = config
         .with_batch(case.batch)
         .with_normalization(Normalization::None)
         .with_precision(precision);
+    if let Some(axes) = &options.custom_axes {
+        config = config.with_axes(axes.clone());
+    }
     let mut tuning = FftTuning::default();
     if let Some(workgroup_size) = options.workgroup_size {
         tuning = tuning
@@ -2144,6 +2148,7 @@ fn parse_options() -> BenchResult<Options> {
         precision: PrecisionMode::F32,
         custom_shape,
         custom_batch: 1,
+        custom_axes: None,
         adapter_selector: None,
         runs: DEFAULT_RUNS,
         iter_cap: DEFAULT_ITER_CAP,
@@ -2225,6 +2230,12 @@ fn parse_options() -> BenchResult<Options> {
                 }
                 options.custom_batch =
                     parse_positive::<usize>(next_value(&mut args, "--batch")?, "--batch")?;
+            }
+            "--axes" => {
+                if suite != Suite::Custom {
+                    return Err(input_error("--axes is valid only in custom shape mode"));
+                }
+                options.custom_axes = Some(parse_axes(&next_value(&mut args, "--axes")?)?);
             }
             "--plan-max-bind-bytes" => {
                 if suite != Suite::Custom {
@@ -2341,6 +2352,17 @@ fn parse_shape(value: &str) -> BenchResult<Vec<usize>> {
     Ok(shape)
 }
 
+fn parse_axes(value: &str) -> BenchResult<Vec<usize>> {
+    value
+        .split(',')
+        .map(|part| {
+            part.trim().parse::<usize>().map_err(|error| {
+                contextual_error(format!("parsing axis {part:?} of --axes"), error)
+            })
+        })
+        .collect()
+}
+
 fn parse_compare_max_buffer_bytes(value: String) -> BenchResult<CompareMaxBufferBytes> {
     let mut caps = value.split(',').map(str::trim);
     let unsharded = caps
@@ -2379,7 +2401,7 @@ fn print_usage() {
     eprintln!(
         r#"Usage:
   cargo bench --bench fft_bench -- <smoke|sample0|sample1000|sample3|sample7|all> [--precision f32|f64|df64|both|df64-f64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--max-cases N] [--wait-timeout-secs N]
-  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--precision f32|f64|df64|both|df64-f64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
+  cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] [--axes A[,A...]] [--precision f32|f64|df64|both|df64-f64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
   cargo bench --bench fft_bench -- shape <N[xN...]> [--batch N] --plan-max-bind-bytes BYTES --compare-max-buffer-bytes UNSHARDED_BYTES,SHARDED_BYTES [--segmented-burst-depth 1|2|3] [--precision f32|f64|df64] [--workgroup-size N] [--adapter INDEX_OR_NAME] [--runs N] [--iter-cap N] [--wait-timeout-secs N]
 
 Defaults:
@@ -2390,6 +2412,7 @@ Defaults:
   Segment-cap comparison recreates both variants per run and alternates their order.
   Segmented burst depth defaults to 2 and is valid only in comparison mode; multi-precision modes are rejected there.
   Workgroup size is unset by default. An explicit positive power of two sets both staged and fused FFT workgroup sizes.
+  --axes transforms only the listed axes of the shape, for timing one axis of a multidimensional transform.
 
 Examples:
   cargo bench --bench fft_bench -- smoke --adapter 0 --runs 1 --iter-cap 2

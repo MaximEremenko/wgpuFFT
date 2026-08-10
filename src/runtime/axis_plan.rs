@@ -1545,6 +1545,7 @@ pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
     // Contiguous lines load line-major; strided lines load element-major so
     // neighbouring invocations touch neighbouring lines.
     let store = multiline_store(split, config.stride_complex);
+    let element_major = config.stride_complex != 1 || store.stride_out != 1;
     let load_split = multiline_split_wgsl(config.stride_complex);
     let store_split = multiline_split_wgsl(store.stride_out);
 
@@ -1571,6 +1572,7 @@ const STRIDE: u32 = {stride}u;
 const STRIDE_OUT: u32 = {stride_out}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const LINES: u32 = {lines}u;
+const LINE_STRIDE: u32 = {line_stride}u;
 
 var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
 
@@ -1598,7 +1600,7 @@ fn main({entry_params}) {{
     {load_split}
     if (lineSlot < lineCount) {{
       let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
-      scratch[lineSlot * N + (reverseBits(p) >> (32u - LOG_N))] = src[srcIdx];
+      scratch[lineSlot * LINE_STRIDE + (reverseBits(p) >> (32u - LOG_N))] = src[srcIdx];
     }}
   }}
   workgroupBarrier();
@@ -1607,7 +1609,7 @@ fn main({entry_params}) {{
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
     {store_split}
     if (lineSlot < lineCount) {{
-      var value: vec2<f32> = scratch[lineSlot * N + p];
+      var value: vec2<f32> = scratch[lineSlot * LINE_STRIDE + p];
 {row_twiddle}{maybe_scale}      let dstIdx: u32 = line_base_out(lineStart + lineSlot) + p * STRIDE_OUT - params.elementBase;
       dst[dstIdx] = value;
     }}
@@ -1620,7 +1622,8 @@ fn main({entry_params}) {{
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
             lines = lines,
-            scratch_len = config.axis_length * lines,
+            scratch_len = multiline_line_stride(config.axis_length, lines, element_major) * lines,
+            line_stride = multiline_line_stride(config.axis_length, lines, element_major),
             twiddle_lookup_wgsl =
                 multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
             line_base_fn = line_base_fn,
@@ -1684,7 +1687,7 @@ fn generate_fused_radix_stage_multiline_wgsl(
       let unit: u32 = slot - lineSlot * UNIT_COUNT;
       let block: u32 = unit / PREVIOUS;
       let j: u32 = unit - block * PREVIOUS;
-      let base: u32 = lineSlot * N + block * (RADIX * PREVIOUS) + j;
+      let base: u32 = lineSlot * LINE_STRIDE + block * (RADIX * PREVIOUS) + j;
 {body}      }}
     }}
     workgroupBarrier();
@@ -1940,7 +1943,8 @@ fn fused_lines_per_workgroup(
     if stride_complex > 1 {
         lines = lines.max(MIN_STRIDED_LINES);
     }
-    let line_bytes = axis_length * precision.complex_size_bytes() as usize;
+    // Padded as for strided axes; contiguous ones never approach this cap.
+    let line_bytes = (axis_length + 1) * precision.complex_size_bytes() as usize;
     let max_by_storage = (max_workgroup_storage_bytes as usize / line_bytes).max(1);
     let max_by_fill = (total_lines / MIN_WORKGROUPS).max(1);
     lines.min(max_by_storage).min(max_by_fill) as u32
@@ -2385,6 +2389,7 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
     }
     debug_assert_eq!(ns, config.axis_length);
     let store = multiline_store(split, config.stride_complex);
+    let element_major = config.stride_complex != 1 || store.stride_out != 1;
     let load_split = multiline_split_wgsl(config.stride_complex);
     let store_split = multiline_split_wgsl(store.stride_out);
 
@@ -2410,6 +2415,7 @@ const STRIDE: u32 = {stride}u;
 const STRIDE_OUT: u32 = {stride_out}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const LINES: u32 = {lines}u;
+const LINE_STRIDE: u32 = {line_stride}u;
 
 var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
 
@@ -2437,7 +2443,7 @@ fn main({entry_params}) {{
     {load_split}
     if (lineSlot < lineCount) {{
       let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
-      scratch[lineSlot * N + p] = src[srcIdx];
+      scratch[lineSlot * LINE_STRIDE + p] = src[srcIdx];
     }}
   }}
   workgroupBarrier();
@@ -2446,7 +2452,7 @@ fn main({entry_params}) {{
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
     {store_split}
     if (lineSlot < lineCount) {{
-      var value: vec2<f32> = scratch[lineSlot * N + p];
+      var value: vec2<f32> = scratch[lineSlot * LINE_STRIDE + p];
 {row_twiddle}{maybe_scale}      let dstIdx: u32 = line_base_out(lineStart + lineSlot) + p * STRIDE_OUT - params.elementBase;
       dst[dstIdx] = value;
     }}
@@ -2458,7 +2464,8 @@ fn main({entry_params}) {{
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
             lines = lines,
-            scratch_len = config.axis_length * lines,
+            scratch_len = multiline_line_stride(config.axis_length, lines, element_major) * lines,
+            line_stride = multiline_line_stride(config.axis_length, lines, element_major),
             twiddle_lookup_wgsl =
                 multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
             line_base_fn = line_base_fn,
@@ -2523,7 +2530,7 @@ fn generate_in_place_smooth_fft_stage_multiline_wgsl(
     let unit_{slot}: u32 = slotUnit_{slot} - lineSlot_{slot} * {unit_count}u;
     let block_{slot}: u32 = unit_{slot} / {ns_div_r}u;
     let j_{slot}: u32 = unit_{slot} - block_{slot} * {ns_div_r}u;
-    let lineOffset_{slot}: u32 = lineSlot_{slot} * N;
+    let lineOffset_{slot}: u32 = lineSlot_{slot} * LINE_STRIDE;
 {stage_outputs}    if (lineSlot_{slot} < lineCount) {{
       let base_{slot}: u32 = lineOffset_{slot} + block_{slot} * {ns_div_r}u + j_{slot};
 {butterfly}    }}
@@ -2748,6 +2755,32 @@ pub(crate) fn radix_root_wgsl(
     let angle = sign * std::f64::consts::TAU * power as f64 / radix as f64;
     let (sin, cos) = angle.sin_cos();
     precision.format_wgsl_complex(cos, sin)
+}
+
+/// Workgroup-memory elements between the lines of a multi-line kernel. When
+/// neighbouring invocations touch neighbouring lines (`element_major`), one
+/// element of padding keeps those lines in different banks instead of all in
+/// one. Line-major kernels gain nothing from it and slow down.
+pub(crate) const fn multiline_line_stride(
+    axis_length: usize,
+    lines: usize,
+    element_major: bool,
+) -> usize {
+    if lines > 1 && element_major {
+        axis_length + 1
+    } else {
+        axis_length
+    }
+}
+
+/// Whether a multi-line kernel loads or stores element-major: a strided
+/// axis, or a split pass storing into a strided output axis.
+pub(crate) fn multiline_element_major(stride_complex: usize, split: Option<&SplitPass>) -> bool {
+    let stride_out = match split.and_then(|split| split.output.as_ref()) {
+        Some((dims, axis)) => stride_for_axis(dims, *axis),
+        None => stride_complex,
+    };
+    stride_complex != 1 || stride_out != 1
 }
 
 /// Maps a flat element index `e` to `(lineSlot, p)`: line-major for
@@ -3706,7 +3739,9 @@ mod tests {
         assert!(contiguous.contains("const LINES: u32 = 32u;"));
         assert!(contiguous.contains("var<workgroup> scratch: array<vec2<f32>, 2048>;"));
         assert!(contiguous.contains("let lineSlot: u32 = e / N;"));
-        assert!(contiguous.contains("scratch[lineSlot * N + (reverseBits(p) >> (32u - LOG_N))]"));
+        assert!(contiguous
+            .contains("scratch[lineSlot * LINE_STRIDE + (reverseBits(p) >> (32u - LOG_N))]"));
+        assert!(contiguous.contains("const LINE_STRIDE: u32 = 64u;"));
         assert!(contiguous.contains("let lineCount: u32 = min(LINES, activeLines - groupLine);"));
         assert!(contiguous.contains("value = value * vec2<f32>(0.25, 0.25);"));
         crate::runtime::assert_workgroup_var_written_before_read(&contiguous, "scratch");
@@ -3716,6 +3751,10 @@ mod tests {
         let strided = multiline_wgsl_for(&[64, 64], 1, 32);
         assert!(strided.contains("const STRIDE: u32 = 64u;"));
         assert!(strided.contains("let lineSlot: u32 = e % LINES;"));
+        // One padding element per line keeps neighbouring lines in
+        // different banks.
+        assert!(strided.contains("const LINE_STRIDE: u32 = 65u;"));
+        assert!(strided.contains("var<workgroup> scratch: array<vec2<f32>, 2080>;"));
         crate::runtime::assert_workgroup_var_written_before_read(&strided, "scratch");
     }
 
@@ -3741,7 +3780,7 @@ mod tests {
             None,
         );
         assert!(wgsl.contains("const LINES: u32 = 16u;"));
-        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 768>;"));
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 784>;"));
         assert!(wgsl.contains("let lineSlot: u32 = e % LINES;"));
         assert!(wgsl.contains("if (lineSlot_0 < lineCount) {"));
         // The last stage writes workgroup memory; only the store pass writes dst.
@@ -3769,13 +3808,14 @@ mod tests {
             fused_lines_per_workgroup(512, 64, AxisPrecision::F32, 1 << 20, storage),
             8
         );
+        // Each line takes one padding element.
         assert_eq!(
             fused_lines_per_workgroup(1024, 64, AxisPrecision::F32, 1 << 20, storage),
-            6
+            5
         );
         assert_eq!(
             fused_lines_per_workgroup(1024, 64, AxisPrecision::F64, 1 << 20, storage),
-            3
+            2
         );
         // Small transforms keep enough workgroups to spread across the GPU.
         assert_eq!(

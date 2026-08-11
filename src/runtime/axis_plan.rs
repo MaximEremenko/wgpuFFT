@@ -1546,7 +1546,6 @@ pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
     // neighbouring invocations touch neighbouring lines.
     let store = multiline_store(split, config.stride_complex);
     let element_major = config.stride_complex != 1 || store.stride_out != 1;
-    let load_split = multiline_split_wgsl(config.stride_complex);
     let store_split = multiline_split_wgsl(store.stride_out);
 
     specialize_complex_wgsl(
@@ -1596,14 +1595,7 @@ fn main({entry_params}) {{
   let lineCount: u32 = min(LINES, activeLines - groupLine);
   let lineStart: u32 = params.lineOffset + firstLine + groupLine;
 
-  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {load_split}
-    if (lineSlot < lineCount) {{
-      let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
-      scratch[lineSlot * LINE_STRIDE + (reverseBits(p) >> (32u - LOG_N))] = src[srcIdx];
-    }}
-  }}
-  workgroupBarrier();
+{load_block}  workgroupBarrier();
 
 {radix_stages}
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
@@ -1631,11 +1623,17 @@ fn main({entry_params}) {{
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             radix_stages = radix_stages,
             maybe_scale = maybe_scale,
-            load_split = load_split,
             store_split = store_split,
             stride_out = store.stride_out,
             line_base_out_fn = store.line_base_out_fn,
             row_twiddle = store.row_twiddle,
+            load_block = multiline_load_wgsl(
+                config.axis_length,
+                lines,
+                config.workgroup_size as usize,
+                config.stride_complex != 1,
+                "(reverseBits(P) >> (32u - LOG_N))",
+            ),
         ),
         config.precision,
     )
@@ -2390,7 +2388,6 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
     debug_assert_eq!(ns, config.axis_length);
     let store = multiline_store(split, config.stride_complex);
     let element_major = config.stride_complex != 1 || store.stride_out != 1;
-    let load_split = multiline_split_wgsl(config.stride_complex);
     let store_split = multiline_split_wgsl(store.stride_out);
 
     specialize_complex_wgsl(
@@ -2439,14 +2436,7 @@ fn main({entry_params}) {{
   let lineCount: u32 = min(LINES, activeLines - groupLine);
   let lineStart: u32 = params.lineOffset + firstLine + groupLine;
 
-  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {load_split}
-    if (lineSlot < lineCount) {{
-      let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
-      scratch[lineSlot * LINE_STRIDE + p] = src[srcIdx];
-    }}
-  }}
-  workgroupBarrier();
+{load_block}  workgroupBarrier();
 
 {radix_stages}
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
@@ -2473,7 +2463,13 @@ fn main({entry_params}) {{
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             radix_stages = radix_stages,
             maybe_scale = maybe_scale,
-            load_split = load_split,
+            load_block = multiline_load_wgsl(
+                config.axis_length,
+                lines,
+                config.workgroup_size as usize,
+                config.stride_complex != 1,
+                "P",
+            ),
             store_split = store_split,
             stride_out = store.stride_out,
             line_base_out_fn = store.line_base_out_fn,
@@ -2781,6 +2777,80 @@ pub(crate) fn multiline_element_major(stride_complex: usize, split: Option<&Spli
         None => stride_complex,
     };
     stride_complex != 1 || stride_out != 1
+}
+
+/// Global loads of a multi-line kernel into workgroup memory, as straight-line
+/// code: every invocation issues all of its loads before storing any, so their
+/// latencies overlap. A loop would serialize them, since naga bounds every loop
+/// and that keeps drivers from unrolling it. `offset` is the element's offset
+/// within its line of workgroup memory, in terms of its index `P`.
+///
+/// Lines past `lineCount` in a partial last workgroup read a valid line
+/// instead and skip the store.
+fn multiline_load_wgsl(
+    axis_length: usize,
+    lines: usize,
+    workgroup_size: usize,
+    element_major: bool,
+    offset: &str,
+) -> String {
+    let total = axis_length * lines;
+    let count = total.div_ceil(workgroup_size);
+    let mut loads = String::new();
+    let mut stores = String::new();
+    // Element-major lines with a line count dividing the workgroup keep one
+    // line per invocation: its base address is computed once.
+    let hoisted = element_major && workgroup_size % lines == 0;
+    if hoisted {
+        loads.push_str(&format!(
+            "  let loadSlot: u32 = lid.x % LINES;\n  let loadBase: u32 = line_base(lineStart + min(loadSlot, lineCount - 1u)) - params.elementBase;\n  let loadP: u32 = lid.x / LINES;\n"
+        ));
+    }
+    for k in 0..count {
+        let tail = (k + 1) * workgroup_size > total;
+        let (slot, p) = if hoisted {
+            let p = format!("loadP + {}u", k * (workgroup_size / lines));
+            ("loadSlot".to_owned(), p)
+        } else {
+            loads.push_str(&format!(
+                "  let e_{k}: u32 = lid.x + {}u;\n",
+                k * workgroup_size
+            ));
+            if element_major {
+                loads.push_str(&format!(
+                    "  let slot_{k}: u32 = e_{k} % LINES;\n  let p_{k}: u32 = e_{k} / LINES;\n"
+                ));
+            } else {
+                loads.push_str(&format!(
+                    "  let slot_{k}: u32 = e_{k} / N;\n  let p_{k}: u32 = e_{k} - slot_{k} * N;\n"
+                ));
+            }
+            (format!("slot_{k}"), format!("p_{k}"))
+        };
+        let clamped_p = if tail {
+            format!("min({p}, N - 1u)")
+        } else {
+            p.clone()
+        };
+        let base = if hoisted {
+            "loadBase".to_owned()
+        } else {
+            format!("line_base(lineStart + min({slot}, lineCount - 1u)) - params.elementBase")
+        };
+        loads.push_str(&format!(
+            "  let loaded_{k}: vec2<f32> = src[{base} + ({clamped_p}) * STRIDE];\n"
+        ));
+        let guard = if tail {
+            format!("{slot} < lineCount && {p} < N")
+        } else {
+            format!("{slot} < lineCount")
+        };
+        stores.push_str(&format!(
+            "  if ({guard}) {{\n    scratch[{slot} * LINE_STRIDE + {}] = loaded_{k};\n  }}\n",
+            offset.replace('P', &format!("({p})"))
+        ));
+    }
+    loads + &stores
 }
 
 /// Maps a flat element index `e` to `(lineSlot, p)`: line-major for
@@ -3739,8 +3809,15 @@ mod tests {
         assert!(contiguous.contains("const LINES: u32 = 32u;"));
         assert!(contiguous.contains("var<workgroup> scratch: array<vec2<f32>, 2048>;"));
         assert!(contiguous.contains("let lineSlot: u32 = e / N;"));
-        assert!(contiguous
-            .contains("scratch[lineSlot * LINE_STRIDE + (reverseBits(p) >> (32u - LOG_N))]"));
+        // Every load is issued before the first store to workgroup memory.
+        assert!(contiguous.contains("let slot_0: u32 = e_0 / N;"));
+        assert!(contiguous.contains(
+            "scratch[slot_7 * LINE_STRIDE + (reverseBits((p_7)) >> (32u - LOG_N))] = loaded_7;"
+        ));
+        assert!(
+            contiguous.find("loaded_7: vec2<f32> = src[").unwrap()
+                < contiguous.find("] = loaded_0;").unwrap()
+        );
         assert!(contiguous.contains("const LINE_STRIDE: u32 = 64u;"));
         assert!(contiguous.contains("let lineCount: u32 = min(LINES, activeLines - groupLine);"));
         assert!(contiguous.contains("value = value * vec2<f32>(0.25, 0.25);"));
@@ -3751,6 +3828,11 @@ mod tests {
         let strided = multiline_wgsl_for(&[64, 64], 1, 32);
         assert!(strided.contains("const STRIDE: u32 = 64u;"));
         assert!(strided.contains("let lineSlot: u32 = e % LINES;"));
+        // Each invocation loads one line: its base is computed once.
+        assert!(strided.contains("let loadSlot: u32 = lid.x % LINES;"));
+        assert!(
+            strided.contains("let loaded_7: vec2<f32> = src[loadBase + (loadP + 56u) * STRIDE];")
+        );
         // One padding element per line keeps neighbouring lines in
         // different banks.
         assert!(strided.contains("const LINE_STRIDE: u32 = 65u;"));

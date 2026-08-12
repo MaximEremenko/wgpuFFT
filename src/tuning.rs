@@ -23,6 +23,9 @@ impl FftLargeRoute {
     }
 }
 
+/// Default of [`FftTuning::fused_workgroup_size`].
+pub(crate) const DEFAULT_FUSED_WORKGROUP_SIZE: u32 = 256;
+
 /// Advanced FFT planning and kernel-selection controls.
 ///
 /// Defaults reproduce the library's untuned behavior. Fields are private so
@@ -52,7 +55,7 @@ impl Default for FftTuning {
     fn default() -> Self {
         Self {
             workgroup_size: 64,
-            fused_workgroup_size: 256,
+            fused_workgroup_size: DEFAULT_FUSED_WORKGROUP_SIZE,
             rader_max_prime: 4096,
             direct_max_prime: 127,
             force_rader_axes: Vec::new(),
@@ -80,6 +83,11 @@ impl FftTuning {
         self.workgroup_size
     }
 
+    /// Workgroup size of the fused kernels that transform their lines in
+    /// workgroup memory. At its default of 256, `f32` power-of-two lines may
+    /// run in register-resident kernels instead, which size their own
+    /// workgroups; any other value keeps lines that workgroup memory holds in
+    /// the workgroup-memory kernels.
     pub const fn fused_workgroup_size(&self) -> u32 {
         self.fused_workgroup_size
     }
@@ -151,6 +159,7 @@ impl FftTuning {
         self
     }
 
+    /// See [`Self::fused_workgroup_size`].
     pub fn with_fused_workgroup_size(mut self, value: u32) -> Self {
         self.fused_workgroup_size = value;
         self

@@ -21,11 +21,10 @@ use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 #[cfg(test)]
 use crate::runtime::twiddle::twiddle_lut_f32;
 use crate::runtime::window_scheduler::WindowScheduler;
+use crate::tuning::DEFAULT_FUSED_WORKGROUP_SIZE;
 
 #[cfg(test)]
 const DEFAULT_WORKGROUP_SIZE: u32 = 64;
-#[cfg(test)]
-const DEFAULT_FUSED_WORKGROUP_SIZE: u32 = 256;
 #[cfg(test)]
 const WORKGROUP_SIZE: u32 = DEFAULT_WORKGROUP_SIZE;
 #[cfg(test)]
@@ -573,16 +572,14 @@ impl AxisPlan {
                 index
             };
 
-            let strided_registers = strided_register_plan(
+            let register_lines = register_lines_plan(
                 axis_len,
                 stride_complex,
                 total_complex / axis_len,
                 &config,
                 &device.limits(),
             );
-            if let Some((lines_per_workgroup, workgroup_size, schedule)) = strided_registers {
-                // Strided lines interleave in registers, so neighbouring
-                // invocations load neighbouring lines.
+            if let Some((lines_per_workgroup, workgroup_size, schedule)) = register_lines {
                 let apply_scale = apply_any_scale && final_axis;
                 let total_lines = total_complex / axis_len;
                 let shader_key = FusedPow2StageKey::new(
@@ -1877,27 +1874,83 @@ fn long_axis_split(
     split
 }
 
+/// Longest line [`register_lines_plan`] runs in registers on any axis.
+const MAX_SHORT_REGISTER_LENGTH: usize = 512;
+/// Shortest contiguous line run in registers; 32-point lines measured faster
+/// in the workgroup-memory kernel.
+const MIN_CONTIGUOUS_REGISTER_LENGTH: usize = 64;
+/// Shortest strided line run in registers.
+const MIN_STRIDED_REGISTER_LENGTH: usize = 32;
+/// Invocations a workgroup of short register lines aims for.
+const SHORT_REGISTER_INVOCATIONS: usize = 128;
+/// Fewest lines a workgroup of short strided lines takes, so each of its
+/// loads spans at least 128 contiguous bytes.
+const MIN_SHORT_STRIDED_LINES: usize = 16;
+/// Workgroups short register lines keep when the transform is small, so its
+/// lines spread over the GPU.
+const MIN_REGISTER_WORKGROUPS: usize = 64;
+/// Shortest contiguous line longer than [`MAX_SHORT_REGISTER_LENGTH`] run in
+/// registers although workgroup memory holds it.
+const MIN_LONG_CONTIGUOUS_REGISTER_LENGTH: usize = 1024;
+/// Invocations a workgroup of long contiguous register lines aims for.
+const LONG_CONTIGUOUS_REGISTER_INVOCATIONS: usize = 256;
+
 /// Lines per workgroup, workgroup size, and schedule of a register-resident
-/// kernel for a strided power-of-two axis, when it interleaves more lines
-/// than a workgroup-memory kernel could, up to eight: neighbouring
-/// invocations then load neighbouring lines.
-fn strided_register_plan(
+/// kernel for a power-of-two axis, when it is the faster kernel.
+///
+/// A register kernel loads its lines straight into registers and passes
+/// them through workgroup memory once per radix-16 stage; the
+/// workgroup-memory kernel scatters them into workgroup memory and passes
+/// through it once per radix-8 stage. Registers win for:
+///
+/// - lines of at most [`MAX_SHORT_REGISTER_LENGTH`] points, contiguous from
+///   [`MIN_CONTIGUOUS_REGISTER_LENGTH`] and strided from
+///   [`MIN_STRIDED_REGISTER_LENGTH`];
+/// - longer contiguous lines, from [`MIN_LONG_CONTIGUOUS_REGISTER_LENGTH`];
+/// - longer strided lines when registers interleave more of them than
+///   workgroup memory could, up to eight, so neighbouring invocations load
+///   neighbouring lines.
+///
+/// A fused workgroup size other than the default keeps the first two in the
+/// workgroup-memory kernel, which honours it; the third follows
+/// `fuse_long_axes`.
+fn register_lines_plan(
     axis_length: usize,
     stride_complex: usize,
     total_lines: usize,
     config: &AxisPlanConfig,
     limits: &wgpu::Limits,
 ) -> Option<(u32, u32, crate::runtime::pipeline_cache::RegisterSchedule)> {
-    const MAX_LINES: usize = 8;
-    if stride_complex == 1 || !config.long_axes.allows_registers() {
-        return None;
+    let default_fused = config.fused_workgroup_size == DEFAULT_FUSED_WORKGROUP_SIZE;
+    if axis_length <= MAX_SHORT_REGISTER_LENGTH {
+        if !default_fused {
+            return None;
+        }
+        return short_register_lines_plan(axis_length, stride_complex, total_lines, config, limits);
     }
-    let shared_lines = if fused_pow2_supported(
+    let line_invocations =
+        axis_length / crate::runtime::register_fft::REGISTER_VALUES_PER_INVOCATION;
+    let fused = fused_pow2_supported(
         axis_length,
         config.precision,
         config.fused_workgroup_size,
         limits,
-    ) {
+    );
+    if stride_complex == 1 {
+        if !default_fused || axis_length < MIN_LONG_CONTIGUOUS_REGISTER_LENGTH || !fused {
+            return None;
+        }
+        // No more lines than there are, rounded up to a power of two.
+        let lines = (LONG_CONTIGUOUS_REGISTER_INVOCATIONS / line_invocations)
+            .max(1)
+            .min(total_lines.max(1).next_power_of_two());
+        return largest_register_schedule(axis_length, lines, 1, config.precision, limits);
+    }
+    if !config.long_axes.allows_registers() {
+        return None;
+    }
+    const MAX_LINES: usize = 8;
+    let shared_lines = if fused {
         fused_lines_per_workgroup(
             axis_length,
             stride_complex,
@@ -1908,10 +1961,63 @@ fn strided_register_plan(
     } else {
         0
     };
-    let mut lines = MAX_LINES;
-    while lines >= 2 && lines > shared_lines {
+    largest_register_schedule(
+        axis_length,
+        MAX_LINES,
+        (shared_lines + 1).max(2),
+        config.precision,
+        limits,
+    )
+}
+
+/// [`register_lines_plan`] for lines of at most [`MAX_SHORT_REGISTER_LENGTH`]
+/// points: about [`SHORT_REGISTER_INVOCATIONS`] invocations per workgroup,
+/// strided axes taking at least [`MIN_SHORT_STRIDED_LINES`] lines, and whole
+/// lines in the exchange buffer, whose rounds would add barriers.
+fn short_register_lines_plan(
+    axis_length: usize,
+    stride_complex: usize,
+    total_lines: usize,
+    config: &AxisPlanConfig,
+    limits: &wgpu::Limits,
+) -> Option<(u32, u32, crate::runtime::pipeline_cache::RegisterSchedule)> {
+    let min_length = if stride_complex == 1 {
+        MIN_CONTIGUOUS_REGISTER_LENGTH
+    } else {
+        MIN_STRIDED_REGISTER_LENGTH
+    };
+    if axis_length < min_length {
+        return None;
+    }
+    let line_invocations =
+        axis_length / crate::runtime::register_fft::REGISTER_VALUES_PER_INVOCATION;
+    let mut lines = (SHORT_REGISTER_INVOCATIONS / line_invocations).max(1);
+    if stride_complex != 1 {
+        lines = lines.max(MIN_SHORT_STRIDED_LINES);
+    }
+    lines = lines.min(total_lines.max(1).next_power_of_two());
+    while lines > 1 && total_lines / lines < MIN_REGISTER_WORKGROUPS {
+        lines /= 2;
+    }
+    let line_bytes = axis_length * config.precision.complex_size_bytes() as usize;
+    while lines > 1 && lines * line_bytes > limits.max_compute_workgroup_storage_size as usize {
+        lines /= 2;
+    }
+    largest_register_schedule(axis_length, lines, 1, config.precision, limits)
+}
+
+/// The register schedule for the most lines per workgroup from `lines` down
+/// to `min_lines`, halving, that the device can run.
+fn largest_register_schedule(
+    axis_length: usize,
+    mut lines: usize,
+    min_lines: usize,
+    precision: AxisPrecision,
+    limits: &wgpu::Limits,
+) -> Option<(u32, u32, crate::runtime::pipeline_cache::RegisterSchedule)> {
+    while lines >= min_lines.max(1) {
         if let Some((workgroup_size, schedule)) =
-            register_schedule_for_lines(axis_length, lines, config.precision, limits)
+            register_schedule_for_lines(axis_length, lines, precision, limits)
         {
             return Some((lines as u32, workgroup_size, schedule));
         }

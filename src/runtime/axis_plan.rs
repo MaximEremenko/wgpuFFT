@@ -2032,7 +2032,9 @@ fn largest_register_schedule(
 /// invocations busy; strided axes take at least 8 adjacent lines so their
 /// loads coalesce. Workgroup storage caps the result, and small transforms
 /// keep at least 256 workgroups so their lines spread across the GPU instead
-/// of queueing on a few compute units.
+/// of queueing on a few compute units. Strided axes round down to a power of
+/// two: the row a workgroup reads then fills whole 32-byte sectors, and each
+/// invocation keeps one line for all its loads.
 fn fused_lines_per_workgroup(
     axis_length: usize,
     stride_complex: usize,
@@ -2051,7 +2053,12 @@ fn fused_lines_per_workgroup(
     let line_bytes = (axis_length + 1) * precision.complex_size_bytes() as usize;
     let max_by_storage = (max_workgroup_storage_bytes as usize / line_bytes).max(1);
     let max_by_fill = (total_lines / MIN_WORKGROUPS).max(1);
-    lines.min(max_by_storage).min(max_by_fill) as u32
+    let lines = lines.min(max_by_storage).min(max_by_fill);
+    if stride_complex > 1 {
+        1 << lines.ilog2()
+    } else {
+        lines as u32
+    }
 }
 
 pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConfig<'_>) -> String {
@@ -4169,10 +4176,15 @@ mod tests {
             fused_lines_per_workgroup(512, 64, AxisPrecision::F32, 1 << 20, storage),
             8
         );
-        // Each line takes one padding element.
+        // Each line takes one padding element, and strided counts round down
+        // to a power of two.
         assert_eq!(
             fused_lines_per_workgroup(1024, 64, AxisPrecision::F32, 1 << 20, storage),
-            5
+            4
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(1080, 1920, AxisPrecision::F32, 1920, storage),
+            4
         );
         assert_eq!(
             fused_lines_per_workgroup(1024, 64, AxisPrecision::F64, 1 << 20, storage),

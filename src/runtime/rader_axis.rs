@@ -283,6 +283,7 @@ impl RaderAxis {
                 stride_complex,
                 config.precision,
                 config.fused_workgroup_size,
+                lines_u32 as usize,
                 u64::from(device.limits().max_compute_workgroup_storage_size),
             );
             let shader_key = FusedPrimeStageKey::new(

@@ -11,11 +11,13 @@
 //! C_k = sum_{n=1..h} a_n cos(2 pi n k / p),  S_k = sum_{n=1..h} b_n sin(2 pi n k / p)
 //! ```
 //!
-//! so one invocation produces an output pair from `h` terms, a quarter of the
-//! multiply-adds of the plain sum. A workgroup loads several lines and the
-//! `p` roots into workgroup memory; invocation `k` of a line produces
-//! `X[k]` and `X[p - k]`, and invocation 0 produces `X[0]`. Work per line
-//! still grows as `p^2`, so longer primes keep Rader.
+//! so an output pair takes `h` terms, a quarter of the multiply-adds of the
+//! plain sum. A workgroup loads several lines and the `p` roots into
+//! workgroup memory; each invocation produces one or more consecutive output
+//! pairs `X[k]` and `X[p - k]` of one line (`X[0]` counts as the pair
+//! `k = 0`), sharing its loads of `a_n` and `b_n` between them (see
+//! [`direct_pairs_per_invocation`]).
+//! Work per line still grows as `p^2`, so longer primes keep Rader.
 
 use crate::config::FftDirection;
 use crate::runtime::axis_plan::{wgsl_line_base_fn, AxisPrecision};
@@ -45,13 +47,39 @@ pub(crate) fn direct_prime_supported(
         && 2 * axis_length * complex_bytes <= limits.max_compute_workgroup_storage_size as usize
 }
 
+/// Invocations a transform keeps before its invocations take several output
+/// pairs each.
+const MIN_PAIRED_TASKS: usize = 100_000;
+
 /// Output pairs per line, counting `X[0]` as one.
-const fn tasks_per_line(axis_length: usize) -> usize {
+const fn pairs_per_line(axis_length: usize) -> usize {
     axis_length.div_ceil(2)
 }
 
-/// Lines per workgroup of a direct kernel: enough output pairs to give each
-/// invocation one, at least [`MIN_STRIDED_LINES`] on strided axes, and
+/// Invocations per line.
+const fn tasks_per_line(axis_length: usize, pairs_per_invocation: usize) -> usize {
+    pairs_per_line(axis_length).div_ceil(pairs_per_invocation)
+}
+
+/// Output pairs each invocation of a direct kernel produces. Several pairs
+/// read `a_n` and `b_n` once for all of them, cutting the workgroup-memory
+/// loads per term, which bound long primes, from three to one and a half
+/// with four pairs; but they leave fewer invocations to fill the GPU and
+/// hide latency. Four pairs paid off from `N = 97` and two
+/// from `N = 61`, each while the transform kept about 100,000 invocations.
+pub(crate) fn direct_pairs_per_invocation(axis_length: usize, total_lines: usize) -> usize {
+    [(4, 97), (2, 61)]
+        .into_iter()
+        .find(|&(pairs, min_length)| {
+            axis_length >= min_length
+                && total_lines.saturating_mul(tasks_per_line(axis_length, pairs))
+                    >= MIN_PAIRED_TASKS
+        })
+        .map_or(1, |(pairs, _)| pairs)
+}
+
+/// Lines per workgroup of a direct kernel: enough to give each invocation
+/// its output pairs, at least [`MIN_STRIDED_LINES`] on strided axes, and
 /// within workgroup storage after the roots. A transform of few lines keeps
 /// [`MIN_WORKGROUPS`] workgroups where it has the lines: each line costs
 /// `O(N^2)`, so spreading lines over the GPU beats coalescing them.
@@ -60,10 +88,12 @@ pub(crate) fn direct_lines_per_workgroup(
     stride_complex: usize,
     precision: AxisPrecision,
     workgroup_size: u32,
+    pairs_per_invocation: usize,
     total_lines: usize,
     max_workgroup_storage_bytes: u64,
 ) -> u32 {
-    let mut lines = (workgroup_size as usize / tasks_per_line(axis_length)).max(1);
+    let mut lines =
+        (workgroup_size as usize / tasks_per_line(axis_length, pairs_per_invocation)).max(1);
     if stride_complex > 1 {
         lines = lines.max(MIN_STRIDED_LINES);
     }
@@ -87,12 +117,12 @@ pub(crate) fn generate_direct_prime_wgsl_for_key(key: &FusedPrimeStageKey) -> St
     let (load_split, task_split) = if key.stride_complex == 1 {
         (
             "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;",
-            "let lineSlot: u32 = e / TASKS;\n    let k: u32 = e - lineSlot * TASKS;",
+            "let lineSlot: u32 = e / TASKS;\n    let task: u32 = e - lineSlot * TASKS;",
         )
     } else {
         (
             "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;",
-            "let lineSlot: u32 = e % LINES;\n    let k: u32 = e / LINES;",
+            "let lineSlot: u32 = e % LINES;\n    let task: u32 = e / LINES;",
         )
     };
     // `rotation` is the sine term's contribution to `X[k]`: `-i S` forward,
@@ -111,6 +141,28 @@ pub(crate) fn generate_direct_prime_wgsl_for_key(key: &FusedPrimeStageKey) -> St
             value.to_owned()
         }
     };
+    // Pair `i` of a task is `k = task * pairs + i`; its root index
+    // `j * k mod N` advances by `k` per term.
+    let pairs = key.pairs_per_invocation as usize;
+    let mut accumulators = String::new();
+    let mut terms = String::new();
+    let mut stores = String::new();
+    for i in 0..pairs {
+        accumulators.push_str(&format!(
+            "      let k{i}: u32 = task * {pairs}u + {i}u;\n      var cosine{i}: vec2<f32> = vec2<f32>(0.0, 0.0);\n      var sine{i}: vec2<f32> = vec2<f32>(0.0, 0.0);\n      var index{i}: u32 = 0u;\n"
+        ));
+        terms.push_str(&format!(
+            "        index{i} = index{i} + k{i};\n        if (index{i} >= N) {{\n          index{i} = index{i} - N;\n        }}\n        let angle{i}: vec2<f32> = trig[index{i}];\n        cosine{i} = cosine{i} + pairSum * angle{i}.x;\n        sine{i} = sine{i} + pairDifference * angle{i}.y;\n"
+        ));
+        let sine = format!("sine{i}");
+        let rotation = rotation.replace("sine", &sine);
+        stores.push_str(&format!(
+            "      {{\n        let even: vec2<f32> = first + cosine{i};\n        if (k{i} == 0u) {{\n          output[base] = {};\n        }} else if (k{i} <= HALF) {{\n          let rotation: vec2<f32> = {rotation};\n          output[base + k{i} * STRIDE] = {};\n          output[base + (N - k{i}) * STRIDE] = {};\n        }}\n      }}\n",
+            scale("even"),
+            scale("even + rotation"),
+            scale("even - rotation"),
+        ));
+    }
     format!(
         r#"struct Params {{
   lines: u32,
@@ -126,7 +178,7 @@ pub(crate) fn generate_direct_prime_wgsl_for_key(key: &FusedPrimeStageKey) -> St
 
 const N: u32 = {n}u;
 const HALF: u32 = {half}u;
-const TASKS: u32 = HALF + 1u;
+const TASKS: u32 = {tasks}u;
 const STRIDE: u32 = {stride}u;
 const LINES: u32 = {lines}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
@@ -165,40 +217,25 @@ fn main({entry_params}) {{
     if (lineSlot < lineCount) {{
       let row: u32 = lineSlot * N;
       let first: vec2<f32> = values[row];
-      var cosine: vec2<f32> = vec2<f32>(0.0, 0.0);
-      var sine: vec2<f32> = vec2<f32>(0.0, 0.0);
-      var index: u32 = 0u;
-      for (var j: u32 = 1u; j <= HALF; j = j + 1u) {{
-        index = index + k;
-        if (index >= N) {{
-          index = index - N;
-        }}
+{accumulators}      for (var j: u32 = 1u; j <= HALF; j = j + 1u) {{
         let low: vec2<f32> = values[row + j];
         let high: vec2<f32> = values[row + N - j];
-        let angle: vec2<f32> = trig[index];
-        cosine = cosine + (low + high) * angle.x;
-        sine = sine + (low - high) * angle.y;
-      }}
+        let pairSum: vec2<f32> = low + high;
+        let pairDifference: vec2<f32> = low - high;
+{terms}      }}
       let base: u32 = line_base(lineStart + lineSlot);
-      let even: vec2<f32> = first + cosine;
-      if (k == 0u) {{
-        output[base] = {scaled_zero};
-      }} else {{
-        let rotation: vec2<f32> = {rotation};
-        output[base + k * STRIDE] = {scaled_low};
-        output[base + (N - k) * STRIDE] = {scaled_high};
-      }}
-    }}
+{stores}    }}
   }}
 }}
 "#,
         half = (n - 1) / 2,
+        tasks = tasks_per_line(n, pairs),
+        accumulators = accumulators,
+        terms = terms,
+        stores = stores,
         stride = key.stride_complex,
         workgroup_size = key.workgroup_size,
         values_len = lines * n,
-        scaled_zero = scale("even"),
-        scaled_low = scale("even + rotation"),
-        scaled_high = scale("even - rotation"),
         line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims),
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -231,41 +268,60 @@ mod tests {
             stride,
             AxisPrecision::F32,
             256,
+            4,
             1 << 20,
             48 * 1024,
         ))
+        .with_pairs_per_invocation(4)
     }
 
     #[test]
-    fn line_count_gives_each_invocation_an_output_pair() {
-        // N=17 has 9 output pairs per line (X[0] and eight pairs).
+    fn line_count_gives_each_invocation_its_output_pairs() {
+        // N=17 has 9 output pairs per line (X[0] and eight pairs): three
+        // invocations of up to four pairs.
         assert_eq!(
-            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
-            28
+            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 4, 1 << 20, 48 * 1024),
+            85
         );
         assert_eq!(
-            direct_lines_per_workgroup(127, 1, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
-            4
+            direct_lines_per_workgroup(127, 1, AxisPrecision::F32, 256, 4, 1 << 20, 48 * 1024),
+            16
         );
         // Strided axes load at least eight neighbouring lines.
         assert_eq!(
-            direct_lines_per_workgroup(127, 64, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
+            direct_lines_per_workgroup(509, 64, AxisPrecision::F32, 256, 4, 1 << 20, 48 * 1024),
             8
+        );
+        // One pair per invocation: N=17 has 9 per line.
+        assert_eq!(
+            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 1, 1 << 20, 48 * 1024),
+            28
         );
         // A transform of few lines keeps enough workgroups.
         assert_eq!(
-            direct_lines_per_workgroup(83, 83, AxisPrecision::F32, 256, 83, 48 * 1024),
+            direct_lines_per_workgroup(83, 83, AxisPrecision::F32, 256, 1, 83, 48 * 1024),
             1
         );
         assert_eq!(
-            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 17 * 17 * 17, 48 * 1024),
+            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 1, 17 * 17 * 17, 48 * 1024),
             19
         );
         // Storage keeps room for the roots.
         assert_eq!(
-            direct_lines_per_workgroup(1021, 64, AxisPrecision::F32, 256, 1 << 20, 16 * 1024),
+            direct_lines_per_workgroup(1021, 64, AxisPrecision::F32, 256, 1, 1 << 20, 16 * 1024),
             1
         );
+    }
+
+    #[test]
+    fn long_primes_with_enough_lines_take_several_pairs_per_invocation() {
+        assert_eq!(direct_pairs_per_invocation(97, 97 * 97), 4);
+        assert_eq!(direct_pairs_per_invocation(89, 89 * 89), 2);
+        assert_eq!(direct_pairs_per_invocation(61, 131_072), 2);
+        // Too few lines, or too short a prime.
+        assert_eq!(direct_pairs_per_invocation(97, 97), 1);
+        assert_eq!(direct_pairs_per_invocation(61, 61 * 61), 1);
+        assert_eq!(direct_pairs_per_invocation(31, 1 << 20), 1);
     }
 
     /// Evaluates the kernel's symmetric sums on the CPU for one line.
@@ -324,18 +380,22 @@ mod tests {
     fn kernel_pairs_outputs_from_workgroup_memory() {
         let wgsl = generate_direct_prime_wgsl_for_key(&key(17, &[17], 0, FftDirection::Forward));
         assert!(wgsl.contains("const HALF: u32 = 8u;"));
-        assert!(wgsl.contains("const LINES: u32 = 28u;"));
-        assert!(wgsl.contains("var<workgroup> values: array<vec2<f32>, 476>;"));
-        assert!(wgsl.contains("let k: u32 = e - lineSlot * TASKS;"));
-        assert!(wgsl.contains("let rotation: vec2<f32> = vec2<f32>(sine.y, -sine.x);"));
-        assert!(wgsl.contains("output[base + (N - k) * STRIDE] = (even - rotation) * 0.5;"));
+        assert!(wgsl.contains("const LINES: u32 = 85u;"));
+        assert!(wgsl.contains("const TASKS: u32 = 3u;"));
+        assert!(wgsl.contains("var<workgroup> values: array<vec2<f32>, 1445>;"));
+        assert!(wgsl.contains("let task: u32 = e - lineSlot * TASKS;"));
+        // Each invocation's four pairs share the loads of a term's samples.
+        assert_eq!(wgsl.matches("values[row + j]").count(), 1);
+        assert!(wgsl.contains("let k3: u32 = task * 4u + 3u;"));
+        assert!(wgsl.contains("let rotation: vec2<f32> = vec2<f32>(sine3.y, -sine3.x);"));
+        assert!(wgsl.contains("output[base + (N - k0) * STRIDE] = (even - rotation) * 0.5;"));
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "values");
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "trig");
 
         let strided =
             generate_direct_prime_wgsl_for_key(&key(31, &[4, 31], 1, FftDirection::Inverse));
         assert!(strided.contains("const STRIDE: u32 = 4u;"));
-        assert!(strided.contains("let k: u32 = e / LINES;"));
-        assert!(strided.contains("vec2<f32>(-sine.y, sine.x)"));
+        assert!(strided.contains("let task: u32 = e / LINES;"));
+        assert!(strided.contains("vec2<f32>(-sine0.y, sine0.x)"));
     }
 }

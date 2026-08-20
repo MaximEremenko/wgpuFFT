@@ -41,7 +41,7 @@ use crate::runtime::pipeline_cache::{
 };
 use crate::runtime::rader_axis::{
     fused_rader_supported_by_limits, rader_bfft, rader_convolution_length, rader_permutation,
-    RaderAxis, RaderAxisConfig,
+    rader_prefers_register_bluestein, RaderAxis, RaderAxisConfig,
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::segmented_volume::{validate_segmented_burst_depth, SegmentedVolumeC2cPlan};
@@ -235,7 +235,16 @@ fn prime_binding_inventory(
                 compute_limits.max_compute_invocations_per_workgroup,
                 compute_limits.max_compute_workgroup_size_x,
             );
-        let register_bluestein = register_bluestein.filter(|_| !direct_prime && !rader_fused);
+        let register_bluestein = register_bluestein.filter(|(register_length, _, _)| {
+            !direct_prime
+                && (kind != AxisKind::Rader
+                    || rader_prefers_register_bluestein(
+                        n,
+                        rader_convolution_length(n).unwrap_or(0),
+                        *register_length,
+                        rader_fused,
+                    ))
+        });
         let m = match kind {
             AxisKind::Mixed => continue,
             AxisKind::Rader => match &register_bluestein {

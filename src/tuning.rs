@@ -501,12 +501,12 @@ fn is_prime(value: usize) -> bool {
     if value < 2 {
         return false;
     }
-    if value % 2 == 0 {
+    if value.is_multiple_of(2) {
         return value == 2;
     }
     let mut divisor = 3usize;
     while divisor <= value / divisor {
-        if value % divisor == 0 {
+        if value.is_multiple_of(divisor) {
             return false;
         }
         divisor += 2;
@@ -586,9 +586,11 @@ mod tests {
 
     #[test]
     fn device_validation_checks_both_workgroup_controls() {
-        let mut limits = wgpu::Limits::default();
-        limits.max_compute_invocations_per_workgroup = 128;
-        limits.max_compute_workgroup_size_x = 128;
+        let limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 128,
+            max_compute_workgroup_size_x: 128,
+            ..wgpu::Limits::default()
+        };
         assert!(matches!(
             FftTuning::default().validate_for_device(&limits),
             Err(FftError::InvalidTuning {

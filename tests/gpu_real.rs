@@ -2671,12 +2671,11 @@ fn gather_strided_scalar(
     batch: u64,
 ) -> Vec<f32> {
     let total = (logical_per_batch * batch) as usize;
-    let mut logical = vec![0.0; total];
-    for logical_index in 0..total {
-        let physical_index = physical_index(layout, logical_per_batch, logical_index as u64);
-        logical[logical_index] = physical[physical_index];
-    }
-    logical
+    (0..total)
+        .map(|logical_index| {
+            physical[physical_index(layout, logical_per_batch, logical_index as u64)]
+        })
+        .collect()
 }
 
 fn scatter_strided_complex(

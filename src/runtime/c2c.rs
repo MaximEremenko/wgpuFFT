@@ -487,6 +487,7 @@ pub struct C2cPlan {
     execution: C2cExecution,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum C2cExecution {
     Normal(C2cRouteImpl),
     LargeChunk(LargeChunkC2cPlan),
@@ -591,6 +592,7 @@ struct SmoothDecompositionC2cPlan {
     workgroup_size: u32,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SmoothExecutionStep {
     Mixed(MixedAxisExecution),
     Smooth(SmoothAxisExecution),
@@ -619,6 +621,7 @@ struct SmoothAxisExecution {
     inverse: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SmoothPhaseExecution {
     Axis(AxisPlan),
     C2c(Box<C2cPlan>),
@@ -947,8 +950,7 @@ impl C2cPlan {
             )?),
             LargeRouteMode::LargeChunk => {
                 let bytes_per_batch = bytes_per_batch(&config)?;
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_policy_limits;
                 // Staged Rader/Bluestein helpers scale with the child batch count.
                 // Cap chunks so a recursively planned child fits those helper
                 // bindings as well as its input/output binding. Without this cap,
@@ -1136,8 +1138,7 @@ impl C2cPlan {
                 })
             }
             LargeRouteMode::LargeOutOfCore => {
-                let limits =
-                    policy_limits.unwrap_or_else(|| LargePolicyLimits::from(&device.limits()));
+                let limits = effective_policy_limits;
                 let required_bytes = config.required_buffer_size_bytes()?;
                 let use_segmented = match config.tuning().large_route() {
                     FftLargeRoute::ForceFourStep => {
@@ -4984,6 +4985,7 @@ fn build_axis_sequence_c2c_graph_from_steps(
     Ok(graph)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_rader_c2c_stages(
     graph: &mut LargeExecutionGraph,
     input: LogicalRange,
@@ -5114,6 +5116,7 @@ fn add_rader_c2c_stages(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_bluestein_c2c_stages(
     graph: &mut LargeExecutionGraph,
     input: LogicalRange,
@@ -5325,6 +5328,7 @@ fn build_large_axis_sequence_c2c_graph(
     Ok(LargeExecutionPlan::new(graph))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_child_c2c_graph(
     graph: &mut LargeExecutionGraph,
     child_graph: &LargeExecutionGraph,
@@ -6211,6 +6215,7 @@ fn smooth_chunk_copy_direction(kind: C2cSmoothKernelKind) -> Result<SmoothChunkC
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_c2c_axis_line_copy_blocks(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -6251,6 +6256,7 @@ fn dispatch_c2c_axis_line_copy_blocks(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_axis_line_copy_count(
     device: &wgpu::Device,
     kind: C2cSmoothKernelKind,
@@ -6572,6 +6578,7 @@ fn bridge_pipeline_key<'a>(
     key.ok_or(FftError::LargeBridgeUnsupported { route, reason })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_bridge_mul_windows(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -6621,6 +6628,7 @@ fn dispatch_bridge_mul_windows(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_bridge_kernel(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -6773,6 +6781,7 @@ fn dispatch_c2c_smooth_axis_chunk_copy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_c2c_smooth_copy_pipeline(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -6836,6 +6845,7 @@ fn dispatch_c2c_smooth_copy_pipeline(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_c2c_smooth_twiddle_transpose(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -6946,6 +6956,7 @@ fn create_smooth_params_buffer(
     buffer
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_c2c_strided_copy(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,

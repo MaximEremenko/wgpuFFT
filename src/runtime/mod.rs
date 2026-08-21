@@ -40,7 +40,7 @@ pub fn factor_supported_length(len: usize) -> Result<Vec<usize>> {
     while remaining > 1 {
         let Some(&radix) = FACTORIZATION_ORDER
             .iter()
-            .find(|&&candidate| remaining % candidate == 0)
+            .find(|&&candidate| remaining.is_multiple_of(candidate))
         else {
             return Err(FftError::UnsupportedLength { len });
         };

@@ -799,7 +799,7 @@ fn can_axis_len_fit_or_two_step(
 
     let root = (axis_len as f64).sqrt() as usize;
     for d in 2..=root {
-        if axis_len % d != 0 {
+        if !axis_len.is_multiple_of(d) {
             continue;
         }
         let q = axis_len / d;
@@ -861,9 +861,11 @@ mod tests {
 
     #[test]
     fn tuning_limit_overrides_only_reduce_device_caps() {
-        let mut device = wgpu::Limits::default();
-        device.max_storage_buffer_binding_size = 4096;
-        device.max_buffer_size = 8192;
+        let device = wgpu::Limits {
+            max_storage_buffer_binding_size: 4096,
+            max_buffer_size: 8192,
+            ..wgpu::Limits::default()
+        };
 
         assert_eq!(
             LargePolicyLimits::effective_with_overrides(&device, None, None),

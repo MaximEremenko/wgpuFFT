@@ -658,8 +658,8 @@ async fn run_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision, &options).validate()?;
-    benchmark_config(case, true, precision, &options).validate()?;
+    benchmark_config(case, false, precision, options).validate()?;
+    benchmark_config(case, true, precision, options).validate()?;
     let max_buffer_size = device.limits().max_buffer_size;
     if expected_buffer_size > max_buffer_size {
         return Err(input_error(format!(
@@ -744,12 +744,12 @@ async fn run_case(
             let forward = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, false, precision, &options),
+                benchmark_config(case, false, precision, options),
             )?;
             let inverse = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, true, precision, &options),
+                benchmark_config(case, true, precision, options),
             )?;
             Ok((forward, inverse))
         })();
@@ -1140,8 +1140,8 @@ async fn run_compare_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision, &options).validate()?;
-    benchmark_config(case, true, precision, &options).validate()?;
+    benchmark_config(case, false, precision, options).validate()?;
+    benchmark_config(case, true, precision, options).validate()?;
 
     let device_limits = device.limits();
     let real_max_buffer_size = device_limits.max_buffer_size;
@@ -1260,7 +1260,7 @@ async fn run_compare_case(
             let error_scopes = push_gpu_error_scopes(device);
             let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
                 let create = |inverse| {
-                    let config = benchmark_config(case, inverse, precision, &options);
+                    let config = benchmark_config(case, inverse, precision, options);
                     if variant_label == "sharded" {
                         FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
                             device,
@@ -1949,7 +1949,10 @@ fn compute_pass_count(diagnostics: &FftDiagnostics) -> BenchResult<(u64, u64, St
             .iter()
             .filter(|stage| stage.label == "large-chunk-copy-input")
             .count();
-        if chunk_count == 0 || graph_count % chunk_count != 0 || traffic_count % chunk_count != 0 {
+        if chunk_count == 0
+            || graph_count % chunk_count != 0
+            || !traffic_count.is_multiple_of(chunk_count)
+        {
             return Err(input_error(format!(
                 "cannot collapse batch-chunk graph: {graph_count} graph stages and {traffic_count} traffic-equivalent passes across {chunk_count} chunks"
             )));

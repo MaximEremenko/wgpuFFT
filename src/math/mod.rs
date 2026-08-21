@@ -348,12 +348,12 @@ fn packed_coords_for_full_spectrum(coords: &[usize], shape: &[usize]) -> Vec<usi
 
 fn is_self_conjugate_bin(coords: &[usize], shape: &[usize]) -> bool {
     let x = coords[0];
-    let even_x = shape[0] % 2 == 0;
+    let even_x = shape[0].is_multiple_of(2);
     if !(x == 0 || (even_x && x == shape[0] / 2)) {
         return false;
     }
     for dim in 1..shape.len() {
-        if shape[dim] % 2 == 0 {
+        if shape[dim].is_multiple_of(2) {
             if coords[dim] != 0 && coords[dim] != shape[dim] / 2 {
                 return false;
             }

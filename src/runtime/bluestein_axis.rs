@@ -113,7 +113,7 @@ struct MultiPassBluesteinExecution {
 
 impl BluesteinAxisConfig {
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.shape.is_empty() || self.shape.iter().any(|&len| len == 0) {
+        if self.shape.is_empty() || self.shape.contains(&0) {
             return Err(FftError::ZeroLength);
         }
         if self.axis >= self.shape.len() {

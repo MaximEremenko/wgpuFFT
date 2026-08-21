@@ -39,35 +39,25 @@ impl FftPrecision {
 
 /// Direction of a complex-to-complex transform.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FftDirection {
+    #[default]
     Forward,
     Inverse,
 }
 
-impl Default for FftDirection {
-    fn default() -> Self {
-        Self::Forward
-    }
-}
-
 /// Scaling policy applied by both CPU reference helpers and GPU execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Normalization {
     /// Do not scale either transform direction.
     None,
     /// Scale forward transforms by `1 / product(shape)`.
     Forward,
     /// Scale inverse transforms by `1 / product(shape)`.
+    #[default]
     Inverse,
     /// Scale both directions by `1 / sqrt(product(shape))`.
     Orthogonal,
-}
-
-impl Default for Normalization {
-    fn default() -> Self {
-        Self::Inverse
-    }
 }
 
 /// Configuration for transforms over interleaved complex buffers.
@@ -176,7 +166,7 @@ impl FftConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.shape.is_empty() || self.shape.iter().any(|&len| len == 0) {
+        if self.shape.is_empty() || self.shape.contains(&0) {
             return Err(FftError::ZeroLength);
         }
 

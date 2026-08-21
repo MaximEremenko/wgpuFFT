@@ -255,7 +255,7 @@ pub(crate) fn strided_span_elements(count: u64, stride: u64) -> Result<u64> {
 
 fn exact_element_count(size_bytes: u64, format: ElementFormat) -> Result<u64> {
     let element_bytes = format.bytes_per_element();
-    if size_bytes % element_bytes != 0 {
+    if !size_bytes.is_multiple_of(element_bytes) {
         return Err(FftError::BufferViewCopyUnaligned {
             offset: 0,
             size: size_bytes,

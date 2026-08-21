@@ -359,7 +359,7 @@ impl AxisPlanConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.shape.is_empty() || self.shape.iter().any(|&len| len == 0) {
+        if self.shape.is_empty() || self.shape.contains(&0) {
             return Err(FftError::ZeroLength);
         }
 
@@ -2373,6 +2373,7 @@ fn generate_fused_smooth_first_stage_multiline_wgsl(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_fused_smooth_final_stage_wgsl(
     axis_length: usize,
     stride_complex: usize,
@@ -3167,11 +3168,9 @@ fn multiline_load_wgsl(
     let mut stores = String::new();
     // Element-major lines with a line count dividing the workgroup keep one
     // line per invocation: its base address is computed once.
-    let hoisted = element_major && workgroup_size % lines == 0;
+    let hoisted = element_major && workgroup_size.is_multiple_of(lines);
     if hoisted {
-        loads.push_str(&format!(
-            "  let loadSlot: u32 = lid.x % LINES;\n  let loadBase: u32 = line_base(lineStart + min(loadSlot, lineCount - 1u)) - params.elementBase;\n  let loadP: u32 = lid.x / LINES;\n"
-        ));
+        loads.push_str("  let loadSlot: u32 = lid.x % LINES;\n  let loadBase: u32 = line_base(lineStart + min(loadSlot, lineCount - 1u)) - params.elementBase;\n  let loadP: u32 = lid.x / LINES;\n");
     }
     for k in 0..count {
         let tail = (k + 1) * workgroup_size > total;

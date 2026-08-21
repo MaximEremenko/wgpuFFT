@@ -188,7 +188,7 @@ fn validate_twiddle_lut_len_with_precision(
 #[cfg(test)]
 pub(crate) fn stockham_twiddle_index(len: usize, ns: usize, r: usize, q: usize) -> usize {
     assert!(len > 0);
-    assert!(ns > 0 && len % ns == 0);
+    assert!(ns > 0 && len.is_multiple_of(ns));
     assert!(r < ns);
 
     let phase = ((r as u128 * q as u128) % ns as u128) as usize;

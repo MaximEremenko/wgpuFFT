@@ -1212,7 +1212,7 @@ fn real_oversized_shape(limits: &wgpu::Limits) -> Option<(usize, usize, u64)> {
 
 fn is_smooth(mut value: usize) -> bool {
     for factor in [2usize, 3, 5, 7, 11, 13] {
-        while value % factor == 0 {
+        while value.is_multiple_of(factor) {
             value /= factor;
         }
     }

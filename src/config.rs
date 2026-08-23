@@ -46,6 +46,16 @@ pub enum FftDirection {
     Inverse,
 }
 
+impl FftDirection {
+    /// The other direction.
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Inverse,
+            Self::Inverse => Self::Forward,
+        }
+    }
+}
+
 /// Scaling policy applied by both CPU reference helpers and GPU execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Normalization {

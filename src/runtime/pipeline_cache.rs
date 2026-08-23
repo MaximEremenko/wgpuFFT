@@ -2083,6 +2083,10 @@ pub(crate) struct FusedSmoothStageKey {
     /// [`FusedPow2StageKey::with_in_place`]).
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) in_place: bool,
+    /// Pads workgroup-memory indices by one element per 16 (see
+    /// `fused_smooth_pads_indices`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) padded_indices: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2282,7 +2286,23 @@ impl FusedSmoothStageKey {
             lines_per_workgroup: 1,
             split_pass: None,
             in_place: false,
+            padded_indices: false,
         }
+    }
+
+    /// Pads workgroup-memory indices by one element per 16.
+    pub(crate) fn with_padded_indices(mut self) -> Self {
+        self.padded_indices = true;
+        self
+    }
+
+    /// Whether `limits` allow this kernel.
+    pub(crate) fn supported_by_device_limits(&self, limits: &wgpu::Limits) -> bool {
+        self.is_supported_by_limits(
+            u64::from(limits.max_compute_workgroup_storage_size),
+            limits.max_compute_invocations_per_workgroup,
+            limits.max_compute_workgroup_size_x,
+        )
     }
 
     /// See [`FusedPow2StageKey::with_in_place`].
@@ -2333,6 +2353,9 @@ impl FusedSmoothStageKey {
         if self.in_place {
             key.push_str(":in_place");
         }
+        if self.padded_indices {
+            key.push_str(":pad16");
+        }
         key
     }
 
@@ -2351,6 +2374,13 @@ impl FusedSmoothStageKey {
             ),
         )
         .checked_mul(self.lines_per_workgroup as usize)
+        .map(|elements| {
+            if self.padded_indices {
+                crate::runtime::axis_plan::padded_workgroup_len(elements)
+            } else {
+                elements
+            }
+        })
         .and_then(|elements| elements.checked_mul(self.precision.complex_size_bytes() as usize)) else {
             return false;
         };

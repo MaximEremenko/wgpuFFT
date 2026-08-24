@@ -694,28 +694,34 @@ impl AxisPlan {
                     total_lines,
                     u64::from(device.limits().max_compute_workgroup_storage_size),
                 );
-                let smooth_factors = fused_smooth_factors(axis_len, &axis_factors);
-                let shader_key = FusedSmoothStageKey::new(
-                    config.shape.len(),
-                    axis,
-                    &config.shape,
-                    axis_len,
-                    stride_complex,
-                    &smooth_factors,
-                    config.direction,
-                    config.fused_workgroup_size,
-                    apply_scale,
-                    scale,
-                    config.precision,
-                )
-                .with_lines_per_workgroup(lines_per_workgroup);
-                let padded_key = shader_key.clone().with_padded_indices();
-                let shader_key = if fused_smooth_pads_indices(&smooth_factors, stride_complex != 1)
-                    && padded_key.supported_by_device_limits(&device.limits())
-                {
-                    padded_key
+                let smooth_key = |factors: &[usize]| {
+                    FusedSmoothStageKey::new(
+                        config.shape.len(),
+                        axis,
+                        &config.shape,
+                        axis_len,
+                        stride_complex,
+                        factors,
+                        config.direction,
+                        config.fused_workgroup_size,
+                        apply_scale,
+                        scale,
+                        config.precision,
+                    )
+                    .with_lines_per_workgroup(lines_per_workgroup)
+                };
+                let schedule = fused_smooth_factors(axis_len, &axis_factors);
+                // A schedule whose first stage needs padded indices keeps
+                // the multi-pass factors where the padding does not fit.
+                let shader_key = if fused_smooth_pads_indices(&schedule, stride_complex != 1) {
+                    let padded = smooth_key(&schedule).with_padded_indices();
+                    if padded.supported_by_device_limits(&device.limits()) {
+                        padded
+                    } else {
+                        smooth_key(&axis_factors)
+                    }
                 } else {
-                    shader_key
+                    smooth_key(&schedule)
                 };
                 let pipeline_key = ComputePipelineCacheKey::fused_smooth_stage(shader_key.clone());
 
@@ -2046,8 +2052,9 @@ const FUSED_SMOOTH_RADICES: &[usize] = &[16, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 
 /// the most radix-16 stages, whose butterflies need the fewest
 /// multiplications, then the most balanced radices (the largest smallest
 /// radix); largest radix first, since the first stage needs no twiddles.
-/// Falls back to `factors` when that would leave a single stage. A grid
-/// search over schedules favoured these.
+/// Keeps `factors` unless that saves stages, and when it would leave a
+/// single stage. A grid search over schedules favoured these;
+/// schedules with as many stages as `factors` measured no better.
 pub(crate) fn fused_smooth_factors(axis_length: usize, factors: &[usize]) -> Vec<usize> {
     fn rank(schedule: &[usize]) -> (usize, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>) {
         let sixteens = schedule.iter().filter(|&&radix| radix == 16).count();
@@ -2085,7 +2092,7 @@ pub(crate) fn fused_smooth_factors(axis_length: usize, factors: &[usize]) -> Vec
     let mut best = None;
     search(axis_length, 0, &mut Vec::new(), &mut best);
     match best {
-        Some(schedule) if schedule.len() >= 2 => schedule,
+        Some(schedule) if schedule.len() >= 2 && schedule.len() < factors.len() => schedule,
         _ => factors.to_vec(),
     }
 }
@@ -2109,7 +2116,7 @@ pub(crate) fn fused_smooth_pads_indices(factors: &[usize], element_major: bool) 
 /// Rewrites every `scratch[index]` of a fused smooth kernel to
 /// `scratch[padded(index)]`, with `padded(i) = i + i / 16`, and enlarges the
 /// declaration to match.
-fn pad_workgroup_indices(source: &str) -> String {
+pub(crate) fn pad_workgroup_indices(source: &str) -> String {
     let mut out = String::with_capacity(source.len() + 256);
     let mut rest = source;
     while let Some(at) = rest.find("scratch[") {

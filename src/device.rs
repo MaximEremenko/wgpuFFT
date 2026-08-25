@@ -39,17 +39,44 @@ fn force_fallback_from_env() -> bool {
     }
 }
 
+/// `WGPU_ADAPTER_NAME=<text>` picks the adapter whose name contains `text`,
+/// ignoring case, as in wgpu's own examples: for machines with several GPUs.
+/// Native builds only; ignored in wasm.
+fn adapter_name_from_env() -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("WGPU_ADAPTER_NAME")
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_lowercase())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// Requests the high-performance adapter, or the one `WGPU_ADAPTER_NAME`
+/// names (see [`adapter_name_from_env`]), and a device with its limits.
+/// Returns `None` when no such adapter exists.
 pub async fn request_default_device() -> Option<GpuContext> {
     let instance = wgpu::Instance::new(default_instance_descriptor());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: force_fallback_from_env(),
-            apply_limit_buckets: false,
-            compatible_surface: None,
-        })
-        .await
-        .ok()?;
+    let adapter = match adapter_name_from_env() {
+        Some(name) => instance
+            .enumerate_adapters(default_instance_descriptor().backends)
+            .await
+            .into_iter()
+            .find(|adapter| adapter.get_info().name.to_lowercase().contains(&name))?,
+        None => instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: force_fallback_from_env(),
+                apply_limit_buckets: false,
+                compatible_surface: None,
+            })
+            .await
+            .ok()?,
+    };
 
     let required_features = precision_features_supported_by_adapter(adapter.features());
     let maximum_descriptor = wgpu::DeviceDescriptor {

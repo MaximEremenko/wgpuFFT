@@ -3,13 +3,12 @@
 use futures_channel::oneshot;
 use wasm_bindgen_test::*;
 use wgpu_fft::math::{
-    from_interleaved_f32, reference_c2c_nd, reference_c2c_nd_f64,
-    reference_c2r_from_packed_interleaved, reference_r2c_packed_interleaved, to_interleaved_f32,
+    reference_c2c_nd_f64, reference_c2r_from_packed_interleaved, reference_r2c_packed_interleaved,
     Complex64,
 };
 use wgpu_fft::{
-    validate_df64_invariants, C2cRoute, FftConfig, FftError, FftPlan, FftPrecision, Normalization,
-    DF64_CANARY_CASE_COUNT, DF64_CANARY_WORD_COUNT,
+    validate_df64_invariants, C2cRoute, FftConfig, FftError, FftPlan, FftPrecision, FftTuning,
+    Normalization, DF64_CANARY_CASE_COUNT, DF64_CANARY_WORD_COUNT,
 };
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -101,6 +100,41 @@ async fn browser_default_limits_correctness_matrix() {
             FftConfig::inverse(85),
             C2cRoute::Bluestein,
         ),
+        // Multi-line, register, and in-place kernels at the default limits.
+        (
+            "registers-2d-128x96",
+            FftConfig::new_nd([128, 96]).with_normalization(Normalization::None),
+            C2cRoute::MixedRadix,
+        ),
+        (
+            "registers-3d-inverse-32x32x32",
+            FftConfig::inverse_nd([32, 32, 32]),
+            C2cRoute::MixedRadix,
+        ),
+        (
+            "smooth-3d-60x48x10",
+            FftConfig::new_nd([60, 48, 10]).with_normalization(Normalization::None),
+            C2cRoute::MixedRadix,
+        ),
+        // A composite-radix schedule with padded workgroup indices that still
+        // fits 16 KiB.
+        (
+            "smooth-padded-1920",
+            FftConfig::new(1920).with_normalization(Normalization::None),
+            C2cRoute::MixedRadix,
+        ),
+        // Primes: the direct kernel on a small 2D transform, and a Rader
+        // axis whose convolution runs as a short register Bluestein one.
+        (
+            "direct-2d-31x31",
+            FftConfig::new_nd([31, 31]).with_normalization(Normalization::None),
+            C2cRoute::AxisSequence,
+        ),
+        (
+            "rader-register-bluestein-inverse-179",
+            FftConfig::inverse(179).with_batch(3),
+            C2cRoute::Rader,
+        ),
     ] {
         run_c2c_case(&context, label, config, expected_route).await;
     }
@@ -150,14 +184,15 @@ async fn run_c2c_case(
     expected_route: C2cRoute,
 ) {
     let input = complex_signal(config.total_complex_len().unwrap());
-    let expected =
-        to_interleaved_f32(&reference_c2c_nd(&from_interleaved_f32(&input), &config).unwrap());
+    // An f64 reference: an f32 one drifts by about 3e-4 of the peak at 1920
+    // points, more than the transforms under test.
+    let expected = reference_c2c_f64_as_f32(&input, &config);
     let plan = FftPlan::c2c_checked(&context.device, &context.queue, config)
         .await
         .unwrap_or_else(|error| panic!("{label}: failed to create C2C plan: {error}"));
     assert_eq!(plan.route(), expected_route, "{label}: unexpected route");
     let actual = execute_f32(context, &plan, &input, label).await;
-    assert_close(&actual, &expected, label);
+    assert_fft_accuracy(&actual, &expected, label);
 }
 
 async fn assert_browser_fused_boundary(context: &BrowserDefaultContext) {
@@ -177,7 +212,27 @@ async fn assert_browser_fused_boundary(context: &BrowserDefaultContext) {
     let fused_actual = execute_f32(context, &fused, &fused_input, "fused-boundary-2048").await;
     assert_fft_accuracy(&fused_actual, &fused_expected, "fused-boundary-2048");
 
-    let multipass_config = FftConfig::new(4096).with_normalization(Normalization::None);
+    // N=4096 outgrows 16 KiB of workgroup memory: it runs as one
+    // register-resident kernel, exchanging through workgroup memory in rounds.
+    let long_config = FftConfig::new(4096).with_normalization(Normalization::None);
+    let long = FftPlan::c2c_checked(&context.device, &context.queue, long_config.clone())
+        .await
+        .expect("N=4096 must plan at browser defaults");
+    assert_eq!(
+        kernel_labels(&long),
+        ["fused-pow2-workgroup-stage"],
+        "N=4096 must run as one register-resident kernel at browser defaults"
+    );
+    assert_eq!(long.workspace_size_bytes(), 0);
+    let long_input = complex_signal(4096);
+    let long_expected = reference_c2c_f64_as_f32(&long_input, &long_config);
+    let long_actual = execute_f32(context, &long, &long_input, "register-long-4096").await;
+    assert_fft_accuracy(&long_actual, &long_expected, "register-long-4096");
+
+    // Without long-axis fusion it keeps the multipass Stockham fallback.
+    let multipass_config = FftConfig::new(4096)
+        .with_normalization(Normalization::None)
+        .with_tuning(FftTuning::default().with_fuse_long_axes(false));
     let multipass = FftPlan::c2c_checked(&context.device, &context.queue, multipass_config.clone())
         .await
         .expect("N=4096 must retain the multipass fallback at browser defaults");

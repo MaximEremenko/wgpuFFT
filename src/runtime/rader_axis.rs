@@ -4,9 +4,10 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
-    fused_smooth_factors, fused_smooth_pads_indices, generate_fused_scratch_fft_stages_wgsl,
-    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
-    LongAxisRoute,
+    fused_lines_per_workgroup, fused_smooth_factors, fused_smooth_pads_indices,
+    generate_fused_scratch_fft_stages_wgsl, generate_in_place_smooth_fft_stage_multiline_wgsl,
+    multiline_line_stride, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
+    AxisTwiddleLutPool, LongAxisRoute,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -268,7 +269,20 @@ impl RaderAxis {
             }
         }
 
+        // A cyclic convolution in the fused Rader kernel, several lines per
+        // workgroup, beats the direct kernel's O(n^2) sums; the direct kernel
+        // keeps the primes whose convolution would be linear.
+        let cyclic_fused = m == n - 1
+            && fused_rader_supported(
+                n,
+                m,
+                config.precision,
+                config.fused_workgroup_size,
+                config.fused_min_convolution_length,
+                &device.limits(),
+            );
         let execution = if n <= config.direct_max_prime
+            && !cyclic_fused
             && direct_prime_supported(
                 n,
                 config.precision,
@@ -391,11 +405,31 @@ impl RaderAxis {
                     config.precision,
                 )
             };
+            // Several lines per workgroup keep its invocations busy on short
+            // convolutions, as in the fused axis kernels. Fewer than
+            // MIN_RADER_LINES measured slower than one line per workgroup.
+            let lines_per_workgroup = fused_lines_per_workgroup(
+                m,
+                stride_complex,
+                config.precision,
+                lines_u32 as usize,
+                u64::from(device.limits().max_compute_workgroup_storage_size),
+            )
+            .min(config.fused_workgroup_size);
+            let lines_per_workgroup = if lines_per_workgroup < MIN_RADER_LINES {
+                1
+            } else {
+                lines_per_workgroup
+            };
+            let element_major = lines_per_workgroup > 1 && stride_complex != 1;
+            let rader_key = |factors: &[usize]| {
+                rader_key(factors).with_lines_per_workgroup(lines_per_workgroup)
+            };
             // The convolution runs the fused smooth schedule; one whose first
             // stage needs padded indices keeps the multi-pass factors where
             // the padding does not fit.
             let schedule = fused_smooth_factors(m, &factors);
-            let shader_key = if fused_smooth_pads_indices(&schedule, false) {
+            let shader_key = if fused_smooth_pads_indices(&schedule, element_major) {
                 let padded = rader_key(&schedule).with_padded_indices();
                 if padded.supported_by_device_limits(&device.limits()) {
                     padded
@@ -405,11 +439,18 @@ impl RaderAxis {
             } else {
                 rader_key(&schedule)
             };
+            // Storage that holds one line may not hold several.
+            let shader_key = if shader_key.supported_by_device_limits(&device.limits()) {
+                shader_key
+            } else {
+                shader_key.with_lines_per_workgroup(1)
+            };
+            let lines_per_workgroup = shader_key.lines_per_workgroup;
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = cached_layout(device, pipeline_key.layout);
             let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
             RaderExecution::Fused(FusedRaderExecution {
-                workgroups: lines_u32,
+                workgroups: lines_u32.div_ceil(lines_per_workgroup),
                 pipeline,
                 bind_group_layout,
                 twiddle_buffer,
@@ -1254,6 +1295,14 @@ fn bind_view_entry<'a>(
 /// store.
 pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
     debug_assert_eq!(key.kind, FusedPrimeKind::Rader);
+    if key.lines_per_workgroup > 1 {
+        let source = generate_fused_rader_multiline_wgsl(key);
+        return if key.padded_indices {
+            crate::runtime::axis_plan::pad_workgroup_indices(&source)
+        } else {
+            source
+        };
+    }
     let n = key.axis_length;
     let l = n - 1;
     let m = key.convolution_length;
@@ -1459,6 +1508,264 @@ fn main({entry_params}) {{
     } else {
         source
     }
+}
+
+/// Fewest lines a multi-line fused Rader kernel takes per workgroup: with
+/// two, the 1008-point convolution of N=1009 measured 24% slower than one
+/// line per workgroup, while 4 to 16 lines of convolutions up to 126 points
+/// measured 17% to 41% faster.
+const MIN_RADER_LINES: u32 = 4;
+
+/// WGSL of a fused Rader kernel over `key.lines_per_workgroup` lines per
+/// workgroup: the single-line kernel's steps with every line's
+/// convolution in workgroup memory, `LINE_STRIDE` apart, and each line's
+/// `x[0]` in `firsts`. Strided lines load and store element-major, so
+/// neighbouring invocations touch neighbouring lines.
+fn generate_fused_rader_multiline_wgsl(key: &FusedPrimeStageKey) -> String {
+    let n = key.axis_length;
+    let l = n - 1;
+    let m = key.convolution_length;
+    let lines = key.lines_per_workgroup as usize;
+    let workgroup_size = key.workgroup_size as usize;
+    debug_assert!(lines > 1 && lines <= workgroup_size);
+    let element_major = key.stride_complex != 1;
+    let line_stride = multiline_line_stride(m, lines, element_major);
+    let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
+    let scale = match key.precision {
+        AxisPrecision::Df64 => format_df64(key.scale_factor()),
+        _ => key.precision.format_wgsl_scalar(key.scale_factor()),
+    };
+    let inverse_m = match key.precision {
+        AxisPrecision::F32 => key
+            .precision
+            .format_wgsl_scalar(f64::from(1.0f32 / m as f32)),
+        AxisPrecision::F64 => key.precision.format_wgsl_scalar(1.0 / m as f64),
+        AxisPrecision::Df64 => format_df64(1.0 / m as f64),
+    };
+    let scale_ref = if key.precision == AxisPrecision::Df64 {
+        scale.as_str()
+    } else {
+        "SCALE"
+    };
+    let inverse_m_ref = if key.precision == AxisPrecision::Df64 {
+        inverse_m.as_str()
+    } else {
+        "INVERSE_M"
+    };
+    let stages = |direction: FftDirection, twiddle: &str| {
+        let mut ns = 1usize;
+        let mut stages = String::new();
+        for &radix in &key.factors {
+            ns *= radix;
+            stages.push_str(&generate_in_place_smooth_fft_stage_multiline_wgsl(
+                m,
+                radix,
+                ns,
+                direction,
+                key.workgroup_size,
+                lines,
+                twiddle,
+                key.precision,
+            ));
+        }
+        stages
+    };
+    let forward_stages = stages(FftDirection::Forward, "twiddle_forward");
+    let inverse_stages = stages(FftDirection::Inverse, "twiddle_inverse");
+
+    let zero = complex_zero(key.precision);
+    let twiddle_inverse_value = match key.precision {
+        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
+        _ => "vec2<f32>(value.x, -value.y)",
+    };
+    // Invocation `e` takes line `lineSlot`, input `q` of the permuted load
+    // and natural-order store.
+    let split = if element_major {
+        "let lineSlot: u32 = e % LINES;\n    let q: u32 = e / LINES;"
+    } else {
+        "let lineSlot: u32 = e / L;\n    let q: u32 = e - lineSlot * L;"
+    };
+    let zero_fill = if m > l {
+        format!(
+            r#"  for (var e: u32 = lid.x; e < LINES * (M - L); e = e + WORKGROUP_SIZE) {{
+    let lineSlot: u32 = e / (M - L);
+    let t: u32 = L + e - lineSlot * (M - L);
+    if (lineSlot < lineCount) {{
+      scratch[lineSlot * LINE_STRIDE + t] = {zero};
+    }}
+  }}
+"#
+        )
+    } else {
+        String::new()
+    };
+    let scaled_first = complex_scale_expr(
+        key.precision,
+        &format!(
+            "({})",
+            complex_add_expr(key.precision, "firsts[lineSlot]", "scratch[index]")
+        ),
+        scale_ref,
+    );
+    let scaled_result = complex_scale_expr(
+        key.precision,
+        "scratch[lineSlot * LINE_STRIDE + q]",
+        scale_ref,
+    );
+
+    // Each invocation holds its outputs while others still read the
+    // convolution, then writes them back in natural order.
+    let mut collect = String::new();
+    let mut scatter = String::new();
+    for slot in 0..(lines * l).div_ceil(workgroup_size) {
+        let scaled_convolution = complex_scale_expr(
+            key.precision,
+            &format!("scratch[lineSlot{slot} * LINE_STRIDE + t{slot}]"),
+            inverse_m_ref,
+        );
+        let scaled_wrap = complex_scale_expr(
+            key.precision,
+            &format!("scratch[lineSlot{slot} * LINE_STRIDE + wrap]"),
+            inverse_m_ref,
+        );
+        let wrap_add = complex_add_expr(key.precision, "convolution", &scaled_wrap);
+        let first_add = complex_add_expr(
+            key.precision,
+            &format!("firsts[lineSlot{slot}]"),
+            "convolution",
+        );
+        collect.push_str(&format!(
+            r#"  let e{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+  let lineSlot{slot}: u32 = e{slot} / L;
+  let t{slot}: u32 = e{slot} - lineSlot{slot} * L;
+  var value{slot}: vec2<f32> = {zero};
+  if (lineSlot{slot} < lineCount) {{
+    var convolution: vec2<f32> = {scaled_convolution};
+    let wrap: u32 = t{slot} + L;
+    if (wrap < M) {{
+      convolution = {wrap_add};
+    }}
+    value{slot} = {first_add};
+  }}
+"#
+        ));
+        scatter.push_str(&format!(
+            "  if (lineSlot{slot} < lineCount) {{\n    scratch[lineSlot{slot} * LINE_STRIDE + perm[t{slot}] - 1u] = value{slot};\n  }}\n"
+        ));
+    }
+
+    specialize_rader_wgsl(
+        format!(
+            r#"struct Params {{
+  lines: u32,
+  lineOffset: u32,
+  pad0: u32,
+  pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+// perm[t] is the natural index of convolution output t; perm[L + q] is the
+// convolution input slot of x[q + 1].
+@group(0) @binding(2) var<storage, read> perm: array<u32>;
+@group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a + b;
+}}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a - b;
+}}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}}
+
+fn twiddle_forward(index: u32) -> vec2<f32> {{
+  return axisTwiddles[index];
+}}
+
+fn twiddle_inverse(index: u32) -> vec2<f32> {{
+  let value: vec2<f32> = axisTwiddles[index];
+  return {twiddle_inverse_value};
+}}
+
+const N: u32 = {n}u;
+const L: u32 = {l}u;
+const M: u32 = {m}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const LINES: u32 = {lines}u;
+const LINE_STRIDE: u32 = {line_stride}u;
+const INVERSE_M: {scalar} = {inverse_m};
+const SCALE: {scalar} = {scale};
+
+var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
+var<workgroup> firsts: array<vec2<f32>, {lines}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= params.lines) {{
+    return;
+  }}
+  let lineCount: u32 = min(LINES, params.lines - groupLine);
+  let lineStart: u32 = params.lineOffset + groupLine;
+
+  if (lid.x < lineCount) {{
+    firsts[lid.x] = input[line_base(lineStart + lid.x)];
+  }}
+  for (var e: u32 = lid.x; e < LINES * L; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      scratch[lineSlot * LINE_STRIDE + perm[L + q]] = input[line_base(lineStart + lineSlot) + (q + 1u) * STRIDE];
+    }}
+  }}
+{zero_fill}  workgroupBarrier();
+
+{forward_stages}
+  // Bin 0 of each line's forward FFT is the sum of its x[1..N).
+  for (var e: u32 = lid.x; e < LINES * M; e = e + WORKGROUP_SIZE) {{
+    let lineSlot: u32 = e / M;
+    let t: u32 = e - lineSlot * M;
+    if (lineSlot < lineCount) {{
+      let index: u32 = lineSlot * LINE_STRIDE + t;
+      if (t == 0u) {{
+        output[line_base(lineStart + lineSlot)] = {scaled_first};
+      }}
+      scratch[index] = c_mul(scratch[index], bfft[t]);
+    }}
+  }}
+  workgroupBarrier();
+
+{inverse_stages}
+{collect}  workgroupBarrier();
+{scatter}  workgroupBarrier();
+  for (var e: u32 = lid.x; e < LINES * L; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      output[line_base(lineStart + lineSlot) + (q + 1u) * STRIDE] = {scaled_result};
+    }}
+  }}
+}}
+"#,
+            stride = key.stride_complex,
+            scratch_len = line_stride * lines,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+            scalar = staged_scalar_type(key.precision),
+        ),
+        key.precision,
+    )
 }
 
 pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {

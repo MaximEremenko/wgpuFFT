@@ -56,6 +56,52 @@ async fn run_fused_prime_cases() {
         }
     }
 
+    // Many lines: the fused Rader kernel packs several per workgroup,
+    // contiguous and strided, cyclic and linear (zero-padded).
+    for (label, config) in [
+        (
+            "Rader multi-line N=101 batch=1024",
+            config_1d(101, 1024, false).with_tuning(rader_only()),
+        ),
+        (
+            "Rader multi-line inverse N=101 batch=1024",
+            config_1d(101, 1024, true).with_tuning(rader_only()),
+        ),
+        (
+            "Rader multi-line strided 64x101 axis 1 batch=16",
+            FftConfig::new_nd([64, 101])
+                .with_axes([1])
+                .with_batch(16)
+                .with_normalization(Normalization::None)
+                .with_tuning(rader_only()),
+        ),
+        (
+            "Rader multi-line linear N=107 batch=1024",
+            config_1d(107, 1024, false).with_tuning(
+                FftTuning::default()
+                    .with_direct_max_prime(0)
+                    .with_force_rader_axes([0]),
+            ),
+        ),
+    ] {
+        run_fused_case(
+            &context.device,
+            &context.queue,
+            config,
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            label,
+        );
+    }
+    assert!(
+        wgpu_fft::export_pipeline_cache_snapshot(&context.device)
+            .pipeline_keys()
+            .iter()
+            .any(|key| key.contains("fused-prime:rader") && key.contains(":lines=")),
+        "no multi-line fused Rader kernel was built"
+    );
+
     // N=517 convolves over 1040 points in workgroup memory: a 2048-point
     // register convolution would be almost twice as long.
     for (length, batch, fused_storage_bytes) in [(517, 2, 8_320u64), (2026, 1, 32_448)] {
@@ -336,7 +382,9 @@ fn rader_only() -> FftTuning {
 /// Short primes transform with the direct DFT kernel: one kernel per axis,
 /// many lines per workgroup, and f32 accuracy on par with the FFT routes.
 fn run_direct_cases(context: &wgpu_fft::device::GpuContext) {
-    for (length, batch) in [(17, 5), (31, 1), (61, 3), (101, 2), (127, 7)] {
+    // Primes whose Rader convolution would be linear (103, 107) or too short
+    // for the fused kernel (17 to 61) take the direct kernel.
+    for (length, batch) in [(17, 5), (31, 1), (61, 3), (103, 2), (107, 7)] {
         for inverse in [false, true] {
             run_fused_case(
                 &context.device,
@@ -348,6 +396,19 @@ fn run_direct_cases(context: &wgpu_fft::device::GpuContext) {
                 &format!("direct N={length} batch={batch} inverse={inverse}"),
             );
         }
+    }
+    // Cyclic convolutions (N - 1 smooth) in the fused Rader kernel beat the
+    // direct kernel.
+    for (length, batch) in [(101, 2), (127, 7)] {
+        run_fused_case(
+            &context.device,
+            &context.queue,
+            config_1d(length, batch, false),
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            &format!("cyclic Rader N={length} batch={batch}"),
+        );
     }
     // A long batch spreads over many workgroups, and a strided prime axis
     // loads several neighbouring lines together.

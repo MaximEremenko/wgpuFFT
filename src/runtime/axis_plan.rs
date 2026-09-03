@@ -1895,7 +1895,7 @@ const MAX_SHORT_REGISTER_LENGTH: usize = 512;
 /// in the workgroup-memory kernel.
 const MIN_CONTIGUOUS_REGISTER_LENGTH: usize = 64;
 /// Shortest strided line run in registers.
-const MIN_STRIDED_REGISTER_LENGTH: usize = 32;
+const MIN_STRIDED_REGISTER_LENGTH: usize = 16;
 /// Invocations a workgroup of short register lines aims for.
 const SHORT_REGISTER_INVOCATIONS: usize = 128;
 /// Fewest lines a workgroup of short strided lines takes, so each of its

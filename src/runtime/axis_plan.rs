@@ -3020,7 +3020,6 @@ fn main({entry_params}) {{
 /// One in-place smooth radix stage over `lines` lines of `axis_length`
 /// elements in `scratch`, with each line's units on consecutive invocations.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_in_place_smooth_fft_stage_multiline_wgsl(
     axis_length: usize,
     radix: usize,

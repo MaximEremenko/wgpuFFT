@@ -267,6 +267,90 @@ pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<V
     Ok(values)
 }
 
+/// Unnormalized DFT of `input` in `f64`, of any length: a mixed-radix
+/// Cooley-Tukey FFT that splits off the smallest prime factor at each level
+/// and transforms prime lengths directly, so it takes `O(n (p1 + p2 + ...))`
+/// operations for `n = p1 p2 ...`. It builds the filter spectra of Rader and
+/// Bluestein axes, whose lengths reach tens of thousands of points.
+pub(crate) fn fft_f64(input: &[Complex64], direction: FftDirection) -> Vec<Complex64> {
+    let n = input.len();
+    if n <= 1 {
+        return input.to_vec();
+    }
+    let sign = match direction {
+        FftDirection::Forward => -1.0,
+        FftDirection::Inverse => 1.0,
+    };
+    let roots = (0..n)
+        .map(|k| {
+            let (sin, cos) = (sign * std::f64::consts::TAU * k as f64 / n as f64).sin_cos();
+            Complex64::new(cos, sin)
+        })
+        .collect::<Vec<_>>();
+    let mut output = vec![Complex64::default(); n];
+    fft_f64_recursive(input, 1, &mut output, &roots, 1);
+    output
+}
+
+/// Transforms the `output.len()` points `input[0], input[stride], ...` into
+/// `output`, where `roots[k * root_stride]` is the `k`-th root of unity of
+/// that length.
+fn fft_f64_recursive(
+    input: &[Complex64],
+    stride: usize,
+    output: &mut [Complex64],
+    roots: &[Complex64],
+    root_stride: usize,
+) {
+    let mul = |a: Complex64, b: Complex64| {
+        Complex64::new(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+    };
+    let n = output.len();
+    let p = (2..n)
+        .take_while(|factor| factor * factor <= n)
+        .find(|factor| n.is_multiple_of(*factor))
+        .unwrap_or(n);
+    if p == n {
+        for (k, value) in output.iter_mut().enumerate() {
+            let mut sum = Complex64::default();
+            for j in 0..n {
+                let term = mul(input[j * stride], roots[(j * k % n) * root_stride]);
+                sum.re += term.re;
+                sum.im += term.im;
+            }
+            *value = sum;
+        }
+        return;
+    }
+    // Sub-transform r holds the points p * j + r; output point k + m * s
+    // sums W_n^(r k) W_p^(r s) times point k of sub-transform r.
+    let m = n / p;
+    for r in 0..p {
+        fft_f64_recursive(
+            &input[r * stride..],
+            stride * p,
+            &mut output[r * m..(r + 1) * m],
+            roots,
+            root_stride * p,
+        );
+    }
+    let mut column = vec![Complex64::default(); p];
+    for k in 0..m {
+        for (r, value) in column.iter_mut().enumerate() {
+            *value = mul(output[r * m + k], roots[r * k * root_stride]);
+        }
+        for s in 0..p {
+            let mut sum = Complex64::default();
+            for (r, value) in column.iter().enumerate() {
+                let term = mul(*value, roots[(r * s % p) * m * root_stride]);
+                sum.re += term.re;
+                sum.im += term.im;
+            }
+            output[k + m * s] = sum;
+        }
+    }
+}
+
 fn validate_real_reference_config(config: &FftConfig, direction: FftDirection) -> Result<()> {
     config.validate()?;
     if config.direction() != direction {
@@ -470,6 +554,34 @@ mod tests {
             Complex64::new(-2.0, -2.0),
         ];
         assert_close_f64(&output, &expected);
+    }
+
+    #[test]
+    fn f64_fft_matches_the_reference_dft() {
+        for n in [1, 2, 3, 4, 5, 12, 16, 17, 30, 49, 97, 128, 210, 282, 1060] {
+            let input = (0..n)
+                .map(|i| Complex64::new((i as f64 * 0.37).sin(), (i as f64 * 0.11).cos()))
+                .collect::<Vec<_>>();
+            for direction in [FftDirection::Forward, FftDirection::Inverse] {
+                let config = FftConfig::new(n).with_normalization(Normalization::None);
+                let config = match direction {
+                    FftDirection::Forward => config,
+                    FftDirection::Inverse => config.with_direction(FftDirection::Inverse),
+                };
+                let expected = reference_c2c_nd_f64(&input, &config).unwrap();
+                let actual = fft_f64(&input, direction);
+                let scale = expected
+                    .iter()
+                    .map(|value| value.re.abs().max(value.im.abs()))
+                    .fold(1.0, f64::max);
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        actual.abs_diff(*expected) < 1.0e-12 * scale,
+                        "n={n} {direction:?} index {index}: {actual:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

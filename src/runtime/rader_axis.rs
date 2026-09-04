@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
+use crate::math::{fft_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
     fused_lines_per_workgroup, fused_smooth_factors, fused_smooth_pads_indices,
     generate_fused_scratch_fft_stages_wgsl, generate_in_place_smooth_fft_stage_multiline_wgsl,
@@ -1195,8 +1195,7 @@ pub(crate) fn rader_bfft_f64(
         values[k] = Complex64::new(cos, sin);
     }
 
-    let config = crate::config::FftConfig::new(m).with_normalization(Normalization::None);
-    reference_c2c_nd_f64(&values, &config)
+    Ok(fft_f64(&values, FftDirection::Forward))
 }
 
 fn round_complex64(value: Complex64) -> Complex32 {
@@ -2478,11 +2477,7 @@ mod tests {
                 let (sin, cos) = angle.sin_cos();
                 kernel[k] = Complex64::new(cos, sin);
             }
-            let expected = reference_c2c_nd_f64(
-                &kernel,
-                &crate::config::FftConfig::new(m).with_normalization(Normalization::None),
-            )
-            .unwrap();
+            let expected = fft_f64(&kernel, FftDirection::Forward);
 
             for (actual, expected) in actual.iter().zip(expected) {
                 assert_eq!(actual.re.to_bits(), (expected.re as f32).to_bits());

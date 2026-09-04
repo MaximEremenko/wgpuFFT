@@ -1,7 +1,9 @@
 //! Rust `wgpu` FFT library.
 //!
-//! The crate supports out-of-place C2C, R2C, and C2R `f32` transforms over
-//! 1D/ND shapes and batches. Public `FftLogicalView` and `BufferView` inputs
+//! The crate supports out-of-place C2C transforms over 1D/ND shapes and batches
+//! using `f32`, native `f64`, or portable double-float (`df64`) precision.
+//! Out-of-place R2C and C2R transforms use `f32`. Public `FftLogicalView` and
+//! `BufferView` inputs
 //! normalize contiguous, offset, segmented, strided, and segmented+strided
 //! logical I/O before dispatch. Existing `FftIoView` compatibility views route
 //! through the same logical I/O path.

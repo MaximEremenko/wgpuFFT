@@ -2,13 +2,19 @@
 
 Rust `wgpu` FFT library. The package name is `wgpu-fft`; the library target is
 imported as `wgpu_fft`. This is the Rust counterpart of the JavaScript
-[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The downstream
-`wgpuNUFFT` library builds nonuniform transforms on this FFT crate.
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The upper
+`wgpuNUFFT` repository builds nonuniform transforms on this FFT crate.
+
+In a `wgpuNUFFT` checkout, this repository is pinned as the `wgpuFFT/` Git
+submodule. Clone the upper repository with `--recurse-submodules`, or run
+`git submodule update --init --recursive` there, so its NUFFT implementation
+uses the exact FFT revision recorded by the upper repository. This crate also
+remains usable as the standalone FFT repository.
 
 ## Installation
 
-The crates are not yet published on crates.io; depend on the library as a git
-dependency:
+This crate is intentionally kept local/GitHub-only and is not published on
+crates.io. For standalone use, depend on it directly from GitHub:
 
 ```toml
 [dependencies]
@@ -256,16 +262,19 @@ $env:WGPU_BACKEND = 'dx12'; $env:WGPU_FFT_RUN_GPU_TESTS = '1'
 cargo test --test gpu_df64_canary --release -- --nocapture
 ```
 
-Standalone FFT browser (Wasm) tests run through the tracked runner, which needs a
-ChromeDriver matching the installed Chrome build (set `CHROMEDRIVER` or put
-`chromedriver.exe` on `PATH`):
+FFT browser (Wasm) tests are maintained by the upper `wgpuNUFFT` repository,
+whose harness pins this submodule revision and needs a ChromeDriver matching the
+installed Chrome build (set `CHROMEDRIVER` or put `chromedriver.exe` on
+`PATH`). From the root of a recursive `wgpuNUFFT` checkout, run:
 
 ```bat
 web\run_browser_tests.cmd
 ```
 
-The runner covers only this crate's FFT smoke, correctness-matrix, and large-route
-tests. See [web/README.md](web/README.md) for browser prerequisites and details.
+The FFT portion covers this crate's smoke, correctness-matrix, and large-route
+tests. See `web/README.md` in the upper repository for browser prerequisites and
+the complete cross-library test matrix. A standalone `wgpuFFT` checkout does
+not contain that runner.
 
 The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
 is set. The native test helper excludes the GL backend by default because EGL

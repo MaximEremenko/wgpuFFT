@@ -1203,18 +1203,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wgpu-nufft"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "futures-channel",
- "pollster",
- "wasm-bindgen-test",
- "wgpu",
- "wgpu-fft",
-]
-
-[[package]]
 name = "wgpu-types"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1226,21 +1214,6 @@ dependencies = [
  "log",
  "raw-window-handle",
  "web-sys",
-]
-
-[[package]]
-name = "wgpu-web"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "futures-channel",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "wgpu",
- "wgpu-fft",
- "wgpu-nufft",
 ]
 
 [[package]]

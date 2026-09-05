@@ -203,6 +203,9 @@ pub fn reference_c2c_nd(input: &[Complex32], config: &FftConfig) -> Result<Vec<C
     Ok(values)
 }
 
+/// `f64` reference transform: each line of each axis goes through
+/// [`fft_f64`], which agrees with the plain DFT to a few units in the last
+/// place while taking `O(n log n)` for smooth lengths.
 pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<Vec<Complex64>> {
     config.validate()?;
     let total_complex = config.total_complex_len()?;
@@ -212,11 +215,6 @@ pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<V
         "reference input length must match FftConfig::total_complex_len"
     );
 
-    let sign = match config.direction() {
-        FftDirection::Forward => -1.0,
-        FftDirection::Inverse => 1.0,
-    };
-    let tau = std::f64::consts::TAU;
     let shape = config.shape();
     let strides = strides_for_shape(shape);
     let logical_complex_len = config.logical_complex_len()?;
@@ -232,7 +230,6 @@ pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<V
     let mut values = input.to_vec();
     for (axis_index, &axis) in config.axes().iter().enumerate() {
         let axis_len = shape[axis];
-        let axis_len_f64 = axis_len as f64;
         let stride = strides[axis];
         let lines_per_batch = logical_complex_len / axis_len;
         let scale = if axis_index + 1 == config.axes().len() {
@@ -241,22 +238,18 @@ pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<V
             1.0
         };
         let mut output = vec![Complex64::default(); total_complex];
+        let mut line_values = vec![Complex64::default(); axis_len];
 
         for batch in 0..config.batch() {
             let batch_base = batch * logical_complex_len;
             for line in 0..lines_per_batch {
                 let base = batch_base + line_base_for_axis(line, axis, shape, &strides);
-                for k in 0..axis_len {
-                    let mut sum = Complex64::default();
-                    for n in 0..axis_len {
-                        let value = values[base + n * stride];
-                        let exponent = ((k as u128 * n as u128) % axis_len as u128) as usize;
-                        let angle = sign * tau * exponent as f64 / axis_len_f64;
-                        let (sin, cos) = angle.sin_cos();
-                        sum.re += value.re * cos - value.im * sin;
-                        sum.im += value.re * sin + value.im * cos;
-                    }
-                    output[base + k * stride] = Complex64::new(sum.re * scale, sum.im * scale);
+                for (n, value) in line_values.iter_mut().enumerate() {
+                    *value = values[base + n * stride];
+                }
+                let spectrum = fft_f64(&line_values, config.direction());
+                for (k, value) in spectrum.into_iter().enumerate() {
+                    output[base + k * stride] = Complex64::new(value.re * scale, value.im * scale);
                 }
             }
         }
@@ -557,18 +550,32 @@ mod tests {
     }
 
     #[test]
-    fn f64_fft_matches_the_reference_dft() {
+    fn f64_fft_matches_a_plain_dft() {
         for n in [1, 2, 3, 4, 5, 12, 16, 17, 30, 49, 97, 128, 210, 282, 1060] {
             let input = (0..n)
                 .map(|i| Complex64::new((i as f64 * 0.37).sin(), (i as f64 * 0.11).cos()))
                 .collect::<Vec<_>>();
             for direction in [FftDirection::Forward, FftDirection::Inverse] {
-                let config = FftConfig::new(n).with_normalization(Normalization::None);
-                let config = match direction {
-                    FftDirection::Forward => config,
-                    FftDirection::Inverse => config.with_direction(FftDirection::Inverse),
+                let sign = match direction {
+                    FftDirection::Forward => -1.0,
+                    FftDirection::Inverse => 1.0,
                 };
-                let expected = reference_c2c_nd_f64(&input, &config).unwrap();
+                let expected = (0..n)
+                    .map(|k| {
+                        input
+                            .iter()
+                            .enumerate()
+                            .fold(Complex64::default(), |sum, (j, value)| {
+                                let angle =
+                                    sign * std::f64::consts::TAU * ((j * k) % n) as f64 / n as f64;
+                                let (sin, cos) = angle.sin_cos();
+                                Complex64::new(
+                                    sum.re + value.re * cos - value.im * sin,
+                                    sum.im + value.re * sin + value.im * cos,
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 let actual = fft_f64(&input, direction);
                 let scale = expected
                     .iter()

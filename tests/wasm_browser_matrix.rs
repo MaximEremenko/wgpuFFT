@@ -135,6 +135,14 @@ async fn browser_default_limits_correctness_matrix() {
             FftConfig::inverse(179).with_batch(3),
             C2cRoute::Rader,
         ),
+        // A cyclic Rader convolution with a radix-23 stage (1380 = 60 * 23).
+        (
+            "rader-medium-prime-1381",
+            FftConfig::new(1381)
+                .with_batch(2)
+                .with_normalization(Normalization::None),
+            C2cRoute::Rader,
+        ),
     ] {
         run_c2c_case(&context, label, config, expected_route).await;
     }

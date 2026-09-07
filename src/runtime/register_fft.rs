@@ -32,6 +32,12 @@ use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, Registe
 const VALUES_PER_INVOCATION: usize = 16;
 /// Largest radix of a register stage.
 const MAX_RADIX: usize = 16;
+/// Most invocations a single-line register kernel takes; a longer line
+/// keeps twice as many values per invocation. A 16384-point Bluestein
+/// convolution over 512 invocations of 32 values ran 8% to 18% faster than
+/// over 1024 of 16: the same exchange rounds, but half the
+/// invocations to synchronize and more work between barriers.
+const MAX_LINE_INVOCATIONS: usize = 512;
 /// Smallest exchange buffer: one 16-value unit. The bank swizzle permutes
 /// aligned 16-element blocks, so it maps any power-of-two length onto itself.
 const MIN_EXCHANGE_LEN: usize = 16;
@@ -64,9 +70,17 @@ pub(crate) fn register_schedule_for_lines(
     let max_invocations = limits
         .max_compute_invocations_per_workgroup
         .min(limits.max_compute_workgroup_size_x) as usize;
-    let line_invocations = axis_length / VALUES_PER_INVOCATION;
+    if axis_length / VALUES_PER_INVOCATION * lines > max_invocations {
+        return None;
+    }
+    let values = if lines == 1 && axis_length / VALUES_PER_INVOCATION > MAX_LINE_INVOCATIONS {
+        2 * VALUES_PER_INVOCATION
+    } else {
+        VALUES_PER_INVOCATION
+    };
+    let line_invocations = axis_length / values;
     let workgroup_size = line_invocations.checked_mul(lines)?;
-    if line_invocations == 0 || workgroup_size > max_invocations {
+    if line_invocations == 0 {
         return None;
     }
 
@@ -88,10 +102,7 @@ pub(crate) fn register_schedule_for_lines(
     if rest > 1 {
         radices.push(rest);
     }
-    if radices
-        .iter()
-        .any(|&radix| !VALUES_PER_INVOCATION.is_multiple_of(radix))
-    {
+    if radices.iter().any(|&radix| !values.is_multiple_of(radix)) {
         return None;
     }
     Some((
@@ -912,9 +923,11 @@ mod tests {
         assert_eq!(schedule.radices, [16, 16, 16, 2]);
         assert_eq!(schedule.exchange_len, 4096);
 
+        // Beyond 512 invocations a line keeps 32 values per invocation.
         let (workgroup, schedule) = register_schedule(16384, AxisPrecision::F32, &vulkan).unwrap();
-        assert_eq!(workgroup, 1024);
+        assert_eq!(workgroup, 512);
         assert_eq!(schedule.radices, [16, 16, 16, 4]);
+        assert!(register_schedule(16384, AxisPrecision::F32, &limits(512, 48 * 1024)).is_none());
 
         // A 256-invocation device with 16 KiB of workgroup memory.
         let webgpu = limits(256, 16 * 1024);
@@ -1038,6 +1051,7 @@ mod tests {
         assert!(simulate(512, 32, &[16, 16, 2], 256) < 1e-9);
         assert!(simulate(1024, 64, &[16, 16, 4], 256) < 1e-9);
         assert!(simulate(2048, 64, &[16, 16, 8], 512) < 1e-9);
+        assert!(simulate(16384, 512, &[16, 16, 16, 4], 4096) < 1e-9);
     }
 
     #[test]

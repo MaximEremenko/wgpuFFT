@@ -185,9 +185,10 @@ async fn run_fused_prime_cases() {
         );
     }
 
-    // N=517 convolves over 1040 points in workgroup memory: a 2048-point
-    // register convolution would be almost twice as long.
-    for (length, batch, fused_storage_bytes) in [(517, 2, 8_320u64), (2026, 1, 32_448)] {
+    // N=517 and N=2062 convolve over 1040 and 4125 points in workgroup
+    // memory: 2048- and 8192-point register convolutions would be about
+    // twice as long.
+    for (length, batch, fused_storage_bytes) in [(517, 2, 8_320u64), (2062, 1, 33_000)] {
         for inverse in [false, true] {
             let config = config_1d(length, batch, inverse);
             let label = format!("Bluestein N={length} batch={batch} inverse={inverse}");
@@ -385,9 +386,9 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         );
     }
 
-    let input = test_signal(2026);
+    let input = test_signal(2062);
     for inverse in [false, true] {
-        let config = config_1d(2026, 1, inverse);
+        let config = config_1d(2062, 1, inverse);
         let expected = reference_f64(&input, &config);
         let (fused, fused_plan) =
             execute_c2c(&context.device, &context.queue, config.clone(), &input);
@@ -400,23 +401,23 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
             BLUESTEIN_FUSED_LABEL,
             &["bluestein-chirp-helper", "bluestein-bfft-helper"],
         );
-        // The 4096-point convolution no longer fits 16 KiB of workgroup
-        // memory, so it runs in registers.
+        // The 4125-point convolution does not fit 16 KiB of workgroup
+        // memory, so it runs in registers over 8192 points.
         assert_eq!(
             kernel_labels(&fallback_plan),
             [BLUESTEIN_REGISTER_LABEL],
-            "forced 16 KiB N=2026"
+            "forced 16 KiB N=2062"
         );
         let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
         assert_eq!(
             unsplit.1.len(),
-            11,
-            "unsplit forced 16 KiB N=2026 should use three bridge kernels and eight Stockham stages: {:?}",
+            13,
+            "unsplit forced 16 KiB N=2062 should use three bridge kernels and ten Stockham stages: {:?}",
             unsplit.1
         );
-        assert_matches_reference(&unsplit.0, &expected, "Bluestein N=2026 unsplit fallback");
+        assert_matches_reference(&unsplit.0, &expected, "Bluestein N=2062 unsplit fallback");
 
-        let label = format!("Bluestein N=2026 inverse={inverse}");
+        let label = format!("Bluestein N=2062 inverse={inverse}");
         let (fused_max, fused_rms) = relative_error_metrics(&fused, &expected);
         assert!(fused_max < 5.0e-7 && fused_rms < 5.0e-7, "{label}");
         assert_matches_reference(&fallback, &expected, &format!("{label} fallback"));

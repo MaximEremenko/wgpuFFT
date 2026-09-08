@@ -262,9 +262,10 @@ pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<V
 
 /// Unnormalized DFT of `input` in `f64`, of any length: a mixed-radix
 /// Cooley-Tukey FFT that splits off the smallest prime factor at each level
-/// and transforms prime lengths directly, so it takes `O(n (p1 + p2 + ...))`
-/// operations for `n = p1 p2 ...`. It builds the filter spectra of Rader and
-/// Bluestein axes, whose lengths reach tens of thousands of points.
+/// and transforms prime lengths directly, or through Bluestein's convolution
+/// above [`MAX_DIRECT_PRIME_F64`], so it takes `O(n log n)` operations. It
+/// builds the filter spectra of Rader and Bluestein axes, whose lengths reach
+/// tens of thousands of points.
 pub(crate) fn fft_f64(input: &[Complex64], direction: FftDirection) -> Vec<Complex64> {
     let n = input.len();
     if n <= 1 {
@@ -281,9 +282,12 @@ pub(crate) fn fft_f64(input: &[Complex64], direction: FftDirection) -> Vec<Compl
         })
         .collect::<Vec<_>>();
     let mut output = vec![Complex64::default(); n];
-    fft_f64_recursive(input, 1, &mut output, &roots, 1);
+    fft_f64_recursive(input, 1, &mut output, &roots, 1, direction);
     output
 }
+
+/// Longest prime [`fft_f64`] transforms as a plain DFT.
+const MAX_DIRECT_PRIME_F64: usize = 64;
 
 /// Transforms the `output.len()` points `input[0], input[stride], ...` into
 /// `output`, where `roots[k * root_stride]` is the `k`-th root of unity of
@@ -294,6 +298,7 @@ fn fft_f64_recursive(
     output: &mut [Complex64],
     roots: &[Complex64],
     root_stride: usize,
+    direction: FftDirection,
 ) {
     let mul = |a: Complex64, b: Complex64| {
         Complex64::new(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
@@ -303,6 +308,11 @@ fn fft_f64_recursive(
         .take_while(|factor| factor * factor <= n)
         .find(|factor| n.is_multiple_of(*factor))
         .unwrap_or(n);
+    if p == n && n > MAX_DIRECT_PRIME_F64 {
+        let values = (0..n).map(|j| input[j * stride]).collect::<Vec<_>>();
+        output.copy_from_slice(&bluestein_f64(&values, direction));
+        return;
+    }
     if p == n {
         for (k, value) in output.iter_mut().enumerate() {
             let mut sum = Complex64::default();
@@ -325,6 +335,7 @@ fn fft_f64_recursive(
             &mut output[r * m..(r + 1) * m],
             roots,
             root_stride * p,
+            direction,
         );
     }
     let mut column = vec![Complex64::default(); p];
@@ -342,6 +353,50 @@ fn fft_f64_recursive(
             output[k + m * s] = sum;
         }
     }
+}
+
+/// DFT of `values` through Bluestein's convolution over a power-of-two
+/// length: with the chirp `c_k = W^(k^2 / 2)`, output `k` is `c_k` times the
+/// convolution of `x_j c_j` with the conjugate chirp.
+fn bluestein_f64(values: &[Complex64], direction: FftDirection) -> Vec<Complex64> {
+    let mul = |a: Complex64, b: Complex64| {
+        Complex64::new(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+    };
+    let n = values.len();
+    let sign = match direction {
+        FftDirection::Forward => -1.0,
+        FftDirection::Inverse => 1.0,
+    };
+    let chirp = (0..n)
+        .map(|k| {
+            let square = (k as u128 * k as u128 % (2 * n as u128)) as f64;
+            let (sin, cos) = (sign * std::f64::consts::PI * square / n as f64).sin_cos();
+            Complex64::new(cos, sin)
+        })
+        .collect::<Vec<_>>();
+    let m = (2 * n - 1).next_power_of_two();
+    let mut a = vec![Complex64::default(); m];
+    let mut b = vec![Complex64::default(); m];
+    for k in 0..n {
+        a[k] = mul(values[k], chirp[k]);
+        let conjugate = Complex64::new(chirp[k].re, -chirp[k].im);
+        b[k] = conjugate;
+        if k > 0 {
+            b[m - k] = conjugate;
+        }
+    }
+    let product = fft_f64(&a, FftDirection::Forward)
+        .into_iter()
+        .zip(fft_f64(&b, FftDirection::Forward))
+        .map(|(a, b)| mul(a, b))
+        .collect::<Vec<_>>();
+    let convolution = fft_f64(&product, FftDirection::Inverse);
+    (0..n)
+        .map(|k| {
+            let value = mul(convolution[k], chirp[k]);
+            Complex64::new(value.re / m as f64, value.im / m as f64)
+        })
+        .collect()
 }
 
 fn validate_real_reference_config(config: &FftConfig, direction: FftDirection) -> Result<()> {
@@ -551,7 +606,9 @@ mod tests {
 
     #[test]
     fn f64_fft_matches_a_plain_dft() {
-        for n in [1, 2, 3, 4, 5, 12, 16, 17, 30, 49, 97, 128, 210, 282, 1060] {
+        for n in [
+            1, 2, 3, 4, 5, 12, 16, 17, 30, 49, 97, 128, 210, 282, 1060, 1523, 3946,
+        ] {
             let input = (0..n)
                 .map(|i| Complex64::new((i as f64 * 0.37).sin(), (i as f64 * 0.11).cos()))
                 .collect::<Vec<_>>();

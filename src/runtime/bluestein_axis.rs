@@ -20,7 +20,9 @@ use crate::runtime::pipeline_cache::{
     FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule, ShaderCacheKey,
 };
 use crate::runtime::recorder::CommandRecorder;
-use crate::runtime::register_fft::{generate_register_bluestein_wgsl, register_schedule};
+use crate::runtime::register_fft::{
+    generate_register_bluestein_wgsl, register_schedule, register_schedule_for_lines,
+};
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
@@ -275,6 +277,15 @@ impl BluesteinAxis {
         }
 
         let execution = if let Some((_, workgroup_size, schedule)) = register {
+            // Strided lines interleave in one workgroup where they fit.
+            let (lines_per_workgroup, workgroup_size, schedule) = register_bluestein_lines(
+                m,
+                stride_complex,
+                lines_u32 as usize,
+                config.precision,
+                &device.limits(),
+            )
+            .unwrap_or((1, workgroup_size, schedule));
             let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
                 device,
                 queue,
@@ -297,14 +308,15 @@ impl BluesteinAxis {
                 scale,
                 config.precision,
             )
-            .with_registers(schedule);
+            .with_registers(schedule)
+            .with_lines_per_workgroup(lines_per_workgroup);
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = with_device_pipeline_cache(device, |cache| {
                 cache.get_bind_group_layout(device, pipeline_key.layout)
             });
             let pipeline = cached_fused_bluestein_pipeline(device, &pipeline_key, &shader_key);
             BluesteinExecution::Register(FusedBluesteinExecution {
-                workgroups: lines_u32,
+                workgroups: lines_u32.div_ceil(lines_per_workgroup),
                 pipeline,
                 bind_group_layout,
                 twiddle_buffer,
@@ -910,6 +922,50 @@ pub(crate) fn register_bluestein_plan(
     }
     let (workgroup_size, schedule) = register_schedule(m, precision, limits)?;
     Some((m, workgroup_size, schedule))
+}
+
+/// Most strided lines a register Bluestein workgroup interleaves.
+const MAX_REGISTER_BLUESTEIN_LINES: usize = 8;
+/// Workgroups a strided register Bluestein axis keeps, so its lines still
+/// spread over the GPU.
+const MIN_REGISTER_BLUESTEIN_WORKGROUPS: usize = 256;
+
+/// Lines per workgroup, workgroup size, and schedule of a register Bluestein
+/// kernel of `m` points on a strided axis: neighbouring lines interleave
+/// element by element so each row a workgroup loads spans several lines, as
+/// many as one workgroup fits with a whole-line exchange buffer each, up to
+/// [`MAX_REGISTER_BLUESTEIN_LINES`], while [`MIN_REGISTER_BLUESTEIN_WORKGROUPS`]
+/// workgroups remain. `None` keeps one line per workgroup.
+fn register_bluestein_lines(
+    m: usize,
+    stride_complex: usize,
+    total_lines: usize,
+    precision: AxisPrecision,
+    limits: &wgpu::Limits,
+) -> Option<(u32, u32, RegisterSchedule)> {
+    if stride_complex == 1 {
+        return None;
+    }
+    let max_invocations = limits
+        .max_compute_invocations_per_workgroup
+        .min(limits.max_compute_workgroup_size_x) as usize;
+    let line_invocations = m / crate::runtime::register_fft::REGISTER_VALUES_PER_INVOCATION;
+    // Each line keeps an exchange buffer as long as itself: exchanging in
+    // rounds takes two barriers per round, and four 4096-point lines with
+    // 1024-point buffers ran up to 25% slower than one line per workgroup.
+    let storage_lines = limits.max_compute_workgroup_storage_size as usize
+        / precision.complex_size_bytes() as usize
+        / m;
+    let lines = MAX_REGISTER_BLUESTEIN_LINES
+        .min(max_invocations / line_invocations.max(1))
+        .min(storage_lines)
+        .min(total_lines / MIN_REGISTER_BLUESTEIN_WORKGROUPS);
+    if lines < 2 {
+        return None;
+    }
+    let lines = 1 << lines.ilog2();
+    let (workgroup_size, schedule) = register_schedule_for_lines(m, lines, precision, limits)?;
+    Some((lines as u32, workgroup_size, schedule))
 }
 
 /// Longest register convolution preferred over a workgroup-memory one that

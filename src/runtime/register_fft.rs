@@ -20,8 +20,9 @@ use std::collections::BTreeSet;
 
 use crate::config::FftDirection;
 use crate::runtime::axis_plan::{
-    complex_wgsl, radix_root_wgsl, scaled_complex_expr, specialize_complex_wgsl,
-    twiddle_lookup_wgsl, wgsl_line_base_fn, AxisPrecision, FusedPow2StageWgslConfig,
+    complex_wgsl, emit_split_twiddles, radix_root_wgsl, scaled_complex_expr,
+    specialize_complex_wgsl, twiddle_lookup_wgsl, wgsl_line_base_fn, AxisPrecision,
+    FusedPow2StageWgslConfig,
 };
 use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule};
 
@@ -301,21 +302,28 @@ fn emit_register_stages(
             body.push_str(&format!("  let j{stage}: u32 = t & {}u;\n", previous - 1));
         }
         for m in 0..values / radix {
+            let twiddles = if previous == 1 {
+                Vec::new()
+            } else {
+                let j = if previous <= workgroup {
+                    format!("j{stage}")
+                } else {
+                    format!("({} & {}u)", thread_offset(m * workgroup), previous - 1)
+                };
+                emit_split_twiddles(body, &format!("t{stage}_{m}"), radix, "  ", &|q| {
+                    format!("{twiddle}({j} * {}u)", q * (n / span))
+                })
+            };
             let inputs = (0..radix)
                 .map(|q| {
                     let input = format!("x{stage}_{}", m * radix + q);
                     if previous == 1 || q == 0 {
                         return input;
                     }
-                    let j = if previous <= workgroup {
-                        format!("j{stage}")
-                    } else {
-                        format!("({} & {}u)", thread_offset(m * workgroup), previous - 1)
-                    };
                     let twiddled = format!("w{stage}_{m}_{q}");
                     body.push_str(&format!(
-                        "  let {twiddled}: vec2<f32> = c_mul({twiddle}({j} * {}u), {input});\n",
-                        q * (n / span)
+                        "  let {twiddled}: vec2<f32> = c_mul({}, {input});\n",
+                        twiddles[q]
                     ));
                     twiddled
                 })

@@ -102,6 +102,42 @@ async fn run_fused_prime_cases() {
         "no multi-line fused Rader kernel was built"
     );
 
+    // Strided lines too long for several per workgroup load and store two
+    // (810-point convolutions) or four (2178-point) at a time and convolve
+    // one after another; 769 and 1027 lines leave a partial last group.
+    for (label, config, fragment) in [
+        (
+            "Rader serial strided 769x811 axis 1",
+            FftConfig::new_nd([769, 811])
+                .with_axes([1])
+                .with_normalization(Normalization::None),
+            ":n=811:stride=769:",
+        ),
+        (
+            "Rader serial strided inverse 1027x1087 axis 1",
+            FftConfig::inverse_nd([1027, 1087]).with_axes([1]),
+            ":n=1087:stride=1027:",
+        ),
+    ] {
+        run_fused_case(
+            &context.device,
+            &context.queue,
+            config,
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            label,
+        );
+        let snapshot = wgpu_fft::export_pipeline_cache_snapshot(&context.device);
+        assert!(
+            snapshot
+                .pipeline_keys()
+                .iter()
+                .any(|key| key.contains(fragment) && key.contains(":serial=")),
+            "{label}: no serial-line Rader kernel"
+        );
+    }
+
     // Primes whose N - 1 has a prime factor from 17 to 61 convolve
     // cyclically over N - 1 points with radix-p stages where workgroup
     // storage holds them: 613 (612 = 36 * 17), strided lines of it four per

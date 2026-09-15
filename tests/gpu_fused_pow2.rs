@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use wgpu_fft::math::{from_interleaved_f32, reference_c2c_nd, to_interleaved_f32};
 use wgpu_fft::{
     export_pipeline_cache_snapshot, import_pipeline_cache_snapshot, C2cRoute, FftConfig, FftPlan,
-    Normalization,
+    FftTuning, Normalization,
 };
 
 const FUSED_POW2_LABEL: &str = "fused-pow2-workgroup-stage";
@@ -118,13 +118,21 @@ async fn run_fused_cases() {
         (FftConfig::inverse(256).with_batch(3), 1, 0, 0),
         (
             FftConfig::new_nd([8, 16])
+                .with_tuning(per_axis_tuning())
                 .with_batch(2)
                 .with_normalization(Normalization::None),
             2,
             0,
             0,
         ),
-        (FftConfig::inverse_nd([8, 16]).with_batch(2), 2, 0, 0),
+        (
+            FftConfig::inverse_nd([8, 16])
+                .with_tuning(per_axis_tuning())
+                .with_batch(2),
+            2,
+            0,
+            0,
+        ),
         (
             FftConfig::new_nd([3, 256, 5])
                 .with_axes([1])
@@ -143,12 +151,19 @@ async fn run_fused_cases() {
             0,
         ),
         (
-            FftConfig::new_nd([256, 12]).with_normalization(Normalization::None),
+            FftConfig::new_nd([256, 12])
+                .with_tuning(per_axis_tuning())
+                .with_normalization(Normalization::None),
             1,
             1,
             0,
         ),
-        (FftConfig::inverse_nd([256, 12]), 1, 1, 0),
+        (
+            FftConfig::inverse_nd([256, 12]).with_tuning(per_axis_tuning()),
+            1,
+            1,
+            0,
+        ),
         (
             FftConfig::new(315)
                 .with_batch(3)
@@ -166,13 +181,21 @@ async fn run_fused_cases() {
         ),
         (
             FftConfig::new_nd([9, 25])
+                .with_tuning(per_axis_tuning())
                 .with_batch(2)
                 .with_normalization(Normalization::None),
             0,
             2,
             0,
         ),
-        (FftConfig::inverse_nd([9, 25]).with_batch(2), 0, 2, 0),
+        (
+            FftConfig::inverse_nd([9, 25])
+                .with_tuning(per_axis_tuning())
+                .with_batch(2),
+            0,
+            2,
+            0,
+        ),
     ] {
         let input = test_signal(config.logical_complex_len().unwrap() * config.batch());
         let expected = reference_c2c_nd(&from_interleaved_f32(&input), &config).unwrap();
@@ -394,6 +417,12 @@ fn assert_fused_pow2_plan(plan: &FftPlan, fused_stages: usize, workspace_bytes: 
 fn assert_fused_smooth_plan(plan: &FftPlan, fused_stages: usize, workspace_bytes: u64) {
     assert_stage_labels(plan, 0, fused_stages, 0);
     assert_eq!(plan.workspace_size_bytes(), workspace_bytes);
+}
+
+/// Tuning for tiny ND shapes that exercise per-axis plans (their stages and
+/// workspaces) rather than the single small-volume kernel.
+fn per_axis_tuning() -> FftTuning {
+    FftTuning::default().with_fuse_small_volumes(false)
 }
 
 fn assert_stage_labels(

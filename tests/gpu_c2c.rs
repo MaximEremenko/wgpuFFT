@@ -7,8 +7,8 @@ use wgpu_fft::{
     clear_thread_local_pipeline_cache, export_pipeline_cache_snapshot,
     import_pipeline_cache_snapshot, BufferLayout, BufferSegment, BufferView, C2cRoute,
     FftBlockerKind, FftConfig, FftDeviceLimits, FftError, FftIoView, FftLogicalLayout,
-    FftLogicalView, FftPlan, LargeExecutionKind, LargePolicyLimits, LargeRouteMode, Normalization,
-    PIPELINE_CACHE_SNAPSHOT_SCHEMA, PIPELINE_CACHE_SNAPSHOT_VERSION,
+    FftLogicalView, FftPlan, FftTuning, LargeExecutionKind, LargePolicyLimits, LargeRouteMode,
+    Normalization, PIPELINE_CACHE_SNAPSHOT_SCHEMA, PIPELINE_CACHE_SNAPSHOT_VERSION,
 };
 
 fn c2c_route_name(route: C2cRoute) -> &'static str {
@@ -97,6 +97,7 @@ async fn run_gpu_case() {
 
     for config in [
         FftConfig::new_nd([17, 4])
+            .with_tuning(per_axis_tuning())
             .with_axes([0])
             .with_normalization(Normalization::None),
         FftConfig::new_nd([4, 17])
@@ -111,10 +112,13 @@ async fn run_gpu_case() {
     }
 
     for config in [
-        FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+        FftConfig::new_nd([17, 4])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
         FftConfig::new_nd([4, 17]).with_normalization(Normalization::None),
         FftConfig::new_nd([17, 3, 2]).with_normalization(Normalization::None),
         FftConfig::new_nd([17, 4])
+            .with_tuning(per_axis_tuning())
             .with_batch(2)
             .with_normalization(Normalization::None),
     ] {
@@ -166,9 +170,11 @@ async fn run_gpu_case() {
     for config in [
         FftConfig::new_nd([2, 3]).with_normalization(Normalization::None),
         FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
             .with_axes([0])
             .with_normalization(Normalization::None),
         FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
             .with_axes([1])
             .with_normalization(Normalization::None),
         FftConfig::new_nd([4, 3, 2]).with_normalization(Normalization::None),
@@ -203,13 +209,17 @@ async fn run_gpu_case() {
     assert_view_validation_behavior(&context);
     run_one_case_with_caller_workspace(
         &context,
-        FftConfig::new_nd([4, 3]).with_normalization(Normalization::None),
+        FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
     );
     run_offset_view_cases(&context);
     run_segmented_view_cases(&context);
     run_one_case_with_offset_workspace(
         &context,
-        FftConfig::new_nd([4, 3]).with_normalization(Normalization::None),
+        FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
     );
     run_one_case_with_strided_logical_workspace(&context);
     assert_segmented_workspace_rejected(&context);
@@ -430,15 +440,21 @@ fn assert_workspace_behavior(context: &wgpu_fft::device::GpuContext) {
         )
         .unwrap();
 
-    let multi_stage =
-        FftPlan::c2c(&context.device, &context.queue, FftConfig::new_nd([4, 3])).unwrap();
+    let multi_stage = FftPlan::c2c(
+        &context.device,
+        &context.queue,
+        FftConfig::new_nd([4, 3]).with_tuning(per_axis_tuning()),
+    )
+    .unwrap();
     assert_eq!(multi_stage.route(), C2cRoute::MixedRadix);
     assert_eq!(multi_stage.workspace_size_bytes(), 12 * 2 * 4);
 
     let nd_batched = FftPlan::c2c(
         &context.device,
         &context.queue,
-        FftConfig::new_nd([4, 3]).with_batch(2),
+        FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
+            .with_batch(2),
     )
     .unwrap();
     assert_eq!(nd_batched.route(), C2cRoute::MixedRadix);
@@ -448,7 +464,9 @@ fn assert_workspace_behavior(context: &wgpu_fft::device::GpuContext) {
     let sequence = FftPlan::c2c(
         &context.device,
         &context.queue,
-        FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+        FftConfig::new_nd([17, 4])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
     )
     .unwrap();
     assert_eq!(sequence.route(), C2cRoute::AxisSequence);
@@ -571,7 +589,9 @@ fn run_offset_view_cases(context: &wgpu_fft::device::GpuContext) {
             C2cRoute::Bluestein,
         ),
         (
-            FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+            FftConfig::new_nd([17, 4])
+                .with_tuning(per_axis_tuning())
+                .with_normalization(Normalization::None),
             C2cRoute::AxisSequence,
         ),
     ] {
@@ -710,8 +730,16 @@ fn run_one_case_with_offset_workspace(context: &wgpu_fft::device::GpuContext, co
     trace_gpu_step(&format!("finish {label}"));
 }
 
+/// Tuning for tiny ND shapes that exercise per-axis plans (their stages and
+/// workspaces) rather than the single small-volume kernel.
+fn per_axis_tuning() -> FftTuning {
+    FftTuning::default().with_fuse_small_volumes(false)
+}
+
 fn run_one_case_with_strided_logical_workspace(context: &wgpu_fft::device::GpuContext) {
-    let config = FftConfig::new_nd([4, 3]).with_normalization(Normalization::None);
+    let config = FftConfig::new_nd([4, 3])
+        .with_tuning(per_axis_tuning())
+        .with_normalization(Normalization::None);
     trace_gpu_step(&format!(
         "start strided logical workspace config={config:?}"
     ));
@@ -838,7 +866,9 @@ fn run_segmented_view_cases(context: &wgpu_fft::device::GpuContext) {
             C2cRoute::Bluestein,
         ),
         (
-            FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+            FftConfig::new_nd([17, 4])
+                .with_tuning(per_axis_tuning())
+                .with_normalization(Normalization::None),
             C2cRoute::AxisSequence,
         ),
     ] {
@@ -884,7 +914,9 @@ fn run_strided_view_cases(context: &wgpu_fft::device::GpuContext) {
             C2cRoute::Bluestein,
         ),
         (
-            FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+            FftConfig::new_nd([17, 4])
+                .with_tuning(per_axis_tuning())
+                .with_normalization(Normalization::None),
             C2cRoute::AxisSequence,
         ),
         (
@@ -1190,6 +1222,7 @@ fn run_large_chunk_cases(context: &wgpu_fft::device::GpuContext) {
         ),
         (
             FftConfig::new_nd([17, 4])
+                .with_tuning(per_axis_tuning())
                 .with_batch(5)
                 .with_normalization(Normalization::None),
             C2cRoute::AxisSequence,
@@ -1991,7 +2024,9 @@ fn run_large_bridge_cases(context: &wgpu_fft::device::GpuContext) {
 
 fn run_large_axis_sequence_cases(context: &wgpu_fft::device::GpuContext) {
     for config in [
-        FftConfig::new_nd([17, 4]).with_normalization(Normalization::None),
+        FftConfig::new_nd([17, 4])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
         FftConfig::new_nd([34, 16]).with_normalization(Normalization::None),
         FftConfig::inverse_nd([17, 4]),
         FftConfig::inverse_nd([17, 4]).with_batch(2),
@@ -2391,7 +2426,9 @@ fn assert_segmented_workspace_rejected(context: &wgpu_fft::device::GpuContext) {
     let plan = FftPlan::c2c(
         &context.device,
         &context.queue,
-        FftConfig::new_nd([4, 3]).with_normalization(Normalization::None),
+        FftConfig::new_nd([4, 3])
+            .with_tuning(per_axis_tuning())
+            .with_normalization(Normalization::None),
     )
     .unwrap();
     assert_eq!(plan.route(), C2cRoute::MixedRadix);
@@ -3120,8 +3157,12 @@ fn assert_view_validation_behavior(context: &wgpu_fft::device::GpuContext) {
         )
         .unwrap();
 
-    let workspace_plan =
-        FftPlan::c2c(&context.device, &context.queue, FftConfig::new_nd([4, 3])).unwrap();
+    let workspace_plan = FftPlan::c2c(
+        &context.device,
+        &context.queue,
+        FftConfig::new_nd([4, 3]).with_tuning(per_axis_tuning()),
+    )
+    .unwrap();
     let workspace_required = workspace_plan.workspace_size_bytes();
     let valid_input = context.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_fft.test.workspace_view_valid_input"),

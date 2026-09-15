@@ -45,6 +45,7 @@ use crate::runtime::rader_axis::{
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::segmented_volume::{validate_segmented_burst_depth, SegmentedVolumeC2cPlan};
+use crate::runtime::small_volume::SmallVolumePlan;
 use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
 };
@@ -520,6 +521,9 @@ enum C2cRouteImpl {
     Rader(RaderAxis),
     Bluestein(BluesteinAxis),
     AxisSequence(AxisSequencePlan),
+    /// Every axis of each small volume in one kernel (see
+    /// `runtime::small_volume`).
+    SmallVolume(SmallVolumePlan),
 }
 
 struct LargeChunkC2cPlan {
@@ -755,6 +759,7 @@ struct DirectDftPlan {
 fn route_impl_twiddle_lut_storage_bytes(route_impl: &C2cRouteImpl) -> u64 {
     match route_impl {
         C2cRouteImpl::DirectDft(plan) => plan.twiddle_buffer.size(),
+        C2cRouteImpl::SmallVolume(plan) => plan.twiddle_lut_storage_bytes(),
         C2cRouteImpl::MixedRadix(plan) => plan.twiddle_lut_storage_bytes(),
         C2cRouteImpl::Rader(plan) => plan.twiddle_lut_storage_bytes(),
         C2cRouteImpl::Bluestein(plan) => plan.twiddle_lut_storage_bytes(),
@@ -1284,6 +1289,7 @@ impl C2cPlan {
         match &self.execution {
             C2cExecution::Normal(route_impl) => match route_impl {
                 C2cRouteImpl::DirectDft(plan) => plan.workspace_size_bytes(),
+                C2cRouteImpl::SmallVolume(plan) => plan.workspace_size_bytes(),
                 C2cRouteImpl::MixedRadix(plan) => plan.workspace_size_bytes(),
                 C2cRouteImpl::Rader(plan) => plan.workspace_size_bytes(),
                 C2cRouteImpl::Bluestein(plan) => plan.workspace_size_bytes(),
@@ -1797,6 +1803,9 @@ impl C2cPlan {
         match &self.execution {
             C2cExecution::Normal(route_impl) => match route_impl {
                 C2cRouteImpl::DirectDft(plan) => plan.execute_views(device, encoder, input, output),
+                C2cRouteImpl::SmallVolume(plan) => {
+                    plan.execute_views(device, encoder, input, output)
+                }
                 C2cRouteImpl::MixedRadix(plan) => {
                     if let Some(workspace) = workspace {
                         plan.execute_views_with_workspace(device, encoder, input, output, workspace)
@@ -3996,6 +4005,12 @@ fn build_route_impl(
     route: C2cRoute,
     len: u32,
 ) -> Result<C2cRouteImpl> {
+    // A volume that fits one workgroup takes one kernel for all its axes.
+    if matches!(route, C2cRoute::MixedRadix | C2cRoute::AxisSequence) {
+        if let Some(plan) = SmallVolumePlan::try_new(device, queue, config)? {
+            return Ok(C2cRouteImpl::SmallVolume(plan));
+        }
+    }
     Ok(match route {
         C2cRoute::DirectDft => {
             C2cRouteImpl::DirectDft(DirectDftPlan::new(device, queue, config, len)?)
@@ -4031,6 +4046,9 @@ fn axis_factors_for_route_impl(
             .iter()
             .map(|&axis| crate::runtime::factor_supported_length(config.shape()[axis]))
             .collect::<Result<Vec<_>>>(),
+        C2cRouteImpl::SmallVolume(_) => {
+            axis_factors_for_axis_kinds(config, &resolve_axis_kinds_for_config(config)?)
+        }
         C2cRouteImpl::MixedRadix(plan) => Ok(plan.factors().to_vec()),
         C2cRouteImpl::Rader(_) => Ok(config.axes().iter().map(|_| Vec::new()).collect()),
         C2cRouteImpl::Bluestein(_) => Ok(config.axes().iter().map(|_| Vec::new()).collect()),
@@ -4112,6 +4130,13 @@ fn build_normal_c2c_graph_for_impl(
         C2cRouteImpl::DirectDft(_) => {
             build_direct_dft_c2c_graph_with_format(required_bytes, element_format, limits)
         }
+        C2cRouteImpl::SmallVolume(_) => build_single_kernel_c2c_graph(
+            "c2c-small-volume-normal",
+            SMALL_VOLUME_KERNEL_LABEL,
+            required_bytes,
+            element_format,
+            limits,
+        ),
         C2cRouteImpl::MixedRadix(plan) => build_axis_plan_c2c_graph_with_kinds(
             "c2c-mixed-radix-normal",
             "mixed-radix-stockham-stage",
@@ -4319,12 +4344,32 @@ fn build_direct_dft_c2c_graph(
     build_direct_dft_c2c_graph_with_format(required_bytes, ElementFormat::ComplexF32, limits)
 }
 
+/// Diagnostic label of the small-volume kernel.
+pub(crate) const SMALL_VOLUME_KERNEL_LABEL: &str = "small-volume-stage";
+
 fn build_direct_dft_c2c_graph_with_format(
     required_bytes: u64,
     element_format: ElementFormat,
     limits: LargePolicyLimits,
 ) -> Result<LargeExecutionGraph> {
-    let mut graph = LargeExecutionGraph::new("c2c-direct-dft-normal");
+    build_single_kernel_c2c_graph(
+        "c2c-direct-dft-normal",
+        C2cRoute::DirectDft.graph_label(),
+        required_bytes,
+        element_format,
+        limits,
+    )
+}
+
+/// The graph of a plan that runs one kernel from the input to the output.
+fn build_single_kernel_c2c_graph(
+    graph_label: &'static str,
+    kernel_label: &'static str,
+    required_bytes: u64,
+    element_format: ElementFormat,
+    limits: LargePolicyLimits,
+) -> Result<LargeExecutionGraph> {
+    let mut graph = LargeExecutionGraph::new(graph_label);
     graph.push_stage(
         LargeStage::HostWindow {
             label: "logical-input",
@@ -4339,7 +4384,7 @@ fn build_direct_dft_c2c_graph_with_format(
     )?;
     graph.push_stage(
         LargeStage::Kernel {
-            label: C2cRoute::DirectDft.graph_label(),
+            label: kernel_label,
             input: c2c_range_with_format(
                 LogicalBufferId::Input,
                 0,

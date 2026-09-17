@@ -113,7 +113,10 @@ First tagged release.
   that fit workgroup memory) runs as one kernel per FFT, one workgroup per
   volume, instead of one kernel per axis (`FftTuning::fuse_small_volumes`):
   8x8x8 takes 3.6 µs instead of 10.2 µs, 31x31 6.2 µs instead of 8.5 µs,
-  and 16x16x16 batched 256 times 15 µs instead of 32 µs.
+  and 16x16x16 batched 256 times 15 µs instead of 32 µs. Larger smooth
+  volumes run their leading axes the same way over slabs that fit, then
+  the other axes in place: 32x32x32 takes 8.5 µs instead of 12.0 µs
+  and 32x16x16 7.1 µs instead of 10.2 µs.
 - Axes too long for workgroup memory still run fused: contiguous
   power-of-two `f32` axes up to 16384 keep the line in registers in one
   kernel, and other long axes run as two fused passes (`N = N1 * N2`),

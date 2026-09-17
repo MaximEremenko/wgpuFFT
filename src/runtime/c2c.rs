@@ -3573,6 +3573,7 @@ impl SmoothDecompositionC2cPlan {
                             workgroup_size: config.tuning().workgroup_size(),
                             fused_workgroup_size: config.tuning().fused_workgroup_size(),
                             long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
+                            small_volumes: false,
                         },
                         &mut twiddle_lut_pool,
                     )?;
@@ -3608,6 +3609,7 @@ impl SmoothDecompositionC2cPlan {
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
                         long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
+                        small_volumes: false,
                     };
                     let phase1 = build_smooth_phase_execution(
                         device,
@@ -3629,6 +3631,7 @@ impl SmoothDecompositionC2cPlan {
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
                         long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
+                        small_volumes: false,
                     };
                     let phase2 = build_smooth_phase_execution(
                         device,
@@ -4456,6 +4459,7 @@ fn build_axis_plan_c2c_graph_with_kinds(
             AxisStageKind::Stockham { .. } => stockham_label,
             AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
             AxisStageKind::FusedSmooth { .. } => fused_smooth_label,
+            AxisStageKind::SmallVolume { .. } => SMALL_VOLUME_KERNEL_LABEL,
         })
         .collect::<Vec<_>>();
     build_axis_plan_c2c_graph_with_labels_and_format(
@@ -4557,6 +4561,7 @@ fn add_axis_plan_kernel_stages_with_kinds(
             AxisStageKind::Stockham { .. } => stockham_label,
             AxisStageKind::FusedPow2 { .. } => fused_pow2_label,
             AxisStageKind::FusedSmooth { .. } => fused_smooth_label,
+            AxisStageKind::SmallVolume { .. } => SMALL_VOLUME_KERNEL_LABEL,
         })
         .collect::<Vec<_>>();
     add_axis_plan_kernel_stages_with_labels(
@@ -7595,6 +7600,7 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         long_axes: LongAxisRoute::new(config.tuning().fuse_long_axes()),
+        small_volumes: false,
     }
 }
 

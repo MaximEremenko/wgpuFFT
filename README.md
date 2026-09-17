@@ -204,7 +204,7 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 | `max_buffer_size` | `None` | Optional planning cap, clamped to the device limit. |
 | `fused_min_convolution_length` | `128` | Minimum Rader/Bluestein convolution length eligible for fused-prime execution. |
 | `fuse_long_axes` | `true` | Runs an axis too long for workgroup memory as one register-resident fused kernel (contiguous power-of-two `f32` axes up to 16384 on 1024-invocation devices) or as two fused passes (`N = N1 * N2`); `false` keeps one Stockham pass per radix. |
-| `fuse_small_volumes` | `true` | Runs an `f32` C2C transform of every axis of a volume of up to 4096 points that fits workgroup memory as one kernel per FFT, one workgroup per volume; `false` keeps one kernel per axis. |
+| `fuse_small_volumes` | `true` | Runs an `f32` C2C transform of every axis of a volume of up to 4096 points that fits workgroup memory as one kernel per FFT, one workgroup per volume, and the leading axes of larger smooth volumes as one kernel over slabs that fit; `false` keeps one kernel per axis. |
 
 The four-step swap thresholds change sequential window sizing; they do not
 create concurrent window rings or add FFT stages. There is no public

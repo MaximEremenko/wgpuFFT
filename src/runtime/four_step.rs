@@ -739,6 +739,7 @@ impl AxisWindowPlan {
                                 long_axes: LongAxisRoute::windowed(
                                     config.tuning().fuse_long_axes(),
                                 ),
+                                small_volumes: false,
                             },
                             twiddle_lut_pool,
                         )?)

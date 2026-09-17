@@ -159,6 +159,9 @@ pub(crate) struct AxisPlanConfig {
     pub(crate) workgroup_size: u32,
     pub(crate) fused_workgroup_size: u32,
     pub(crate) long_axes: LongAxisRoute,
+    /// Whether leading axes whose slabs fit one workgroup may run as one
+    /// small-volume stage (`FftTuning::fuse_small_volumes`).
+    pub(crate) small_volumes: bool,
 }
 
 /// How an axis too long for one fused workgroup runs.
@@ -206,9 +209,21 @@ impl LongAxisRoute {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisStageKind {
-    Stockham { radix: usize, ns: usize },
-    FusedPow2 { axis_length: usize },
-    FusedSmooth { axis_length: usize },
+    Stockham {
+        radix: usize,
+        ns: usize,
+    },
+    FusedPow2 {
+        axis_length: usize,
+    },
+    FusedSmooth {
+        axis_length: usize,
+    },
+    /// The leading axes of slabs of `elements` points in one kernel (see
+    /// `runtime::small_volume`).
+    SmallVolume {
+        elements: usize,
+    },
 }
 
 impl AxisStageKind {
@@ -217,6 +232,7 @@ impl AxisStageKind {
             Self::Stockham { radix, ns } => format!("stockham.radix{radix}.ns{ns}"),
             Self::FusedPow2 { axis_length } => format!("fused_pow2.n{axis_length}"),
             Self::FusedSmooth { axis_length } => format!("fused_smooth.n{axis_length}"),
+            Self::SmallVolume { elements } => format!("small_volume.e{elements}"),
         }
     }
 }
@@ -355,6 +371,7 @@ impl AxisPlanConfig {
             workgroup_size: config.tuning().workgroup_size(),
             fused_workgroup_size: config.tuning().fused_workgroup_size(),
             long_axes: LongAxisRoute::new(config.tuning().fuse_long_axes()),
+            small_volumes: config.tuning().fuse_small_volumes(),
         }
     }
 
@@ -535,42 +552,88 @@ impl AxisPlan {
         let mut factors = Vec::with_capacity(config.axes.len());
         let mut stages = Vec::new();
         let mut twiddle_luts = Vec::<AxisTwiddleLut>::new();
+        let mut lut_index = |length: usize| -> Result<usize> {
+            if let Some(index) = twiddle_luts
+                .iter()
+                .position(|lut| lut.axis_length == length && lut.precision == config.precision)
+            {
+                return Ok(index);
+            }
+            let pool_key = (config.precision, length);
+            let buffer = if let Some(buffer) = twiddle_lut_pool.buffers.get(&pool_key) {
+                Arc::clone(buffer)
+            } else {
+                let buffer = Arc::new(create_twiddle_lut_buffer_for_len_with_precision(
+                    device,
+                    queue,
+                    "wgpu_fft.axis_plan.twiddle_lut",
+                    length,
+                    config.precision.as_fft_precision(),
+                )?);
+                twiddle_lut_pool
+                    .buffers
+                    .insert(pool_key, Arc::clone(&buffer));
+                buffer
+            };
+            twiddle_luts.push(AxisTwiddleLut {
+                axis_length: length,
+                precision: config.precision,
+                buffer,
+            });
+            Ok(twiddle_luts.len() - 1)
+        };
 
-        for (axis_index, &axis) in config.axes.iter().enumerate() {
+        // Leading axes whose slabs fit one workgroup run as one stage.
+        let slab = (config.small_volumes
+            && config.precision == AxisPrecision::F32
+            && config.layout == AxisLayout::Interleaved)
+            .then(|| {
+                crate::runtime::small_volume::leading_slab(
+                    &config.shape,
+                    &config.axes,
+                    config.direction,
+                    config.fused_workgroup_size,
+                    apply_any_scale,
+                    scale,
+                    &device.limits(),
+                )
+            })
+            .flatten();
+        let slab_axes = slab.as_ref().map_or(0, |(axes, _)| *axes);
+        if let Some((_, key)) = slab {
+            let elements = key.dims.iter().product::<usize>();
+            let twiddle_lut_index = lut_index(key.twiddle_length)?;
+            let pipeline_key = ComputePipelineCacheKey::small_volume(key.clone());
+            let pipeline = with_device_pipeline_cache(device, |cache| {
+                cache.get_compute_pipeline(
+                    device,
+                    &pipeline_key,
+                    "wgpu_fft.axis_plan.small_volume.pipeline",
+                    "wgpu_fft.axis_plan.small_volume.shader",
+                    || crate::runtime::small_volume::generate_small_volume_wgsl_for_key(&key),
+                )
+            });
+            stages.push(AxisStage {
+                axis: 0,
+                kind: AxisStageKind::SmallVolume { elements },
+                stride_complex: 1,
+                apply_scale: key.apply_scale,
+                pipeline_key,
+                twiddle_lut_index,
+                workgroups_x: (total_complex / elements) as u32,
+                pipeline,
+            });
+            for &axis in &config.axes[..slab_axes] {
+                factors.push(crate::runtime::factor_supported_length(config.shape[axis])?);
+            }
+        }
+
+        for (axis_index, &axis) in config.axes.iter().enumerate().skip(slab_axes) {
             let axis_len = config.shape[axis];
             let axis_factors = crate::runtime::factor_supported_length(axis_len)?;
             let stride_complex = stride_for_axis(&config.shape, axis);
             let final_axis = axis_index + 1 == config.axes.len();
-            let twiddle_lut_index = if let Some(index) = twiddle_luts
-                .iter()
-                .position(|lut| lut.axis_length == axis_len && lut.precision == config.precision)
-            {
-                index
-            } else {
-                let pool_key = (config.precision, axis_len);
-                let buffer = if let Some(buffer) = twiddle_lut_pool.buffers.get(&pool_key) {
-                    Arc::clone(buffer)
-                } else {
-                    let buffer = Arc::new(create_twiddle_lut_buffer_for_len_with_precision(
-                        device,
-                        queue,
-                        "wgpu_fft.axis_plan.twiddle_lut",
-                        axis_len,
-                        config.precision.as_fft_precision(),
-                    )?);
-                    twiddle_lut_pool
-                        .buffers
-                        .insert(pool_key, Arc::clone(&buffer));
-                    buffer
-                };
-                let index = twiddle_luts.len();
-                twiddle_luts.push(AxisTwiddleLut {
-                    axis_length: axis_len,
-                    precision: config.precision,
-                    buffer,
-                });
-                index
-            };
+            let twiddle_lut_index = lut_index(axis_len)?;
 
             let register_lines = register_lines_plan(
                 axis_len,
@@ -1004,6 +1067,7 @@ impl AxisPlan {
         let in_place = stages.len() > 1
             && stages
                 .iter()
+                .skip(1)
                 .all(|stage| stage.pipeline_key.supports_in_place());
         let in_place_bind_group_layout = if in_place {
             for stage in stages.iter_mut().skip(1) {

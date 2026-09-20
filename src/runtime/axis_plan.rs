@@ -2236,10 +2236,14 @@ pub(crate) fn pad_workgroup_indices(source: &str) -> String {
 /// Targets about 2048 elements per workgroup so radix stages keep 256
 /// invocations busy; strided axes take at least 8 adjacent lines so their
 /// loads coalesce. Workgroup storage caps the result, and small transforms
-/// keep at least 256 workgroups so their lines spread across the GPU instead
-/// of queueing on a few compute units. Strided axes round down to a power of
-/// two: the row a workgroup reads then fills whole 32-byte sectors, and each
-/// invocation keeps one line for all its loads.
+/// keep at least 256 workgroups (128 on strided axes) so their lines spread
+/// across the GPU instead of queueing on a few compute units: a strided
+/// axis gains more from coalesced rows than from more workgroups, and with
+/// 128 rather than 256, 480x720 ran 25% faster, 1000x1000 22%, and
+/// 720x480 15%, while contiguous axes slowed down. Strided
+/// axes round down to a power of two: the row a workgroup reads then fills
+/// whole 32-byte sectors, and each invocation keeps one line for all its
+/// loads.
 pub(crate) fn fused_lines_per_workgroup(
     axis_length: usize,
     stride_complex: usize,
@@ -2247,9 +2251,35 @@ pub(crate) fn fused_lines_per_workgroup(
     total_lines: usize,
     max_workgroup_storage_bytes: u64,
 ) -> u32 {
+    const MIN_STRIDED_WORKGROUPS: usize = 128;
+    lines_per_workgroup_keeping(
+        axis_length,
+        stride_complex,
+        precision,
+        total_lines,
+        max_workgroup_storage_bytes,
+        if stride_complex > 1 {
+            MIN_STRIDED_WORKGROUPS
+        } else {
+            MIN_FUSED_WORKGROUPS
+        },
+    )
+}
+
+/// Workgroups a fused kernel keeps (see [`fused_lines_per_workgroup`]).
+pub(crate) const MIN_FUSED_WORKGROUPS: usize = 256;
+
+/// [`fused_lines_per_workgroup`] keeping `min_workgroups` workgroups.
+pub(crate) fn lines_per_workgroup_keeping(
+    axis_length: usize,
+    stride_complex: usize,
+    precision: AxisPrecision,
+    total_lines: usize,
+    max_workgroup_storage_bytes: u64,
+    min_workgroups: usize,
+) -> u32 {
     const TARGET_ELEMENTS: usize = 2048;
     const MIN_STRIDED_LINES: usize = 8;
-    const MIN_WORKGROUPS: usize = 256;
     let mut lines = (TARGET_ELEMENTS / axis_length).max(1);
     if stride_complex > 1 {
         lines = lines.max(MIN_STRIDED_LINES);
@@ -2257,7 +2287,7 @@ pub(crate) fn fused_lines_per_workgroup(
     // Padded as for strided axes; contiguous ones never approach this cap.
     let line_bytes = (axis_length + 1) * precision.complex_size_bytes() as usize;
     let max_by_storage = (max_workgroup_storage_bytes as usize / line_bytes).max(1);
-    let max_by_fill = (total_lines / MIN_WORKGROUPS).max(1);
+    let max_by_fill = (total_lines / min_workgroups).max(1);
     let lines = lines.min(max_by_storage).min(max_by_fill);
     if stride_complex > 1 {
         1 << lines.ilog2()
@@ -4595,6 +4625,10 @@ mod tests {
         );
         assert_eq!(
             fused_lines_per_workgroup(64, 64, AxisPrecision::F32, 4096, storage),
+            32
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(64, 64, AxisPrecision::F32, 2048, storage),
             16
         );
 

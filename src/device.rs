@@ -56,9 +56,10 @@ fn adapter_name_from_env() -> Option<String> {
     }
 }
 
-/// Requests the high-performance adapter, or the one `WGPU_ADAPTER_NAME`
-/// names (see [`adapter_name_from_env`]), and a device with its limits.
-/// Returns `None` when no such adapter exists.
+/// Requests the high-performance adapter, or the first whose name contains
+/// the `WGPU_ADAPTER_NAME` environment variable, ignoring case (native builds
+/// only), and a device with its limits. Returns `None` when no such adapter
+/// exists.
 pub async fn request_default_device() -> Option<GpuContext> {
     let instance = wgpu::Instance::new(default_instance_descriptor());
     let adapter = match adapter_name_from_env() {

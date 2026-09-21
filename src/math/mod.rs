@@ -203,9 +203,10 @@ pub fn reference_c2c_nd(input: &[Complex32], config: &FftConfig) -> Result<Vec<C
     Ok(values)
 }
 
-/// `f64` reference transform: each line of each axis goes through
-/// [`fft_f64`], which agrees with the plain DFT to a few units in the last
-/// place while taking `O(n log n)` for smooth lengths.
+/// `f64` reference transform: each line of each axis goes through a
+/// mixed-radix host FFT (Bluestein's for long prime factors), which agrees
+/// with the plain DFT to a few units in the last place while taking
+/// `O(n log n)`.
 pub fn reference_c2c_nd_f64(input: &[Complex64], config: &FftConfig) -> Result<Vec<Complex64>> {
     config.validate()?;
     let total_complex = config.total_complex_len()?;

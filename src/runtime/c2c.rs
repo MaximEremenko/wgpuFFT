@@ -515,6 +515,19 @@ enum C2cExecution {
     SegmentedVolume(SegmentedVolumeC2cPlan),
 }
 
+/// How a C2C plan transforms one buffer in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InPlaceMode {
+    /// The plan's in-place kernels store the lines or volumes they load;
+    /// an axis sequence runs other steps through its workspace.
+    Kernels,
+    /// The plan's first kernel writes its workspace, so its input may be
+    /// its output buffer.
+    Aliased,
+    /// The input is copied first.
+    Copy,
+}
+
 enum C2cRouteImpl {
     DirectDft(DirectDftPlan),
     MixedRadix(AxisPlan),
@@ -1492,6 +1505,59 @@ impl C2cPlan {
             input,
             output,
         )
+    }
+
+    fn in_place_mode(&self) -> InPlaceMode {
+        let C2cExecution::Normal(route) = &self.execution else {
+            return InPlaceMode::Copy;
+        };
+        match route {
+            C2cRouteImpl::MixedRadix(plan) if plan.supports_in_place() => InPlaceMode::Kernels,
+            C2cRouteImpl::MixedRadix(plan) if plan.first_stage_writes_workspace() => {
+                InPlaceMode::Aliased
+            }
+            C2cRouteImpl::SmallVolume(_) | C2cRouteImpl::Rader(_) | C2cRouteImpl::Bluestein(_) => {
+                InPlaceMode::Kernels
+            }
+            C2cRouteImpl::AxisSequence(plan) if plan.supports_in_place() => InPlaceMode::Kernels,
+            _ => InPlaceMode::Copy,
+        }
+    }
+
+    /// Whether the plan transforms one buffer in place without copying its
+    /// input first.
+    pub(crate) fn supports_in_place(&self) -> bool {
+        self.in_place_mode() != InPlaceMode::Copy
+    }
+
+    /// Transforms `buffer` in place; needs [`Self::supports_in_place`].
+    pub(crate) fn execute_in_place_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        buffer.validate_min_size(self.required_buffer_size_bytes())?;
+        match (self.in_place_mode(), &self.execution) {
+            (InPlaceMode::Aliased, _) => {
+                self.execute_views_recorded(device, encoder, buffer.clone(), buffer)
+            }
+            (InPlaceMode::Kernels, C2cExecution::Normal(route)) => match route {
+                C2cRouteImpl::MixedRadix(plan) => {
+                    plan.execute_in_place_views(device, encoder, buffer)
+                }
+                C2cRouteImpl::SmallVolume(plan) => plan.execute_in_place(device, encoder, buffer),
+                C2cRouteImpl::Rader(plan) => plan.execute_in_place_views(device, encoder, buffer),
+                C2cRouteImpl::Bluestein(plan) => {
+                    plan.execute_in_place_views(device, encoder, buffer)
+                }
+                C2cRouteImpl::AxisSequence(plan) => {
+                    plan.execute_in_place_views(device, encoder, buffer)
+                }
+                C2cRouteImpl::DirectDft(_) => unreachable!("direct DFTs copy their input"),
+            },
+            _ => unreachable!("in-place execution needs supports_in_place"),
+        }
     }
 
     /// [`Self::execute_logical_views`] into a shared compute pass.
@@ -7748,6 +7814,69 @@ impl AxisSequencePlan {
         self.workspace_size_bytes
     }
 
+    /// Which steps run in place when the plan transforms one buffer: those
+    /// that can, except one when an odd number of others cannot, so the
+    /// steps through the workspace come in pairs and the last lands in the
+    /// buffer. `None` when no step can make up that pair.
+    fn in_place_steps(&self) -> Option<Vec<bool>> {
+        let mut in_place = self
+            .steps
+            .iter()
+            .map(AxisStep::supports_in_place)
+            .collect::<Vec<_>>();
+        if in_place.iter().filter(|in_place| !**in_place).count() % 2 == 1 {
+            let first = in_place.iter().position(|in_place| *in_place)?;
+            in_place[first] = false;
+        }
+        Some(in_place)
+    }
+
+    fn supports_in_place(&self) -> bool {
+        self.in_place_steps().is_some()
+    }
+
+    /// Transforms `buffer` in place; needs [`Self::supports_in_place`].
+    fn execute_in_place_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        let in_place = self
+            .in_place_steps()
+            .expect("in-place execution needs supports_in_place");
+        let buffer = buffer.prefix(self.required_buffer_size_bytes)?;
+        let workspace = || {
+            self.resolve_buffer(
+                SequenceBufferSlot::Temp,
+                buffer.clone(),
+                buffer.clone(),
+                None,
+            )
+        };
+        let mut in_buffer = true;
+        for (step, in_place) in self.steps.iter().zip(in_place) {
+            let current = if in_buffer {
+                buffer.clone()
+            } else {
+                workspace()?
+            };
+            if in_place {
+                step.execute_in_place_views(device, encoder, current)?;
+            } else {
+                let next = if in_buffer {
+                    workspace()?
+                } else {
+                    buffer.clone()
+                };
+                step.execute_views(device, encoder, current, next)?;
+                in_buffer = !in_buffer;
+            }
+        }
+        debug_assert!(in_buffer);
+        Ok(())
+    }
+
     fn graph_steps(&self) -> Vec<AxisSequenceGraphStep> {
         self.steps
             .iter()
@@ -7868,6 +7997,27 @@ impl AxisSequencePlan {
 }
 
 impl AxisStep {
+    /// Whether [`Self::execute_in_place_views`] can transform one buffer.
+    fn supports_in_place(&self) -> bool {
+        match self {
+            Self::Mixed(plan) => plan.supports_in_place(),
+            Self::Rader(_) | Self::Bluestein(_) => true,
+        }
+    }
+
+    fn execute_in_place_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        match self {
+            Self::Mixed(plan) => plan.execute_in_place_views(device, encoder, buffer),
+            Self::Rader(plan) => plan.execute_in_place_views(device, encoder, buffer),
+            Self::Bluestein(plan) => plan.execute_in_place_views(device, encoder, buffer),
+        }
+    }
+
     fn execute_views(
         &self,
         device: &wgpu::Device,

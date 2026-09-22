@@ -21,6 +21,11 @@ First tagged release.
   same configuration and buffer layouts, built on `rustfft` and `realfft`.
 - `FftRecorder`, which records several executions into one shared compute pass
   (`FftPlan::record`, `record_views`, `record_logical_views`).
+- In-place execution: `FftPlan::execute_in_place` and `record_in_place`
+  transform one buffer. Most C2C plans run their kernels on it: each kernel
+  stores the lines it loaded, or passes them through the plan's workspace.
+  Other plans copy the input into a buffer they keep;
+  `FftPlan::supports_in_place` tells them apart.
 - `WGPU_ADAPTER_NAME=<text>` selects the adapter of
   `device::request_default_device` (used by the GPU tests and examples) by
   name, for machines with several GPUs.
@@ -67,6 +72,9 @@ First tagged release.
   first run in place on the output, so such plans need no workspace and
   cache-resident volumes stay in cache: 256x256x128 takes 348 µs instead of
   430 µs.
+- In place, C2C transforms keep one buffer in the GPU's caches instead of
+  two: a 4096x2048 FFT+iFFT pair takes 0.165 ms instead of 0.248 ms out of
+  place, and 256x256x128 0.172 ms instead of 0.239 ms.
 - Power-of-two `f32` lines of 16 to 512 points (64 when contiguous), and
   contiguous ones from 1024 points, run in register-resident kernels, which
   load straight into registers and pass through workgroup memory once per

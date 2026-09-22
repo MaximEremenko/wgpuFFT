@@ -18,7 +18,6 @@ use crate::runtime::bluestein_axis::{
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::direct_prime::{
     direct_lines_per_workgroup, direct_pairs_per_invocation, direct_prime_supported,
-    generate_direct_prime_wgsl_for_key,
 };
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
@@ -27,8 +26,9 @@ use crate::runtime::nd_wgsl::{
     wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
-    PipelineLayoutCacheKey, RaderKernelKind, RaderStageKey, ShaderCacheKey,
+    generate_fused_prime_wgsl_for_key, with_device_pipeline_cache, ComputePipelineCacheKey,
+    FusedPrimeKind, FusedPrimeStageKey, LazyPipeline, PipelineLayoutCacheKey, RaderKernelKind,
+    RaderStageKey, ShaderCacheKey,
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
@@ -109,6 +109,7 @@ struct FusedRaderExecution {
     workgroups: u32,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    in_place: LazyPipeline,
     twiddle_buffer: wgpu::Buffer,
 }
 
@@ -339,6 +340,10 @@ impl RaderAxis {
                 workgroups: lines_u32.div_ceil(lines_per_workgroup),
                 pipeline,
                 bind_group_layout,
+                in_place: LazyPipeline::new(
+                    "wgpu_fft.rader.fused.in_place",
+                    ComputePipelineCacheKey::fused_prime_stage(shader_key.clone().with_in_place()),
+                ),
                 twiddle_buffer,
             })
         } else if config.bluestein_fallback
@@ -482,6 +487,10 @@ impl RaderAxis {
                 workgroups: lines_u32.div_ceil(lines_per_workgroup),
                 pipeline,
                 bind_group_layout,
+                in_place: LazyPipeline::new(
+                    "wgpu_fft.rader.fused.in_place",
+                    ComputePipelineCacheKey::fused_prime_stage(shader_key.clone().with_in_place()),
+                ),
                 twiddle_buffer,
             })
         } else {
@@ -771,7 +780,7 @@ impl RaderAxis {
 
         match &self.execution {
             RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
-                self.dispatch_fused(device, encoder, input, output, execution)?;
+                self.dispatch_fused(device, encoder, Some(input), output, execution)?;
             }
             RaderExecution::Bluestein(plan) => {
                 plan.execute_views(device, encoder, input, output)?
@@ -799,30 +808,63 @@ impl RaderAxis {
         Ok(())
     }
 
+    /// Transforms `buffer` in place: the fused kernels load the lines of
+    /// their workgroup before storing them, and the multi-pass kernels read
+    /// the whole input before any writes the output.
+    pub(crate) fn execute_in_place_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        match &self.execution {
+            RaderExecution::Direct(execution) | RaderExecution::Fused(execution) => {
+                self.dispatch_fused(device, encoder, None, buffer, execution)
+            }
+            RaderExecution::Bluestein(plan) => plan.execute_in_place_views(device, encoder, buffer),
+            RaderExecution::MultiPass(_) => {
+                self.execute_views(device, encoder, buffer.clone(), buffer)
+            }
+        }
+    }
+
+    /// Runs the fused kernel from `input`, or in place on `output` without
+    /// one.
     fn dispatch_fused(
         &self,
         device: &wgpu::Device,
         encoder: &mut CommandRecorder<'_>,
-        input: BufferView<'_>,
+        input: Option<BufferView<'_>>,
         output: BufferView<'_>,
         execution: &FusedRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let element_format = self.precision.element_format();
+        let (pipeline, layout) = match input {
+            Some(_) => (&execution.pipeline, &execution.bind_group_layout),
+            None => {
+                let (pipeline, layout) = execution.in_place.get(device);
+                (pipeline, layout)
+            }
+        };
+        let mut entries = Vec::with_capacity(6);
+        if let Some(input) = input {
+            entries.push(bind_view_entry(&scheduler, 0, input, element_format)?);
+        }
+        entries.extend([
+            bind_view_entry(&scheduler, 1, output, element_format)?,
+            bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
+            bind_storage_entry(&scheduler, 3, &self.bfft_buffer, element_format)?,
+            bind_storage_entry(&scheduler, 4, &execution.twiddle_buffer, element_format)?,
+            bind_uniform_entry(5, &self.lines_params_buffer),
+        ]);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.rader.fused.bind_group"),
-            layout: &execution.bind_group_layout,
-            entries: &[
-                bind_view_entry(&scheduler, 0, input, element_format)?,
-                bind_view_entry(&scheduler, 1, output, element_format)?,
-                bind_storage_entry(&scheduler, 2, &self.perm_buffer, ElementFormat::U32)?,
-                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, element_format)?,
-                bind_storage_entry(&scheduler, 4, &execution.twiddle_buffer, element_format)?,
-                bind_uniform_entry(5, &self.lines_params_buffer),
-            ],
+            layout,
+            entries: &entries,
         });
         let pass = encoder.pass();
-        pass.set_pipeline(&execution.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) =
             split_workgroups(execution.workgroups, max_workgroups_per_dimension(device))?;
@@ -1065,11 +1107,7 @@ fn cached_fused_pipeline(
     let shader_label = format!("wgpu_fft.rader.fused.shader.{stable_key}");
     with_device_pipeline_cache(device, |cache| {
         cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
-            if shader_key.kind == FusedPrimeKind::Direct {
-                generate_direct_prime_wgsl_for_key(shader_key)
-            } else {
-                generate_fused_rader_wgsl_for_key(shader_key)
-            }
+            generate_fused_prime_wgsl_for_key(shader_key)
         })
     })
 }

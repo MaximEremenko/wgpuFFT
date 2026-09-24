@@ -20,9 +20,9 @@ use std::collections::BTreeSet;
 
 use crate::config::FftDirection;
 use crate::runtime::axis_plan::{
-    complex_wgsl, emit_split_twiddles, radix_root_wgsl, scaled_complex_expr,
-    specialize_complex_wgsl, twiddle_lookup_wgsl, wgsl_line_base_fn, AxisPrecision,
-    FusedPow2StageWgslConfig,
+    complex_wgsl, convolution_twiddle_fns_wgsl, emit_split_twiddles, radix_root_wgsl,
+    scaled_complex_expr, specialize_complex_wgsl, twiddle_lookup_wgsl, wgsl_line_base_fn,
+    AxisPrecision, FusedPow2StageWgslConfig,
 };
 use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule};
 
@@ -235,7 +235,7 @@ fn main({entry_params}) {{
 {body}}}
 "#,
             complex_wgsl = complex_wgsl(),
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(direction, precision),
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(n, direction, precision),
             stride = config.stride_complex,
             exchange_total = exchange * lines,
             workgroup_total = workgroup * lines,
@@ -496,6 +496,7 @@ pub(crate) fn generate_register_bluestein_wgsl(
         )
     };
 
+    let twiddle_fns = convolution_twiddle_fns_wgsl(m, AxisPrecision::F32, true);
     format!(
         r#"struct Params {{
   lines: u32,
@@ -513,14 +514,7 @@ pub(crate) fn generate_register_bluestein_wgsl(
 
 {complex_wgsl}
 
-fn twiddle_forward(index: u32) -> vec2<f32> {{
-  return axisTwiddles[index];
-}}
-
-fn twiddle_inverse(index: u32) -> vec2<f32> {{
-  let value: vec2<f32> = axisTwiddles[index];
-  return vec2<f32>(value.x, -value.y);
-}}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
@@ -1166,6 +1160,9 @@ mod tests {
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "exchange");
 
         let inverse = wgsl_for(8192, 1024, 48 * 1024, FftDirection::Inverse);
-        assert!(inverse.contains("return vec2<f32>(value.x, -value.y);"));
+        assert!(!inverse.contains("axisTwiddles["));
+        assert!(inverse.contains("    select(sine, -sine, (quarter & 2u) != 0u)"));
+        assert!(!inverse.contains("-select(sine"));
+        assert!(wgsl.contains("-select(sine, -sine, (quarter & 2u) != 0u)"));
     }
 }

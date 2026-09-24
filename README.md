@@ -176,7 +176,10 @@ plan.execute(&input, &mut output)?;
 ## Precision
 
 - `FftPrecision::F32` uses native `f32` storage and arithmetic. It is the
-  default and is supported by every backend.
+  default and is supported by every backend. Its kernels compute twiddles
+  rather than read a table: the angle reduces exactly in integers and
+  Taylor polynomials give its sine and cosine to about one ulp, in plain
+  `f32` arithmetic rather than the platform's `sin` and `cos`.
 - `FftPrecision::F64` uses native `f64` storage and arithmetic. The current
   implementation targets Vulkan devices exposing `wgpu::Features::SHADER_F64`;
   plan creation returns structured `PrecisionUnsupported` diagnostics when the

@@ -851,7 +851,7 @@ fn run_real_oversized_sampled_case(context: &wgpu_fft::device::GpuContext) {
     let actual = read_f32(&context.device, &readback);
     for (sample_index, &k1) in sampled_k1.iter().enumerate() {
         let line = &actual[sample_index * n0 * 2..(sample_index + 1) * n0 * 2];
-        for (k0, pair) in line.chunks_exact(2).enumerate() {
+        for (k0, pair) in line.as_chunks::<2>().0.iter().enumerate() {
             let expected = impulses
                 .iter()
                 .fold(Complex64::new(0.0, 0.0), |sum, impulse| {
@@ -974,7 +974,7 @@ fn run_real_oversized_rank3_sampled_case(context: &wgpu_fft::device::GpuContext)
     let actual = read_f32(&context.device, &readback);
     for (sample_index, &(k1, k2)) in sampled_lines.iter().enumerate() {
         let line = &actual[sample_index * n0 * 2..(sample_index + 1) * n0 * 2];
-        for (k0, pair) in line.chunks_exact(2).enumerate() {
+        for (k0, pair) in line.as_chunks::<2>().0.iter().enumerate() {
             let expected =
                 impulses
                     .iter()
@@ -1101,7 +1101,7 @@ fn run_real_oversized_prime_sampled_case(context: &wgpu_fft::device::GpuContext)
     let actual = read_f32(&context.device, &readback);
     for (sample_index, &k1) in sampled_k1.iter().enumerate() {
         let line = &actual[sample_index * n0 * 2..(sample_index + 1) * n0 * 2];
-        for (k0, pair) in line.chunks_exact(2).enumerate() {
+        for (k0, pair) in line.as_chunks::<2>().0.iter().enumerate() {
             let expected = impulses
                 .iter()
                 .fold(Complex64::new(0.0, 0.0), |sum, &(x, y, value)| {
@@ -1233,7 +1233,9 @@ fn test_signal(complex_len: usize) -> Vec<f32> {
 
 fn reference_f64(input: &[f32], config: &FftConfig) -> Vec<Complex64> {
     let values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect::<Vec<_>>();
     reference_c2c_nd_f64(&values, config).unwrap()
@@ -1252,7 +1254,7 @@ fn assert_close_f32(actual: &[f32], expected: &[f32], label: &str) {
 
 fn assert_matches_reference(actual: &[f32], expected: &[Complex64], label: &str) {
     assert_eq!(actual.len(), expected.len() * 2, "{label}");
-    for (index, (pair, expected)) in actual.chunks_exact(2).zip(expected).enumerate() {
+    for (index, (pair, expected)) in actual.as_chunks::<2>().0.iter().zip(expected).enumerate() {
         let error = (f64::from(pair[0]) - expected.re).hypot(f64::from(pair[1]) - expected.im);
         let tolerance = 1.0e-2 + 3.0e-5 * expected.re.hypot(expected.im);
         assert!(

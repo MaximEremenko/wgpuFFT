@@ -485,7 +485,9 @@ fn cpu_fft_pow2(input: &[f32], inverse: bool, normalize: bool) -> Vec<f32> {
     let n = input.len() / 2;
     assert!(n.is_power_of_two());
     let mut values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|value| (f64::from(value[0]), f64::from(value[1])))
         .collect::<Vec<_>>();
 
@@ -534,7 +536,9 @@ fn cpu_fft_smooth(input: &[f32], inverse: bool, normalize: bool) -> Vec<f32> {
     let sign = if inverse { 1.0 } else { -1.0 };
     let scale = if normalize { 1.0 / n as f64 } else { 1.0 };
     let values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|value| (f64::from(value[0]), f64::from(value[1])))
         .collect::<Vec<_>>();
     cpu_fft_smooth_recursive(&values, &factors, sign)

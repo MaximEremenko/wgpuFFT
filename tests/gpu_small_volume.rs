@@ -83,7 +83,9 @@ async fn run_small_volume_cases() {
     for (label, config, route, needed) in cases {
         let input = test_signal(config.total_complex_len().unwrap());
         let values = input
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let expected = reference_c2c_nd_f64(&values, &config).unwrap();
@@ -140,7 +142,9 @@ async fn run_small_volume_cases() {
     ] {
         let input = test_signal(config.total_complex_len().unwrap());
         let values = input
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let expected = reference_c2c_nd_f64(&values, &config).unwrap();
@@ -262,7 +266,7 @@ fn relative_error_metrics(actual: &[f32], expected: &[Complex64]) -> (f64, f64) 
     let mut max_reference = 0.0f64;
     let mut error_energy = 0.0f64;
     let mut reference_energy = 0.0f64;
-    for (pair, expected) in actual.chunks_exact(2).zip(expected) {
+    for (pair, expected) in actual.as_chunks::<2>().0.iter().zip(expected) {
         let dr = f64::from(pair[0]) - expected.re;
         let di = f64::from(pair[1]) - expected.im;
         let error2 = dr * dr + di * di;

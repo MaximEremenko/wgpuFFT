@@ -44,8 +44,10 @@ impl Complex64 {
 
 pub fn from_interleaved_f32(values: &[f32]) -> Vec<Complex32> {
     values
-        .chunks_exact(2)
-        .map(|pair| Complex32::new(pair[0], pair[1]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[re, im]| Complex32::new(re, im))
         .collect()
 }
 
@@ -58,8 +60,10 @@ pub fn to_interleaved_f32(values: &[Complex32]) -> Vec<f32> {
 
 pub fn from_interleaved_f64(values: &[f64]) -> Vec<Complex64> {
     values
-        .chunks_exact(2)
-        .map(|pair| Complex64::new(pair[0], pair[1]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[re, im]| Complex64::new(re, im))
         .collect()
 }
 

@@ -61,6 +61,10 @@ pub struct FftPlan {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// Callers can record their own work between executions:
+/// [`Self::compute_pass`] dispatches into the shared pass, and
+/// [`Self::encoder`] ends it for copies and clears.
 pub struct FftRecorder<'a> {
     inner: CommandRecorder<'a>,
 }
@@ -70,6 +74,23 @@ impl<'a> FftRecorder<'a> {
         Self {
             inner: CommandRecorder::new(encoder),
         }
+    }
+
+    /// Returns the shared compute pass, opening it on first use, so the
+    /// caller's dispatches run in the same pass as the recorded executions.
+    ///
+    /// Executions set their own pipeline and bind groups before each
+    /// dispatch and leave them set, so set yours again before dispatching
+    /// after one. wgpu orders dependent dispatches inside the pass.
+    pub fn compute_pass(&mut self) -> &mut wgpu::ComputePass<'static> {
+        self.inner.pass()
+    }
+
+    /// Returns the command encoder, ending the shared compute pass if one is
+    /// open, for copies, clears, and other encoder-level commands. The next
+    /// execution or [`Self::compute_pass`] call opens a new pass.
+    pub fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        self.inner.encoder()
     }
 }
 

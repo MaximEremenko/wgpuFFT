@@ -136,6 +136,7 @@ struct Options {
     direct_max_prime: Option<usize>,
     rader_max_prime: Option<usize>,
     shared_pass: bool,
+    in_place: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +371,8 @@ async fn run() -> BenchResult<()> {
         if options.shared_pass { ", all pairs in one compute pass (FftRecorder)" } else { "" }
     );
     println!(
-        "comparability: wgpuFFT mode=out-of-place; VkFFT reference samples mode=in-place; both directions normalization=none"
+        "comparability: wgpuFFT mode={}; VkFFT reference samples mode=in-place; both directions normalization=none",
+        if options.in_place { "in-place" } else { "out-of-place" }
     );
     println!(
         "iteration budget note: normalized 3*4096 MiB for every suite as requested; upstream VkFFT sample3/sample7 use 4096 MiB"
@@ -901,18 +903,33 @@ async fn run_case(
             if options.shared_pass {
                 let mut recorder = wgpu_fft::FftRecorder::new(&mut encoder);
                 for iteration in 0..num_iter {
+                    let recorded = if options.in_place {
+                        forward
+                            .record_in_place(device, &mut recorder, &buffer_a)
+                            .and_then(|()| {
+                                inverse.record_in_place(device, &mut recorder, &buffer_a)
+                            })
+                    } else {
+                        forward
+                            .record(device, &mut recorder, &buffer_a, &buffer_b)
+                            .and_then(|()| {
+                                inverse.record(device, &mut recorder, &buffer_b, &buffer_a)
+                            })
+                    };
+                    recorded.map_err(|error| {
+                        input_error(format!(
+                            "recording FFT+iFFT pair for iteration {iteration}: {error}"
+                        ))
+                    })?;
+                }
+            } else if options.in_place {
+                for iteration in 0..num_iter {
                     forward
-                        .record(device, &mut recorder, &buffer_a, &buffer_b)
+                        .execute_in_place(device, &mut encoder, &buffer_a)
+                        .and_then(|()| inverse.execute_in_place(device, &mut encoder, &buffer_a))
                         .map_err(|error| {
                             input_error(format!(
-                                "recording forward FFT for iteration {iteration}: {error}"
-                            ))
-                        })?;
-                    inverse
-                        .record(device, &mut recorder, &buffer_b, &buffer_a)
-                        .map_err(|error| {
-                            input_error(format!(
-                                "recording inverse FFT for iteration {iteration}: {error}"
+                                "recording in-place FFT+iFFT pair for iteration {iteration}: {error}"
                             ))
                         })?;
                 }
@@ -2051,7 +2068,7 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
     let bandwidth_gb_s = traffic_bytes_per_pair / seconds_per_pair / 1_000_000_000.0;
 
     println!(
-        "RESULT suite={} label={} precision={} complex_element_bytes={} shape={:?} batch={} workgroup_size_override={} logical_vkfft_style_buffer_bytes={} logical_buffer_MiB={:.3} mode=out-of-place reference_mode=VkFFT-in-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} vkfft_population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
+        "RESULT suite={} label={} precision={} complex_element_bytes={} shape={:?} batch={} workgroup_size_override={} logical_vkfft_style_buffer_bytes={} logical_buffer_MiB={:.3} mode={} reference_mode=VkFFT-in-place external_io_allocation_bytes={} retained_initialization_seed_allocation_bytes={} harness_owned_buffer_allocation_bytes={} plan_workspace_requirement_bytes={} partial_diagnostic_helper_requirement_bytes={} memory_note=not-total-vram;diagnostic-requirements-are-not-allocations;excludes-unreported-plan-stage-temp-command-pipeline-cache-driver-resources runs={} num_iter={} avg_pair_ms={:.6} stderr_ms={} stderr_defined={} vkfft_population_spread_ms={:.6} score_KiB_per_ms={:.3} diagnostic_axis_passes_per_fft={} diagnostic_traffic_equivalent_passes_per_fft={} pass_count_method={} estimated_axis_traffic_multiplier_per_pair={} bandwidth_model=4x-diagnostic-traffic-equivalent-passes estimated_axis_traffic_bandwidth_GiB_s={:.3} estimated_axis_traffic_bandwidth_GB_s={:.3} route={} axis_kinds={}",
         case.suite,
         case.label,
         result.precision.as_str(),
@@ -2063,6 +2080,7 @@ fn print_case_result(case: &BenchCase, options: &Options, result: &CaseResult) -
             .map_or_else(|| "default".to_owned(), |value| value.to_string()),
         result.buffer_size,
         result.buffer_size as f64 / 1024_f64.powi(2),
+        if options.in_place { "in-place" } else { "out-of-place" },
         result.external_io_bytes,
         result.initialization_seed_bytes,
         harness_owned_buffer_allocation_bytes,
@@ -2166,6 +2184,7 @@ fn parse_options() -> BenchResult<Options> {
         segmented_burst_depth: DEFAULT_SEGMENTED_BURST_DEPTH,
         workgroup_size: None,
         shared_pass: false,
+        in_place: false,
         direct_max_prime: None,
         rader_max_prime: None,
     };
@@ -2224,6 +2243,9 @@ fn parse_options() -> BenchResult<Options> {
             }
             "--shared-pass" => {
                 options.shared_pass = true;
+            }
+            "--in-place" => {
+                options.in_place = true;
             }
             "--workgroup-size" => {
                 options.workgroup_size = Some(parse_workgroup_size(next_value(

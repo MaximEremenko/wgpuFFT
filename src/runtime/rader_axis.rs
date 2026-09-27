@@ -693,7 +693,8 @@ impl RaderAxis {
         output: BufferView<'_>,
     ) -> Result<()> {
         debug_assert!(self.n > 1);
-        debug_assert!(self.m >= 2 * (self.n - 1) - 1);
+        // A cyclic convolution over `n - 1` points, or a linear one.
+        debug_assert!(self.m == self.n - 1 || self.m >= 2 * (self.n - 1) - 1);
         debug_assert!(self.lines > 0);
 
         match &self.execution {

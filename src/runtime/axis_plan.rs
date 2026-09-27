@@ -2608,16 +2608,20 @@ fn generate_fused_smooth_butterfly_math_wgsl(
         "      let x_{slot}_0: vec2<f32> = {};\n",
         load(&format!("base_{slot}"))
     ));
+    let twiddles = if ns_div_r == 1 {
+        Vec::new()
+    } else {
+        emit_split_twiddles(&mut shader, &format!("tw_{slot}"), radix, "      ", &|q| {
+            format!("{twiddle_fn_name}(j_{slot} * {}u)", q * n_div_ns)
+        })
+    };
     for q in 1..radix {
         let input = load(&format!("base_{slot} + {q}u * {n_div_r}u"));
-        if ns_div_r == 1 {
-            shader.push_str(&format!("      let x_{slot}_{q}: vec2<f32> = {input};\n"));
-        } else {
-            shader.push_str(&format!(
-                "      let x_{slot}_{q}: vec2<f32> = c_mul({twiddle_fn_name}(j_{slot} * {}u), {input});\n",
-                q * n_div_ns,
-            ));
-        }
+        let value = match twiddles.get(q) {
+            Some(twiddle) => format!("c_mul({twiddle}, {input})"),
+            None => input,
+        };
+        shader.push_str(&format!("      let x_{slot}_{q}: vec2<f32> = {value};\n"));
     }
 
     let inputs = (0..radix)
@@ -2634,6 +2638,64 @@ fn generate_fused_smooth_butterfly_math_wgsl(
         shader.push_str(&format!("      stageOut_{slot}_{output} = {value};\n"));
     }
     shader
+}
+
+/// Binds the stage twiddles `W^(j q)` for `q` in `1..radix`, where
+/// `twiddle(q)` renders the table read of `W^(j q)`, and returns their names
+/// indexed by `q` (index 0 unused). With `B` the smallest integer whose
+/// square reaches `radix`, `q = B a + b` and `W^(j q) = W^(j B a) W^(j b)`:
+/// about `2 sqrt(radix)` reads instead of `radix - 1` (6 instead of 15 for
+/// radix 16), each other twiddle one product of two exact table values.
+/// The table reads are scattered across the table, so they cost more than
+/// the products.
+pub(crate) fn emit_split_twiddles(
+    body: &mut String,
+    prefix: &str,
+    radix: usize,
+    indent: &str,
+    twiddle: &dyn Fn(usize) -> String,
+) -> Vec<String> {
+    let mut names = vec![String::new(); radix];
+    if radix <= 3 {
+        for (q, name) in names.iter_mut().enumerate().skip(1) {
+            *name = format!("{prefix}_{q}");
+            body.push_str(&format!(
+                "{indent}let {name}: vec2<f32> = {};\n",
+                twiddle(q)
+            ));
+        }
+        return names;
+    }
+    let base = (2..).find(|base| base * base >= radix).unwrap_or(radix);
+    for (b, name) in names.iter_mut().enumerate().take(base).skip(1) {
+        *name = format!("{prefix}_{b}");
+        body.push_str(&format!(
+            "{indent}let {name}: vec2<f32> = {};\n",
+            twiddle(b)
+        ));
+    }
+    for a in 1..=(radix - 1) / base {
+        let q = a * base;
+        names[q] = format!("{prefix}_{q}");
+        body.push_str(&format!(
+            "{indent}let {}: vec2<f32> = {};\n",
+            names[q],
+            twiddle(q)
+        ));
+    }
+    for q in 1..radix {
+        let (a, b) = (q / base, q % base);
+        if a > 0 && b > 0 {
+            names[q] = format!("{prefix}_{q}");
+            body.push_str(&format!(
+                "{indent}let {}: vec2<f32> = c_mul({}, {});\n",
+                names[q],
+                names[a * base],
+                names[b]
+            ));
+        }
+    }
+    names
 }
 
 /// Appends statements computing `DFT_R` of the complex WGSL values `inputs`
@@ -4699,7 +4761,10 @@ mod tests {
         assert_eq!(wgsl.matches("workgroupBarrier();").count(), 4);
         assert!(wgsl.contains("sharedData[base_0 + 7u * 8u]"));
         assert!(wgsl.contains("sharedData[block_0 * 64u + 7u * 8u + j_0]"));
-        assert!(wgsl.contains("lookupInverseRoot(j_0 * 7u)"));
+        // Radix 8 reads W^j, W^2j, W^3j, and W^6j; W^7j = W^6j W^j.
+        assert!(wgsl.contains("lookupInverseRoot(j_0 * 6u)"));
+        assert!(!wgsl.contains("lookupInverseRoot(j_0 * 7u)"));
+        assert!(wgsl.contains("c_mul(tw_0_6, tw_0_1)"));
         assert!(!wgsl.contains("scratch["));
         assert!(!wgsl.contains("twiddle("));
     }

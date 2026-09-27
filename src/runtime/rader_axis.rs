@@ -4,8 +4,9 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
-    generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
-    AxisStageKind, AxisTwiddleLutPool, LongAxisRoute,
+    fused_smooth_factors, fused_smooth_pads_indices, generate_fused_scratch_fft_stages_wgsl,
+    AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
+    LongAxisRoute,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -373,21 +374,37 @@ impl RaderAxis {
                 m,
                 config.precision.as_fft_precision(),
             )?;
-            let shader_key = FusedPrimeStageKey::new(
-                FusedPrimeKind::Rader,
-                config.shape.len(),
-                config.axis,
-                &config.shape,
-                n,
-                stride_complex,
-                m,
-                &factors,
-                config.direction,
-                config.fused_workgroup_size,
-                apply_scale,
-                scale,
-                config.precision,
-            );
+            let rader_key = |factors: &[usize]| {
+                FusedPrimeStageKey::new(
+                    FusedPrimeKind::Rader,
+                    config.shape.len(),
+                    config.axis,
+                    &config.shape,
+                    n,
+                    stride_complex,
+                    m,
+                    factors,
+                    config.direction,
+                    config.fused_workgroup_size,
+                    apply_scale,
+                    scale,
+                    config.precision,
+                )
+            };
+            // The convolution runs the fused smooth schedule; one whose first
+            // stage needs padded indices keeps the multi-pass factors where
+            // the padding does not fit.
+            let schedule = fused_smooth_factors(m, &factors);
+            let shader_key = if fused_smooth_pads_indices(&schedule, false) {
+                let padded = rader_key(&schedule).with_padded_indices();
+                if padded.supported_by_device_limits(&device.limits()) {
+                    padded
+                } else {
+                    rader_key(&factors)
+                }
+            } else {
+                rader_key(&schedule)
+            };
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = cached_layout(device, pipeline_key.layout);
             let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
@@ -1324,7 +1341,7 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         ));
     }
 
-    specialize_rader_wgsl(
+    let source = specialize_rader_wgsl(
         format!(
             r#"struct Params {{
   lines: u32,
@@ -1435,7 +1452,12 @@ fn main({entry_params}) {{
             scalar = staged_scalar_type(key.precision),
         ),
         key.precision,
-    )
+    );
+    if key.padded_indices {
+        crate::runtime::axis_plan::pad_workgroup_indices(&source)
+    } else {
+        source
+    }
 }
 
 pub(crate) fn generate_rader_wgsl_for_key(key: &RaderStageKey) -> String {

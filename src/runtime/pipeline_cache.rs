@@ -2114,6 +2114,10 @@ pub(crate) struct FusedPrimeStageKey {
     /// Output pairs per invocation of a direct kernel; 1 otherwise.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) pairs_per_invocation: u32,
+    /// Pads the workgroup-memory indices of a fused Rader or Bluestein
+    /// convolution by one element per 16.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) padded_indices: bool,
 }
 
 impl FusedPrimeStageKey {
@@ -2158,7 +2162,23 @@ impl FusedPrimeStageKey {
             lines_per_workgroup: 1,
             registers: None,
             pairs_per_invocation: 1,
+            padded_indices: false,
         }
+    }
+
+    /// Pads the convolution's workgroup-memory indices by one element per 16.
+    pub(crate) fn with_padded_indices(mut self) -> Self {
+        self.padded_indices = true;
+        self
+    }
+
+    /// Whether `limits` allow this kernel.
+    pub(crate) fn supported_by_device_limits(&self, limits: &wgpu::Limits) -> bool {
+        self.is_supported_by_limits(
+            u64::from(limits.max_compute_workgroup_storage_size),
+            limits.max_compute_invocations_per_workgroup,
+            limits.max_compute_workgroup_size_x,
+        )
     }
 
     /// Runs the convolution's FFTs in registers with `schedule`.
@@ -2207,6 +2227,9 @@ impl FusedPrimeStageKey {
         if self.pairs_per_invocation > 1 {
             key.push_str(&format!(":pairs={}", self.pairs_per_invocation));
         }
+        if self.padded_indices {
+            key.push_str(":pad16");
+        }
         if let Some(registers) = &self.registers {
             key.push_str(&registers.stable_key_suffix());
         }
@@ -2225,6 +2248,9 @@ impl FusedPrimeStageKey {
             (FusedPrimeKind::Direct, None) => self
                 .axis_length
                 .checked_mul(self.lines_per_workgroup as usize),
+            _ if self.padded_indices => Some(crate::runtime::axis_plan::padded_workgroup_len(
+                self.convolution_length,
+            )),
             _ => Some(self.convolution_length),
         };
         let Some(scratch_bytes) =

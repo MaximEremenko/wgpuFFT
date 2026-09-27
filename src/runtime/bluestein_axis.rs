@@ -323,21 +323,37 @@ impl BluesteinAxis {
                 m,
                 config.precision.as_fft_precision(),
             )?;
-            let shader_key = FusedPrimeStageKey::new(
-                FusedPrimeKind::Bluestein,
-                config.shape.len(),
-                config.axis,
-                &config.shape,
-                n,
-                stride_complex,
-                m,
-                &factors,
-                config.direction,
-                config.fused_workgroup_size,
-                apply_scale,
-                scale,
-                config.precision,
-            );
+            let bluestein_key = |factors: &[usize]| {
+                FusedPrimeStageKey::new(
+                    FusedPrimeKind::Bluestein,
+                    config.shape.len(),
+                    config.axis,
+                    &config.shape,
+                    n,
+                    stride_complex,
+                    m,
+                    factors,
+                    config.direction,
+                    config.fused_workgroup_size,
+                    apply_scale,
+                    scale,
+                    config.precision,
+                )
+            };
+            // As for Rader: the fused smooth schedule, or the multi-pass
+            // factors where its padding does not fit.
+            let schedule = crate::runtime::axis_plan::fused_smooth_factors(m, &factors);
+            let shader_key =
+                if crate::runtime::axis_plan::fused_smooth_pads_indices(&schedule, false) {
+                    let padded = bluestein_key(&schedule).with_padded_indices();
+                    if padded.supported_by_device_limits(&device.limits()) {
+                        padded
+                    } else {
+                        bluestein_key(&factors)
+                    }
+                } else {
+                    bluestein_key(&schedule)
+                };
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = with_device_pipeline_cache(device, |cache| {
                 cache.get_bind_group_layout(device, pipeline_key.layout)
@@ -1118,7 +1134,7 @@ pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) ->
     let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
     let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
 
-    specialize_bluestein_wgsl(
+    let source = specialize_bluestein_wgsl(
         format!(
             r#"struct Params {{
   lines: u32,
@@ -1219,7 +1235,12 @@ fn main({entry_params}) {{
             scalar = staged_scalar_type(key.precision),
         ),
         key.precision,
-    )
+    );
+    if key.padded_indices {
+        crate::runtime::axis_plan::pad_workgroup_indices(&source)
+    } else {
+        source
+    }
 }
 
 pub(crate) fn generate_bluestein_wgsl_for_key(key: &BluesteinStageKey) -> String {

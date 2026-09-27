@@ -9,7 +9,7 @@
 
 use std::sync::mpsc;
 
-use wgpu_fft::{C2cRoute, FftConfig, FftPlan};
+use wgpu_fft::{C2cRoute, FftConfig, FftPlan, FftTuning};
 
 const WORKGROUP_SIZE: u64 = 64;
 
@@ -41,14 +41,17 @@ async fn run_cases() {
         Some("fused-pow2-workgroup-stage"),
     );
     // N=67 uses a small fitting Rader convolution (M=132). The fused prime
-    // kernel dispatches exactly one workgroup per line.
-    roundtrip_c2c(
+    // kernel dispatches exactly one workgroup per line. Short primes would
+    // otherwise take the direct DFT kernel, which packs many lines into each
+    // workgroup and stays within the grid.
+    roundtrip_c2c_with_tuning(
         &context,
         &[67],
         65_537,
         C2cRoute::Rader,
         65_537,
         Some("rader-fused-workgroup-stage"),
+        FftTuning::default().with_direct_max_prime(0),
     );
     // N=68 routes through a small fitting Bluestein convolution (M=135) and
     // likewise dispatches exactly one fused workgroup per line.
@@ -62,7 +65,15 @@ async fn run_cases() {
     );
     // Retain coverage for the legacy multipass kernels as well. N=17 stays
     // below the fused-prime floor, and its sum pass has one workgroup per line.
-    roundtrip_c2c(&context, &[17], 65_537, C2cRoute::Rader, 65_537, None);
+    roundtrip_c2c_with_tuning(
+        &context,
+        &[17],
+        65_537,
+        C2cRoute::Rader,
+        65_537,
+        None,
+        FftTuning::default().with_direct_max_prime(0),
+    );
     // N=34 likewise remains a tiny Bluestein fallback; its flattened M=70
     // pack/multiply dispatch exceeds the one-dimensional limit.
     roundtrip_c2c(&context, &[34], 62_601, C2cRoute::Bluestein, 65_536, None);
@@ -95,6 +106,26 @@ fn roundtrip_c2c(
     oversized_dispatch_workgroups: u64,
     expected_fused_stage: Option<&str>,
 ) {
+    roundtrip_c2c_with_tuning(
+        context,
+        shape,
+        batch,
+        expected_route,
+        oversized_dispatch_workgroups,
+        expected_fused_stage,
+        FftTuning::default(),
+    );
+}
+
+fn roundtrip_c2c_with_tuning(
+    context: &wgpu_fft::device::GpuContext,
+    shape: &[usize],
+    batch: usize,
+    expected_route: C2cRoute,
+    oversized_dispatch_workgroups: u64,
+    expected_fused_stage: Option<&str>,
+    tuning: FftTuning,
+) {
     let label = format!("c2c shape={shape:?} batch={batch}");
     let total: usize = shape.iter().product::<usize>() * batch;
     assert_case_exceeds_limit(context, oversized_dispatch_workgroups, &label);
@@ -119,13 +150,17 @@ fn roundtrip_c2c(
     let forward = FftPlan::c2c(
         &context.device,
         &context.queue,
-        FftConfig::new_nd(shape.to_vec()).with_batch(batch),
+        FftConfig::new_nd(shape.to_vec())
+            .with_batch(batch)
+            .with_tuning(tuning.clone()),
     )
     .unwrap();
     let inverse = FftPlan::c2c(
         &context.device,
         &context.queue,
-        FftConfig::inverse_nd(shape.to_vec()).with_batch(batch),
+        FftConfig::inverse_nd(shape.to_vec())
+            .with_batch(batch)
+            .with_tuning(tuning),
     )
     .unwrap();
     assert_eq!(forward.route(), expected_route, "{label}");

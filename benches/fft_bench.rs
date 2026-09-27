@@ -132,6 +132,7 @@ struct Options {
     compare_max_buffer_bytes: Option<CompareMaxBufferBytes>,
     segmented_burst_depth: usize,
     workgroup_size: Option<u32>,
+    direct_max_prime: Option<usize>,
     shared_pass: bool,
 }
 
@@ -659,8 +660,8 @@ async fn run_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision, options.workgroup_size).validate()?;
-    benchmark_config(case, true, precision, options.workgroup_size).validate()?;
+    benchmark_config(case, false, precision, &options).validate()?;
+    benchmark_config(case, true, precision, &options).validate()?;
     let max_buffer_size = device.limits().max_buffer_size;
     if expected_buffer_size > max_buffer_size {
         return Err(input_error(format!(
@@ -745,12 +746,12 @@ async fn run_case(
             let forward = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, false, precision, options.workgroup_size),
+                benchmark_config(case, false, precision, &options),
             )?;
             let inverse = FftPlan::c2c_with_diagnostics(
                 device,
                 queue,
-                benchmark_config(case, true, precision, options.workgroup_size),
+                benchmark_config(case, true, precision, &options),
             )?;
             Ok((forward, inverse))
         })();
@@ -1141,8 +1142,8 @@ async fn run_compare_case(
         .map_err(|_| input_error("logical element count does not fit u64"))?
         .checked_mul(precision.complex_size_bytes())
         .ok_or_else(|| input_error("logical buffer size overflow"))?;
-    benchmark_config(case, false, precision, options.workgroup_size).validate()?;
-    benchmark_config(case, true, precision, options.workgroup_size).validate()?;
+    benchmark_config(case, false, precision, &options).validate()?;
+    benchmark_config(case, true, precision, &options).validate()?;
 
     let device_limits = device.limits();
     let real_max_buffer_size = device_limits.max_buffer_size;
@@ -1261,7 +1262,7 @@ async fn run_compare_case(
             let error_scopes = push_gpu_error_scopes(device);
             let plans = (|| -> BenchResult<(FftPlan, FftPlan)> {
                 let create = |inverse| {
-                    let config = benchmark_config(case, inverse, precision, options.workgroup_size);
+                    let config = benchmark_config(case, inverse, precision, &options);
                     if variant_label == "sharded" {
                         FftPlan::c2c_with_large_policy_limits_and_burst_depth_for_testing(
                             device,
@@ -1727,7 +1728,7 @@ fn benchmark_config(
     case: &BenchCase,
     inverse: bool,
     precision: FftPrecision,
-    workgroup_size: Option<u32>,
+    options: &Options,
 ) -> FftConfig {
     let config = if inverse {
         FftConfig::inverse_nd(case.shape.clone())
@@ -1738,14 +1739,16 @@ fn benchmark_config(
         .with_batch(case.batch)
         .with_normalization(Normalization::None)
         .with_precision(precision);
-    match workgroup_size {
-        Some(workgroup_size) => config.with_tuning(
-            FftTuning::default()
-                .with_workgroup_size(workgroup_size)
-                .with_fused_workgroup_size(workgroup_size),
-        ),
-        None => config,
+    let mut tuning = FftTuning::default();
+    if let Some(workgroup_size) = options.workgroup_size {
+        tuning = tuning
+            .with_workgroup_size(workgroup_size)
+            .with_fused_workgroup_size(workgroup_size);
     }
+    if let Some(direct_max_prime) = options.direct_max_prime {
+        tuning = tuning.with_direct_max_prime(direct_max_prime);
+    }
+    config.with_tuning(tuning)
 }
 
 fn diagnostic_helper_requirement_bytes(diagnostics: &FftDiagnostics) -> BenchResult<u64> {
@@ -2151,6 +2154,7 @@ fn parse_options() -> BenchResult<Options> {
         segmented_burst_depth: DEFAULT_SEGMENTED_BURST_DEPTH,
         workgroup_size: None,
         shared_pass: false,
+        direct_max_prime: None,
     };
     let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
@@ -2190,6 +2194,13 @@ fn parse_options() -> BenchResult<Options> {
                     "--wait-timeout-secs",
                 )?;
                 options.wait_timeout = Duration::from_secs(seconds);
+            }
+            "--direct-max-prime" => {
+                options.direct_max_prime = Some(
+                    next_value(&mut args, "--direct-max-prime")?
+                        .parse::<usize>()
+                        .map_err(|error| input_error(format!("--direct-max-prime: {error}")))?,
+                );
             }
             "--shared-pass" => {
                 options.shared_pass = true;

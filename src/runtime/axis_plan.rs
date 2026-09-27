@@ -10,8 +10,8 @@ use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::ElementFormat;
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, FusedSmoothStageKey,
-    PipelineLayoutCacheKey, SplitPass, StockhamStageKey,
+    axis_plan_layout, with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey,
+    FusedSmoothStageKey, PipelineLayoutCacheKey, ShaderCacheKey, SplitPass, StockhamStageKey,
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::register_fft::{
@@ -257,6 +257,8 @@ pub(crate) struct AxisPlan {
     factors: Vec<Vec<usize>>,
     stages: Vec<AxisStage>,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// Set when every stage after the first runs in place on the output.
+    in_place_bind_group_layout: Option<wgpu::BindGroupLayout>,
     params_buffer: wgpu::Buffer,
     temp_buffer: Option<wgpu::Buffer>,
     twiddle_luts: Vec<AxisTwiddleLut>,
@@ -984,11 +986,47 @@ impl AxisPlan {
 
         let required_buffer_size_bytes =
             total_complex as u64 * config.precision.complex_size_bytes();
-        let workspace_size_bytes = workspace_size_bytes_for_stage_count_with_precision(
-            stages.len(),
-            total_complex,
-            config.precision,
-        );
+        // Fused kernels store each line where they read it, so after the
+        // first stage they can transform the output in place: the working
+        // set halves and no workspace is needed.
+        let in_place = stages.len() > 1
+            && stages
+                .iter()
+                .all(|stage| stage.pipeline_key.supports_in_place());
+        let in_place_bind_group_layout = if in_place {
+            for stage in stages.iter_mut().skip(1) {
+                let pipeline_key = stage.pipeline_key.in_place();
+                let label = format!(
+                    "wgpu_fft.axis_plan.in_place.axis{}.{}",
+                    stage.axis,
+                    stage.kind.detail()
+                );
+                stage.pipeline = with_device_pipeline_cache(device, |cache| {
+                    cache.get_compute_pipeline(
+                        device,
+                        &pipeline_key,
+                        &format!("{label}.pipeline"),
+                        &format!("{label}.shader"),
+                        || fused_axis_stage_wgsl(&pipeline_key),
+                    )
+                });
+                stage.pipeline_key = pipeline_key;
+            }
+            Some(with_device_pipeline_cache(device, |cache| {
+                cache.get_bind_group_layout(device, axis_plan_layout(config.precision, true))
+            }))
+        } else {
+            None
+        };
+        let workspace_size_bytes = if in_place {
+            0
+        } else {
+            workspace_size_bytes_for_stage_count_with_precision(
+                stages.len(),
+                total_complex,
+                config.precision,
+            )
+        };
         let temp_buffer = if workspace_size_bytes > 0 {
             Some(create_axis_temp_buffer(
                 device,
@@ -1004,6 +1042,7 @@ impl AxisPlan {
             factors,
             stages,
             bind_group_layout,
+            in_place_bind_group_layout,
             params_buffer,
             temp_buffer,
             twiddle_luts,
@@ -1093,8 +1132,9 @@ impl AxisPlan {
 
         let scheduler = WindowScheduler::for_device(device);
         let max_workgroups_per_dimension = max_workgroups_per_dimension(device);
+        let in_place = self.in_place_bind_group_layout.is_some();
         let mut src_slot = BufferSlot::Input;
-        let mut dst_slot = if self.stages.len() % 2 == 1 {
+        let mut dst_slot = if in_place || self.stages.len() % 2 == 1 {
             BufferSlot::Output
         } else {
             BufferSlot::Temp
@@ -1122,28 +1162,48 @@ impl AxisPlan {
                 stage.apply_scale,
                 stage.pipeline_key.stable_key()
             );
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&bind_group_label),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: src_resource,
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: dst_resource,
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.params_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: twiddle_resource,
-                    },
-                ],
-            });
+            let bind_group = match (&self.in_place_bind_group_layout, stage_index) {
+                (Some(layout), 1..) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&bind_group_label),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: dst_resource,
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: twiddle_resource,
+                        },
+                    ],
+                }),
+                _ => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&bind_group_label),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: src_resource,
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: dst_resource,
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: self.params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: twiddle_resource,
+                        },
+                    ],
+                }),
+            };
 
             {
                 let pass = encoder.pass();
@@ -1155,7 +1215,11 @@ impl AxisPlan {
 
             if stage_index + 1 < self.stages.len() {
                 src_slot = dst_slot;
-                dst_slot = next_stage_destination(src_slot)?;
+                dst_slot = if in_place {
+                    BufferSlot::Output
+                } else {
+                    next_stage_destination(src_slot)?
+                };
             }
         }
         Ok(())
@@ -1745,7 +1809,7 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         scale_factor: key.scale_factor(),
         precision: key.precision,
     };
-    if let Some(registers) = &key.registers {
+    let source = if let Some(registers) = &key.registers {
         generate_register_fft_wgsl(&config, registers, key.lines_per_workgroup as usize)
     } else if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
         generate_fused_pow2_multiline_stage_wgsl(
@@ -1755,7 +1819,35 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         )
     } else {
         generate_fused_pow2_stage_wgsl(&config)
+    };
+    if key.in_place {
+        in_place_wgsl(&source)
+    } else {
+        source
     }
+}
+
+/// WGSL of a fused axis kernel from its pipeline key.
+fn fused_axis_stage_wgsl(key: &ComputePipelineCacheKey) -> String {
+    match &key.shader {
+        ShaderCacheKey::FusedPow2Stage(shader) => generate_fused_pow2_stage_wgsl_for_key(shader),
+        ShaderCacheKey::FusedSmoothStage(shader) => {
+            generate_fused_smooth_stage_wgsl_for_key(shader)
+        }
+        _ => unreachable!("only fused axis kernels run in place"),
+    }
+}
+
+/// Rebinds an out-of-place axis kernel to read its lines from `dst`: the
+/// `src` binding goes away and every `src` load reads `dst`.
+fn in_place_wgsl(source: &str) -> String {
+    let source = source
+        .lines()
+        .filter(|line| !line.starts_with("@group(0) @binding(0) var<storage, read> src:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    debug_assert!(!source.contains("var<storage, read> src"));
+    source.replace("src[", "dst[") + "\n"
 }
 
 /// Splits an axis too long for one fused workgroup into `n1 * n2`, where each
@@ -2240,7 +2332,7 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
         scale_factor: key.scale_factor(),
         precision: key.precision,
     };
-    if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
+    let source = if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
         generate_fused_smooth_multiline_stage_wgsl(
             &config,
             key.lines_per_workgroup as usize,
@@ -2248,6 +2340,11 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
         )
     } else {
         generate_fused_smooth_stage_wgsl(&config)
+    };
+    if key.in_place {
+        in_place_wgsl(&source)
+    } else {
+        source
     }
 }
 

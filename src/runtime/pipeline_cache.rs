@@ -335,6 +335,10 @@ pub(crate) enum PipelineLayoutCacheKey {
     AxisPlanInterleavedF32Lut,
     AxisPlanInterleavedF64Lut,
     AxisPlanInterleavedDf64Lut,
+    /// An axis-plan kernel reading and writing one buffer in place.
+    AxisPlanInPlaceF32Lut,
+    AxisPlanInPlaceF64Lut,
+    AxisPlanInPlaceDf64Lut,
     BridgeReadWriteReadF32,
     BridgeReadWriteUniformF32,
     BridgeTwoWriteUniformF32,
@@ -386,6 +390,9 @@ impl PipelineLayoutCacheKey {
             Self::AxisPlanInterleavedF32Lut => "axis-plan/interleaved-f32-lut",
             Self::AxisPlanInterleavedF64Lut => "axis-plan/interleaved-f64-lut",
             Self::AxisPlanInterleavedDf64Lut => "axis-plan/interleaved-df64-lut",
+            Self::AxisPlanInPlaceF32Lut => "axis-plan/in-place-f32-lut",
+            Self::AxisPlanInPlaceF64Lut => "axis-plan/in-place-f64-lut",
+            Self::AxisPlanInPlaceDf64Lut => "axis-plan/in-place-df64-lut",
             Self::BridgeReadWriteReadF32 => "bridge/read-write-read-f32",
             Self::BridgeReadWriteUniformF32 => "bridge/read-write-uniform-f32",
             Self::BridgeTwoWriteUniformF32 => "bridge/two-write-uniform-f32",
@@ -1115,6 +1122,29 @@ pub(crate) struct ComputePipelineCacheKey {
 }
 
 impl ComputePipelineCacheKey {
+    /// Whether this axis-plan kernel may also run in place: a fused kernel
+    /// that stores each line where it read it.
+    pub(crate) fn supports_in_place(&self) -> bool {
+        match &self.shader {
+            ShaderCacheKey::FusedPow2Stage(key) => key.split_pass.is_none(),
+            ShaderCacheKey::FusedSmoothStage(key) => key.split_pass.is_none(),
+            _ => false,
+        }
+    }
+
+    /// The in-place variant of a kernel for which [`Self::supports_in_place`].
+    pub(crate) fn in_place(&self) -> Self {
+        match &self.shader {
+            ShaderCacheKey::FusedPow2Stage(key) => {
+                Self::fused_pow2_stage(key.clone().with_in_place())
+            }
+            ShaderCacheKey::FusedSmoothStage(key) => {
+                Self::fused_smooth_stage(key.clone().with_in_place())
+            }
+            _ => unreachable!("only fused axis kernels run in place"),
+        }
+    }
+
     #[cfg(feature = "serde")]
     fn from_shader_key(shader: ShaderCacheKey) -> Self {
         match shader {
@@ -1143,7 +1173,7 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn fused_pow2_stage(shader: FusedPow2StageKey) -> Self {
-        let layout = axis_plan_layout_for_precision(shader.precision);
+        let layout = axis_plan_layout(shader.precision, shader.in_place);
         Self {
             layout,
             entry_point: String::from("main"),
@@ -1152,7 +1182,7 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn fused_smooth_stage(shader: FusedSmoothStageKey) -> Self {
-        let layout = axis_plan_layout_for_precision(shader.precision);
+        let layout = axis_plan_layout(shader.precision, shader.in_place);
         Self {
             layout,
             entry_point: String::from("main"),
@@ -1379,6 +1409,16 @@ fn axis_plan_layout_for_precision(precision: AxisPrecision) -> PipelineLayoutCac
         AxisPrecision::F32 => PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
         AxisPrecision::F64 => PipelineLayoutCacheKey::AxisPlanInterleavedF64Lut,
         AxisPrecision::Df64 => PipelineLayoutCacheKey::AxisPlanInterleavedDf64Lut,
+    }
+}
+
+/// Layout of an axis-plan kernel, in place or out of place.
+pub(crate) fn axis_plan_layout(precision: AxisPrecision, in_place: bool) -> PipelineLayoutCacheKey {
+    match (precision, in_place) {
+        (_, false) => axis_plan_layout_for_precision(precision),
+        (AxisPrecision::F32, true) => PipelineLayoutCacheKey::AxisPlanInPlaceF32Lut,
+        (AxisPrecision::F64, true) => PipelineLayoutCacheKey::AxisPlanInPlaceF64Lut,
+        (AxisPrecision::Df64, true) => PipelineLayoutCacheKey::AxisPlanInPlaceDf64Lut,
     }
 }
 
@@ -1938,6 +1978,9 @@ pub(crate) struct FusedPow2StageKey {
     /// Set when the line is kept in registers instead of workgroup memory.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) registers: Option<RegisterSchedule>,
+    /// Reads and writes one buffer in place (see [`Self::with_in_place`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) in_place: bool,
 }
 
 /// Radix schedule of a register-resident fused kernel (see
@@ -2036,6 +2079,10 @@ pub(crate) struct FusedSmoothStageKey {
     /// Set when this kernel is one pass of a split long axis.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) split_pass: Option<SplitPass>,
+    /// Reads and writes one buffer in place (see
+    /// [`FusedPow2StageKey::with_in_place`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) in_place: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2221,7 +2268,15 @@ impl FusedSmoothStageKey {
             scale_bits,
             lines_per_workgroup: 1,
             split_pass: None,
+            in_place: false,
         }
+    }
+
+    /// See [`FusedPow2StageKey::with_in_place`].
+    pub(crate) fn with_in_place(mut self) -> Self {
+        debug_assert!(self.split_pass.is_none());
+        self.in_place = true;
+        self
     }
 
     /// Transforms `lines` lines per workgroup instead of one.
@@ -2261,6 +2316,9 @@ impl FusedSmoothStageKey {
         }
         if let Some(split_pass) = &self.split_pass {
             key.push_str(&split_pass.stable_key_suffix());
+        }
+        if self.in_place {
+            key.push_str(":in_place");
         }
         key
     }
@@ -2322,7 +2380,17 @@ impl FusedPow2StageKey {
             lines_per_workgroup: 1,
             split_pass: None,
             registers: None,
+            in_place: false,
         }
+    }
+
+    /// Reads and writes one buffer in place. Safe because every workgroup
+    /// reads its whole lines before writing them and no line crosses
+    /// workgroups; not for split passes, which store transposed.
+    pub(crate) fn with_in_place(mut self) -> Self {
+        debug_assert!(self.split_pass.is_none());
+        self.in_place = true;
+        self
     }
 
     /// Transforms `lines` lines per workgroup instead of one.
@@ -2370,6 +2438,9 @@ impl FusedPow2StageKey {
         }
         if let Some(registers) = &self.registers {
             key.push_str(&registers.stable_key_suffix());
+        }
+        if self.in_place {
+            key.push_str(":in_place");
         }
         key
     }
@@ -2548,6 +2619,13 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         | PipelineLayoutCacheKey::DirectDftInterleavedF64Lut
         | PipelineLayoutCacheKey::DirectDftInterleavedDf64Lut => vec![
             storage_entry(0, true),
+            storage_entry(1, false),
+            uniform_entry(2),
+            storage_entry(3, true),
+        ],
+        PipelineLayoutCacheKey::AxisPlanInPlaceF32Lut
+        | PipelineLayoutCacheKey::AxisPlanInPlaceF64Lut
+        | PipelineLayoutCacheKey::AxisPlanInPlaceDf64Lut => vec![
             storage_entry(1, false),
             uniform_entry(2),
             storage_entry(3, true),

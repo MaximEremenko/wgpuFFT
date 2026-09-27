@@ -308,6 +308,7 @@ impl RaderAxis {
                 twiddle_buffer,
             })
         } else if !fused_rader_supported(
+            n,
             m,
             config.precision,
             config.fused_workgroup_size,
@@ -341,6 +342,7 @@ impl RaderAxis {
                 },
             )?))
         } else if fused_rader_supported(
+            n,
             m,
             config.precision,
             config.fused_workgroup_size,
@@ -989,6 +991,7 @@ fn validate_rader_staged_workgroup(config: &RaderAxisConfig, limits: &wgpu::Limi
 }
 
 fn fused_rader_supported(
+    n: usize,
     m: usize,
     precision: AxisPrecision,
     workgroup_size: u32,
@@ -996,6 +999,7 @@ fn fused_rader_supported(
     limits: &wgpu::Limits,
 ) -> bool {
     fused_rader_supported_by_limits(
+        n,
         m,
         precision,
         workgroup_size,
@@ -1006,7 +1010,36 @@ fn fused_rader_supported(
     )
 }
 
+/// Zero padding a fused Rader kernel needs to reduce the line sum in place;
+/// shorter padding (a cyclic convolution has none) uses a separate array.
+const MIN_PADDED_REDUCTION: usize = 32;
+/// Size of the separate line-sum reduction array.
+const SEPARATE_REDUCTION: usize = 64;
+
+/// Line-sum reduction of a fused Rader kernel: its size, and whether it has
+/// its own array rather than the convolution's zero padding.
+fn fused_rader_reduction(n: usize, m: usize, workgroup_size: u32) -> (usize, bool) {
+    let padding = m.saturating_sub(n.saturating_sub(1));
+    let capacity = workgroup_size.max(1) as usize;
+    if padding >= MIN_PADDED_REDUCTION {
+        (1usize << padding.min(capacity).ilog2(), false)
+    } else {
+        (1usize << SEPARATE_REDUCTION.min(capacity).ilog2(), true)
+    }
+}
+
+/// Workgroup elements a fused Rader kernel needs beyond the convolution:
+/// `x0`, plus the separate reduction array when there is one.
+pub(crate) fn fused_rader_extra_elements(n: usize, m: usize, workgroup_size: u32) -> usize {
+    match fused_rader_reduction(n, m, workgroup_size) {
+        (size, true) => 1 + size,
+        (_, false) => 1,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_rader_supported_by_limits(
+    n: usize,
     m: usize,
     precision: AxisPrecision,
     workgroup_size: u32,
@@ -1015,14 +1048,17 @@ pub(crate) fn fused_rader_supported_by_limits(
     max_invocations_per_workgroup: u32,
     max_workgroup_size_x: u32,
 ) -> bool {
-    if m < min_convolution_length {
+    // The floor applies to the prime's linear convolution length, so a cyclic
+    // convolution fuses exactly when its zero-padded form would.
+    let linear_length = n.saturating_sub(1).saturating_mul(2).saturating_sub(1);
+    if linear_length.max(m) < min_convolution_length {
         return false;
     }
     let complex_bytes = precision.complex_size_bytes() as usize;
-    let Some(scratch_bytes) = m.checked_mul(complex_bytes) else {
-        return false;
-    };
-    let Some(workgroup_bytes) = scratch_bytes.checked_add(complex_bytes) else {
+    let Some(workgroup_bytes) = m
+        .checked_add(fused_rader_extra_elements(n, m, workgroup_size))
+        .and_then(|elements| elements.checked_mul(complex_bytes))
+    else {
         return false;
     };
     workgroup_bytes as u64 <= max_workgroup_storage_bytes
@@ -1031,10 +1067,16 @@ pub(crate) fn fused_rader_supported_by_limits(
         && workgroup_size <= max_workgroup_size_x
 }
 
+/// Length of Rader's convolution for the prime `n`: the cyclic length
+/// `n - 1` itself when an FFT of that length is supported, else a zero-padded
+/// length of at least `2 (n - 1) - 1` whose linear convolution folds back.
 pub(crate) fn rader_convolution_length(n: usize) -> Result<usize> {
     let l = n
         .checked_sub(1)
         .ok_or(FftError::UnsupportedLength { len: n })?;
+    if l >= 2 && crate::runtime::factor_supported_length(l).is_ok() {
+        return Ok(l);
+    }
     let min_conv = l
         .checked_mul(2)
         .and_then(|value| value.checked_sub(1))
@@ -1177,9 +1219,21 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     let m = key.convolution_length;
     let m_slot_count = m.div_ceil(key.workgroup_size as usize);
     let l_slot_count = l.div_ceil(key.workgroup_size as usize);
-    let reduction_capacity = (m - l).min(key.workgroup_size as usize);
-    let reduction_size = 1usize << reduction_capacity.ilog2();
+    let (reduction_size, separate_reduction) = fused_rader_reduction(n, m, key.workgroup_size);
     let sum_slot_count = l.div_ceil(reduction_size);
+    // A cyclic convolution has no zero padding to reduce the line sum in.
+    let reduction_slot = |offset: &str| {
+        if separate_reduction {
+            format!("reduction[{offset}]")
+        } else {
+            format!("scratch[L + {offset}]")
+        }
+    };
+    let reduction_decl = if separate_reduction {
+        format!("var<workgroup> reduction: array<vec2<f32>, {reduction_size}>;\n")
+    } else {
+        String::new()
+    };
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let scale = match key.precision {
         AxisPrecision::Df64 => format_df64(key.scale_factor()),
@@ -1229,10 +1283,10 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     let line_sum_add = complex_add_expr(key.precision, "lineSum", "value");
     let reduction_add = complex_add_expr(
         key.precision,
-        "scratch[L + lid.x]",
-        "scratch[L + lid.x + reductionStride]",
+        &reduction_slot("lid.x"),
+        &reduction_slot("lid.x + reductionStride"),
     );
-    let scaled_sum = complex_scale_expr(key.precision, "scratch[L]", scale_ref);
+    let scaled_sum = complex_scale_expr(key.precision, &reduction_slot("0u"), scale_ref);
     let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
     let scaled_wrap = complex_scale_expr(key.precision, "scratch[wrap]", inverse_m_ref);
     let wrap_add = complex_add_expr(key.precision, "convolution", &scaled_wrap);
@@ -1293,6 +1347,7 @@ const SCALE: {scalar} = {scale};
 
 var<workgroup> scratch: array<vec2<f32>, {m}>;
 var<workgroup> x0Shared: vec2<f32>;
+{reduction_decl}
 
 {line_base_fn}
 
@@ -1319,7 +1374,7 @@ fn main({entry_params}) {{
     }}
   }}
   if (lid.x < REDUCTION_SIZE) {{
-    scratch[L + lid.x] = lineSum;
+    {reduction_store} = lineSum;
   }}
   workgroupBarrier();
 
@@ -1329,7 +1384,7 @@ fn main({entry_params}) {{
       break;
     }}
     if (lid.x < reductionStride) {{
-      scratch[L + lid.x] = {reduction_add};
+      {reduction_store} = {reduction_add};
     }}
     workgroupBarrier();
     reductionStride = reductionStride / 2u;
@@ -1376,6 +1431,7 @@ fn main({entry_params}) {{
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             scalar = staged_scalar_type(key.precision),
+            reduction_store = reduction_slot("lid.x"),
         ),
         key.precision,
     )
@@ -1785,6 +1841,7 @@ mod tests {
     #[test]
     fn fused_rader_gate_accounts_for_x0_and_tiny_line_floor() {
         assert!(fused_rader_supported_by_limits(
+            2999,
             6000,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1794,6 +1851,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            2999,
             6000,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1803,6 +1861,7 @@ mod tests {
             256
         ));
         assert!(fused_rader_supported_by_limits(
+            1009,
             2016,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1812,6 +1871,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            17,
             32,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1821,6 +1881,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            2999,
             6000,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1830,6 +1891,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            2999,
             6000,
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1839,6 +1901,7 @@ mod tests {
             256
         ));
         assert!(fused_rader_supported_by_limits(
+            1500,
             3071,
             AxisPrecision::F64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1848,6 +1911,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            1500,
             3072,
             AxisPrecision::F64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1857,6 +1921,7 @@ mod tests {
             256
         ));
         assert!(fused_rader_supported_by_limits(
+            1500,
             3071,
             AxisPrecision::Df64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1866,6 +1931,7 @@ mod tests {
             256
         ));
         assert!(!fused_rader_supported_by_limits(
+            1500,
             3072,
             AxisPrecision::Df64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
@@ -1875,6 +1941,7 @@ mod tests {
             256
         ));
         assert!(fused_rader_supported_by_limits(
+            17,
             32,
             AxisPrecision::F32,
             64,

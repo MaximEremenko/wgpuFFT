@@ -76,7 +76,9 @@ async fn run_fused_cases() {
         }
     }
 
-    for length in [9, 25, 49, 121, 169, 1001, 2187, 3000] {
+    // 720 and 1920 run composite-radix schedules starting with radix 16, with
+    // padded workgroup indices.
+    for length in [9, 25, 49, 121, 169, 720, 1001, 1920, 2187, 3000] {
         if length * 8 > storage_limit {
             eprintln!(
                 "skipping fused smooth N={length}: {}-byte line exceeds {}-byte workgroup storage limit",

@@ -454,7 +454,24 @@ impl RaderAxis {
             } else {
                 shader_key.with_lines_per_workgroup(1)
             };
-            let lines_per_workgroup = shader_key.lines_per_workgroup;
+            // One strided line per workgroup loads one element per sector:
+            // serial lines load and store together.
+            let serial_lines = serial_rader_lines(m, lines);
+            let shader_key = if shader_key.lines_per_workgroup == 1
+                && stride_complex != 1
+                && config.precision == AxisPrecision::F32
+                && serial_lines > 1
+            {
+                let serial = shader_key.clone().with_serial_lines(serial_lines as u32);
+                if serial.supported_by_device_limits(&device.limits()) {
+                    serial
+                } else {
+                    shader_key
+                }
+            } else {
+                shader_key
+            };
+            let lines_per_workgroup = shader_key.lines_per_workgroup.max(shader_key.serial_lines);
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = cached_layout(device, pipeline_key.layout);
             let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);
@@ -1370,6 +1387,14 @@ fn bind_view_entry<'a>(
 /// store.
 pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
     debug_assert_eq!(key.kind, FusedPrimeKind::Rader);
+    if key.serial_lines > 1 {
+        let source = generate_fused_rader_serial_wgsl(key);
+        return if key.padded_indices {
+            crate::runtime::axis_plan::pad_workgroup_indices(&source)
+        } else {
+            source
+        };
+    }
     if key.lines_per_workgroup > 1 {
         let source = generate_fused_rader_multiline_wgsl(key);
         return if key.padded_indices {
@@ -1583,6 +1608,228 @@ fn main({entry_params}) {{
     } else {
         source
     }
+}
+
+/// Workgroups a strided fused Rader axis keeps when it takes serial lines:
+/// with 64, an axis of 256 lines ran 70% slower.
+const MIN_SERIAL_RADER_WORKGROUPS: usize = 256;
+
+/// Strided lines a one-line fused Rader kernel of `m` points loads and
+/// stores together (see [`generate_fused_rader_serial_wgsl`]) when `lines`
+/// lines leave [`MIN_SERIAL_RADER_WORKGROUPS`] workgroups; 1 otherwise. Each
+/// line's convolution waits for the previous one, so shorter convolutions
+/// take fewer: on an RTX 5090 two lines of 810 points ran 13% faster and
+/// four 4% slower, while four lines of 2178 and 2457 points ran 8% and 13%
+/// faster than one.
+fn serial_rader_lines(m: usize, lines: usize) -> usize {
+    let serial = if m >= 2048 { 4 } else { 2 };
+    if lines >= serial * MIN_SERIAL_RADER_WORKGROUPS {
+        serial
+    } else {
+        1
+    }
+}
+
+/// WGSL of a fused Rader kernel for strided lines too long for several in
+/// workgroup memory: a workgroup loads `key.serial_lines` neighbouring lines
+/// element-major, so each row of the load spans them, convolves them one
+/// after another in one line of workgroup memory, and stores them together.
+/// Invocation `lid` holds elements `lid / LINES + s * LANES` of line
+/// `lid % LINES` in registers.
+fn generate_fused_rader_serial_wgsl(key: &FusedPrimeStageKey) -> String {
+    debug_assert_eq!(key.precision, AxisPrecision::F32);
+    let n = key.axis_length;
+    let l = n - 1;
+    let m = key.convolution_length;
+    let lines = key.serial_lines as usize;
+    let workgroup_size = key.workgroup_size as usize;
+    debug_assert!(lines > 1 && workgroup_size.is_multiple_of(lines));
+    let lanes = workgroup_size / lines;
+    let slots = n.div_ceil(lanes);
+    let m_slot_count = m.div_ceil(workgroup_size);
+    let l_slot_count = l.div_ceil(workgroup_size);
+    let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
+    let scale = key.precision.format_wgsl_scalar(key.scale_factor());
+    let inverse_m = key
+        .precision
+        .format_wgsl_scalar(f64::from(1.0f32 / m as f32));
+    let forward_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Forward,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_forward",
+        key.precision,
+    );
+    let inverse_stages = generate_fused_scratch_fft_stages_wgsl(
+        m,
+        &key.factors,
+        FftDirection::Inverse,
+        key.workgroup_size,
+        "scratch",
+        "twiddle_inverse",
+        key.precision,
+    );
+
+    let mut loads = String::new();
+    let mut scatter = String::new();
+    let mut gather = String::new();
+    let mut stores = String::new();
+    for s in 0..slots {
+        let q = format!("(lane + {}u)", s * lanes);
+        loads.push_str(&format!(
+            "  var v{s}: vec2<f32> = vec2<f32>(0.0, 0.0);\n  if ({q} < N) {{\n    v{s} = input[base + {q} * STRIDE];\n  }}\n"
+        ));
+        scatter.push_str(&format!(
+            "      if ({q} >= 1u && {q} < N) {{\n        scratch[perm[L + {q} - 1u]] = v{s};\n      }}\n"
+        ));
+        gather.push_str(&format!(
+            "      if ({q} >= 1u && {q} < N) {{\n        v{s} = scratch[{q} - 1u] * SCALE;\n      }}\n"
+        ));
+        stores.push_str(&format!(
+            "    if ({q} < N) {{\n      output[base + {q} * STRIDE] = v{s};\n    }}\n"
+        ));
+    }
+    let mut collect = String::new();
+    let mut collect_scatter = String::new();
+    for slot in 0..l_slot_count {
+        collect.push_str(&format!(
+            r#"    var value{slot}: vec2<f32> = vec2<f32>(0.0, 0.0);
+    {{
+      let t: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+      if (t < L) {{
+        var convolution: vec2<f32> = scratch[t] * INVERSE_M;
+        let wrap: u32 = t + L;
+        if (wrap < M) {{
+          convolution = convolution + scratch[wrap] * INVERSE_M;
+        }}
+        value{slot} = x0 + convolution;
+      }}
+    }}
+"#
+        ));
+        collect_scatter.push_str(&format!(
+            "    if (lid.x + {slot}u * WORKGROUP_SIZE < L) {{\n      scratch[perm[lid.x + {slot}u * WORKGROUP_SIZE] - 1u] = value{slot};\n    }}\n"
+        ));
+    }
+
+    format!(
+        r#"struct Params {{
+  lines: u32,
+  lineOffset: u32,
+  pad0: u32,
+  pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+// perm[t] is the natural index of convolution output t; perm[L + q] is the
+// convolution input slot of x[q + 1].
+@group(0) @binding(2) var<storage, read> perm: array<u32>;
+@group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+fn c_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a + b;
+}}
+
+fn c_sub(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return a - b;
+}}
+
+fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
+  return vec2<f32>(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}}
+
+fn twiddle_forward(index: u32) -> vec2<f32> {{
+  return axisTwiddles[index];
+}}
+
+fn twiddle_inverse(index: u32) -> vec2<f32> {{
+  let value: vec2<f32> = axisTwiddles[index];
+  return vec2<f32>(value.x, -value.y);
+}}
+
+const N: u32 = {n}u;
+const L: u32 = {l}u;
+const M: u32 = {m}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const LINES: u32 = {lines}u;
+const LANES: u32 = {lanes}u;
+const M_SLOT_COUNT: u32 = {m_slot_count}u;
+const INVERSE_M: f32 = {inverse_m};
+const SCALE: f32 = {scale};
+
+var<workgroup> scratch: array<vec2<f32>, {m}>;
+// Each line's x[0], and its output bin 0.
+var<workgroup> firsts: array<vec2<f32>, {lines}>;
+var<workgroup> dcs: array<vec2<f32>, {lines}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= params.lines) {{
+    return;
+  }}
+  let lineCount: u32 = min(LINES, params.lines - groupLine);
+  let lineInGroup: u32 = lid.x % LINES;
+  let lane: u32 = lid.x / LINES;
+  let base: u32 = line_base(params.lineOffset + groupLine + min(lineInGroup, lineCount - 1u));
+{loads}  if (lane == 0u) {{
+    firsts[lineInGroup] = v0;
+  }}
+  for (var line: u32 = 0u; line < lineCount; line = line + 1u) {{
+    if (lineInGroup == line) {{
+{scatter}    }}
+    for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+      let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+      if (t >= L && t < M) {{
+        scratch[t] = vec2<f32>(0.0, 0.0);
+      }}
+    }}
+    workgroupBarrier();
+    let x0: vec2<f32> = firsts[line];
+
+{forward_stages}
+    // Bin 0 of the forward FFT is the sum of x[1..N).
+    if (lid.x == 0u) {{
+      dcs[line] = (x0 + scratch[0]) * SCALE;
+    }}
+    for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
+      let t: u32 = lid.x + slot * WORKGROUP_SIZE;
+      if (t < M) {{
+        scratch[t] = c_mul(scratch[t], bfft[t]);
+      }}
+    }}
+    workgroupBarrier();
+
+{inverse_stages}
+{collect}    workgroupBarrier();
+{collect_scatter}    workgroupBarrier();
+    if (lineInGroup == line) {{
+{gather}    }}
+    workgroupBarrier();
+  }}
+  if (lane == 0u) {{
+    v0 = dcs[lineInGroup];
+  }}
+  if (lineInGroup < lineCount) {{
+{stores}  }}
+}}
+"#,
+        stride = key.stride_complex,
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+    )
 }
 
 /// Fewest lines a multi-line fused Rader kernel takes per workgroup: with

@@ -2123,6 +2123,10 @@ pub(crate) struct FusedPrimeStageKey {
     /// convolution by one element per 16.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) padded_indices: bool,
+    /// Strided lines a one-line fused Rader kernel loads and stores together
+    /// and convolves one after another; 1 otherwise.
+    #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
+    pub(crate) serial_lines: u32,
 }
 
 impl FusedPrimeStageKey {
@@ -2168,7 +2172,15 @@ impl FusedPrimeStageKey {
             registers: None,
             pairs_per_invocation: 1,
             padded_indices: false,
+            serial_lines: 1,
         }
+    }
+
+    /// Loads and stores `lines` strided lines together and convolves them one
+    /// after another (one-line fused Rader kernels only).
+    pub(crate) fn with_serial_lines(mut self, lines: u32) -> Self {
+        self.serial_lines = lines.max(1);
+        self
     }
 
     /// Pads the convolution's workgroup-memory indices by one element per 16.
@@ -2235,6 +2247,9 @@ impl FusedPrimeStageKey {
         if self.padded_indices {
             key.push_str(":pad16");
         }
+        if self.serial_lines > 1 {
+            key.push_str(&format!(":serial={}", self.serial_lines));
+        }
         if let Some(registers) = &self.registers {
             key.push_str(&registers.stable_key_suffix());
         }
@@ -2284,6 +2299,10 @@ impl FusedPrimeStageKey {
             return false;
         };
         let extra_bytes = match self.kind {
+            // Each serial line's x[0] and output bin 0.
+            FusedPrimeKind::Rader if self.serial_lines > 1 => {
+                2 * self.serial_lines as usize * complex_bytes
+            }
             FusedPrimeKind::Rader => 0usize,
             FusedPrimeKind::Bluestein => 0usize,
             // The roots.

@@ -16,13 +16,12 @@ use crate::runtime::nd_wgsl::{
     wgsl_line_base_fn,
 };
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, BluesteinKernelKind, BluesteinStageKey, ComputePipelineCacheKey,
-    FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule, ShaderCacheKey,
+    generate_fused_prime_wgsl_for_key, with_device_pipeline_cache, BluesteinKernelKind,
+    BluesteinStageKey, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey, LazyPipeline,
+    RegisterSchedule, ShaderCacheKey,
 };
 use crate::runtime::recorder::CommandRecorder;
-use crate::runtime::register_fft::{
-    generate_register_bluestein_wgsl, register_schedule, register_schedule_for_lines,
-};
+use crate::runtime::register_fft::{register_schedule, register_schedule_for_lines};
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
@@ -94,6 +93,7 @@ struct FusedBluesteinExecution {
     workgroups: u32,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    in_place: LazyPipeline,
     twiddle_buffer: wgpu::Buffer,
 }
 
@@ -319,6 +319,10 @@ impl BluesteinAxis {
                 workgroups: lines_u32.div_ceil(lines_per_workgroup),
                 pipeline,
                 bind_group_layout,
+                in_place: LazyPipeline::new(
+                    "wgpu_fft.bluestein.fused.in_place",
+                    ComputePipelineCacheKey::fused_prime_stage(shader_key.clone().with_in_place()),
+                ),
                 twiddle_buffer,
             })
         } else if fused_bluestein_supported(
@@ -373,6 +377,10 @@ impl BluesteinAxis {
             let pipeline = cached_fused_bluestein_pipeline(device, &pipeline_key, &shader_key);
             BluesteinExecution::Fused(FusedBluesteinExecution {
                 workgroups: lines_u32,
+                in_place: LazyPipeline::new(
+                    "wgpu_fft.bluestein.fused.in_place",
+                    ComputePipelineCacheKey::fused_prime_stage(shader_key.clone().with_in_place()),
+                ),
                 pipeline,
                 bind_group_layout,
                 twiddle_buffer,
@@ -631,7 +639,7 @@ impl BluesteinAxis {
 
         match &self.execution {
             BluesteinExecution::Fused(execution) | BluesteinExecution::Register(execution) => {
-                self.dispatch_fused(device, encoder, input, output, execution)?;
+                self.dispatch_fused(device, encoder, Some(input), output, execution)?;
             }
             BluesteinExecution::MultiPass(execution) => {
                 self.dispatch_pack(device, encoder, input, execution)?;
@@ -654,30 +662,62 @@ impl BluesteinAxis {
         Ok(())
     }
 
+    /// Transforms `buffer` in place: the fused and register kernels load
+    /// the lines of their workgroup before storing them, and the multi-pass
+    /// kernels read the whole input before any writes the output.
+    pub(crate) fn execute_in_place_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        match &self.execution {
+            BluesteinExecution::Fused(execution) | BluesteinExecution::Register(execution) => {
+                self.dispatch_fused(device, encoder, None, buffer, execution)
+            }
+            BluesteinExecution::MultiPass(_) => {
+                self.execute_views(device, encoder, buffer.clone(), buffer)
+            }
+        }
+    }
+
+    /// Runs the fused kernel from `input`, or in place on `output` without
+    /// one.
     fn dispatch_fused(
         &self,
         device: &wgpu::Device,
         encoder: &mut CommandRecorder<'_>,
-        input: BufferView<'_>,
+        input: Option<BufferView<'_>>,
         output: BufferView<'_>,
         execution: &FusedBluesteinExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let element_format = self.precision.element_format();
+        let (pipeline, layout) = match input {
+            Some(_) => (&execution.pipeline, &execution.bind_group_layout),
+            None => {
+                let (pipeline, layout) = execution.in_place.get(device);
+                (pipeline, layout)
+            }
+        };
+        let mut entries = Vec::with_capacity(6);
+        if let Some(input) = input {
+            entries.push(bind_view_entry(&scheduler, 0, input, element_format)?);
+        }
+        entries.extend([
+            bind_view_entry(&scheduler, 1, output, element_format)?,
+            bind_storage_entry(&scheduler, 2, &self.chirp_buffer, element_format)?,
+            bind_storage_entry(&scheduler, 3, &self.bfft_buffer, element_format)?,
+            bind_storage_entry(&scheduler, 4, &execution.twiddle_buffer, element_format)?,
+            bind_uniform_entry(5, &self.lines_params_buffer),
+        ]);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_fft.bluestein.fused.bind_group"),
-            layout: &execution.bind_group_layout,
-            entries: &[
-                bind_view_entry(&scheduler, 0, input, element_format)?,
-                bind_view_entry(&scheduler, 1, output, element_format)?,
-                bind_storage_entry(&scheduler, 2, &self.chirp_buffer, element_format)?,
-                bind_storage_entry(&scheduler, 3, &self.bfft_buffer, element_format)?,
-                bind_storage_entry(&scheduler, 4, &execution.twiddle_buffer, element_format)?,
-                bind_uniform_entry(5, &self.lines_params_buffer),
-            ],
+            layout,
+            entries: &entries,
         });
         let pass = encoder.pass();
-        pass.set_pipeline(&execution.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) =
             split_workgroups(execution.workgroups, max_workgroups_per_dimension(device))?;
@@ -1055,16 +1095,9 @@ fn cached_fused_bluestein_pipeline(
     let pipeline_label = format!("wgpu_fft.bluestein.fused.pipeline.{stable_key}");
     let shader_label = format!("wgpu_fft.bluestein.fused.shader.{stable_key}");
     with_device_pipeline_cache(device, |cache| {
-        cache.get_compute_pipeline(
-            device,
-            key,
-            &pipeline_label,
-            &shader_label,
-            || match &shader_key.registers {
-                Some(registers) => generate_register_bluestein_wgsl(shader_key, registers),
-                None => generate_fused_bluestein_wgsl_for_key(shader_key),
-            },
-        )
+        cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
+            generate_fused_prime_wgsl_for_key(shader_key)
+        })
     })
 }
 

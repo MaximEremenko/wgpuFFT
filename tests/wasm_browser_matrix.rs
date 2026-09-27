@@ -201,6 +201,10 @@ async fn run_c2c_case(
     assert_eq!(plan.route(), expected_route, "{label}: unexpected route");
     let actual = execute_f32(context, &plan, &input, label).await;
     assert_fft_accuracy(&actual, &expected, label);
+
+    assert!(plan.supports_in_place(), "{label}: runs in place");
+    let in_place = execute_in_place_f32(context, &plan, &input, label).await;
+    assert_fft_accuracy(&in_place, &expected, &format!("{label} in place"));
 }
 
 async fn assert_browser_fused_boundary(context: &BrowserDefaultContext) {
@@ -353,12 +357,6 @@ async fn execute_f32(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let readback = context.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("wgpu_fft.browser_matrix.readback"),
-        size: output_bytes,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
 
     let mut encoder = context
         .device
@@ -367,7 +365,58 @@ async fn execute_f32(
         });
     plan.execute_checked(&context.device, &mut encoder, &input_buffer, &output_buffer)
         .unwrap_or_else(|error| panic!("{label}: failed to encode: {error}"));
-    encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, output_bytes);
+    context.queue.submit([encoder.finish()]);
+    read_f32(context, &output_buffer, output_bytes, label).await
+}
+
+/// `plan` run in place on one buffer that holds `input`.
+async fn execute_in_place_f32(
+    context: &BrowserDefaultContext,
+    plan: &FftPlan,
+    input: &[f32],
+    label: &str,
+) -> Vec<f32> {
+    let output_bytes = plan.required_output_buffer_size_bytes();
+    let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.browser_matrix.in_place"),
+        size: plan.required_input_buffer_size_bytes().max(output_bytes),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    context
+        .queue
+        .write_buffer(&buffer, 0, bytemuck::cast_slice(input));
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.browser_matrix.in_place_encoder"),
+        });
+    plan.execute_in_place(&context.device, &mut encoder, &buffer)
+        .unwrap_or_else(|error| panic!("{label}: failed to encode in place: {error}"));
+    context.queue.submit([encoder.finish()]);
+    read_f32(context, &buffer, output_bytes, label).await
+}
+
+async fn read_f32(
+    context: &BrowserDefaultContext,
+    buffer: &wgpu::Buffer,
+    bytes: u64,
+    label: &str,
+) -> Vec<f32> {
+    let readback = context.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_fft.browser_matrix.readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = context
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("wgpu_fft.browser_matrix.readback_encoder"),
+        });
+    encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, bytes);
     context.queue.submit([encoder.finish()]);
 
     let (sender, receiver) = oneshot::channel();

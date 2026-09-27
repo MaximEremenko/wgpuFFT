@@ -61,10 +61,24 @@ drop(recorder); // ends the pass; the encoder records other commands again
 On an RTX 5090 this halves the time of a small forward and inverse pair (a
 64x64 pair takes 8 µs instead of 17 µs).
 
-This crate exposes a native Rust API for out-of-place complex-to-complex `f32`,
-native `f64`, and portable double-float (`df64`) transforms, plus
-real/packed-complex `f32` transforms, over 1D/ND shapes and batches. F32 and
-native-f64 C2C buffers are interleaved complex scalars:
+`execute_in_place` and `record_in_place` transform one buffer, reading the
+input from its start and writing the output over it:
+
+```rust
+plan.execute_in_place(&gpu.device, &mut encoder, &buffer)?;
+```
+
+Most C2C plans run their kernels on the buffer itself, which keeps one
+buffer in the GPU's caches instead of two: on an RTX 5090 a 4096x2048
+FFT+iFFT pair takes 0.165 ms in place instead of 0.248 ms out of place. R2C
+and C2R plans, and a few C2C routes, copy the input into a buffer they keep,
+so `buffer` then needs `COPY_SRC`; `supports_in_place()` reports which plans
+run in place without that copy.
+
+This crate exposes a native Rust API for out-of-place and in-place
+complex-to-complex `f32`, native `f64`, and portable double-float (`df64`)
+transforms, plus real/packed-complex `f32` transforms, over 1D/ND shapes and
+batches. F32 and native-f64 C2C buffers are interleaved complex scalars:
 
 ```text
 [re0, im0, re1, im1, ...]
@@ -231,7 +245,8 @@ pass.
 - Batch count through `FftConfig::with_batch(...)`.
 - Validated per-plan performance tuning through `FftConfig::with_tuning(...)`;
   default tuning preserves the measured planner choices.
-- Out-of-place execution only.
+- Out-of-place and in-place execution (`FftPlan::execute_in_place`,
+  `record_in_place`).
 - Caller-owned `wgpu::Buffer` input and output.
 - `FftPlan::r2c(...)`, `FftPlan::c2r(...)`, `create_r2c_plan(...)`, and
   `create_c2r_plan(...)`.
@@ -308,8 +323,8 @@ pass.
 - R2C requires forward direction; C2R requires inverse direction. Real
   transforms currently use the full-shape axis set under the packed axis-0
   convention. Unsupported real axis subsets return structured diagnostics.
-- In-place execution, `f16`, DCT/DST, public convolution, and nonuniform
-  transforms remain out of scope. Nonuniform FFTs live in
+- `f16`, DCT/DST, public convolution, and nonuniform transforms remain out of
+  scope. Nonuniform FFTs live in
   [wgpuNUFFT](https://github.com/MaximEremenko/wgpuNUFFT).
 - The native test/example device helper requests the selected adapter's active
   limits so planner diagnostics and huge-route scheduling see the real storage

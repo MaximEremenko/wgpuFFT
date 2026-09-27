@@ -290,6 +290,69 @@ pub(crate) struct PipelineCache {
     compute_pipelines: HashMap<ComputePipelineCacheKey, wgpu::ComputePipeline>,
 }
 
+/// WGSL of a fused prime kernel; one running in place reads its lines
+/// from its output buffer.
+pub(crate) fn generate_fused_prime_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
+    let source = match key.kind {
+        FusedPrimeKind::Rader => crate::runtime::rader_axis::generate_fused_rader_wgsl_for_key(key),
+        FusedPrimeKind::Bluestein => match &key.registers {
+            Some(registers) => {
+                crate::runtime::register_fft::generate_register_bluestein_wgsl(key, registers)
+            }
+            None => crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key),
+        },
+        FusedPrimeKind::Direct => {
+            crate::runtime::direct_prime::generate_direct_prime_wgsl_for_key(key)
+        }
+    };
+    if key.in_place {
+        crate::runtime::axis_plan::rebind_in_place(&source, "input", "output")
+    } else {
+        source
+    }
+}
+
+/// A pipeline built on first use from its key's source, such as the in-place
+/// variant of a kernel, which plans that never run in place do not compile.
+pub(crate) struct LazyPipeline {
+    label: &'static str,
+    key: ComputePipelineCacheKey,
+    pipeline: std::sync::OnceLock<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+}
+
+impl LazyPipeline {
+    pub(crate) fn new(label: &'static str, key: ComputePipelineCacheKey) -> Self {
+        Self {
+            label,
+            key,
+            pipeline: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The pipeline and its bind group layout.
+    pub(crate) fn get(
+        &self,
+        device: &wgpu::Device,
+    ) -> &(wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        self.pipeline.get_or_init(|| {
+            let stable_key = self.key.stable_key();
+            with_device_pipeline_cache(device, |cache| {
+                let pipeline = cache.get_compute_pipeline(
+                    device,
+                    &self.key,
+                    &format!("{}.pipeline.{stable_key}", self.label),
+                    &format!("{}.shader.{stable_key}", self.label),
+                    || self.key.shader.fallback_source(),
+                );
+                (
+                    pipeline,
+                    cache.get_bind_group_layout(device, self.key.layout),
+                )
+            })
+        })
+    }
+}
+
 pub(crate) fn with_device_pipeline_cache<R>(
     device: &wgpu::Device,
     f: impl FnOnce(&mut PipelineCache) -> R,
@@ -364,6 +427,10 @@ pub(crate) enum PipelineLayoutCacheKey {
     FusedPrimeInterleavedF32,
     FusedPrimeInterleavedF64,
     FusedPrimeInterleavedDf64,
+    /// A fused prime kernel reading and writing one buffer in place.
+    FusedPrimeInPlaceF32,
+    FusedPrimeInPlaceF64,
+    FusedPrimeInPlaceDf64,
     FourStepUnaryF32,
     RealBinaryF32,
     RaderBridgePostF32,
@@ -418,6 +485,9 @@ impl PipelineLayoutCacheKey {
             Self::FusedPrimeInterleavedF32 => "fused-prime/interleaved-f32",
             Self::FusedPrimeInterleavedF64 => "fused-prime/interleaved-f64",
             Self::FusedPrimeInterleavedDf64 => "fused-prime/interleaved-df64",
+            Self::FusedPrimeInPlaceF32 => "fused-prime/in-place-f32",
+            Self::FusedPrimeInPlaceF64 => "fused-prime/in-place-f64",
+            Self::FusedPrimeInPlaceDf64 => "fused-prime/in-place-df64",
             Self::FourStepUnaryF32 => "four-step/unary-f32",
             Self::RealBinaryF32 => "real/binary-f32",
             Self::RaderBridgePostF32 => "bridge/rader-post-f32",
@@ -650,24 +720,7 @@ impl ShaderCacheKey {
             Self::FusedSmoothStage(key) => {
                 crate::runtime::axis_plan::generate_fused_smooth_stage_wgsl_for_key(key)
             }
-            Self::FusedPrimeStage(key) => match key.kind {
-                FusedPrimeKind::Rader => {
-                    crate::runtime::rader_axis::generate_fused_rader_wgsl_for_key(key)
-                }
-                FusedPrimeKind::Bluestein => match &key.registers {
-                    Some(registers) => {
-                        crate::runtime::register_fft::generate_register_bluestein_wgsl(
-                            key, registers,
-                        )
-                    }
-                    None => {
-                        crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
-                    }
-                },
-                FusedPrimeKind::Direct => {
-                    crate::runtime::direct_prime::generate_direct_prime_wgsl_for_key(key)
-                }
-            },
+            Self::FusedPrimeStage(key) => generate_fused_prime_wgsl_for_key(key),
             Self::FourStepStage(key) => {
                 crate::runtime::four_step::generate_four_step_wgsl_for_key(key)
             }
@@ -800,6 +853,7 @@ impl ShaderCacheKey {
                     || key.ns > key.axis_length
                     || key.ns % key.radix != 0
                     || key.axis_length % key.ns != 0
+                    || (key.in_place && key.ns != key.axis_length)
                 {
                     return snapshot_integrity("invalid Stockham radix/stage geometry");
                 }
@@ -1154,12 +1208,16 @@ pub(crate) struct ComputePipelineCacheKey {
 }
 
 impl ComputePipelineCacheKey {
-    /// Whether this axis-plan kernel may also run in place: a fused kernel
-    /// that stores each line where it read it.
+    /// Whether this axis-plan kernel may also run in place: one that stores
+    /// each line where it read it.
     pub(crate) fn supports_in_place(&self) -> bool {
         match &self.shader {
+            // The last pass: each butterfly stores the elements it loaded.
+            ShaderCacheKey::StockhamStage(key) => key.ns == key.axis_length,
             ShaderCacheKey::FusedPow2Stage(key) => key.split_pass.is_none(),
             ShaderCacheKey::FusedSmoothStage(key) => key.split_pass.is_none(),
+            // A workgroup loads its whole volume before storing any of it.
+            ShaderCacheKey::SmallVolume(_) => true,
             _ => false,
         }
     }
@@ -1167,12 +1225,14 @@ impl ComputePipelineCacheKey {
     /// The in-place variant of a kernel for which [`Self::supports_in_place`].
     pub(crate) fn in_place(&self) -> Self {
         match &self.shader {
+            ShaderCacheKey::StockhamStage(key) => Self::stockham_stage(key.clone().with_in_place()),
             ShaderCacheKey::FusedPow2Stage(key) => {
                 Self::fused_pow2_stage(key.clone().with_in_place())
             }
             ShaderCacheKey::FusedSmoothStage(key) => {
                 Self::fused_smooth_stage(key.clone().with_in_place())
             }
+            ShaderCacheKey::SmallVolume(key) => Self::small_volume(key.clone().with_in_place()),
             _ => unreachable!("only fused axis kernels run in place"),
         }
     }
@@ -1197,7 +1257,7 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn stockham_stage(shader: StockhamStageKey) -> Self {
-        let layout = axis_plan_layout_for_precision(shader.precision);
+        let layout = axis_plan_layout(shader.precision, shader.in_place);
         Self {
             layout,
             entry_point: String::from("main"),
@@ -1224,10 +1284,13 @@ impl ComputePipelineCacheKey {
     }
 
     pub(crate) fn fused_prime_stage(shader: FusedPrimeStageKey) -> Self {
-        let layout = match shader.precision {
-            AxisPrecision::F32 => PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
-            AxisPrecision::F64 => PipelineLayoutCacheKey::FusedPrimeInterleavedF64,
-            AxisPrecision::Df64 => PipelineLayoutCacheKey::FusedPrimeInterleavedDf64,
+        let layout = match (shader.precision, shader.in_place) {
+            (AxisPrecision::F32, false) => PipelineLayoutCacheKey::FusedPrimeInterleavedF32,
+            (AxisPrecision::F64, false) => PipelineLayoutCacheKey::FusedPrimeInterleavedF64,
+            (AxisPrecision::Df64, false) => PipelineLayoutCacheKey::FusedPrimeInterleavedDf64,
+            (AxisPrecision::F32, true) => PipelineLayoutCacheKey::FusedPrimeInPlaceF32,
+            (AxisPrecision::F64, true) => PipelineLayoutCacheKey::FusedPrimeInPlaceF64,
+            (AxisPrecision::Df64, true) => PipelineLayoutCacheKey::FusedPrimeInPlaceDf64,
         };
         Self {
             layout,
@@ -1262,7 +1325,7 @@ impl ComputePipelineCacheKey {
 
     pub(crate) fn small_volume(shader: SmallVolumeKey) -> Self {
         Self {
-            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+            layout: axis_plan_layout(AxisPrecision::F32, shader.in_place),
             entry_point: String::from("main"),
             shader: ShaderCacheKey::SmallVolume(shader),
         }
@@ -1995,6 +2058,9 @@ pub(crate) struct StockhamStageKey {
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
     scale_bits: u64,
+    /// Reads and writes one buffer in place (see [`Self::with_in_place`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) in_place: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2164,6 +2230,9 @@ pub(crate) struct FusedPrimeStageKey {
     /// and convolves one after another; 1 otherwise.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) serial_lines: u32,
+    /// Reads and writes one buffer in place (see [`Self::with_in_place`]).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) in_place: bool,
 }
 
 /// How one axis of a small volume is transformed (see
@@ -2191,6 +2260,9 @@ pub(crate) struct SmallVolumeKey {
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
     scale_bits: u64,
+    /// Reads and writes one buffer in place.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) in_place: bool,
 }
 
 impl SmallVolumeKey {
@@ -2212,7 +2284,14 @@ impl SmallVolumeKey {
             workgroup_size,
             apply_scale,
             scale_bits: axis_scale_bits(AxisPrecision::F32, apply_scale, scale_factor),
+            in_place: false,
         }
+    }
+
+    /// The kernel reading and writing one buffer in place.
+    pub(crate) fn with_in_place(mut self) -> Self {
+        self.in_place = true;
+        self
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {
@@ -2257,13 +2336,14 @@ impl SmallVolumeKey {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "shader:v1:small-volume:precision=f32:dims={}:axes={axes}:twiddles={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-f32-v1",
+            "shader:v1:small-volume:precision=f32:dims={}:axes={axes}:twiddles={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-f32-v1{}",
             dims_key(&self.dims),
             self.twiddle_length,
             direction_key(self.direction),
             self.workgroup_size,
             self.apply_scale,
             axis_scale_bits_key(AxisPrecision::F32, self.scale_bits),
+            if self.in_place { ":in_place" } else { "" },
         )
     }
 }
@@ -2312,7 +2392,15 @@ impl FusedPrimeStageKey {
             pairs_per_invocation: 1,
             padded_indices: false,
             serial_lines: 1,
+            in_place: false,
         }
+    }
+
+    /// The kernel reading and writing one buffer in place: every fused
+    /// prime kernel loads the lines of its workgroup before storing them.
+    pub(crate) fn with_in_place(mut self) -> Self {
+        self.in_place = true;
+        self
     }
 
     /// Loads and stores `lines` strided lines together and convolves them one
@@ -2391,6 +2479,9 @@ impl FusedPrimeStageKey {
         }
         if let Some(registers) = &self.registers {
             key.push_str(&registers.stable_key_suffix());
+        }
+        if self.in_place {
+            key.push_str(":in_place");
         }
         key
     }
@@ -2767,7 +2858,16 @@ impl StockhamStageKey {
             workgroup_size,
             apply_scale,
             scale_bits,
+            in_place: false,
         }
+    }
+
+    /// The kernel reading and writing one buffer in place, for the axis's
+    /// last pass, whose butterflies store the elements they load.
+    pub(crate) fn with_in_place(mut self) -> Self {
+        debug_assert_eq!(self.ns, self.axis_length);
+        self.in_place = true;
+        self
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {
@@ -2776,7 +2876,7 @@ impl StockhamStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v3:stockham:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            "shader:v3:stockham:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1{}",
             self.precision.as_str(),
             self.rank,
             self.axis,
@@ -2790,6 +2890,7 @@ impl StockhamStageKey {
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
             self.precision.as_str(),
+            if self.in_place { ":in_place" } else { "" },
         )
     }
 }
@@ -2902,6 +3003,15 @@ fn bind_group_layout_entries(key: PipelineLayoutCacheKey) -> Vec<wgpu::BindGroup
         | PipelineLayoutCacheKey::FusedPrimeInterleavedF64
         | PipelineLayoutCacheKey::FusedPrimeInterleavedDf64 => vec![
             storage_entry(0, true),
+            storage_entry(1, false),
+            storage_entry(2, true),
+            storage_entry(3, true),
+            storage_entry(4, true),
+            uniform_entry(5),
+        ],
+        PipelineLayoutCacheKey::FusedPrimeInPlaceF32
+        | PipelineLayoutCacheKey::FusedPrimeInPlaceF64
+        | PipelineLayoutCacheKey::FusedPrimeInPlaceDf64 => vec![
             storage_entry(1, false),
             storage_entry(2, true),
             storage_entry(3, true),

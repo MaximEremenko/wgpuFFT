@@ -31,6 +31,8 @@ pub enum FftTransformKind {
 /// Public plan handle for supported FFT transforms.
 pub struct FftPlan {
     inner: FftPlanInner,
+    /// The input copy of in-place executions that need one.
+    in_place_copy: std::sync::OnceLock<wgpu::Buffer>,
 }
 
 /// Records several FFT executions into one shared compute pass.
@@ -196,9 +198,9 @@ async fn finish_checked_c2c_plan_creation(
 
 impl FftPlan {
     pub fn c2c(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::C2c(C2cPlan::new(device, queue, config)?),
-        })
+        Ok(Self::from_inner(FftPlanInner::C2c(C2cPlan::new(
+            device, queue, config,
+        )?)))
     }
 
     pub fn c2c_with_diagnostics(
@@ -244,11 +246,9 @@ impl FftPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::C2c(C2cPlan::new_with_large_policy_limits_for_testing(
-                device, queue, config, limits,
-            )?),
-        })
+        Ok(Self::from_inner(FftPlanInner::C2c(
+            C2cPlan::new_with_large_policy_limits_for_testing(device, queue, config, limits)?,
+        )))
     }
 
     #[doc(hidden)]
@@ -259,17 +259,15 @@ impl FftPlan {
         limits: LargePolicyLimits,
         burst_depth: usize,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::C2c(
-                C2cPlan::new_with_large_policy_limits_and_burst_depth_for_testing(
-                    device,
-                    queue,
-                    config,
-                    limits,
-                    burst_depth,
-                )?,
-            ),
-        })
+        Ok(Self::from_inner(FftPlanInner::C2c(
+            C2cPlan::new_with_large_policy_limits_and_burst_depth_for_testing(
+                device,
+                queue,
+                config,
+                limits,
+                burst_depth,
+            )?,
+        )))
     }
 
     #[doc(hidden)]
@@ -306,9 +304,9 @@ impl FftPlan {
     }
 
     pub fn r2c(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::R2c(R2cPlan::new(device, queue, config)?),
-        })
+        Ok(Self::from_inner(FftPlanInner::R2c(R2cPlan::new(
+            device, queue, config,
+        )?)))
     }
 
     pub fn r2c_with_diagnostics(
@@ -328,17 +326,15 @@ impl FftPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::R2c(R2cPlan::new_with_large_policy_limits_for_testing(
-                device, queue, config, limits,
-            )?),
-        })
+        Ok(Self::from_inner(FftPlanInner::R2c(
+            R2cPlan::new_with_large_policy_limits_for_testing(device, queue, config, limits)?,
+        )))
     }
 
     pub fn c2r(device: &wgpu::Device, queue: &wgpu::Queue, config: FftConfig) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::C2r(C2rPlan::new(device, queue, config)?),
-        })
+        Ok(Self::from_inner(FftPlanInner::C2r(C2rPlan::new(
+            device, queue, config,
+        )?)))
     }
 
     pub fn c2r_with_diagnostics(
@@ -358,11 +354,16 @@ impl FftPlan {
         config: FftConfig,
         limits: LargePolicyLimits,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: FftPlanInner::C2r(C2rPlan::new_with_large_policy_limits_for_testing(
-                device, queue, config, limits,
-            )?),
-        })
+        Ok(Self::from_inner(FftPlanInner::C2r(
+            C2rPlan::new_with_large_policy_limits_for_testing(device, queue, config, limits)?,
+        )))
+    }
+
+    fn from_inner(inner: FftPlanInner) -> Self {
+        Self {
+            inner,
+            in_place_copy: std::sync::OnceLock::new(),
+        }
     }
 
     pub fn kind(&self) -> FftTransformKind {
@@ -781,6 +782,79 @@ impl FftPlan {
                     error,
                 )
             })
+    }
+
+    /// Whether [`Self::execute_in_place`] runs the plan's kernels on the
+    /// buffer itself, without copying the input first. Most C2C plans do:
+    /// each kernel stores the lines it loaded, or passes them through the
+    /// plan's workspace, and one buffer instead of two stays in the GPU's
+    /// caches. R2C and C2R plans, and a few C2C routes (direct DFTs, some
+    /// multi-pass Stockham axes, and transforms too large for one dispatch
+    /// per stage), copy the input into a buffer they keep for it.
+    pub fn supports_in_place(&self) -> bool {
+        match &self.inner {
+            FftPlanInner::C2c(plan) => plan.supports_in_place(),
+            FftPlanInner::R2c(_) | FftPlanInner::C2r(_) => false,
+        }
+    }
+
+    /// Transforms `buffer` in place: reads the input from its start and
+    /// writes the output over it. `buffer` must hold both the input and the
+    /// output. Plans that do not [`Self::supports_in_place`] copy the input
+    /// into a buffer they create on first use and keep, so `buffer` then
+    /// needs `COPY_SRC` usage.
+    pub fn execute_in_place(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        buffer: &wgpu::Buffer,
+    ) -> Result<()> {
+        let mut recorder = FftRecorder::new(encoder);
+        self.record_in_place(device, &mut recorder, buffer)
+    }
+
+    /// [`Self::execute_in_place`] recorded into `recorder`'s shared compute
+    /// pass.
+    pub fn record_in_place(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut FftRecorder<'_>,
+        buffer: &wgpu::Buffer,
+    ) -> Result<()> {
+        let view = BufferView::whole(buffer);
+        let input_bytes = self.required_input_buffer_size_bytes();
+        view.validate_min_size(input_bytes.max(self.required_output_buffer_size_bytes()))?;
+        if let FftPlanInner::C2c(plan) = &self.inner {
+            if plan.supports_in_place() {
+                return plan.execute_in_place_recorded(device, &mut recorder.inner, view);
+            }
+        }
+        if !buffer.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+            return Err(FftError::BufferViewMissingUsage { usage: "COPY_SRC" });
+        }
+        let input_copy = self.in_place_copy.get_or_init(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("wgpu_fft.in_place.input_copy"),
+                size: input_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let scheduler = WindowScheduler::for_device(device);
+        StageExecutor::new(&scheduler).copy_view_range_to_buffer(
+            &mut recorder.inner,
+            &view,
+            0,
+            input_copy,
+            0,
+            input_bytes,
+        )?;
+        self.record_views(
+            device,
+            recorder,
+            BufferView::whole(input_copy),
+            BufferView::whole(buffer),
+        )
     }
 
     /// [`Self::execute`] recorded into `recorder`'s shared compute pass.

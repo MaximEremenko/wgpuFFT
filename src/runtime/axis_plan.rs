@@ -1063,12 +1063,14 @@ impl AxisPlan {
             total_complex as u64 * config.precision.complex_size_bytes();
         // Fused kernels store each line where they read it, so after the
         // first stage they can transform the output in place: the working
-        // set halves and no workspace is needed.
+        // set halves and no workspace is needed. Stockham passes run in place
+        // only when the plan transforms one buffer, so plans with Stockham
+        // stages keep their workspace.
         let in_place = stages.len() > 1
-            && stages
-                .iter()
-                .skip(1)
-                .all(|stage| stage.pipeline_key.supports_in_place());
+            && stages.iter().skip(1).all(|stage| {
+                !matches!(stage.kind, AxisStageKind::Stockham { .. })
+                    && stage.pipeline_key.supports_in_place()
+            });
         let in_place_bind_group_layout = if in_place {
             for stage in stages.iter_mut().skip(1) {
                 let pipeline_key = stage.pipeline_key.in_place();
@@ -1297,6 +1299,91 @@ impl AxisPlan {
                     next_stage_destination(src_slot)?
                 };
             }
+        }
+        Ok(())
+    }
+
+    /// Whether the first stage writes the workspace rather than the output,
+    /// so the plan may read its input from its output buffer: an even number
+    /// of stages ping-ponging through the workspace.
+    pub(crate) fn first_stage_writes_workspace(&self) -> bool {
+        self.in_place_bind_group_layout.is_none() && self.stages.len().is_multiple_of(2)
+    }
+
+    /// Whether every stage stores each line where it read it, so the whole
+    /// plan can transform one buffer in place.
+    pub(crate) fn supports_in_place(&self) -> bool {
+        self.config.layout == AxisLayout::Interleaved
+            && self
+                .stages
+                .iter()
+                .all(|stage| stage.pipeline_key.supports_in_place())
+    }
+
+    /// Transforms `buffer` in place; needs [`Self::supports_in_place`].
+    pub(crate) fn execute_in_place_views(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        debug_assert!(self.supports_in_place());
+        let buffer = buffer.prefix(self.required_buffer_size_bytes)?;
+        let scheduler = WindowScheduler::for_device(device);
+        let max_workgroups_per_dimension = max_workgroups_per_dimension(device);
+        let element_format = self.config.precision.element_format();
+        let layout = with_device_pipeline_cache(device, |cache| {
+            cache.get_bind_group_layout(device, axis_plan_layout(self.config.precision, true))
+        });
+        for (stage_index, stage) in self.stages.iter().enumerate() {
+            // Stages after the first of an in-place plan already run in place.
+            let pipeline = if stage_index > 0 && self.in_place_bind_group_layout.is_some() {
+                stage.pipeline.clone()
+            } else {
+                let pipeline_key = stage.pipeline_key.in_place();
+                let label = format!(
+                    "wgpu_fft.axis_plan.in_place.axis{}.{}",
+                    stage.axis,
+                    stage.kind.detail()
+                );
+                with_device_pipeline_cache(device, |cache| {
+                    cache.get_compute_pipeline(
+                        device,
+                        &pipeline_key,
+                        &format!("{label}.pipeline"),
+                        &format!("{label}.shader"),
+                        || fused_axis_stage_wgsl(&pipeline_key),
+                    )
+                })
+            };
+            let buffer_resource = scheduler.storage_binding_resource(&buffer, element_format)?;
+            let twiddle_lut = &self.twiddle_luts[stage.twiddle_lut_index];
+            let twiddle_view = BufferView::whole(twiddle_lut.buffer.as_ref());
+            let twiddle_resource =
+                scheduler.storage_binding_resource(&twiddle_view, element_format)?;
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wgpu_fft.axis_plan.in_place.bind_group"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buffer_resource,
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: twiddle_resource,
+                    },
+                ],
+            });
+            let pass = encoder.pass();
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let (x, y, z) = split_workgroups(stage.workgroups_x, max_workgroups_per_dimension)?;
+            pass.dispatch_workgroups(x, y, z);
         }
         Ok(())
     }
@@ -1907,24 +1994,48 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
 /// WGSL of a fused axis kernel from its pipeline key.
 fn fused_axis_stage_wgsl(key: &ComputePipelineCacheKey) -> String {
     match &key.shader {
+        ShaderCacheKey::StockhamStage(shader) => generate_stockham_radix_stage_wgsl_for_key(shader),
         ShaderCacheKey::FusedPow2Stage(shader) => generate_fused_pow2_stage_wgsl_for_key(shader),
         ShaderCacheKey::FusedSmoothStage(shader) => {
             generate_fused_smooth_stage_wgsl_for_key(shader)
+        }
+        ShaderCacheKey::SmallVolume(shader) => {
+            crate::runtime::small_volume::generate_small_volume_wgsl_for_key(shader)
         }
         _ => unreachable!("only fused axis kernels run in place"),
     }
 }
 
-/// Rebinds an out-of-place axis kernel to read its lines from `dst`: the
-/// `src` binding goes away and every `src` load reads `dst`.
+/// Rebinds an out-of-place axis kernel to read its lines from `dst` (see
+/// [`rebind_in_place`]).
 fn in_place_wgsl(source: &str) -> String {
+    rebind_in_place(source, "src", "dst")
+}
+
+/// Rebinds an out-of-place kernel to read its input from its output buffer:
+/// the `input` binding goes away and every `input` load reads `output`.
+pub(crate) fn rebind_in_place(source: &str, input: &str, output: &str) -> String {
+    let declaration = format!("@group(0) @binding(0) var<storage, read> {input}:");
     let source = source
         .lines()
-        .filter(|line| !line.starts_with("@group(0) @binding(0) var<storage, read> src:"))
+        .filter(|line| !line.starts_with(&declaration))
         .collect::<Vec<_>>()
         .join("\n");
-    debug_assert!(!source.contains("var<storage, read> src"));
-    source.replace("src[", "dst[") + "\n"
+    debug_assert!(!source.contains(&format!("var<storage, read> {input}:")));
+    let load = format!("{input}[");
+    let mut rebound = String::with_capacity(source.len() + 1);
+    let mut rest = source.as_str();
+    while let Some(position) = rest.find(&load) {
+        rebound.push_str(&rest[..position]);
+        // Whole identifiers only.
+        let whole = !rebound.ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        rebound.push_str(if whole { output } else { input });
+        rebound.push('[');
+        rest = &rest[position + load.len()..];
+    }
+    rebound.push_str(rest);
+    rebound.push('\n');
+    rebound
 }
 
 /// Splits an axis too long for one fused workgroup into `n1 * n2`, where each
@@ -3384,7 +3495,7 @@ fn main({entry_params}) {{
 }
 
 pub(crate) fn generate_stockham_radix_stage_wgsl_for_key(key: &StockhamStageKey) -> String {
-    generate_stockham_radix_stage_wgsl(&StockhamStageWgslConfig {
+    let source = generate_stockham_radix_stage_wgsl(&StockhamStageWgslConfig {
         rank: key.rank,
         axis: key.axis,
         dims: &key.dims,
@@ -3397,7 +3508,12 @@ pub(crate) fn generate_stockham_radix_stage_wgsl_for_key(key: &StockhamStageKey)
         apply_scale: key.apply_scale,
         scale_factor: key.scale_factor(),
         precision: key.precision,
-    })
+    });
+    if key.in_place {
+        in_place_wgsl(&source)
+    } else {
+        source
+    }
 }
 
 pub(crate) fn complex_wgsl() -> &'static str {

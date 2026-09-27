@@ -15,13 +15,14 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, FftPrecision};
 use crate::error::Result;
 use crate::runtime::axis_plan::{
-    complex_wgsl, fused_smooth_factors, generate_fused_smooth_butterfly_math_wgsl,
+    complex_wgsl, fused_smooth_factors, generate_fused_smooth_butterfly_math_wgsl, rebind_in_place,
     scaled_complex_expr, AxisPrecision,
 };
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::pipeline_cache::{
-    with_device_pipeline_cache, ComputePipelineCacheKey, SmallVolumeAxis, SmallVolumeKey,
+    with_device_pipeline_cache, ComputePipelineCacheKey, LazyPipeline, SmallVolumeAxis,
+    SmallVolumeKey,
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
@@ -55,6 +56,7 @@ struct SmallVolumeParams {
 pub(crate) struct SmallVolumePlan {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    in_place: LazyPipeline,
     params_buffer: wgpu::Buffer,
     twiddle_buffer: wgpu::Buffer,
     volumes: u32,
@@ -111,10 +113,53 @@ impl SmallVolumePlan {
         Ok(Some(Self {
             pipeline,
             bind_group_layout,
+            in_place: LazyPipeline::new(
+                "wgpu_fft.small_volume.in_place",
+                ComputePipelineCacheKey::small_volume(key.with_in_place()),
+            ),
             params_buffer,
             twiddle_buffer,
             volumes,
         }))
+    }
+
+    /// Transforms `buffer` in place.
+    pub(crate) fn execute_in_place(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        buffer: BufferView<'_>,
+    ) -> Result<()> {
+        let (pipeline, layout) = self.in_place.get(device);
+        let scheduler = WindowScheduler::for_device(device);
+        let element_format = AxisPrecision::F32.element_format();
+        let buffer_resource = scheduler.storage_binding_resource(&buffer, element_format)?;
+        let twiddle_view = BufferView::whole(&self.twiddle_buffer);
+        let twiddle_resource = scheduler.storage_binding_resource(&twiddle_view, element_format)?;
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_fft.small_volume.in_place.bind_group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buffer_resource,
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: twiddle_resource,
+                },
+            ],
+        });
+        let pass = encoder.pass();
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let (x, y, z) = split_workgroups(self.volumes, max_workgroups_per_dimension(device))?;
+        pass.dispatch_workgroups(x, y, z);
+        Ok(())
     }
 
     pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
@@ -393,7 +438,7 @@ pub(crate) fn generate_small_volume_wgsl_for_key(key: &SmallVolumeKey) -> String
     }
     let stored = scaled_complex_expr("vol[i]", scale_factor, precision);
 
-    format!(
+    let source = format!(
         r#"struct Params {{
   total: u32,
   baseIndex: u32,
@@ -429,7 +474,12 @@ fn main({entry_params}) {{
         complex = complex_wgsl(),
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
-    )
+    );
+    if key.in_place {
+        rebind_in_place(&source, "input", "output")
+    } else {
+        source
+    }
 }
 
 /// Statements binding the line and unit (or task) of work item `w_{slot}` on

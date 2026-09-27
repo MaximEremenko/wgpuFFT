@@ -929,8 +929,9 @@ pub(crate) fn register_bluestein_plan(
 /// Most strided lines a register Bluestein workgroup interleaves.
 const MAX_REGISTER_BLUESTEIN_LINES: usize = 8;
 /// Workgroups a strided register Bluestein axis keeps, so its lines still
-/// spread over the GPU.
-const MIN_REGISTER_BLUESTEIN_WORKGROUPS: usize = 256;
+/// spread over the GPU: with 64 rather than 256, 179x179, 283x283, and
+/// 419x419 ran 9% to 16% faster on an RTX 5090, and with 32 slower again.
+const MIN_REGISTER_BLUESTEIN_WORKGROUPS: usize = 64;
 
 /// Lines per workgroup, workgroup size, and schedule of a register Bluestein
 /// kernel of `m` points on a strided axis: neighbouring lines interleave

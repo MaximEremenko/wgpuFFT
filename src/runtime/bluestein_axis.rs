@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
-use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
+use crate::math::{fft_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
     AxisStageKind, AxisTwiddleLutPool, LongAxisRoute,
@@ -797,8 +797,7 @@ pub(crate) fn bluestein_bfft_f64(
         values[m - i] = value;
     }
 
-    let config = crate::config::FftConfig::new(m).with_normalization(Normalization::None);
-    reference_c2c_nd_f64(&values, &config)
+    Ok(fft_f64(&values, FftDirection::Forward))
 }
 
 fn bluestein_phase(n: usize, i: usize, sign: f64) -> Complex64 {
@@ -1756,11 +1755,7 @@ mod tests {
                 kernel[i] = value;
                 kernel[m - i] = value;
             }
-            let expected = reference_c2c_nd_f64(
-                &kernel,
-                &crate::config::FftConfig::new(m).with_normalization(Normalization::None),
-            )
-            .unwrap();
+            let expected = fft_f64(&kernel, FftDirection::Forward);
 
             for (actual, expected) in actual.iter().zip(expected) {
                 assert_eq!(actual.re.to_bits(), (expected.re as f32).to_bits());

@@ -2274,7 +2274,7 @@ fn generate_in_place_smooth_fft_stage_wgsl(
             n_div_ns,
             direction,
             slot,
-            scratch_name,
+            &|index| format!("{scratch_name}[{index}]"),
             twiddle_fn_name,
             precision,
         );
@@ -2313,6 +2313,66 @@ fn generate_in_place_smooth_fft_stage_wgsl(
     )
 }
 
+/// First radix stage of a multi-line fused smooth kernel, reading its
+/// inputs straight from global memory instead of from a copy of the lines in
+/// workgroup memory. It needs no twiddles, and nothing in workgroup memory is
+/// read before it writes there, so it writes its outputs as soon as they are
+/// ready and ends with one barrier. Strided (`element_major`) lines assign
+/// neighbouring invocations to neighbouring lines, so their reads coalesce.
+fn generate_fused_smooth_first_stage_multiline_wgsl(
+    axis_length: usize,
+    radix: usize,
+    direction: FftDirection,
+    workgroup_size: u32,
+    lines: usize,
+    element_major: bool,
+    precision: AxisPrecision,
+) -> String {
+    debug_assert_eq!(axis_length % radix, 0);
+    let unit_count = axis_length / radix;
+    let slot_count = (unit_count * lines).div_ceil(workgroup_size as usize);
+    let mut slots = String::new();
+    for slot in 0..slot_count {
+        let split = if element_major {
+            format!(
+                "    let lineSlot_{slot}: u32 = slotUnit_{slot} % LINES;\n    let unit_{slot}: u32 = slotUnit_{slot} / LINES;\n"
+            )
+        } else {
+            format!(
+                "    let lineSlot_{slot}: u32 = slotUnit_{slot} / {unit_count}u;\n    let unit_{slot}: u32 = slotUnit_{slot} - lineSlot_{slot} * {unit_count}u;\n"
+            )
+        };
+        let butterfly = generate_fused_smooth_butterfly_math_wgsl(
+            radix,
+            1,
+            unit_count,
+            unit_count,
+            direction,
+            slot,
+            &|index| format!("src[first_{slot} + ({index}) * STRIDE]"),
+            "twiddle",
+            precision,
+        );
+        let mut outputs = String::new();
+        let mut writes = String::new();
+        for output in 0..radix {
+            outputs.push_str(&format!("      var stageOut_{slot}_{output}: vec2<f32>;\n"));
+            writes.push_str(&format!(
+                "      scratch[lineSlot_{slot} * LINE_STRIDE + unit_{slot} * {radix}u + {output}u] = stageOut_{slot}_{output};\n"
+            ));
+        }
+        slots.push_str(&format!(
+            "    let slotUnit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;\n{split}    if (lineSlot_{slot} < lineCount && unit_{slot} < {unit_count}u) {{\n      let first_{slot}: u32 = line_base(lineStart + lineSlot_{slot}) - params.elementBase;\n      let base_{slot}: u32 = unit_{slot};\n{outputs}{butterfly}{writes}    }}\n"
+        ));
+    }
+    specialize_complex_wgsl(
+        format!(
+            "  {{ // fused smooth radix-{radix} butterflies from global memory, {lines} lines\n{slots}    workgroupBarrier();\n  }}\n"
+        ),
+        precision,
+    )
+}
+
 fn generate_fused_smooth_final_stage_wgsl(
     axis_length: usize,
     stride_complex: usize,
@@ -2345,7 +2405,15 @@ fn generate_fused_smooth_final_stage_wgsl(
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
-            radix, ns_div_r, n_div_r, n_div_ns, direction, slot, "scratch", "twiddle", precision,
+            radix,
+            ns_div_r,
+            n_div_r,
+            n_div_ns,
+            direction,
+            slot,
+            &|index| format!("scratch[{index}]"),
+            "twiddle",
+            precision,
         );
         let mut stores = String::new();
         for output in 0..radix {
@@ -2386,24 +2454,25 @@ fn generate_fused_smooth_butterfly_math_wgsl(
     n_div_ns: usize,
     direction: FftDirection,
     slot: usize,
-    scratch_name: &str,
+    load: &dyn Fn(&str) -> String,
     twiddle_fn_name: &str,
     precision: AxisPrecision,
 ) -> String {
     // Workgroup-scratch form of the same unit-centric Stockham factorization
-    // used by the multi-pass generator.
+    // used by the multi-pass generator; `load` renders the read of a line
+    // position.
     let mut shader = String::new();
     shader.push_str(&format!(
-        "      let x_{slot}_0: vec2<f32> = {scratch_name}[base_{slot}];\n"
+        "      let x_{slot}_0: vec2<f32> = {};\n",
+        load(&format!("base_{slot}"))
     ));
     for q in 1..radix {
+        let input = load(&format!("base_{slot} + {q}u * {n_div_r}u"));
         if ns_div_r == 1 {
-            shader.push_str(&format!(
-                "      let x_{slot}_{q}: vec2<f32> = {scratch_name}[base_{slot} + {q}u * {n_div_r}u];\n"
-            ));
+            shader.push_str(&format!("      let x_{slot}_{q}: vec2<f32> = {input};\n"));
         } else {
             shader.push_str(&format!(
-                "      let x_{slot}_{q}: vec2<f32> = c_mul({twiddle_fn_name}(j_{slot} * {}u), {scratch_name}[base_{slot} + {q}u * {n_div_r}u]);\n",
+                "      let x_{slot}_{q}: vec2<f32> = c_mul({twiddle_fn_name}(j_{slot} * {}u), {input});\n",
                 q * n_div_ns,
             ));
         }
@@ -2659,17 +2728,29 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
     let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
     let mut ns = 1usize;
     let mut radix_stages = String::new();
-    for &radix in config.factors {
+    for (stage_index, &radix) in config.factors.iter().enumerate() {
         ns *= radix;
-        radix_stages.push_str(&generate_in_place_smooth_fft_stage_multiline_wgsl(
-            config.axis_length,
-            radix,
-            ns,
-            config.direction,
-            config.workgroup_size,
-            lines,
-            config.precision,
-        ));
+        if stage_index == 0 {
+            radix_stages.push_str(&generate_fused_smooth_first_stage_multiline_wgsl(
+                config.axis_length,
+                radix,
+                config.direction,
+                config.workgroup_size,
+                lines,
+                config.stride_complex != 1,
+                config.precision,
+            ));
+        } else {
+            radix_stages.push_str(&generate_in_place_smooth_fft_stage_multiline_wgsl(
+                config.axis_length,
+                radix,
+                ns,
+                config.direction,
+                config.workgroup_size,
+                lines,
+                config.precision,
+            ));
+        }
     }
     debug_assert_eq!(ns, config.axis_length);
     let store = multiline_store(split, config.stride_complex);
@@ -2722,7 +2803,6 @@ fn main({entry_params}) {{
   let lineCount: u32 = min(LINES, activeLines - groupLine);
   let lineStart: u32 = params.lineOffset + firstLine + groupLine;
 
-{load_block}  workgroupBarrier();
 
 {radix_stages}
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
@@ -2749,13 +2829,6 @@ fn main({entry_params}) {{
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             radix_stages = radix_stages,
             maybe_scale = maybe_scale,
-            load_block = multiline_load_wgsl(
-                config.axis_length,
-                lines,
-                config.workgroup_size as usize,
-                config.stride_complex != 1,
-                "P",
-            ),
             store_split = store_split,
             stride_out = store.stride_out,
             line_base_out_fn = store.line_base_out_fn,
@@ -2804,7 +2877,15 @@ fn generate_in_place_smooth_fft_stage_multiline_wgsl(
             ));
         }
         let butterfly = generate_fused_smooth_butterfly_math_wgsl(
-            radix, ns_div_r, n_div_r, n_div_ns, direction, slot, "scratch", "twiddle", precision,
+            radix,
+            ns_div_r,
+            n_div_r,
+            n_div_ns,
+            direction,
+            slot,
+            &|index| format!("scratch[{index}]"),
+            "twiddle",
+            precision,
         );
         computes.push_str(&format!(
             r#"    let slotUnit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
@@ -4151,6 +4232,13 @@ mod tests {
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 784>;"));
         assert!(wgsl.contains("let lineSlot: u32 = e % LINES;"));
         assert!(wgsl.contains("if (lineSlot_0 < lineCount) {"));
+        // The first stage reads the strided lines from global memory,
+        // neighbouring invocations on neighbouring lines.
+        assert!(wgsl.contains("let lineSlot_0: u32 = slotUnit_0 % LINES;"));
+        assert!(wgsl.contains(
+            "let first_0: u32 = line_base(lineStart + lineSlot_0) - params.elementBase;"
+        ));
+        assert!(!wgsl.contains("= src[srcIdx]"));
         // The last stage writes workgroup memory; only the store pass writes dst.
         assert_eq!(wgsl.matches("dst[").count(), 1);
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");

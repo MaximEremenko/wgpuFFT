@@ -90,6 +90,29 @@ pipelines. Typed in-memory cache snapshots can be exported and imported through
 entries that exceed the target device's fused-kernel compute limits or require
 an unavailable shader feature are skipped.
 
+## CPU backend
+
+The default `cpu` feature adds `CpuFftPlan`, which runs the same transforms on
+host memory for machines without a usable GPU adapter. It takes the same
+`FftConfig` and uses the same layouts as the GPU plans: interleaved complex
+values, `[re_hi, re_lo, im_hi, im_lo]` for `df64`, and the packed real
+spectrum. It is built on `rustfft` and `realfft` (AVX, SSE, or NEON where the
+CPU supports them) and splits large transforms across CPU threads. C2C plans
+support every precision, with `df64` computed in native `f64`; real transforms
+support `f32` and `f64`.
+
+```rust
+use wgpu_fft::{CpuFftPlan, FftConfig};
+
+let plan = CpuFftPlan::c2c(FftConfig::new(1024))?;
+let input = vec![0.0f32; plan.required_input_len()];
+let mut output = vec![0.0f32; plan.required_output_len()];
+plan.execute(&input, &mut output)?;
+```
+
+`F64` plans execute with `execute_f64` on `f64` slices. Build with
+`default-features = false` to leave the CPU backend out of GPU-only builds.
+
 ## Precision
 
 - `FftPrecision::F32` uses native `f32` storage and arithmetic. It is the

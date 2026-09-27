@@ -67,12 +67,13 @@ async fn run_split_cases() {
                 .with_normalization(Normalization::None),
             1,
         ),
+        // A strided long axis interleaves two lines in registers.
         (
             "3x8192-axis1",
             FftConfig::new_nd([3, 8192])
                 .with_axes([1])
                 .with_normalization(Normalization::None),
-            2,
+            1,
         ),
         (
             "3x10000x2-axis1",
@@ -122,6 +123,46 @@ async fn run_split_cases() {
         assert!(
             max_relative < 2.0e-6 && rms_relative < 5.0e-7,
             "{label}: Stockham errors max {max_relative:.3e}, rms {rms_relative:.3e}"
+        );
+    }
+
+    // Strided axes that fit workgroup memory still interleave more lines in
+    // registers than a workgroup-memory kernel holds.
+    for (label, config, register_kernels) in [
+        (
+            "16x2048-axis1-batch2",
+            FftConfig::new_nd([16, 2048])
+                .with_axes([1])
+                .with_batch(2)
+                .with_normalization(Normalization::None),
+            1,
+        ),
+        (
+            "5x4096-axis1-inverse",
+            FftConfig::inverse_nd([5, 4096]).with_axes([1]),
+            1,
+        ),
+        ("1024x1024", FftConfig::new_nd([1024, 1024]), 2),
+    ] {
+        let input = test_signal(config.total_complex_len().unwrap());
+        let reference = cpu_reference(&input, &config);
+        let (output, plan) = execute_c2c(device, queue, config, &input);
+        let kernels = kernel_labels(&plan);
+        assert!(
+            kernels.iter().all(|kernel| kernel == FUSED_POW2_LABEL),
+            "{label}: {kernels:?}"
+        );
+        if full_register_support {
+            assert_eq!(kernels.len(), register_kernels, "{label}: {kernels:?}");
+        }
+        let (max_relative, rms_relative) = relative_errors(&output, &reference);
+        eprintln!(
+            "LONG_AXIS label={label} kernels={} max_relative={max_relative:.3e} rms_relative={rms_relative:.3e}",
+            kernels.len()
+        );
+        assert!(
+            max_relative < 2.0e-6 && rms_relative < 5.0e-7,
+            "{label}: errors max {max_relative:.3e}, rms {rms_relative:.3e}"
         );
     }
 }

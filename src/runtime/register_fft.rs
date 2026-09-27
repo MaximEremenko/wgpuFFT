@@ -42,19 +42,33 @@ pub(crate) fn register_schedule(
     precision: AxisPrecision,
     limits: &wgpu::Limits,
 ) -> Option<(u32, RegisterSchedule)> {
-    if precision != AxisPrecision::F32 || !axis_length.is_power_of_two() {
+    register_schedule_for_lines(axis_length, 1, precision, limits)
+}
+
+/// Like [`register_schedule`] for `lines` lines per workgroup, interleaved
+/// so neighbouring invocations touch neighbouring lines; the workgroup size
+/// counts all lines, and the schedule's exchange length is per line.
+pub(crate) fn register_schedule_for_lines(
+    axis_length: usize,
+    lines: usize,
+    precision: AxisPrecision,
+    limits: &wgpu::Limits,
+) -> Option<(u32, RegisterSchedule)> {
+    if precision != AxisPrecision::F32 || !axis_length.is_power_of_two() || lines == 0 {
         return None;
     }
     let max_invocations = limits
         .max_compute_invocations_per_workgroup
         .min(limits.max_compute_workgroup_size_x) as usize;
-    let workgroup_size = axis_length / VALUES_PER_INVOCATION;
-    if workgroup_size == 0 || workgroup_size > max_invocations {
+    let line_invocations = axis_length / VALUES_PER_INVOCATION;
+    let workgroup_size = line_invocations.checked_mul(lines)?;
+    if line_invocations == 0 || workgroup_size > max_invocations {
         return None;
     }
 
     let storage_elements = limits.max_compute_workgroup_storage_size as usize
-        / precision.complex_size_bytes() as usize;
+        / precision.complex_size_bytes() as usize
+        / lines;
     let exchange_len = storage_elements.min(axis_length);
     if exchange_len < MIN_EXCHANGE_LEN {
         return None;
@@ -85,13 +99,15 @@ pub(crate) fn register_schedule(
     ))
 }
 
-/// WGSL of a register-resident kernel; one workgroup transforms one line.
+/// WGSL of a register-resident kernel; one workgroup transforms `lines`
+/// lines, invocation `lid` working on line `lid % lines`.
 pub(crate) fn generate_register_fft_wgsl(
     config: &FusedPow2StageWgslConfig<'_>,
     schedule: &RegisterSchedule,
+    lines: usize,
 ) -> String {
     let n = config.axis_length;
-    let workgroup = config.workgroup_size as usize;
+    let workgroup = config.workgroup_size as usize / lines;
     let values = n / workgroup;
     let radices = &schedule.radices;
     let exchange = schedule.exchange_len.min(n);
@@ -118,12 +134,37 @@ pub(crate) fn generate_register_fft_wgsl(
     let (last, previous) =
         emit_register_stages(&mut body, layout, 0, direction, precision, "twiddle");
     let scale_factor = config.apply_scale.then_some(config.scale_factor);
+    // The last workgroup's absent lines compute a present line's data and
+    // store nothing.
+    body.push_str("  if (exchangeLine < lineCount) {\n");
     emit_register_stores(&mut body, layout, last, previous, |value, position| {
         format!(
             "  dst[base + {position} * STRIDE] = {};\n",
             scaled_complex_expr(value, scale_factor, precision)
         )
     });
+    body.push_str("  }\n");
+    // Strided lines interleave element by element so neighbouring
+    // invocations load neighbouring lines; contiguous lines stay whole so
+    // neighbouring invocations load neighbouring elements.
+    let element_major = config.stride_complex > 1;
+    let (swizzle_line, line_mapping) = match (lines > 1, element_major) {
+        (false, _) => (
+            "",
+            "exchangeLine = 0u;
+  let t: u32 = lid.x;",
+        ),
+        (true, true) => (
+            " * LINES + exchangeLine",
+            "exchangeLine = lid.x % LINES;
+  let t: u32 = lid.x / LINES;",
+        ),
+        (true, false) => (
+            " + exchangeLine * EXCHANGE",
+            "exchangeLine = lid.x / LINE_INVOCATIONS;
+  let t: u32 = lid.x % LINE_INVOCATIONS;",
+        ),
+    };
 
     specialize_complex_wgsl(
         format!(
@@ -144,18 +185,23 @@ pub(crate) fn generate_register_fft_wgsl(
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
+const LINES: u32 = {lines}u;
+const LINE_INVOCATIONS: u32 = {workgroup}u;
+const EXCHANGE: u32 = {exchange}u;
 
-var<workgroup> exchange: array<vec2<f32>, {exchange}>;
+var<workgroup> exchange: array<vec2<f32>, {exchange_total}>;
+// The line this invocation works on; lines interleave in the exchange buffer.
+var<private> exchangeLine: u32;
 
 // Spreads the 16 consecutive elements of each 256-element block over all
 // banks so strided exchange accesses do not conflict.
 fn swizzle(index: u32) -> u32 {{
-  return index ^ ((index >> 4u) & 15u);
+  return (index ^ ((index >> 4u) & 15u)){swizzle_line};
 }}
 
 {line_base_fn}
 
-@compute @workgroup_size({workgroup}, 1, 1)
+@compute @workgroup_size({workgroup_total}, 1, 1)
 fn main({entry_params}) {{
   {flat_workgroup_index}
   let firstLine: u32 = params.baseIndex / N;
@@ -163,16 +209,20 @@ fn main({entry_params}) {{
   if (firstLine >= totalLines) {{
     return;
   }}
-  if (wgFlat >= totalLines - firstLine) {{
+  let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= totalLines - firstLine) {{
     return;
   }}
-  let base: u32 = line_base(params.lineOffset + firstLine + wgFlat) - params.elementBase;
-  let t: u32 = lid.x;
+  let lineCount: u32 = min(LINES, totalLines - firstLine - groupLine);
+  {line_mapping}
+  let base: u32 = line_base(params.lineOffset + firstLine + groupLine + min(exchangeLine, lineCount - 1u)) - params.elementBase;
 {body}}}
 "#,
             complex_wgsl = complex_wgsl(),
             twiddle_lookup_wgsl = twiddle_lookup_wgsl(direction, precision),
             stride = config.stride_complex,
+            exchange_total = exchange * lines,
+            workgroup_total = workgroup * lines,
             line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims),
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -986,6 +1036,39 @@ mod tests {
         assert!(simulate(2048, 64, &[16, 16, 8], 512) < 1e-9);
     }
 
+    #[test]
+    fn interleaved_lines_share_the_exchange_buffer() {
+        let vulkan = limits(1024, 48 * 1024);
+        // Eight 1024-point lines: 64 invocations each, 512 exchange slots per line.
+        let (workgroup, schedule) =
+            register_schedule_for_lines(1024, 8, AxisPrecision::F32, &vulkan).unwrap();
+        assert_eq!(workgroup, 512);
+        assert_eq!(schedule.exchange_len, 512);
+        assert!(register_schedule_for_lines(4096, 8, AxisPrecision::F32, &vulkan).is_none());
+        let wgsl = generate_register_fft_wgsl(
+            &FusedPow2StageWgslConfig {
+                rank: 2,
+                axis: 1,
+                dims: &[16, 1024],
+                axis_length: 1024,
+                stride_complex: 16,
+                direction: FftDirection::Forward,
+                workgroup_size: workgroup,
+                apply_scale: false,
+                scale_factor: 1.0,
+                precision: AxisPrecision::F32,
+            },
+            &schedule,
+            8,
+        );
+        assert!(wgsl.contains("@compute @workgroup_size(512, 1, 1)"));
+        assert!(wgsl.contains("var<workgroup> exchange: array<vec2<f32>, 4096>;"));
+        assert!(wgsl.contains("return (index ^ ((index >> 4u) & 15u)) * LINES + exchangeLine;"));
+        assert!(wgsl.contains("let t: u32 = lid.x / LINES;"));
+        assert!(wgsl.contains("if (exchangeLine < lineCount) {"));
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "exchange");
+    }
+
     fn wgsl_for(n: usize, invocations: u32, storage: u32, direction: FftDirection) -> String {
         let (workgroup, schedule) =
             register_schedule(n, AxisPrecision::F32, &limits(invocations, storage)).unwrap();
@@ -1003,6 +1086,7 @@ mod tests {
                 precision: AxisPrecision::F32,
             },
             &schedule,
+            1,
         )
     }
 

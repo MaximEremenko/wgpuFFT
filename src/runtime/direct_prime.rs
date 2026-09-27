@@ -23,6 +23,8 @@ use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey};
 
 /// Least lines per workgroup on strided axes, so loads coalesce.
 const MIN_STRIDED_LINES: usize = 8;
+/// Workgroups a small transform keeps, so its lines spread across the GPU.
+const MIN_WORKGROUPS: usize = 256;
 
 /// Whether a direct kernel can transform a line of the prime `axis_length`
 /// with `workgroup_size` invocations on a device with `limits`.
@@ -50,12 +52,15 @@ const fn tasks_per_line(axis_length: usize) -> usize {
 
 /// Lines per workgroup of a direct kernel: enough output pairs to give each
 /// invocation one, at least [`MIN_STRIDED_LINES`] on strided axes, and
-/// within workgroup storage after the roots.
+/// within workgroup storage after the roots. A transform of few lines keeps
+/// [`MIN_WORKGROUPS`] workgroups where it has the lines: each line costs
+/// `O(N^2)`, so spreading lines over the GPU beats coalescing them.
 pub(crate) fn direct_lines_per_workgroup(
     axis_length: usize,
     stride_complex: usize,
     precision: AxisPrecision,
     workgroup_size: u32,
+    total_lines: usize,
     max_workgroup_storage_bytes: u64,
 ) -> u32 {
     let mut lines = (workgroup_size as usize / tasks_per_line(axis_length)).max(1);
@@ -65,7 +70,8 @@ pub(crate) fn direct_lines_per_workgroup(
     let complex_bytes = precision.complex_size_bytes() as usize;
     let storage_elements = max_workgroup_storage_bytes as usize / complex_bytes;
     let max_by_storage = (storage_elements.saturating_sub(axis_length) / axis_length).max(1);
-    lines.min(max_by_storage) as u32
+    let max_by_fill = (total_lines / MIN_WORKGROUPS).max(1);
+    lines.min(max_by_storage).min(max_by_fill) as u32
 }
 
 /// WGSL of a direct-DFT kernel for `key` (`key.kind` is
@@ -225,6 +231,7 @@ mod tests {
             stride,
             AxisPrecision::F32,
             256,
+            1 << 20,
             48 * 1024,
         ))
     }
@@ -233,21 +240,30 @@ mod tests {
     fn line_count_gives_each_invocation_an_output_pair() {
         // N=17 has 9 output pairs per line (X[0] and eight pairs).
         assert_eq!(
-            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 48 * 1024),
+            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
             28
         );
         assert_eq!(
-            direct_lines_per_workgroup(127, 1, AxisPrecision::F32, 256, 48 * 1024),
+            direct_lines_per_workgroup(127, 1, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
             4
         );
         // Strided axes load at least eight neighbouring lines.
         assert_eq!(
-            direct_lines_per_workgroup(127, 64, AxisPrecision::F32, 256, 48 * 1024),
+            direct_lines_per_workgroup(127, 64, AxisPrecision::F32, 256, 1 << 20, 48 * 1024),
             8
+        );
+        // A transform of few lines keeps enough workgroups.
+        assert_eq!(
+            direct_lines_per_workgroup(83, 83, AxisPrecision::F32, 256, 83, 48 * 1024),
+            1
+        );
+        assert_eq!(
+            direct_lines_per_workgroup(17, 1, AxisPrecision::F32, 256, 17 * 17 * 17, 48 * 1024),
+            19
         );
         // Storage keeps room for the roots.
         assert_eq!(
-            direct_lines_per_workgroup(1021, 64, AxisPrecision::F32, 256, 16 * 1024),
+            direct_lines_per_workgroup(1021, 64, AxisPrecision::F32, 256, 1 << 20, 16 * 1024),
             1
         );
     }

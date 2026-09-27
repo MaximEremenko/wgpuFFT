@@ -10,7 +10,9 @@ use crate::runtime::axis_plan::{
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
 };
-use crate::runtime::bluestein_axis::{register_bluestein_plan, BluesteinAxis, BluesteinAxisConfig};
+use crate::runtime::bluestein_axis::{
+    register_bluestein_plan, short_register_convolution, BluesteinAxis, BluesteinAxisConfig,
+};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::direct_prime::{
     direct_lines_per_workgroup, direct_pairs_per_invocation, direct_prime_supported,
@@ -315,14 +317,7 @@ impl RaderAxis {
                 bind_group_layout,
                 twiddle_buffer,
             })
-        } else if !fused_rader_supported(
-            n,
-            m,
-            config.precision,
-            config.fused_workgroup_size,
-            config.fused_min_convolution_length,
-            &device.limits(),
-        ) && config.bluestein_fallback
+        } else if config.bluestein_fallback
             && register_bluestein_plan(
                 n,
                 config.precision,
@@ -331,7 +326,21 @@ impl RaderAxis {
                 config.fuse_long_axes,
                 &device.limits(),
             )
-            .is_some()
+            .is_some_and(|(register_length, _, _)| {
+                rader_prefers_register_bluestein(
+                    n,
+                    m,
+                    register_length,
+                    fused_rader_supported(
+                        n,
+                        m,
+                        config.precision,
+                        config.fused_workgroup_size,
+                        config.fused_min_convolution_length,
+                        &device.limits(),
+                    ),
+                )
+            })
         {
             RaderExecution::Bluestein(Box::new(BluesteinAxis::new(
                 device,
@@ -1047,6 +1056,21 @@ pub(crate) fn fused_rader_supported_by_limits(
 /// Length of Rader's convolution for the prime `n`: the cyclic length
 /// `n - 1` itself when an FFT of that length is supported, else a zero-padded
 /// length of at least `2 (n - 1) - 1` whose linear convolution folds back.
+/// Whether a Rader axis of the prime `n`, whose convolution takes
+/// `rader_length` points, runs as a register Bluestein convolution of
+/// `register_length` points instead: when its own fused convolution does
+/// not fit, or when that convolution is linear (`n - 1` is not smooth) and
+/// the register one is short (see [`short_register_convolution`]).
+pub(crate) fn rader_prefers_register_bluestein(
+    n: usize,
+    rader_length: usize,
+    register_length: usize,
+    rader_fused: bool,
+) -> bool {
+    !rader_fused
+        || (rader_length != n - 1 && short_register_convolution(register_length, rader_length))
+}
+
 pub(crate) fn rader_convolution_length(n: usize) -> Result<usize> {
     let l = n
         .checked_sub(1)

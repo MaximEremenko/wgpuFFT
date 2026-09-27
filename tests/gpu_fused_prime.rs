@@ -56,7 +56,9 @@ async fn run_fused_prime_cases() {
         }
     }
 
-    for (length, batch, fused_storage_bytes) in [(221, 2, 3_528u64), (2026, 1, 32_448)] {
+    // N=517 convolves over 1040 points in workgroup memory: a 2048-point
+    // register convolution would be almost twice as long.
+    for (length, batch, fused_storage_bytes) in [(517, 2, 8_320u64), (2026, 1, 32_448)] {
         for inverse in [false, true] {
             let config = config_1d(length, batch, inverse);
             let label = format!("Bluestein N={length} batch={batch} inverse={inverse}");
@@ -78,9 +80,9 @@ async fn run_fused_prime_cases() {
 
     for inverse in [false, true] {
         let config = if inverse {
-            FftConfig::inverse_nd([2, 221, 3])
+            FftConfig::inverse_nd([2, 517, 3])
         } else {
-            FftConfig::new_nd([2, 221, 3]).with_normalization(Normalization::None)
+            FftConfig::new_nd([2, 517, 3]).with_normalization(Normalization::None)
         }
         .with_axes([1])
         .with_batch(2);
@@ -91,8 +93,24 @@ async fn run_fused_prime_cases() {
             C2cRoute::Bluestein,
             BLUESTEIN_FUSED_LABEL,
             &["bluestein-chirp-helper", "bluestein-bfft-helper"],
-            &format!("Bluestein ND axis shape=2x221x3 batch=2 inverse={inverse}"),
+            &format!("Bluestein ND axis shape=2x517x3 batch=2 inverse={inverse}"),
         );
+    }
+
+    // N=221 convolves over 512 points in registers rather than 441 in
+    // workgroup memory: fewer stages and barriers. So does a prime whose
+    // Rader convolution would be linear (N=179: 178 = 2 * 89).
+    for (length, route) in [(221, C2cRoute::Bluestein), (179, C2cRoute::Rader)] {
+        for inverse in [false, true] {
+            let config = config_1d(length, 2, inverse);
+            let label = format!("short register Bluestein N={length} inverse={inverse}");
+            let input = test_signal(config.total_complex_len().unwrap());
+            let expected = reference_f64(&input, &config);
+            let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
+            assert_eq!(plan.route(), route, "{label}");
+            assert_eq!(kernel_labels(&plan), [BLUESTEIN_REGISTER_LABEL], "{label}");
+            assert_matches_reference(&actual, &expected, &label);
+        }
     }
 
     for (shape, fused_label, expected_helpers) in [
@@ -102,7 +120,7 @@ async fn run_fused_prime_cases() {
             &["rader-permutation-helper", "rader-bfft-helper"][..],
         ),
         (
-            [2, 221],
+            [2, 517],
             BLUESTEIN_FUSED_LABEL,
             &["bluestein-chirp-helper", "bluestein-bfft-helper"][..],
         ),

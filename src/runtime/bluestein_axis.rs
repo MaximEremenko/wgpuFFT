@@ -876,24 +876,38 @@ pub(crate) fn register_bluestein_plan(
         return None;
     }
     let smooth = bluestein_convolution_length(n).ok()?;
+    let m = n
+        .checked_mul(2)?
+        .checked_sub(1)?
+        .checked_next_power_of_two()?;
     if fused_bluestein_supported(
         smooth,
         precision,
         fused_workgroup_size,
         fused_min_convolution_length,
         limits,
-    ) {
+    ) && !short_register_convolution(m, smooth)
+    {
         return None;
     }
-    let m = n
-        .checked_mul(2)?
-        .checked_sub(1)?
-        .checked_next_power_of_two()?;
     if m < fused_min_convolution_length {
         return None;
     }
     let (workgroup_size, schedule) = register_schedule(m, precision, limits)?;
     Some((m, workgroup_size, schedule))
+}
+
+/// Longest register convolution preferred over a workgroup-memory one that
+/// fits.
+pub(crate) const MAX_SHORT_REGISTER_CONVOLUTION: usize = 2048;
+
+/// Whether a power-of-two register convolution of `register_length` points
+/// beats a workgroup-memory one of `smooth_length` points: when it is short
+/// and not much longer. It then takes fewer stages and barriers; on an RTX
+/// 5090 up to 1.85 times the smooth length paid off.
+pub(crate) fn short_register_convolution(register_length: usize, smooth_length: usize) -> bool {
+    register_length <= MAX_SHORT_REGISTER_CONVOLUTION
+        && register_length.saturating_mul(20) <= smooth_length.saturating_mul(37)
 }
 
 pub(crate) fn bluestein_convolution_length(n: usize) -> Result<usize> {

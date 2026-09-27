@@ -3,7 +3,7 @@ use crate::error::{FftError, Result};
 use crate::runtime::SUPPORTED_RADICES;
 use crate::tuning::FftTuning;
 
-pub const DEFAULT_RADER_MAX_PRIME: usize = 4096;
+pub const DEFAULT_RADER_MAX_PRIME: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AxisKind {
@@ -187,7 +187,8 @@ mod tests {
         assert_eq!(axis_kind_for_len(17), AxisKind::Rader);
         assert_eq!(axis_kind_for_len(29), AxisKind::Rader);
         assert_eq!(axis_kind_for_len(34), AxisKind::Bluestein);
-        assert_eq!(axis_kind_for_len(4099), AxisKind::Bluestein);
+        assert_eq!(axis_kind_for_len(4099), AxisKind::Rader);
+        assert_eq!(axis_kind_for_len(8209), AxisKind::Bluestein);
     }
 
     #[test]
@@ -219,7 +220,7 @@ mod tests {
         );
 
         let forced_rader_above_auto_threshold =
-            FftConfig::new(4099).with_tuning(FftTuning::default().with_force_rader_axes([0]));
+            FftConfig::new(8209).with_tuning(FftTuning::default().with_force_rader_axes([0]));
         assert_eq!(
             resolve_axis_kinds_for_config(&forced_rader_above_auto_threshold).unwrap(),
             [AxisKind::Rader]

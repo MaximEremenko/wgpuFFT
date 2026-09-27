@@ -7,7 +7,7 @@ use crate::runtime::axis_plan::{
     fused_lines_per_workgroup, fused_smooth_factors, fused_smooth_pads_indices,
     generate_fused_scratch_fft_stages_wgsl, generate_in_place_smooth_fft_stage_multiline_wgsl,
     multiline_line_stride, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
-    AxisTwiddleLutPool, LongAxisRoute,
+    AxisTwiddleLutPool, LongAxisRoute, FUSED_PRIME_RADICES,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -205,8 +205,17 @@ impl RaderAxis {
         config.validate()?;
         let n = config.shape[config.axis];
         let l = n - 1;
-        let m = rader_convolution_length(n)?;
-        let factors = crate::runtime::factor_supported_length(m)?;
+        let (m, medium_prime_schedule) = rader_axis_convolution(
+            n,
+            config.precision,
+            config.fused_workgroup_size,
+            config.fused_min_convolution_length,
+            &device.limits(),
+        )?;
+        let factors = match medium_prime_schedule {
+            Some(schedule) => schedule,
+            None => crate::runtime::factor_supported_length(m)?,
+        };
 
         let lines = checked_mul(config.batch, lines_per_batch(&config.shape, config.axis))?;
         let lines_u32 = lines as u32;
@@ -1110,6 +1119,73 @@ pub(crate) fn fused_rader_supported_by_limits(
         && workgroup_size > 0
         && workgroup_size <= max_invocations_per_workgroup
         && workgroup_size <= max_workgroup_size_x
+}
+
+/// Fewest butterflies of the largest medium prime radix (see
+/// [`FUSED_PRIME_RADICES`]) per line for a Rader axis to take the cyclic
+/// medium-prime convolution: each butterfly is one invocation's long
+/// straight-line sum, so with fewer of them most invocations wait. On an
+/// RTX 5090 lines with at least 36 ran 5% to 55% faster than the zero-padded
+/// or register Bluestein convolution (N = 4241 three times as fast), while
+/// shorter ones ranged from 40% faster to twice as slow.
+const MIN_MEDIUM_PRIME_BUTTERFLIES: usize = 36;
+
+/// Fused schedule of the cyclic convolution of the prime `n` when `n - 1`
+/// has prime factors from [`FUSED_PRIME_RADICES`] besides radices up to 13:
+/// those primes' stages, largest first, then the fused smooth schedule of
+/// the rest. `None` when `n - 1` is 13-smooth, has a larger prime factor, or
+/// holds fewer than [`MIN_MEDIUM_PRIME_BUTTERFLIES`] butterflies of its
+/// largest medium prime.
+pub(crate) fn medium_prime_rader_schedule(n: usize) -> Option<Vec<usize>> {
+    let l = n.checked_sub(1)?;
+    if l < 2 || crate::runtime::factor_supported_length(l).is_ok() {
+        return None;
+    }
+    let mut rest = l;
+    let mut schedule = Vec::new();
+    for &prime in FUSED_PRIME_RADICES.iter().rev() {
+        while rest.is_multiple_of(prime) {
+            schedule.push(prime);
+            rest /= prime;
+        }
+    }
+    let largest = *schedule.first()?;
+    if l / largest < MIN_MEDIUM_PRIME_BUTTERFLIES {
+        return None;
+    }
+    if rest > 1 {
+        let factors = crate::runtime::factor_supported_length(rest).ok()?;
+        schedule.extend(fused_smooth_factors(rest, &factors));
+    }
+    Some(schedule)
+}
+
+/// Convolution length of the Rader axis of the prime `n`, and its fused
+/// schedule when it is a cyclic medium-prime convolution (see
+/// [`medium_prime_rader_schedule`]), which needs an `f32` fused kernel the
+/// device fits; otherwise [`rader_convolution_length`].
+pub(crate) fn rader_axis_convolution(
+    n: usize,
+    precision: AxisPrecision,
+    fused_workgroup_size: u32,
+    fused_min_convolution_length: usize,
+    limits: &wgpu::Limits,
+) -> Result<(usize, Option<Vec<usize>>)> {
+    if precision == AxisPrecision::F32 {
+        if let Some(schedule) = medium_prime_rader_schedule(n).filter(|_| {
+            fused_rader_supported(
+                n,
+                n - 1,
+                precision,
+                fused_workgroup_size,
+                fused_min_convolution_length,
+                limits,
+            )
+        }) {
+            return Ok((n - 1, Some(schedule)));
+        }
+    }
+    Ok((rader_convolution_length(n)?, None))
 }
 
 /// Length of Rader's convolution for the prime `n`: the cyclic length
@@ -2450,6 +2526,49 @@ mod tests {
                 crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
             }
         }
+    }
+
+    #[test]
+    fn medium_prime_rader_schedules_need_enough_butterflies() {
+        // 4240 = 80 * 53, 1380 = 60 * 23, 5002 = 82 * 61 = 2 * 41 * 61.
+        assert_eq!(medium_prime_rader_schedule(4241), Some(vec![53, 16, 5]));
+        assert_eq!(medium_prime_rader_schedule(1381), Some(vec![23, 10, 6]));
+        assert_eq!(medium_prime_rader_schedule(5003), Some(vec![61, 41, 2]));
+        assert_eq!(medium_prime_rader_schedule(613), Some(vec![17, 6, 6]));
+        // Too few butterflies (946 = 22 * 43, 282 = 6 * 47), N - 1 smooth
+        // (1008), or a prime factor above 61 (7726 = 2 * 3863).
+        for n in [947, 283, 1009, 7727] {
+            assert_eq!(medium_prime_rader_schedule(n), None, "N={n}");
+        }
+    }
+
+    #[test]
+    fn medium_prime_rader_convolutions_need_storage_and_f32() {
+        let limits = |storage: u32| wgpu::Limits {
+            max_compute_workgroup_storage_size: storage,
+            max_compute_invocations_per_workgroup: 256,
+            max_compute_workgroup_size_x: 256,
+            ..wgpu::Limits::default()
+        };
+        let convolution = |n, precision, storage| {
+            rader_axis_convolution(n, precision, 256, 0, &limits(storage)).unwrap()
+        };
+        assert_eq!(
+            convolution(4241, AxisPrecision::F32, 49_152),
+            (4240, Some(vec![53, 16, 5]))
+        );
+        assert_eq!(
+            convolution(4241, AxisPrecision::F32, 16_384),
+            (rader_convolution_length(4241).unwrap(), None)
+        );
+        assert_eq!(
+            convolution(1381, AxisPrecision::F64, 49_152),
+            (rader_convolution_length(1381).unwrap(), None)
+        );
+        assert_eq!(
+            convolution(1381, AxisPrecision::F32, 16_384),
+            (1380, Some(vec![23, 10, 6]))
+        );
     }
 
     #[test]

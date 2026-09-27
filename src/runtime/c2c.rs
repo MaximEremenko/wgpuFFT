@@ -40,7 +40,7 @@ use crate::runtime::pipeline_cache::{
     PipelineLayoutCacheKey, ShaderCacheKey,
 };
 use crate::runtime::rader_axis::{
-    fused_rader_supported_by_limits, rader_bfft, rader_convolution_length, rader_permutation,
+    fused_rader_supported_by_limits, rader_axis_convolution, rader_bfft, rader_permutation,
     rader_prefers_register_bluestein, RaderAxis, RaderAxisConfig,
 };
 use crate::runtime::recorder::CommandRecorder;
@@ -215,10 +215,24 @@ fn prime_binding_inventory(
                 )
             })
             .flatten();
+        // The Rader axis's own convolution length, a cyclic medium-prime
+        // one included.
+        let rader_length = if kind == AxisKind::Rader {
+            rader_axis_convolution(
+                n,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                config.tuning().fused_min_convolution_length(),
+                compute_limits,
+            )?
+            .0
+        } else {
+            0
+        };
         let rader_fused = kind == AxisKind::Rader
             && fused_rader_supported_by_limits(
                 n,
-                rader_convolution_length(n)?,
+                rader_length,
                 axis_precision,
                 config.tuning().fused_workgroup_size(),
                 config.tuning().fused_min_convolution_length(),
@@ -230,7 +244,7 @@ fn prime_binding_inventory(
         let direct_prime = kind == AxisKind::Rader
             && !forced_rader
             && n <= config.tuning().direct_max_prime()
-            && !(rader_fused && rader_convolution_length(n)? == n - 1)
+            && !(rader_fused && rader_length == n - 1)
             && direct_prime_supported(
                 n,
                 axis_precision,
@@ -242,7 +256,7 @@ fn prime_binding_inventory(
                 && (kind != AxisKind::Rader
                     || rader_prefers_register_bluestein(
                         n,
-                        rader_convolution_length(n).unwrap_or(0),
+                        rader_length,
                         *register_length,
                         rader_fused,
                     ))
@@ -251,7 +265,7 @@ fn prime_binding_inventory(
             AxisKind::Mixed => continue,
             AxisKind::Rader => match &register_bluestein {
                 Some((m, _, _)) => *m,
-                None => rader_convolution_length(n)?,
+                None => rader_length,
             },
             AxisKind::Bluestein => match &register_bluestein {
                 Some((m, _, _)) => *m,
@@ -7991,6 +8005,7 @@ impl DirectDftPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::rader_axis::rader_convolution_length;
 
     #[test]
     fn c2c_policy_byte_math_follows_precision() {

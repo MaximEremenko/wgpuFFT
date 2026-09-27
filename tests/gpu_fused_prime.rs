@@ -102,6 +102,89 @@ async fn run_fused_prime_cases() {
         "no multi-line fused Rader kernel was built"
     );
 
+    // Primes whose N - 1 has a prime factor from 17 to 61 convolve
+    // cyclically over N - 1 points with radix-p stages where workgroup
+    // storage holds them: 613 (612 = 36 * 17), strided lines of it four per
+    // workgroup, 1381 (1380 = 60 * 23), 4093 (4092 = 132 * 31, just within
+    // 32 KiB), 4241 (4240 = 80 * 53), and 5003 (5002 = 2 * 41 * 61).
+    for (label, config, storage_bytes) in [
+        (
+            "medium-prime Rader N=613 batch=3",
+            config_1d(613, 3, false),
+            4_896u64,
+        ),
+        (
+            "medium-prime Rader inverse N=613 batch=3",
+            config_1d(613, 3, true),
+            4_896,
+        ),
+        (
+            "medium-prime Rader strided 64x613 axis 1 batch=16",
+            FftConfig::new_nd([64, 613])
+                .with_axes([1])
+                .with_batch(16)
+                .with_normalization(Normalization::None),
+            4_896,
+        ),
+        (
+            "medium-prime Rader inverse N=1381 batch=2",
+            config_1d(1381, 2, true),
+            11_040,
+        ),
+        (
+            "medium-prime Rader N=4093",
+            config_1d(4093, 1, false),
+            32_736,
+        ),
+        (
+            "medium-prime Rader N=4241 batch=2",
+            config_1d(4241, 2, false),
+            33_920,
+        ),
+        (
+            "medium-prime Rader inverse N=5003",
+            config_1d(5003, 1, true),
+            40_016,
+        ),
+    ] {
+        if storage_limit < storage_bytes {
+            eprintln!("skipping {label}: device exposes only {storage_limit} bytes");
+            continue;
+        }
+        run_fused_case(
+            &context.device,
+            &context.queue,
+            config,
+            C2cRoute::Rader,
+            RADER_FUSED_LABEL,
+            &["rader-permutation-helper", "rader-bfft-helper"],
+            label,
+        );
+    }
+    let snapshot = wgpu_fft::export_pipeline_cache_snapshot(&context.device);
+    let keys = snapshot.pipeline_keys();
+    let built = |fragment: &str| {
+        keys.iter()
+            .any(|key| key.contains("fused-prime:rader") && key.contains(fragment))
+    };
+    assert!(
+        built(":m=612:factors=17x6x6"),
+        "no radix-17 Rader kernel: {keys:?}"
+    );
+    if storage_limit >= 19_648 {
+        assert!(
+            keys.iter()
+                .any(|key| key.contains(":n=613:stride=64:m=612:") && key.contains(":lines=4")),
+            "no multi-line radix-17 Rader kernel: {keys:?}"
+        );
+    }
+    if storage_limit >= 33_920 {
+        assert!(
+            built(":m=4240:factors=53x16x5"),
+            "no radix-53 Rader kernel: {keys:?}"
+        );
+    }
+
     // N=517 convolves over 1040 points in workgroup memory: a 2048-point
     // register convolution would be almost twice as long.
     for (length, batch, fused_storage_bytes) in [(517, 2, 8_320u64), (2026, 1, 32_448)] {
@@ -202,12 +285,13 @@ async fn run_fused_prime_cases() {
         "tiny N=17",
     );
 
-    // Rader N=4093 uses M=8190, so its fused scratch requires 8*M + 8 bytes.
-    if storage_limit < 65_528 {
-        run_rader_fallback_case(&context, 4093, "storage-limited N=4093");
+    // Rader N=4099 (4098 = 2 * 3 * 683) uses M=8232, so its fused scratch
+    // requires 8*M + 8 bytes.
+    if storage_limit < 65_864 {
+        run_rader_fallback_case(&context, 4099, "storage-limited N=4099");
     } else {
         eprintln!(
-            "skipping N=4093 storage-fallback assertion: device exposes {storage_limit} bytes"
+            "skipping N=4099 storage-fallback assertion: device exposes {storage_limit} bytes"
         );
     }
 

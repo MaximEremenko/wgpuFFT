@@ -56,7 +56,7 @@ impl Default for FftTuning {
         Self {
             workgroup_size: 64,
             fused_workgroup_size: DEFAULT_FUSED_WORKGROUP_SIZE,
-            rader_max_prime: 4096,
+            rader_max_prime: 8192,
             direct_max_prime: 127,
             force_rader_axes: Vec::new(),
             force_bluestein_axes: Vec::new(),
@@ -92,6 +92,12 @@ impl FftTuning {
         self.fused_workgroup_size
     }
 
+    /// Largest prime axis classified as Rader rather than Bluestein. A
+    /// Rader axis still runs Bluestein's register kernel when its own
+    /// convolution would be zero-padded and longer, so above 4096 only
+    /// primes whose convolution is cyclic over `N - 1` points and fits
+    /// workgroup memory change kernels: a 4241x4241 FFT+iFFT pair takes
+    /// 2.3 ms instead of 5.2 ms.
     pub const fn rader_max_prime(&self) -> usize {
         self.rader_max_prime
     }
@@ -525,7 +531,7 @@ mod tests {
         let defaults = FftTuning::default();
         assert_eq!(defaults.workgroup_size(), 64);
         assert_eq!(defaults.fused_workgroup_size(), 256);
-        assert_eq!(defaults.rader_max_prime(), 4096);
+        assert_eq!(defaults.rader_max_prime(), 8192);
         assert_eq!(defaults.direct_max_prime(), 127);
         assert_eq!(defaults.large_route(), FftLargeRoute::Auto);
         assert_eq!(defaults.segmented_burst_depth(), 2);

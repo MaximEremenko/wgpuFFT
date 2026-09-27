@@ -2047,6 +2047,12 @@ fn largest_register_schedule(
 /// memory than its prime factors as separate stages.
 const FUSED_SMOOTH_RADICES: &[usize] = &[16, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2];
 
+/// Primes above 13 that fused Rader convolutions also run as radices, each
+/// as one straight-line butterfly (see [`emit_small_dft_wgsl`]) of about
+/// `p^2` real multiplications, so a cyclic convolution of `N - 1` points can
+/// replace a zero-padded one about twice as long.
+pub(crate) const FUSED_PRIME_RADICES: &[usize] = &[17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61];
+
 /// Radix schedule of a fused smooth kernel for `axis_length`, whose
 /// multi-pass factorization is `factors`: the fewest stages; among those,
 /// the most radix-16 stages, whose butterflies need the fewest
@@ -2324,7 +2330,7 @@ pub(crate) fn generate_fused_scratch_fft_stages_wgsl(
     debug_assert!(!factors.is_empty());
     debug_assert!(factors
         .iter()
-        .all(|radix| FUSED_SMOOTH_RADICES.contains(radix)));
+        .all(|radix| FUSED_SMOOTH_RADICES.contains(radix) || FUSED_PRIME_RADICES.contains(radix)));
     debug_assert_eq!(factors.iter().product::<usize>(), axis_length);
     debug_assert!(workgroup_size > 0);
     debug_assert!(!scratch_name.is_empty());

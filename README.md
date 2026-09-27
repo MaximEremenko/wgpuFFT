@@ -190,7 +190,7 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 |---|---:|---|
 | `workgroup_size` | `64` | Staged FFT and linear helper kernels. |
 | `fused_workgroup_size` | `256` | Fused power-of-two, smooth, and prime kernels, subject to device invocation and storage limits. |
-| `rader_max_prime` | `4096` | Largest non-smooth prime selected for Rader automatically. |
+| `rader_max_prime` | `8192` | Largest non-smooth prime selected for Rader automatically; Rader axes whose convolution would be longer than Bluestein's run Bluestein's register kernel. |
 | `direct_max_prime` | `127` | Largest prime axis transformed by a direct DFT kernel instead of Rader (`f32`); `0` keeps Rader for every prime. |
 | `force_rader_axes` | `[]` | Physical selected axes that must use Rader; infeasible requests fail instead of changing algorithm. |
 | `force_bluestein_axes` | `[]` | Physical selected axes that must use Bluestein. |
@@ -328,7 +328,7 @@ through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual Studio 2022
 17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to the
 executable or on `PATH`. Otherwise it falls back to the legacy FXC compiler.
 Every route works with both, but FXC is much slower to create plans: on an RTX
-5090 the GPU test suite takes about 300 s with FXC and 45 s with DXC. `df64`
+5090 the GPU test suite takes about 380 s with FXC and 40 s with DXC. `df64`
 plans and the register-resident kernels of 8192- and 16384-point `f32` axes
 are the slowest; an N=8192 plan takes 2.6 s with FXC and 0.1 s on Vulkan.
 Ship DXC with DX12 applications, or prefer Vulkan. The WARP software adapter

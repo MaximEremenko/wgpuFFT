@@ -4,10 +4,10 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{fft_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
-    fused_lines_per_workgroup, fused_smooth_factors, fused_smooth_pads_indices,
-    generate_fused_scratch_fft_stages_wgsl, generate_in_place_smooth_fft_stage_multiline_wgsl,
+    fused_smooth_factors, fused_smooth_pads_indices, generate_fused_scratch_fft_stages_wgsl,
+    generate_in_place_smooth_fft_stage_multiline_wgsl, lines_per_workgroup_keeping,
     multiline_line_stride, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
-    AxisTwiddleLutPool, LongAxisRoute, FUSED_PRIME_RADICES,
+    AxisTwiddleLutPool, LongAxisRoute, FUSED_PRIME_RADICES, MIN_FUSED_WORKGROUPS,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -417,12 +417,15 @@ impl RaderAxis {
             // Several lines per workgroup keep its invocations busy on short
             // convolutions, as in the fused axis kernels. Fewer than
             // MIN_RADER_LINES measured slower than one line per workgroup.
-            let lines_per_workgroup = fused_lines_per_workgroup(
+            // Rader kernels keep 256 workgroups on strided axes too: with 128,
+            // 811x811 and 89x89x89 ran 3% to 4% slower.
+            let lines_per_workgroup = lines_per_workgroup_keeping(
                 m,
                 stride_complex,
                 config.precision,
                 lines_u32 as usize,
                 u64::from(device.limits().max_compute_workgroup_storage_size),
+                MIN_FUSED_WORKGROUPS,
             )
             .min(config.fused_workgroup_size);
             let lines_per_workgroup = if lines_per_workgroup < MIN_RADER_LINES {

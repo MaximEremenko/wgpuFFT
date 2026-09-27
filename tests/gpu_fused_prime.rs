@@ -185,6 +185,68 @@ async fn run_fused_prime_cases() {
         );
     }
 
+    // Strided axes interleave several lines per register Bluestein
+    // workgroup where the device allows it: eight 512-point convolutions of a
+    // Rader axis (N=179), four 1024-point ones (N=419), and two 2048-point
+    // ones of a Bluestein axis (N=986 = 2 * 17 * 29).
+    for (label, config, route) in [
+        (
+            "register Bluestein strided 2048x179 axis 1",
+            FftConfig::new_nd([2048, 179])
+                .with_axes([1])
+                .with_normalization(Normalization::None),
+            C2cRoute::Rader,
+        ),
+        (
+            "register Bluestein strided inverse 1024x419 axis 1",
+            FftConfig::inverse_nd([1024, 419]).with_axes([1]),
+            C2cRoute::Rader,
+        ),
+        (
+            "register Bluestein strided 1024x986 axis 1",
+            FftConfig::new_nd([1024, 986])
+                .with_axes([1])
+                .with_normalization(Normalization::None),
+            C2cRoute::Bluestein,
+        ),
+    ] {
+        let input = test_signal(config.total_complex_len().unwrap());
+        let expected = reference_f64(&input, &config);
+        let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
+        assert_eq!(plan.route(), route, "{label}");
+        assert_eq!(kernel_labels(&plan), [BLUESTEIN_REGISTER_LABEL], "{label}");
+        assert_matches_reference(&actual, &expected, label);
+        let (max_relative, rms_relative) = relative_error_metrics(&actual, &expected);
+        eprintln!(
+            "FUSED_PRIME_ACCURACY label={label:?} max_relative={max_relative:.9e} rms_relative={rms_relative:.9e}"
+        );
+        assert!(
+            max_relative < 5.0e-7 && rms_relative < 5.0e-7,
+            "{label}: max/rms relative error={max_relative}/{rms_relative}"
+        );
+    }
+    if context
+        .device
+        .limits()
+        .max_compute_invocations_per_workgroup
+        >= 1024
+    {
+        let snapshot = wgpu_fft::export_pipeline_cache_snapshot(&context.device);
+        let keys = snapshot.pipeline_keys();
+        for (fragment, lines) in [
+            (":n=179:stride=2048:m=512:", ":lines=8"),
+            (":n=419:stride=1024:m=1024:", ":lines=4"),
+            (":n=986:stride=1024:m=2048:", ":lines=2"),
+        ] {
+            assert!(
+                keys.iter().any(|key| key.contains("fused-prime:bluestein")
+                    && key.contains(fragment)
+                    && key.contains(lines)),
+                "no multi-line register Bluestein kernel {fragment}{lines}: {keys:?}"
+            );
+        }
+    }
+
     // N=517 and N=2062 convolve over 1040 and 4125 points in workgroup
     // memory: 2048- and 8192-point register convolutions would be about
     // twice as long.

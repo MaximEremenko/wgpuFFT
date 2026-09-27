@@ -376,11 +376,14 @@ fn emit_register_stores(
     }
 }
 
-/// WGSL of a register-resident Bluestein kernel: one workgroup convolves one
-/// line of `key.axis_length` with forward and inverse FFTs of
-/// `key.convolution_length` points held in registers, so the line is read
-/// and written once. The chirp is applied on load and store, and the filter
-/// spectrum on the exchange between the two FFTs.
+/// WGSL of a register-resident Bluestein kernel: one workgroup convolves
+/// `key.lines_per_workgroup` lines of `key.axis_length` with forward and
+/// inverse FFTs of `key.convolution_length` points held in registers, so
+/// each line is read and written once. The chirp is applied on load and
+/// store, and the filter spectrum on the exchange between the two FFTs.
+/// Several lines interleave element by element, invocation `lid` working on
+/// line `lid % LINES`, so neighbouring invocations load neighbouring lines of
+/// a strided axis.
 pub(crate) fn generate_register_bluestein_wgsl(
     key: &FusedPrimeStageKey,
     schedule: &RegisterSchedule,
@@ -389,7 +392,8 @@ pub(crate) fn generate_register_bluestein_wgsl(
     debug_assert_eq!(key.precision, AxisPrecision::F32);
     let n = key.axis_length;
     let m = key.convolution_length;
-    let workgroup = key.workgroup_size as usize;
+    let lines = key.lines_per_workgroup as usize;
+    let workgroup = key.workgroup_size as usize / lines;
     let layout = RegisterLayout {
         n: m,
         workgroup,
@@ -438,6 +442,11 @@ pub(crate) fn generate_register_bluestein_wgsl(
     );
     // The inverse FFT is unnormalized: fold 1/M into the output scale.
     let scale = precision.format_wgsl_scalar(key.scale_factor() / m as f64);
+    // The last workgroup's absent lines compute a present line's data and
+    // store nothing.
+    if lines > 1 {
+        body.push_str("  if (exchangeLine < lineCount) {\n");
+    }
     emit_register_stores(
         &mut body,
         layout,
@@ -449,6 +458,35 @@ pub(crate) fn generate_register_bluestein_wgsl(
         )
         },
     );
+    if lines > 1 {
+        body.push_str("  }\n");
+    }
+    let (line_declarations, swizzle, line_mapping) = if lines > 1 {
+        (
+            format!(
+                "const LINES: u32 = {lines}u;\n\n// The line this invocation works on; lines interleave in the exchange buffer.\nvar<private> exchangeLine: u32;\n"
+            ),
+            "(index ^ ((index >> 4u) & 15u)) * LINES + exchangeLine",
+            "let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= params.lines) {
+    return;
+  }
+  let lineCount: u32 = min(LINES, params.lines - groupLine);
+  exchangeLine = lid.x % LINES;
+  let t: u32 = lid.x / LINES;
+  let base: u32 = line_base(params.lineOffset + groupLine + min(exchangeLine, lineCount - 1u));",
+        )
+    } else {
+        (
+            String::new(),
+            "index ^ ((index >> 4u) & 15u)",
+            "if (wgFlat >= params.lines) {
+    return;
+  }
+  let base: u32 = line_base(params.lineOffset + wgFlat);
+  let t: u32 = lid.x;",
+        )
+    };
 
     format!(
         r#"struct Params {{
@@ -478,30 +516,27 @@ fn twiddle_inverse(index: u32) -> vec2<f32> {{
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
-
-var<workgroup> exchange: array<vec2<f32>, {exchange}>;
+{line_declarations}
+var<workgroup> exchange: array<vec2<f32>, {exchange_total}>;
 
 // Spreads the 16 consecutive elements of each 256-element block over all
 // banks so strided exchange accesses do not conflict.
 fn swizzle(index: u32) -> u32 {{
-  return index ^ ((index >> 4u) & 15u);
+  return {swizzle};
 }}
 
 {line_base_fn}
 
-@compute @workgroup_size({workgroup}, 1, 1)
+@compute @workgroup_size({workgroup_total}, 1, 1)
 fn main({entry_params}) {{
   {flat_workgroup_index}
-  if (wgFlat >= params.lines) {{
-    return;
-  }}
-  let base: u32 = line_base(params.lineOffset + wgFlat);
-  let t: u32 = lid.x;
+  {line_mapping}
 {body}}}
 "#,
         complex_wgsl = complex_wgsl(),
         stride = key.stride_complex,
-        exchange = layout.exchange,
+        exchange_total = layout.exchange * lines,
+        workgroup_total = workgroup * lines,
         line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims),
         entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
         flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,

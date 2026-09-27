@@ -2107,6 +2107,9 @@ pub(crate) struct FusedPrimeStageKey {
     /// Set when a Bluestein convolution runs in registers.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) registers: Option<RegisterSchedule>,
+    /// Output pairs per invocation of a direct kernel; 1 otherwise.
+    #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
+    pub(crate) pairs_per_invocation: u32,
 }
 
 impl FusedPrimeStageKey {
@@ -2150,6 +2153,7 @@ impl FusedPrimeStageKey {
             scale_bits,
             lines_per_workgroup: 1,
             registers: None,
+            pairs_per_invocation: 1,
         }
     }
 
@@ -2162,6 +2166,12 @@ impl FusedPrimeStageKey {
     /// Transforms `lines` lines per workgroup (direct kernels only).
     pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
         self.lines_per_workgroup = lines.max(1);
+        self
+    }
+
+    /// Produces `pairs` output pairs per invocation (direct kernels only).
+    pub(crate) fn with_pairs_per_invocation(mut self, pairs: u32) -> Self {
+        self.pairs_per_invocation = pairs.max(1);
         self
     }
 
@@ -2189,6 +2199,9 @@ impl FusedPrimeStageKey {
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        if self.pairs_per_invocation > 1 {
+            key.push_str(&format!(":pairs={}", self.pairs_per_invocation));
         }
         if let Some(registers) = &self.registers {
             key.push_str(&registers.stable_key_suffix());

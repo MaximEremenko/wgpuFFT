@@ -13,7 +13,8 @@ use crate::runtime::axis_policy::{
 use crate::runtime::bluestein_axis::{register_bluestein_plan, BluesteinAxis, BluesteinAxisConfig};
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::direct_prime::{
-    direct_lines_per_workgroup, direct_prime_supported, generate_direct_prime_wgsl_for_key,
+    direct_lines_per_workgroup, direct_pairs_per_invocation, direct_prime_supported,
+    generate_direct_prime_wgsl_for_key,
 };
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::{ElementFormat, HelperBufferRange};
@@ -278,11 +279,13 @@ impl RaderAxis {
                 n,
                 config.precision.as_fft_precision(),
             )?;
+            let pairs_per_invocation = direct_pairs_per_invocation(n, lines_u32 as usize);
             let lines_per_workgroup = direct_lines_per_workgroup(
                 n,
                 stride_complex,
                 config.precision,
                 config.fused_workgroup_size,
+                pairs_per_invocation,
                 lines_u32 as usize,
                 u64::from(device.limits().max_compute_workgroup_storage_size),
             );
@@ -301,7 +304,8 @@ impl RaderAxis {
                 scale,
                 config.precision,
             )
-            .with_lines_per_workgroup(lines_per_workgroup);
+            .with_lines_per_workgroup(lines_per_workgroup)
+            .with_pairs_per_invocation(pairs_per_invocation as u32);
             let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
             let bind_group_layout = cached_layout(device, pipeline_key.layout);
             let pipeline = cached_fused_pipeline(device, &pipeline_key, &shader_key);

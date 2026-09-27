@@ -425,10 +425,12 @@ async fn run_fused_and_multipass_cases(
             "wgpu_fft.test.df64_low_storage_device",
         )
         .await;
+        // Stockham coverage: keep the long axis unsplit on the low-storage device.
+        let unsplit_tuning = config_2048.tuning().clone().with_split_long_axes(false);
         let (multipass, multipass_plan) = execute_c2c_df64(
             &low.0,
             &low.1,
-            config_2048,
+            config_2048.with_tuning(unsplit_tuning),
             &input_2048,
             "pow2-forward-n2048-forced-multipass",
         );
@@ -452,7 +454,11 @@ async fn run_fused_and_multipass_cases(
         "pow2-inverse-n4096",
     );
     assert_sampled_df64_accuracy("pow2-inverse-n4096", &actual_4096, &expected_4096);
-    assert_stockham_plan(&plan_4096, 4096, "pow2-inverse-n4096");
+    if storage_limit >= 4096 * 16 {
+        assert_eq!(kernel_labels(&plan_4096), vec![FUSED_POW2_LABEL]);
+    } else {
+        assert_split_plan(&plan_4096, 4096, FUSED_POW2_LABEL, "pow2-inverse-n4096");
+    }
 
     let config_3000 = FftConfig::new(3000)
         .with_normalization(Normalization::None)
@@ -471,7 +477,12 @@ async fn run_fused_and_multipass_cases(
         assert_eq!(kernel_labels(&smooth_plan), vec![FUSED_SMOOTH_LABEL]);
         assert_eq!(smooth_plan.workspace_size_bytes(), 0);
     } else {
-        assert_stockham_plan(&smooth_plan, 3000, "smooth-forward-n3000");
+        assert_split_plan(
+            &smooth_plan,
+            3000,
+            FUSED_SMOOTH_LABEL,
+            "smooth-forward-n3000",
+        );
     }
 }
 
@@ -730,6 +741,20 @@ fn assert_stockham_plan(plan: &FftPlan, len: usize, label: &str) {
         "{label}: expected Stockham stages, got {kernels:?}"
     );
     assert_eq!(plan.workspace_size_bytes(), (len * 16) as u64);
+}
+
+/// Axes too long for one workgroup run as two fused passes (`N = N1 * N2`).
+fn assert_split_plan(plan: &FftPlan, len: usize, fused_label: &str, label: &str) {
+    assert_eq!(
+        kernel_labels(plan),
+        vec![fused_label; 2],
+        "{label}: N={len} should split into two fused passes"
+    );
+    assert_eq!(
+        plan.workspace_size_bytes(),
+        (len * 16) as u64,
+        "{label}: split workspace"
+    );
 }
 
 fn kernel_labels(plan: &FftPlan) -> Vec<String> {

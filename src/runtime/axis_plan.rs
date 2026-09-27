@@ -11,7 +11,7 @@ use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::large_graph::ElementFormat;
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPow2StageKey, FusedSmoothStageKey,
-    PipelineLayoutCacheKey, StockhamStageKey,
+    PipelineLayoutCacheKey, SplitPass, StockhamStageKey,
 };
 use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
@@ -156,6 +156,8 @@ pub(crate) struct AxisPlanConfig {
     pub(crate) precision: AxisPrecision,
     pub(crate) workgroup_size: u32,
     pub(crate) fused_workgroup_size: u32,
+    /// Run axes too long for one fused workgroup as two fused passes.
+    pub(crate) split_long_axes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +308,7 @@ impl AxisPlanConfig {
             precision: config.precision().into(),
             workgroup_size: config.tuning().workgroup_size(),
             fused_workgroup_size: config.tuning().fused_workgroup_size(),
+            split_long_axes: config.tuning().split_long_axes(),
         }
     }
 
@@ -637,6 +640,133 @@ impl AxisPlan {
                     workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
                     pipeline,
                 });
+            } else if let Some((n1, n2)) = config
+                .split_long_axes
+                .then(|| {
+                    long_axis_split(
+                        axis_len,
+                        config.precision,
+                        config.fused_workgroup_size,
+                        &device.limits(),
+                    )
+                })
+                .flatten()
+            {
+                // View the axis as n = n2 + n2_len * n1 (see `SplitPass`): the
+                // first pass transforms n1 and applies the split twiddle, the
+                // second transforms n2 and stores transposed.
+                let lower = &config.shape[..axis];
+                let upper = &config.shape[axis + 1..];
+                let split_dims = [lower, &[n2, n1][..], upper].concat();
+                let out_dims = [lower, &[n1, n2][..], upper].concat();
+                let row_stride_lines = lower.iter().product::<usize>();
+                let passes = [
+                    (
+                        axis + 1,
+                        n1,
+                        SplitPass {
+                            full_length: axis_len,
+                            twiddle_scale: n2,
+                            row_twiddle: Some((n2, row_stride_lines)),
+                            output: None,
+                        },
+                        false,
+                    ),
+                    (
+                        axis,
+                        n2,
+                        SplitPass {
+                            full_length: axis_len,
+                            twiddle_scale: n1,
+                            row_twiddle: None,
+                            output: Some((out_dims, axis + 1)),
+                        },
+                        apply_any_scale && final_axis,
+                    ),
+                ];
+                for (pass_axis, pass_len, split_pass, apply_scale) in passes {
+                    let pass_stride = stride_for_axis(&split_dims, pass_axis);
+                    let total_lines = total_complex / pass_len;
+                    let lines_per_workgroup = fused_lines_per_workgroup(
+                        pass_len,
+                        pass_stride,
+                        config.precision,
+                        total_lines,
+                        u64::from(device.limits().max_compute_workgroup_storage_size),
+                    );
+                    let (kind, pipeline_key, shader_source): (_, _, Box<dyn FnOnce() -> String>) =
+                        if pass_len.is_power_of_two() {
+                            let key = FusedPow2StageKey::new(
+                                split_dims.len(),
+                                pass_axis,
+                                &split_dims,
+                                pass_len,
+                                pass_stride,
+                                config.direction,
+                                config.fused_workgroup_size,
+                                apply_scale,
+                                scale,
+                                config.precision,
+                            )
+                            .with_lines_per_workgroup(lines_per_workgroup)
+                            .with_split_pass(split_pass);
+                            (
+                                AxisStageKind::FusedPow2 {
+                                    axis_length: pass_len,
+                                },
+                                ComputePipelineCacheKey::fused_pow2_stage(key.clone()),
+                                Box::new(move || generate_fused_pow2_stage_wgsl_for_key(&key)),
+                            )
+                        } else {
+                            let key = FusedSmoothStageKey::new(
+                                split_dims.len(),
+                                pass_axis,
+                                &split_dims,
+                                pass_len,
+                                pass_stride,
+                                &crate::runtime::factor_supported_length(pass_len)?,
+                                config.direction,
+                                config.fused_workgroup_size,
+                                apply_scale,
+                                scale,
+                                config.precision,
+                            )
+                            .with_lines_per_workgroup(lines_per_workgroup)
+                            .with_split_pass(split_pass);
+                            (
+                                AxisStageKind::FusedSmooth {
+                                    axis_length: pass_len,
+                                },
+                                ComputePipelineCacheKey::fused_smooth_stage(key.clone()),
+                                Box::new(move || generate_fused_smooth_stage_wgsl_for_key(&key)),
+                            )
+                        };
+                    let shader_label = format!(
+                        "wgpu_fft.axis_plan.split.axis{axis}.n{axis_len}.pass{pass_len}.shader"
+                    );
+                    let pipeline_label = format!(
+                        "wgpu_fft.axis_plan.split.axis{axis}.n{axis_len}.pass{pass_len}.pipeline"
+                    );
+                    let pipeline = with_device_pipeline_cache(device, |cache| {
+                        cache.get_compute_pipeline(
+                            device,
+                            &pipeline_key,
+                            &pipeline_label,
+                            &shader_label,
+                            shader_source,
+                        )
+                    });
+                    stages.push(AxisStage {
+                        axis,
+                        kind,
+                        stride_complex: pass_stride,
+                        apply_scale,
+                        pipeline_key,
+                        twiddle_lut_index,
+                        workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
+                        pipeline,
+                    });
+                }
             } else {
                 let mut ns = 1usize;
                 for (stage_index, &radix) in axis_factors.iter().enumerate() {
@@ -1174,11 +1304,12 @@ fn main({entry_params}) {{
 pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
     config: &FusedPow2StageWgslConfig<'_>,
     lines: usize,
+    split: Option<&SplitPass>,
 ) -> String {
     debug_assert_eq!(config.rank, config.dims.len());
     debug_assert_eq!(config.axis_length, config.dims[config.axis]);
     debug_assert!(config.axis_length.is_power_of_two() && config.axis_length >= 2);
-    debug_assert!(lines > 1 && config.workgroup_size > 0);
+    debug_assert!(lines >= 1 && config.workgroup_size > 0);
 
     let maybe_scale = if config.apply_scale {
         let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
@@ -1203,11 +1334,9 @@ pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
     }
     // Contiguous lines load line-major; strided lines load element-major so
     // neighbouring invocations touch neighbouring lines.
-    let split = if config.stride_complex == 1 {
-        "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;"
-    } else {
-        "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;"
-    };
+    let store = multiline_store(split, config.stride_complex);
+    let load_split = multiline_split_wgsl(config.stride_complex);
+    let store_split = multiline_split_wgsl(store.stride_out);
 
     specialize_complex_wgsl(
         format!(
@@ -1229,12 +1358,15 @@ pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
 const N: u32 = {n}u;
 const LOG_N: u32 = {log_n}u;
 const STRIDE: u32 = {stride}u;
+const STRIDE_OUT: u32 = {stride_out}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const LINES: u32 = {lines}u;
 
 var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
 
 {line_base_fn}
+
+{line_base_out_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main({entry_params}) {{
@@ -1253,7 +1385,7 @@ fn main({entry_params}) {{
   let lineStart: u32 = params.lineOffset + firstLine + groupLine;
 
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {split}
+    {load_split}
     if (lineSlot < lineCount) {{
       let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
       scratch[lineSlot * N + (reverseBits(p) >> (32u - LOG_N))] = src[srcIdx];
@@ -1263,10 +1395,10 @@ fn main({entry_params}) {{
 
 {radix_stages}
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {split}
+    {store_split}
     if (lineSlot < lineCount) {{
       var value: vec2<f32> = scratch[lineSlot * N + p];
-{maybe_scale}      let dstIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+{row_twiddle}{maybe_scale}      let dstIdx: u32 = line_base_out(lineStart + lineSlot) + p * STRIDE_OUT - params.elementBase;
       dst[dstIdx] = value;
     }}
   }}
@@ -1279,13 +1411,18 @@ fn main({entry_params}) {{
             workgroup_size = config.workgroup_size,
             lines = lines,
             scratch_len = config.axis_length * lines,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            twiddle_lookup_wgsl =
+                multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             radix_stages = radix_stages,
             maybe_scale = maybe_scale,
-            split = split,
+            load_split = load_split,
+            store_split = store_split,
+            stride_out = store.stride_out,
+            line_base_out_fn = store.line_base_out_fn,
+            row_twiddle = store.row_twiddle,
         ),
         config.precision,
     )
@@ -1462,11 +1599,41 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         scale_factor: key.scale_factor(),
         precision: key.precision,
     };
-    if key.lines_per_workgroup > 1 {
-        generate_fused_pow2_multiline_stage_wgsl(&config, key.lines_per_workgroup as usize)
+    if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
+        generate_fused_pow2_multiline_stage_wgsl(
+            &config,
+            key.lines_per_workgroup as usize,
+            key.split_pass.as_ref(),
+        )
     } else {
         generate_fused_pow2_stage_wgsl(&config)
     }
+}
+
+/// Splits an axis too long for one fused workgroup into `n1 * n2`, where each
+/// factor fits a fused kernel, preferring the most balanced split. Returns
+/// `None` when no such split exists.
+fn long_axis_split(
+    axis_length: usize,
+    precision: AxisPrecision,
+    fused_workgroup_size: u32,
+    limits: &wgpu::Limits,
+) -> Option<(usize, usize)> {
+    let fused = |len: usize| {
+        fused_pow2_supported(len, precision, fused_workgroup_size, limits)
+            || crate::runtime::factor_supported_length(len).is_ok_and(|factors| {
+                fused_smooth_supported(len, &factors, precision, fused_workgroup_size, limits)
+            })
+    };
+    let mut split = None;
+    let mut n1 = 2;
+    while n1 * n1 <= axis_length {
+        if axis_length.is_multiple_of(n1) && fused(n1) && fused(axis_length / n1) {
+            split = Some((n1, axis_length / n1));
+        }
+        n1 += 1;
+    }
+    split
 }
 
 /// Lines per workgroup for a fused kernel on an axis of `axis_length`.
@@ -1882,8 +2049,12 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
         scale_factor: key.scale_factor(),
         precision: key.precision,
     };
-    if key.lines_per_workgroup > 1 {
-        generate_fused_smooth_multiline_stage_wgsl(&config, key.lines_per_workgroup as usize)
+    if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
+        generate_fused_smooth_multiline_stage_wgsl(
+            &config,
+            key.lines_per_workgroup as usize,
+            key.split_pass.as_ref(),
+        )
     } else {
         generate_fused_smooth_stage_wgsl(&config)
     }
@@ -1896,11 +2067,12 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
 pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
     config: &FusedSmoothStageWgslConfig<'_>,
     lines: usize,
+    split: Option<&SplitPass>,
 ) -> String {
     debug_assert_eq!(config.rank, config.dims.len());
     debug_assert_eq!(config.axis_length, config.dims[config.axis]);
     debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
-    debug_assert!(lines > 1 && config.workgroup_size > 0);
+    debug_assert!(lines >= 1 && config.workgroup_size > 0);
 
     let maybe_scale = if config.apply_scale {
         let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
@@ -1924,11 +2096,9 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
         ));
     }
     debug_assert_eq!(ns, config.axis_length);
-    let split = if config.stride_complex == 1 {
-        "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;"
-    } else {
-        "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;"
-    };
+    let store = multiline_store(split, config.stride_complex);
+    let load_split = multiline_split_wgsl(config.stride_complex);
+    let store_split = multiline_split_wgsl(store.stride_out);
 
     specialize_complex_wgsl(
         format!(
@@ -1949,12 +2119,15 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
+const STRIDE_OUT: u32 = {stride_out}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const LINES: u32 = {lines}u;
 
 var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
 
 {line_base_fn}
+
+{line_base_out_fn}
 
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main({entry_params}) {{
@@ -1973,7 +2146,7 @@ fn main({entry_params}) {{
   let lineStart: u32 = params.lineOffset + firstLine + groupLine;
 
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {split}
+    {load_split}
     if (lineSlot < lineCount) {{
       let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
       scratch[lineSlot * N + p] = src[srcIdx];
@@ -1983,10 +2156,10 @@ fn main({entry_params}) {{
 
 {radix_stages}
   for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
-    {split}
+    {store_split}
     if (lineSlot < lineCount) {{
       var value: vec2<f32> = scratch[lineSlot * N + p];
-{maybe_scale}      let dstIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+{row_twiddle}{maybe_scale}      let dstIdx: u32 = line_base_out(lineStart + lineSlot) + p * STRIDE_OUT - params.elementBase;
       dst[dstIdx] = value;
     }}
   }}
@@ -1998,13 +2171,18 @@ fn main({entry_params}) {{
             workgroup_size = config.workgroup_size,
             lines = lines,
             scratch_len = config.axis_length * lines,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            twiddle_lookup_wgsl =
+                multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             radix_stages = radix_stages,
             maybe_scale = maybe_scale,
-            split = split,
+            load_split = load_split,
+            store_split = store_split,
+            stride_out = store.stride_out,
+            line_base_out_fn = store.line_base_out_fn,
+            row_twiddle = store.row_twiddle,
         ),
         config.precision,
     )
@@ -2282,6 +2460,69 @@ fn radix_root_wgsl(
     let angle = sign * std::f64::consts::TAU * power as f64 / radix as f64;
     let (sin, cos) = angle.sin_cos();
     precision.format_wgsl_complex(cos, sin)
+}
+
+/// Maps a flat element index `e` to `(lineSlot, p)`: line-major for
+/// contiguous lines, element-major for strided lines so neighbouring
+/// invocations touch neighbouring lines.
+fn multiline_split_wgsl(stride: usize) -> &'static str {
+    if stride == 1 {
+        "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;"
+    } else {
+        "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;"
+    }
+}
+
+/// Twiddle lookup for a multi-line kernel. A split-axis pass binds the full
+/// axis's table, so `twiddle` scales its own indices and `twiddle_full` reads
+/// the table directly for the split twiddle.
+fn multiline_twiddle_lookup_wgsl(
+    direction: FftDirection,
+    precision: AxisPrecision,
+    split: Option<&SplitPass>,
+) -> String {
+    let lookup = twiddle_lookup_wgsl(direction, precision);
+    match split {
+        None => lookup,
+        Some(split) => format!(
+            "{}\n\nfn twiddle(index: u32) -> vec2<f32> {{\n  return twiddle_full(index * {}u);\n}}",
+            lookup.replace("fn twiddle(", "fn twiddle_full("),
+            split.twiddle_scale
+        ),
+    }
+}
+
+/// Store-side WGSL of a multi-line kernel: the split twiddle of a first pass
+/// and the transposed output addressing of a second pass.
+struct MultilineStore {
+    line_base_out_fn: String,
+    stride_out: usize,
+    row_twiddle: String,
+}
+
+fn multiline_store(split: Option<&SplitPass>, stride_in: usize) -> MultilineStore {
+    let (line_base_out_fn, stride_out) = match split.and_then(|split| split.output.as_ref()) {
+        Some((dims, axis)) => (
+            wgsl_line_base_fn(dims.len(), *axis, dims)
+                .replace("fn line_base(", "fn line_base_out("),
+            stride_for_axis(dims, *axis),
+        ),
+        None => (
+            "fn line_base_out(line: u32) -> u32 {\n  return line_base(line);\n}".to_owned(),
+            stride_in,
+        ),
+    };
+    let row_twiddle = match split.and_then(|split| split.row_twiddle) {
+        Some((rows, row_stride_lines)) => format!(
+            "      let row: u32 = ((lineStart + lineSlot) / {row_stride_lines}u) % {rows}u;\n      value = c_mul(value, twiddle_full(row * p));\n"
+        ),
+        None => String::new(),
+    };
+    MultilineStore {
+        line_base_out_fn,
+        stride_out,
+        row_twiddle,
+    }
 }
 
 fn specialize_complex_wgsl(source: String, precision: AxisPrecision) -> String {
@@ -3163,6 +3404,7 @@ mod tests {
                 precision: AxisPrecision::F32,
             },
             lines,
+            None,
         )
     }
 
@@ -3204,6 +3446,7 @@ mod tests {
                 precision: AxisPrecision::F32,
             },
             16,
+            None,
         );
         assert!(wgsl.contains("const LINES: u32 = 16u;"));
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 768>;"));
@@ -3267,6 +3510,135 @@ mod tests {
         assert!(!key.stable_key().contains(":lines="));
         let key = key.with_lines_per_workgroup(32);
         assert!(key.stable_key().ends_with(":lines=32"));
+    }
+
+    #[test]
+    fn long_axis_split_prefers_balanced_fused_factors() {
+        let limits = wgpu::Limits {
+            max_compute_workgroup_storage_size: 32 * 1024,
+            ..wgpu::Limits::default()
+        };
+        let split =
+            |len, precision| long_axis_split(len, precision, DEFAULT_FUSED_WORKGROUP_SIZE, &limits);
+        assert_eq!(split(8192, AxisPrecision::F32), Some((64, 128)));
+        assert_eq!(split(12288, AxisPrecision::F32), Some((96, 128)));
+        assert_eq!(split(1 << 20, AxisPrecision::F32), Some((1024, 1024)));
+        assert_eq!(split(3000, AxisPrecision::F32), Some((50, 60)));
+        assert_eq!(split(4096, AxisPrecision::Df64), Some((64, 64)));
+        // Every factor must fit one workgroup, and primes have no split.
+        assert_eq!(split(1 << 26, AxisPrecision::F32), None);
+        assert_eq!(split(8191, AxisPrecision::F32), None);
+        assert_eq!(split(2 * 4099, AxisPrecision::F32), None);
+    }
+
+    fn split_pow2_wgsl(
+        dims: &[usize],
+        axis: usize,
+        lines: usize,
+        apply_scale: bool,
+        split: &SplitPass,
+    ) -> String {
+        generate_fused_pow2_multiline_stage_wgsl(
+            &FusedPow2StageWgslConfig {
+                rank: dims.len(),
+                axis,
+                dims,
+                axis_length: dims[axis],
+                stride_complex: stride_for_axis(dims, axis),
+                direction: FftDirection::Forward,
+                workgroup_size: FUSED_POW2_WORKGROUP_SIZE,
+                apply_scale,
+                scale_factor: 0.5,
+                precision: AxisPrecision::F32,
+            },
+            lines,
+            Some(split),
+        )
+    }
+
+    #[test]
+    fn split_passes_twiddle_rows_and_store_transposed() {
+        // N = 8192 as n = n2 + 128 * n1, viewed as dims [128, 64].
+        let dims = [128usize, 64];
+        let first = split_pow2_wgsl(
+            &dims,
+            1,
+            8,
+            false,
+            &SplitPass {
+                full_length: 8192,
+                twiddle_scale: 128,
+                row_twiddle: Some((128, 1)),
+                output: None,
+            },
+        );
+        assert!(first.contains("fn twiddle_full(index: u32)"));
+        assert!(first.contains("return twiddle_full(index * 128u);"));
+        assert!(first.contains("const STRIDE: u32 = 128u;"));
+        assert!(first.contains("const STRIDE_OUT: u32 = 128u;"));
+        assert!(first.contains("let row: u32 = ((lineStart + lineSlot) / 1u) % 128u;"));
+        assert!(first.contains("value = c_mul(value, twiddle_full(row * p));"));
+        crate::runtime::assert_workgroup_var_written_before_read(&first, "scratch");
+
+        // The second pass reads contiguous n2 lines and writes them as the
+        // strided axis of [64, 128], after scaling.
+        let second = split_pow2_wgsl(
+            &dims,
+            0,
+            1,
+            true,
+            &SplitPass {
+                full_length: 8192,
+                twiddle_scale: 64,
+                row_twiddle: None,
+                output: Some((vec![64, 128], 1)),
+            },
+        );
+        assert!(second.contains("return twiddle_full(index * 64u);"));
+        assert!(!second.contains("let row: u32"));
+        assert!(second.contains("const STRIDE: u32 = 1u;"));
+        assert!(second.contains("const STRIDE_OUT: u32 = 64u;"));
+        assert!(second.contains("fn line_base_out(line: u32) -> u32 {"));
+        assert!(second.contains("value = value * vec2<f32>(0.5, 0.5);"));
+        assert!(second.contains("line_base_out(lineStart + lineSlot) + p * STRIDE_OUT"));
+        crate::runtime::assert_workgroup_var_written_before_read(&second, "scratch");
+    }
+
+    #[test]
+    fn split_passes_have_distinct_cache_keys() {
+        let key = FusedPow2StageKey::new(
+            2,
+            1,
+            &[128, 64],
+            64,
+            128,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+            AxisPrecision::F32,
+        )
+        .with_lines_per_workgroup(8);
+        let first = key.clone().with_split_pass(SplitPass {
+            full_length: 8192,
+            twiddle_scale: 128,
+            row_twiddle: Some((128, 1)),
+            output: None,
+        });
+        let second = key.clone().with_split_pass(SplitPass {
+            full_length: 8192,
+            twiddle_scale: 128,
+            row_twiddle: None,
+            output: Some((vec![64, 128], 1)),
+        });
+        assert!(!key.stable_key().contains(":split="));
+        assert!(first
+            .stable_key()
+            .contains(":split=n8192.scale128.rows128.rowstride1"));
+        assert!(second
+            .stable_key()
+            .contains(":split=n8192.scale128.out64x128.axis1"));
+        assert_ne!(first.stable_key(), second.stable_key());
     }
 
     #[test]

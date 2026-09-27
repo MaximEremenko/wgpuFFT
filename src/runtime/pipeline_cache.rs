@@ -1891,11 +1891,46 @@ pub(crate) struct FusedPow2StageKey {
     /// Lines transformed by one workgroup; 1 keeps the original kernel.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) lines_per_workgroup: u32,
+    /// Set when this kernel is one pass of a split long axis.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) split_pass: Option<SplitPass>,
 }
 
 #[cfg(feature = "serde")]
 fn one_line_per_workgroup() -> u32 {
     1
+}
+
+/// One pass of an axis split into two fused passes, `N = N1 * N2`.
+///
+/// Viewing the axis as `n = n2 + N2 * n1`, the first pass transforms `n1`
+/// and multiplies by `W_N^(n2 * k1)` on store; the second transforms `n2` and
+/// stores element `k2` of line `k1` at `k1 + N1 * k2`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SplitPass {
+    /// Full axis length `N`; the bound twiddle table holds `N` entries.
+    pub(crate) full_length: usize,
+    /// Multiplier for this pass's own twiddle indices (`N` / pass length).
+    pub(crate) twiddle_scale: usize,
+    /// First pass: `(rows, row_stride_lines)`, where the row index `n2` of a
+    /// line is `(line / row_stride_lines) % rows`.
+    pub(crate) row_twiddle: Option<(usize, usize)>,
+    /// Second pass: the `(dims, axis)` the transform stores through.
+    pub(crate) output: Option<(Vec<usize>, usize)>,
+}
+
+impl SplitPass {
+    fn stable_key_suffix(&self) -> String {
+        let mut suffix = format!(":split=n{}.scale{}", self.full_length, self.twiddle_scale);
+        if let Some((rows, row_stride_lines)) = self.row_twiddle {
+            suffix.push_str(&format!(".rows{rows}.rowstride{row_stride_lines}"));
+        }
+        if let Some((dims, axis)) = &self.output {
+            suffix.push_str(&format!(".out{}.axis{axis}", dims_key(dims)));
+        }
+        suffix
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1915,6 +1950,9 @@ pub(crate) struct FusedSmoothStageKey {
     /// Lines transformed by one workgroup; 1 keeps the original kernel.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) lines_per_workgroup: u32,
+    /// Set when this kernel is one pass of a split long axis.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) split_pass: Option<SplitPass>,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2061,12 +2099,19 @@ impl FusedSmoothStageKey {
             apply_scale,
             scale_bits,
             lines_per_workgroup: 1,
+            split_pass: None,
         }
     }
 
     /// Transforms `lines` lines per workgroup instead of one.
     pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
         self.lines_per_workgroup = lines.max(1);
+        self
+    }
+
+    /// Makes this kernel one pass of a split long axis.
+    pub(crate) fn with_split_pass(mut self, split_pass: SplitPass) -> Self {
+        self.split_pass = Some(split_pass);
         self
     }
 
@@ -2092,6 +2137,9 @@ impl FusedSmoothStageKey {
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        if let Some(split_pass) = &self.split_pass {
+            key.push_str(&split_pass.stable_key_suffix());
         }
         key
     }
@@ -2151,12 +2199,19 @@ impl FusedPow2StageKey {
             apply_scale,
             scale_bits,
             lines_per_workgroup: 1,
+            split_pass: None,
         }
     }
 
     /// Transforms `lines` lines per workgroup instead of one.
     pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
         self.lines_per_workgroup = lines.max(1);
+        self
+    }
+
+    /// Makes this kernel one pass of a split long axis.
+    pub(crate) fn with_split_pass(mut self, split_pass: SplitPass) -> Self {
+        self.split_pass = Some(split_pass);
         self
     }
 
@@ -2181,6 +2236,9 @@ impl FusedPow2StageKey {
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        if let Some(split_pass) = &self.split_pass {
+            key.push_str(&split_pass.stable_key_suffix());
         }
         key
     }

@@ -272,7 +272,14 @@ async fn compare_fused_and_multipass_4096(context: &wgpu_fft::device::GpuContext
         let expected = cpu_fft_pow2(&input, inverse, inverse);
         let (fused, fused_plan) =
             execute_c2c(&context.device, &context.queue, config.clone(), &input);
-        let (multipass, multipass_plan) = execute_c2c(&low_device, &low_queue, config, &input);
+        // Stockham coverage: keep the long axis unsplit on the low-storage device.
+        let unsplit_tuning = config.tuning().clone().with_split_long_axes(false);
+        let (multipass, multipass_plan) = execute_c2c(
+            &low_device,
+            &low_queue,
+            config.with_tuning(unsplit_tuning),
+            &input,
+        );
 
         assert_fused_pow2_plan(&fused_plan, 1, 0);
         assert_stage_labels(&multipass_plan, 0, 0, 4);
@@ -303,8 +310,14 @@ async fn compare_fused_and_multipass_4096(context: &wgpu_fft::device::GpuContext
             config.clone(),
             &smooth_input,
         );
-        let (multipass, multipass_plan) =
-            execute_c2c(&low_device, &low_queue, config, &smooth_input);
+        // Stockham coverage: keep the long axis unsplit on the low-storage device.
+        let unsplit_tuning = config.tuning().clone().with_split_long_axes(false);
+        let (multipass, multipass_plan) = execute_c2c(
+            &low_device,
+            &low_queue,
+            config.with_tuning(unsplit_tuning),
+            &smooth_input,
+        );
 
         assert_fused_smooth_plan(&fused_plan, 1, 0);
         assert_stage_labels(&multipass_plan, 0, 0, 7);

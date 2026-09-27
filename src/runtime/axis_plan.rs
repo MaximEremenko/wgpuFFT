@@ -2170,7 +2170,7 @@ pub(crate) fn pad_workgroup_indices(source: &str) -> String {
 /// of queueing on a few compute units. Strided axes round down to a power of
 /// two: the row a workgroup reads then fills whole 32-byte sectors, and each
 /// invocation keeps one line for all its loads.
-fn fused_lines_per_workgroup(
+pub(crate) fn fused_lines_per_workgroup(
     axis_length: usize,
     stride_complex: usize,
     precision: AxisPrecision,
@@ -2926,6 +2926,7 @@ pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
                 config.direction,
                 config.workgroup_size,
                 lines,
+                "twiddle",
                 config.precision,
             ));
         }
@@ -3019,13 +3020,15 @@ fn main({entry_params}) {{
 /// One in-place smooth radix stage over `lines` lines of `axis_length`
 /// elements in `scratch`, with each line's units on consecutive invocations.
 #[allow(clippy::too_many_arguments)]
-fn generate_in_place_smooth_fft_stage_multiline_wgsl(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_in_place_smooth_fft_stage_multiline_wgsl(
     axis_length: usize,
     radix: usize,
     ns: usize,
     direction: FftDirection,
     workgroup_size: u32,
     lines: usize,
+    twiddle_fn_name: &str,
     precision: AxisPrecision,
 ) -> String {
     debug_assert_eq!(ns % radix, 0);
@@ -3062,7 +3065,7 @@ fn generate_in_place_smooth_fft_stage_multiline_wgsl(
             direction,
             slot,
             &|index| format!("scratch[{index}]"),
-            "twiddle",
+            twiddle_fn_name,
             precision,
         );
         computes.push_str(&format!(

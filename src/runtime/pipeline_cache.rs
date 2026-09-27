@@ -2248,6 +2248,24 @@ impl FusedPrimeStageKey {
             (FusedPrimeKind::Direct, None) => self
                 .axis_length
                 .checked_mul(self.lines_per_workgroup as usize),
+            // Several lines of the convolution, and each line's x[0].
+            (FusedPrimeKind::Rader, None) if self.lines_per_workgroup > 1 => {
+                let lines = self.lines_per_workgroup as usize;
+                crate::runtime::axis_plan::multiline_line_stride(
+                    self.convolution_length,
+                    lines,
+                    self.stride_complex != 1,
+                )
+                .checked_mul(lines)
+                .map(|elements| {
+                    if self.padded_indices {
+                        crate::runtime::axis_plan::padded_workgroup_len(elements)
+                    } else {
+                        elements
+                    }
+                })
+                .and_then(|elements| elements.checked_add(lines))
+            }
             _ if self.padded_indices => Some(crate::runtime::axis_plan::padded_workgroup_len(
                 self.convolution_length,
             )),

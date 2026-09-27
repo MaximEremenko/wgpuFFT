@@ -98,6 +98,8 @@ impl FftTuning {
 
     /// Largest prime axis transformed by a direct DFT kernel instead of
     /// Rader's convolution (`f32` only); `0` keeps Rader for every prime.
+    /// Primes whose Rader convolution is cyclic (`N - 1` smooth) and fits a
+    /// fused kernel run Rader regardless, which measured faster.
     pub const fn direct_max_prime(&self) -> usize {
         self.direct_max_prime
     }

@@ -215,15 +215,6 @@ fn prime_binding_inventory(
                 )
             })
             .flatten();
-        let direct_prime = kind == AxisKind::Rader
-            && !forced_rader
-            && n <= config.tuning().direct_max_prime()
-            && direct_prime_supported(
-                n,
-                axis_precision,
-                config.tuning().fused_workgroup_size(),
-                compute_limits,
-            );
         let rader_fused = kind == AxisKind::Rader
             && fused_rader_supported_by_limits(
                 n,
@@ -234,6 +225,17 @@ fn prime_binding_inventory(
                 u64::from(compute_limits.max_compute_workgroup_storage_size),
                 compute_limits.max_compute_invocations_per_workgroup,
                 compute_limits.max_compute_workgroup_size_x,
+            );
+        // As in the Rader axis: a cyclic fused convolution takes priority.
+        let direct_prime = kind == AxisKind::Rader
+            && !forced_rader
+            && n <= config.tuning().direct_max_prime()
+            && !(rader_fused && rader_convolution_length(n)? == n - 1)
+            && direct_prime_supported(
+                n,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                compute_limits,
             );
         let register_bluestein = register_bluestein.filter(|(register_length, _, _)| {
             !direct_prime

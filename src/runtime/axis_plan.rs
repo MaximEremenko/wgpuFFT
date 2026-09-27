@@ -2402,28 +2402,201 @@ fn generate_fused_smooth_butterfly_math_wgsl(
         }
     }
 
-    for output in 0..radix {
-        shader.push_str(&format!(
-            "      var out_{slot}_{output}: vec2<f32> = x_{slot}_0;\n"
-        ));
-        for q in 1..radix {
-            let power = (output * q) % radix;
-            if power == 0 {
-                shader.push_str(&format!(
-                    "      out_{slot}_{output} = c_add(out_{slot}_{output}, x_{slot}_{q});\n"
-                ));
-            } else {
-                let root = radix_root_wgsl(radix, power, direction, precision);
-                shader.push_str(&format!(
-                    "      out_{slot}_{output} = c_add(out_{slot}_{output}, c_mul({root}, x_{slot}_{q}));\n"
-                ));
-            }
-        }
-        shader.push_str(&format!(
-            "      stageOut_{slot}_{output} = out_{slot}_{output};\n"
-        ));
+    let inputs = (0..radix)
+        .map(|q| format!("x_{slot}_{q}"))
+        .collect::<Vec<_>>();
+    let outputs = emit_small_dft_wgsl(
+        &mut shader,
+        &format!("dft_{slot}"),
+        &inputs,
+        direction,
+        precision,
+    );
+    for (output, value) in outputs.iter().enumerate() {
+        shader.push_str(&format!("      stageOut_{slot}_{output} = {value};\n"));
     }
     shader
+}
+
+/// Appends statements computing `DFT_R` of the complex WGSL values `inputs`
+/// and returns the names of its outputs in order. Radices 2, 4, and 8 run as
+/// radix-2 and radix-4 layers whose rotations by `-i` are component swaps.
+/// Odd primes pair `x[k]` with `x[R - k]`: output `m` and `R - m` share the
+/// cosine sum of the pair sums and the sine sum of the pair differences, so
+/// the DFT takes `(R - 1)^2` real multiplications instead of `(R - 1)^2`
+/// complex ones.
+fn emit_small_dft_wgsl(
+    body: &mut String,
+    prefix: &str,
+    inputs: &[String],
+    direction: FftDirection,
+    precision: AxisPrecision,
+) -> Vec<String> {
+    let bind = |body: &mut String, name: String, value: String| {
+        body.push_str(&format!("      let {name}: vec2<f32> = {value};\n"));
+        name
+    };
+    let radix = inputs.len();
+    match radix {
+        1 => inputs.to_vec(),
+        2 => vec![
+            bind(
+                body,
+                format!("{prefix}_0"),
+                format!("c_add({}, {})", inputs[0], inputs[1]),
+            ),
+            bind(
+                body,
+                format!("{prefix}_1"),
+                format!("c_sub({}, {})", inputs[0], inputs[1]),
+            ),
+        ],
+        4 => {
+            let (x0, x1, x2, x3) = (&inputs[0], &inputs[1], &inputs[2], &inputs[3]);
+            let s0 = bind(body, format!("{prefix}_s0"), format!("c_add({x0}, {x2})"));
+            let d0 = bind(body, format!("{prefix}_d0"), format!("c_sub({x0}, {x2})"));
+            let s1 = bind(body, format!("{prefix}_s1"), format!("c_add({x1}, {x3})"));
+            let d1 = bind(body, format!("{prefix}_d1"), format!("c_sub({x1}, {x3})"));
+            let r1 = bind(
+                body,
+                format!("{prefix}_r1"),
+                quarter_turn_wgsl(&d1, direction, precision),
+            );
+            vec![
+                bind(body, format!("{prefix}_0"), format!("c_add({s0}, {s1})")),
+                bind(body, format!("{prefix}_1"), format!("c_add({d0}, {r1})")),
+                bind(body, format!("{prefix}_2"), format!("c_sub({s0}, {s1})")),
+                bind(body, format!("{prefix}_3"), format!("c_sub({d0}, {r1})")),
+            ]
+        }
+        8 => {
+            // n = 2 * n1 + n2 and k = k1 + 4 * k2: a DFT_4 over n1 for each
+            // n2, twiddled by W_8^(n2 * k1), then a DFT_2 over n2.
+            let columns = (0..2)
+                .map(|n2| {
+                    let column = (0..4)
+                        .map(|n1| inputs[2 * n1 + n2].clone())
+                        .collect::<Vec<_>>();
+                    emit_small_dft_wgsl(
+                        body,
+                        &format!("{prefix}c{n2}"),
+                        &column,
+                        direction,
+                        precision,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut outputs = vec![String::new(); 8];
+            for k1 in 0..4 {
+                let odd = match k1 {
+                    0 => columns[1][0].clone(),
+                    2 => bind(
+                        body,
+                        format!("{prefix}t{k1}"),
+                        quarter_turn_wgsl(&columns[1][2], direction, precision),
+                    ),
+                    _ => bind(
+                        body,
+                        format!("{prefix}t{k1}"),
+                        format!(
+                            "c_mul({}, {})",
+                            columns[1][k1],
+                            radix_root_wgsl(8, k1, direction, precision)
+                        ),
+                    ),
+                };
+                let row = [columns[0][k1].clone(), odd];
+                let row_outputs = emit_small_dft_wgsl(
+                    body,
+                    &format!("{prefix}r{k1}"),
+                    &row,
+                    direction,
+                    precision,
+                );
+                outputs[k1] = row_outputs[0].clone();
+                outputs[k1 + 4] = row_outputs[1].clone();
+            }
+            outputs
+        }
+        _ => {
+            debug_assert!(radix % 2 == 1, "unsupported small DFT radix {radix}");
+            let half = (radix - 1) / 2;
+            let mut sums = Vec::with_capacity(half);
+            let mut differences = Vec::with_capacity(half);
+            for k in 1..=half {
+                let (a, b) = (&inputs[k], &inputs[radix - k]);
+                sums.push(bind(
+                    body,
+                    format!("{prefix}_s{k}"),
+                    format!("c_add({a}, {b})"),
+                ));
+                differences.push(bind(
+                    body,
+                    format!("{prefix}_d{k}"),
+                    format!("c_sub({a}, {b})"),
+                ));
+            }
+            let mut outputs = vec![String::new(); radix];
+            let total = sums.iter().fold(inputs[0].clone(), |sum, value| {
+                format!("c_add({sum}, {value})")
+            });
+            outputs[0] = bind(body, format!("{prefix}_0"), total);
+            for m in 1..=half {
+                let angle =
+                    |k: usize| std::f64::consts::TAU * ((k * m) % radix) as f64 / radix as f64;
+                let cosine = sums
+                    .iter()
+                    .enumerate()
+                    .fold(inputs[0].clone(), |sum, (i, value)| {
+                        let term = scaled_complex_expr(value, Some(angle(i + 1).cos()), precision);
+                        format!("c_add({sum}, {term})")
+                    });
+                let sine = differences
+                    .iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        scaled_complex_expr(value, Some(angle(i + 1).sin()), precision)
+                    })
+                    .reduce(|sum, term| format!("c_add({sum}, {term})"))
+                    .expect("odd radices above 1 have pairs");
+                let cosine = bind(body, format!("{prefix}_a{m}"), cosine);
+                let sine = bind(body, format!("{prefix}_b{m}"), sine);
+                // Forward: X[m] = A - iB and X[R - m] = A + iB; inverse flips
+                // the rotation.
+                let rotated = bind(
+                    body,
+                    format!("{prefix}_r{m}"),
+                    quarter_turn_wgsl(&sine, direction, precision),
+                );
+                outputs[m] = bind(
+                    body,
+                    format!("{prefix}_{m}"),
+                    format!("c_add({cosine}, {rotated})"),
+                );
+                outputs[radix - m] = bind(
+                    body,
+                    format!("{prefix}_{}", radix - m),
+                    format!("c_sub({cosine}, {rotated})"),
+                );
+            }
+            outputs
+        }
+    }
+}
+
+/// `value` times `-i` for a forward transform and `i` for an inverse one:
+/// a swap of the real and imaginary parts and one sign.
+fn quarter_turn_wgsl(value: &str, direction: FftDirection, precision: AxisPrecision) -> String {
+    match (precision, direction) {
+        (AxisPrecision::Df64, FftDirection::Forward) => {
+            format!("vec4<f32>({value}.z, {value}.w, -{value}.x, -{value}.y)")
+        }
+        (AxisPrecision::Df64, FftDirection::Inverse) => {
+            format!("vec4<f32>(-{value}.z, -{value}.w, {value}.x, {value}.y)")
+        }
+        (_, FftDirection::Forward) => format!("vec2<f32>({value}.y, -{value}.x)"),
+        (_, FftDirection::Inverse) => format!("vec2<f32>(-{value}.y, {value}.x)"),
+    }
 }
 
 pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey) -> String {

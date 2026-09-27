@@ -914,15 +914,22 @@ pub(crate) fn register_bluestein_plan(
 
 /// Longest register convolution preferred over a workgroup-memory one that
 /// fits.
-pub(crate) const MAX_SHORT_REGISTER_CONVOLUTION: usize = 2048;
+pub(crate) const MAX_SHORT_REGISTER_CONVOLUTION: usize = 4096;
 
 /// Whether a power-of-two register convolution of `register_length` points
-/// beats a workgroup-memory one of `smooth_length` points: when it is short
-/// and not much longer. It then takes fewer stages and barriers; on an RTX
-/// 5090 up to 1.85 times the smooth length paid off.
+/// beats a workgroup-memory one of `smooth_length` points: when it is not
+/// much longer. It takes fewer stages and barriers, which pays off less as
+/// lines grow: on an RTX 5090, up to 2048 points it won at up to 1.85 times
+/// the smooth length, and at 4096 points up to 1.45 times (1.33 times ran
+/// 10% faster, 1.59 times up to 10% slower); at 8192 points it lost even at
+/// 1.35 times.
 pub(crate) fn short_register_convolution(register_length: usize, smooth_length: usize) -> bool {
-    register_length <= MAX_SHORT_REGISTER_CONVOLUTION
-        && register_length.saturating_mul(20) <= smooth_length.saturating_mul(37)
+    let (numerator, denominator) = match register_length {
+        0..=2048 => (37, 20),
+        2049..=MAX_SHORT_REGISTER_CONVOLUTION => (29, 20),
+        _ => return false,
+    };
+    register_length.saturating_mul(denominator) <= smooth_length.saturating_mul(numerator)
 }
 
 pub(crate) fn bluestein_convolution_length(n: usize) -> Result<usize> {

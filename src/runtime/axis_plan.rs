@@ -680,7 +680,7 @@ impl AxisPlan {
                 });
             } else if fused_smooth_supported(
                 axis_len,
-                &axis_factors,
+                &fused_smooth_factors(axis_len, &axis_factors),
                 config.precision,
                 config.fused_workgroup_size,
                 &device.limits(),
@@ -694,13 +694,14 @@ impl AxisPlan {
                     total_lines,
                     u64::from(device.limits().max_compute_workgroup_storage_size),
                 );
+                let smooth_factors = fused_smooth_factors(axis_len, &axis_factors);
                 let shader_key = FusedSmoothStageKey::new(
                     config.shape.len(),
                     axis,
                     &config.shape,
                     axis_len,
                     stride_complex,
-                    &axis_factors,
+                    &smooth_factors,
                     config.direction,
                     config.fused_workgroup_size,
                     apply_scale,
@@ -708,6 +709,14 @@ impl AxisPlan {
                     config.precision,
                 )
                 .with_lines_per_workgroup(lines_per_workgroup);
+                let padded_key = shader_key.clone().with_padded_indices();
+                let shader_key = if fused_smooth_pads_indices(&smooth_factors, stride_complex != 1)
+                    && padded_key.supported_by_device_limits(&device.limits())
+                {
+                    padded_key
+                } else {
+                    shader_key
+                };
                 let pipeline_key = ComputePipelineCacheKey::fused_smooth_stage(shader_key.clone());
 
                 let shader_label =
@@ -2026,6 +2035,125 @@ fn largest_register_schedule(
     None
 }
 
+/// Radices of fused smooth kernels, largest first. A composite radix runs as
+/// one butterfly in registers (see [`emit_small_dft_wgsl`]): more work per
+/// invocation, but fewer stages, barriers, and trips through workgroup
+/// memory than its prime factors as separate stages.
+const FUSED_SMOOTH_RADICES: &[usize] = &[16, 15, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2];
+
+/// Radix schedule of a fused smooth kernel for `axis_length`, whose
+/// multi-pass factorization is `factors`: the fewest stages; among those,
+/// the most radix-16 stages, whose butterflies need the fewest
+/// multiplications, then the most balanced radices (the largest smallest
+/// radix); largest radix first, since the first stage needs no twiddles.
+/// Falls back to `factors` when that would leave a single stage. A grid
+/// search over schedules on an RTX 5090 favoured these.
+pub(crate) fn fused_smooth_factors(axis_length: usize, factors: &[usize]) -> Vec<usize> {
+    fn rank(schedule: &[usize]) -> (usize, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>) {
+        let sixteens = schedule.iter().filter(|&&radix| radix == 16).count();
+        let smallest = schedule.iter().copied().min().unwrap_or(0);
+        (
+            schedule.len(),
+            std::cmp::Reverse(sixteens),
+            std::cmp::Reverse(smallest),
+        )
+    }
+    // Non-increasing radix sequences, each schedule once.
+    fn search(rest: usize, from: usize, current: &mut Vec<usize>, best: &mut Option<Vec<usize>>) {
+        if rest == 1 {
+            if best.as_ref().is_none_or(|best| {
+                rank(current) < rank(best) || (rank(current) == rank(best) && *current > *best)
+            }) {
+                *best = Some(current.clone());
+            }
+            return;
+        }
+        if best
+            .as_ref()
+            .is_some_and(|best| current.len() >= best.len())
+        {
+            return;
+        }
+        for (index, &radix) in FUSED_SMOOTH_RADICES.iter().enumerate().skip(from) {
+            if rest.is_multiple_of(radix) {
+                current.push(radix);
+                search(rest / radix, index, current, best);
+                current.pop();
+            }
+        }
+    }
+    let mut best = None;
+    search(axis_length, 0, &mut Vec::new(), &mut best);
+    match best {
+        Some(schedule) if schedule.len() >= 2 => schedule,
+        _ => factors.to_vec(),
+    }
+}
+
+/// Elements of workgroup memory a padded fused smooth kernel needs for
+/// `elements` unpadded ones (see [`pad_workgroup_indices`]).
+pub(crate) const fn padded_workgroup_len(elements: usize) -> usize {
+    elements + elements.saturating_sub(1) / 16
+}
+
+/// Whether a fused smooth kernel pads its workgroup-memory indices: when it
+/// keeps its lines line-major and starts with a radix that is a multiple of
+/// 8. Its first stage writes each invocation's outputs at a stride of that
+/// radix, which puts a warp's writes into a few banks; one element of
+/// padding per 16 spreads them. Kernels that interleave lines, or start with
+/// a radix whose stride spreads anyway, measured no gain.
+pub(crate) fn fused_smooth_pads_indices(factors: &[usize], element_major: bool) -> bool {
+    !element_major && factors.first().is_some_and(|radix| radix.is_multiple_of(8))
+}
+
+/// Rewrites every `scratch[index]` of a fused smooth kernel to
+/// `scratch[padded(index)]`, with `padded(i) = i + i / 16`, and enlarges the
+/// declaration to match.
+fn pad_workgroup_indices(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 256);
+    let mut rest = source;
+    while let Some(at) = rest.find("scratch[") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "scratch[".len()..];
+        let mut depth = 1usize;
+        let end = after
+            .char_indices()
+            .find_map(|(position, character)| {
+                match character {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(position);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            })
+            .expect("balanced workgroup-memory index");
+        out.push_str(&format!("scratch[padded({})]", &after[..end]));
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    let declaration = "var<workgroup> scratch: array<";
+    let at = out.find(declaration).expect("a scratch declaration");
+    let tail = &out[at + declaration.len()..];
+    let comma = tail.find(", ").expect("a scratch element type");
+    let close = tail.find(">;").expect("a scratch length");
+    let length: usize = tail[comma + 2..close]
+        .trim()
+        .parse()
+        .expect("a literal scratch length");
+    let old = format!("{declaration}{}", &tail[..close + 2]);
+    let new = format!(
+        "fn padded(index: u32) -> u32 {{\n  return index + (index >> 4u);\n}}\n\n{declaration}{}, {}>;",
+        &tail[..comma],
+        padded_workgroup_len(length)
+    );
+    out.replacen(&old, &new, 1)
+}
+
 /// Lines per workgroup for a fused kernel on an axis of `axis_length`.
 ///
 /// Targets about 2048 elements per workgroup so radix stages keep 256
@@ -2189,7 +2317,7 @@ pub(crate) fn generate_fused_scratch_fft_stages_wgsl(
     debug_assert!(!factors.is_empty());
     debug_assert!(factors
         .iter()
-        .all(|radix| crate::runtime::SUPPORTED_RADICES.contains(radix)));
+        .all(|radix| FUSED_SMOOTH_RADICES.contains(radix)));
     debug_assert_eq!(factors.iter().product::<usize>(), axis_length);
     debug_assert!(workgroup_size > 0);
     debug_assert!(!scratch_name.is_empty());
@@ -2496,12 +2624,14 @@ fn generate_fused_smooth_butterfly_math_wgsl(
 }
 
 /// Appends statements computing `DFT_R` of the complex WGSL values `inputs`
-/// and returns the names of its outputs in order. Radices 2, 4, and 8 run as
-/// radix-2 and radix-4 layers whose rotations by `-i` are component swaps.
-/// Odd primes pair `x[k]` with `x[R - k]`: output `m` and `R - m` share the
-/// cosine sum of the pair sums and the sine sum of the pair differences, so
-/// the DFT takes `(R - 1)^2` real multiplications instead of `(R - 1)^2`
-/// complex ones.
+/// and returns the names of its outputs in order. Radix 2 and 4 run as
+/// butterflies whose rotations by `-i` are component swaps. Odd primes pair
+/// `x[k]` with `x[R - k]`: output `m` and `R - m` share the cosine sum of the
+/// pair sums and the sine sum of the pair differences, so the DFT takes
+/// `(R - 1)^2` real multiplications instead of `(R - 1)^2` complex ones.
+/// Composite radices split as `R = R1 * R2` with `R2` their smallest prime
+/// factor: `R2` DFTs of `R1` points, twiddles `W_R^(n2 * k1)`, then `R1` DFTs
+/// of `R2` points.
 fn emit_small_dft_wgsl(
     body: &mut String,
     prefix: &str,
@@ -2546,13 +2676,15 @@ fn emit_small_dft_wgsl(
                 bind(body, format!("{prefix}_3"), format!("c_sub({d0}, {r1})")),
             ]
         }
-        8 => {
-            // n = 2 * n1 + n2 and k = k1 + 4 * k2: a DFT_4 over n1 for each
-            // n2, twiddled by W_8^(n2 * k1), then a DFT_2 over n2.
-            let columns = (0..2)
+        _ if smallest_prime_factor(radix) < radix => {
+            // n = R2 * n1 + n2 and k = k1 + R1 * k2: a DFT_R1 over n1 for
+            // each n2, twiddled by W_R^(n2 * k1), then a DFT_R2 over n2.
+            let r2 = smallest_prime_factor(radix);
+            let r1 = radix / r2;
+            let columns = (0..r2)
                 .map(|n2| {
-                    let column = (0..4)
-                        .map(|n1| inputs[2 * n1 + n2].clone())
+                    let column = (0..r1)
+                        .map(|n1| inputs[r2 * n1 + n2].clone())
                         .collect::<Vec<_>>();
                     emit_small_dft_wgsl(
                         body,
@@ -2563,26 +2695,37 @@ fn emit_small_dft_wgsl(
                     )
                 })
                 .collect::<Vec<_>>();
-            let mut outputs = vec![String::new(); 8];
-            for k1 in 0..4 {
-                let odd = match k1 {
-                    0 => columns[1][0].clone(),
-                    2 => bind(
-                        body,
-                        format!("{prefix}t{k1}"),
-                        quarter_turn_wgsl(&columns[1][2], direction, precision),
-                    ),
-                    _ => bind(
-                        body,
-                        format!("{prefix}t{k1}"),
-                        format!(
-                            "c_mul({}, {})",
-                            columns[1][k1],
-                            radix_root_wgsl(8, k1, direction, precision)
-                        ),
-                    ),
-                };
-                let row = [columns[0][k1].clone(), odd];
+            let mut outputs = vec![String::new(); radix];
+            for k1 in 0..r1 {
+                let row = (0..r2)
+                    .map(|n2| {
+                        let exponent = (n2 * k1) % radix;
+                        let value = &columns[n2][k1];
+                        if exponent == 0 {
+                            value.clone()
+                        } else if (4 * exponent).is_multiple_of(radix) {
+                            bind(
+                                body,
+                                format!("{prefix}t{n2}_{k1}"),
+                                rotate_quarters_wgsl(
+                                    value,
+                                    4 * exponent / radix,
+                                    direction,
+                                    precision,
+                                ),
+                            )
+                        } else {
+                            bind(
+                                body,
+                                format!("{prefix}t{n2}_{k1}"),
+                                format!(
+                                    "c_mul({value}, {})",
+                                    radix_root_wgsl(radix, exponent, direction, precision)
+                                ),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 let row_outputs = emit_small_dft_wgsl(
                     body,
                     &format!("{prefix}r{k1}"),
@@ -2590,8 +2733,9 @@ fn emit_small_dft_wgsl(
                     direction,
                     precision,
                 );
-                outputs[k1] = row_outputs[0].clone();
-                outputs[k1 + 4] = row_outputs[1].clone();
+                for (k2, value) in row_outputs.into_iter().enumerate() {
+                    outputs[k1 + r1 * k2] = value;
+                }
             }
             outputs
         }
@@ -2661,6 +2805,27 @@ fn emit_small_dft_wgsl(
     }
 }
 
+/// `value` times `W_4^quarters` of `direction`: a component swap and sign
+/// changes, or a negation.
+fn rotate_quarters_wgsl(
+    value: &str,
+    quarters: usize,
+    direction: FftDirection,
+    precision: AxisPrecision,
+) -> String {
+    match quarters % 4 {
+        0 => value.to_owned(),
+        1 => quarter_turn_wgsl(value, direction, precision),
+        2 => format!("-{value}"),
+        _ => quarter_turn_wgsl(value, direction.opposite(), precision),
+    }
+}
+
+/// The smallest prime factor of `n` (at least 2).
+fn smallest_prime_factor(n: usize) -> usize {
+    (2..n).find(|factor| n.is_multiple_of(*factor)).unwrap_or(n)
+}
+
 /// `value` times `-i` for a forward transform and `i` for an inverse one:
 /// a swap of the real and imaginary parts and one sign.
 fn quarter_turn_wgsl(value: &str, direction: FftDirection, precision: AxisPrecision) -> String {
@@ -2698,6 +2863,11 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
         )
     } else {
         generate_fused_smooth_stage_wgsl(&config)
+    };
+    let source = if key.padded_indices {
+        pad_workgroup_indices(&source)
+    } else {
+        source
     };
     if key.in_place {
         in_place_wgsl(&source)
@@ -4552,6 +4722,39 @@ mod tests {
         assert!(wgsl.contains("dst[dstIdx_3_2] = value_3_2;"));
         assert!(!wgsl.contains("bit_reverse"));
         assert_eq!(wgsl.matches("workgroupBarrier();").count(), 9);
+    }
+
+    #[test]
+    fn fused_smooth_schedules_take_few_balanced_stages() {
+        let schedule = |n: usize| {
+            fused_smooth_factors(n, &crate::runtime::factor_supported_length(n).unwrap())
+        };
+        assert_eq!(schedule(1920), [16, 12, 10]);
+        assert_eq!(schedule(1080), [12, 10, 9]);
+        assert_eq!(schedule(720), [16, 9, 5]);
+        assert_eq!(schedule(1280), [16, 16, 5]);
+        assert_eq!(schedule(1000), [10, 10, 10]);
+        // A single composite stage falls back to the multi-pass factors.
+        assert_eq!(schedule(12), [4, 3]);
+        assert_eq!(schedule(15), [5, 3]);
+    }
+
+    #[test]
+    fn padded_smooth_kernels_spread_every_workgroup_index() {
+        let wgsl = pad_workgroup_indices(
+            "var<workgroup> scratch: array<vec2<f32>, 1280>;
+let a = scratch[i * 16u + scratch_len[j]];
+scratch[k] = a;
+",
+        );
+        assert!(wgsl.contains("fn padded(index: u32) -> u32 {"));
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 1359>;"));
+        assert!(wgsl.contains("scratch[padded(i * 16u + scratch_len[j])]"));
+        assert!(wgsl.contains("scratch[padded(k)] = a;"));
+        assert_eq!(padded_workgroup_len(1280), 1359);
+        assert!(fused_smooth_pads_indices(&[16, 16, 5], false));
+        assert!(!fused_smooth_pads_indices(&[16, 16, 5], true));
+        assert!(!fused_smooth_pads_indices(&[10, 10, 10], false));
     }
 
     #[test]

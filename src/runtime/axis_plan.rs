@@ -2589,7 +2589,7 @@ fn generate_fused_smooth_final_stage_wgsl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate_fused_smooth_butterfly_math_wgsl(
+pub(crate) fn generate_fused_smooth_butterfly_math_wgsl(
     radix: usize,
     ns_div_r: usize,
     n_div_r: usize,

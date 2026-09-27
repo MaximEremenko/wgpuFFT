@@ -49,6 +49,7 @@ pub struct FftTuning {
     max_buffer_size: Option<u64>,
     fused_min_convolution_length: usize,
     fuse_long_axes: bool,
+    fuse_small_volumes: bool,
 }
 
 impl Default for FftTuning {
@@ -70,6 +71,7 @@ impl Default for FftTuning {
             max_buffer_size: None,
             fused_min_convolution_length: 128,
             fuse_long_axes: true,
+            fuse_small_volumes: true,
         }
     }
 }
@@ -162,6 +164,14 @@ impl FftTuning {
         self.fuse_long_axes
     }
 
+    /// Whether an `f32` C2C transform of every axis of a small volume (up to
+    /// 4096 points that fit workgroup memory) runs as one kernel per FFT, one
+    /// workgroup per volume, instead of one kernel per axis: 16x16x16 takes
+    /// one dispatch instead of three.
+    pub const fn fuse_small_volumes(&self) -> bool {
+        self.fuse_small_volumes
+    }
+
     pub fn with_workgroup_size(mut self, value: u32) -> Self {
         self.workgroup_size = value;
         self
@@ -243,6 +253,13 @@ impl FftTuning {
     /// stages for long axes.
     pub fn with_fuse_long_axes(mut self, value: bool) -> Self {
         self.fuse_long_axes = value;
+        self
+    }
+
+    /// See [`Self::fuse_small_volumes`]. Disabling it keeps one kernel per
+    /// axis.
+    pub fn with_fuse_small_volumes(mut self, value: bool) -> Self {
+        self.fuse_small_volumes = value;
         self
     }
 
@@ -537,6 +554,7 @@ mod tests {
         assert_eq!(defaults.segmented_burst_depth(), 2);
         assert_eq!(defaults.fused_min_convolution_length(), 128);
         assert!(defaults.fuse_long_axes());
+        assert!(defaults.fuse_small_volumes());
 
         let tuned = FftTuning::new()
             .with_workgroup_size(128)
@@ -554,8 +572,10 @@ mod tests {
             .with_max_storage_buffer_binding_size(Some(1 << 20))
             .with_max_buffer_size(Some(1 << 24))
             .with_fused_min_convolution_length(64)
-            .with_fuse_long_axes(false);
+            .with_fuse_long_axes(false)
+            .with_fuse_small_volumes(false);
         assert_eq!(tuned.workgroup_size(), 128);
+        assert!(!tuned.fuse_small_volumes());
         assert_eq!(tuned.direct_max_prime(), 31);
         assert!(!tuned.fuse_long_axes());
         assert_eq!(tuned.force_rader_axes(), &[1]);

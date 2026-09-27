@@ -613,6 +613,7 @@ pub(crate) enum ShaderCacheKey {
     C2cSmoothStage(C2cSmoothStageKey),
     C2cStridedStage(C2cStridedStageKey),
     DirectDftC2cLut(AxisPrecision),
+    SmallVolume(SmallVolumeKey),
 }
 
 impl ShaderCacheKey {
@@ -634,6 +635,7 @@ impl ShaderCacheKey {
                 precision.as_str(),
                 precision.as_str()
             ),
+            Self::SmallVolume(key) => key.stable_key(),
         }
     }
 
@@ -682,6 +684,9 @@ impl ShaderCacheKey {
             Self::DirectDftC2cLut(precision) => {
                 crate::runtime::c2c::generate_direct_dft_wgsl(*precision)
             }
+            Self::SmallVolume(key) => {
+                crate::runtime::small_volume::generate_small_volume_wgsl_for_key(key)
+            }
         }
     }
 
@@ -711,6 +716,7 @@ impl ShaderCacheKey {
                 limits.max_compute_invocations_per_workgroup,
                 limits.max_compute_workgroup_size_x,
             ),
+            Self::SmallVolume(key) => key.supported_by_device_limits(&limits),
             _ => true,
         }
     }
@@ -735,6 +741,7 @@ impl ShaderCacheKey {
             Self::RealStage(key) => key.workgroup_size,
             Self::C2cSmoothStage(key) => key.workgroup_size,
             Self::C2cStridedStage(key) => key.workgroup_size,
+            Self::SmallVolume(key) => key.workgroup_size,
             Self::FourStepStage(key) if key.kind == FourStepKernelKind::Scale => key.workgroup_size,
             // Direct DFT has a fixed 64-lane shader. Four-step transpose is
             // 16x16 even though its key records 256 total invocations, so it
@@ -771,6 +778,7 @@ impl ShaderCacheKey {
             Self::RaderStage(key) => Some(key.precision),
             Self::BluesteinStage(key) => Some(key.precision),
             Self::FusedPrimeStage(key) => Some(key.precision),
+            Self::SmallVolume(_) => Some(AxisPrecision::F32),
             _ => None,
         }
     }
@@ -980,6 +988,26 @@ impl ShaderCacheKey {
                 Ok(())
             }
             Self::DirectDftC2cLut(_) => Ok(()),
+            Self::SmallVolume(key) => {
+                validate_snapshot_dims(key.dims.len(), &key.dims)?;
+                let consistent = key.workgroup_size > 0
+                    && key.dims.len() == key.axes.len()
+                    && key.dims.iter().zip(&key.axes).all(|(&n, axis)| match axis {
+                        SmallVolumeAxis::Stages(radices) => {
+                            radices.iter().product::<usize>() == n
+                                && radices.iter().all(|&radix| (2..=16).contains(&radix))
+                        }
+                        SmallVolumeAxis::Direct => n % 2 == 1,
+                    })
+                    && key
+                        .dims
+                        .iter()
+                        .all(|&n| key.twiddle_length.is_multiple_of(n));
+                if !consistent {
+                    return snapshot_integrity("invalid small-volume geometry");
+                }
+                validate_snapshot_axis_scale(AxisPrecision::F32, key.apply_scale, key.scale_bits)
+            }
         }
     }
 }
@@ -1164,6 +1192,7 @@ impl ComputePipelineCacheKey {
             ShaderCacheKey::C2cSmoothStage(key) => Self::c2c_smooth_stage(key),
             ShaderCacheKey::C2cStridedStage(key) => Self::c2c_strided_stage(key),
             ShaderCacheKey::DirectDftC2cLut(precision) => Self::direct_dft_c2c(precision),
+            ShaderCacheKey::SmallVolume(key) => Self::small_volume(key),
         }
     }
 
@@ -1228,6 +1257,14 @@ impl ComputePipelineCacheKey {
             },
             entry_point: String::from("main"),
             shader: ShaderCacheKey::DirectDftC2cLut(precision),
+        }
+    }
+
+    pub(crate) fn small_volume(shader: SmallVolumeKey) -> Self {
+        Self {
+            layout: PipelineLayoutCacheKey::AxisPlanInterleavedF32Lut,
+            entry_point: String::from("main"),
+            shader: ShaderCacheKey::SmallVolume(shader),
         }
     }
 
@@ -2127,6 +2164,108 @@ pub(crate) struct FusedPrimeStageKey {
     /// and convolves one after another; 1 otherwise.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) serial_lines: u32,
+}
+
+/// How one axis of a small volume is transformed (see
+/// `runtime::small_volume`).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum SmallVolumeAxis {
+    /// Stockham stages of these radices, first stage first.
+    Stages(Vec<usize>),
+    /// A direct DFT of an odd length over symmetric pairs.
+    Direct,
+}
+
+/// An `f32` kernel that transforms every axis of a volume small enough for
+/// one workgroup's memory (see `runtime::small_volume`).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SmallVolumeKey {
+    /// Axis lengths, the first contiguous.
+    pub(crate) dims: Vec<usize>,
+    pub(crate) axes: Vec<SmallVolumeAxis>,
+    /// Points of the twiddle table, a multiple of every axis length.
+    pub(crate) twiddle_length: usize,
+    pub(crate) direction: FftDirection,
+    pub(crate) workgroup_size: u32,
+    pub(crate) apply_scale: bool,
+    scale_bits: u64,
+}
+
+impl SmallVolumeKey {
+    pub(crate) fn new(
+        dims: &[usize],
+        axes: Vec<SmallVolumeAxis>,
+        twiddle_length: usize,
+        direction: FftDirection,
+        workgroup_size: u32,
+        apply_scale: bool,
+        scale_factor: f64,
+    ) -> Self {
+        debug_assert_eq!(dims.len(), axes.len());
+        Self {
+            dims: dims.to_vec(),
+            axes,
+            twiddle_length,
+            direction,
+            workgroup_size,
+            apply_scale,
+            scale_bits: axis_scale_bits(AxisPrecision::F32, apply_scale, scale_factor),
+        }
+    }
+
+    pub(crate) fn scale_factor(&self) -> f64 {
+        axis_scale_factor(AxisPrecision::F32, self.scale_bits)
+    }
+
+    /// Workgroup memory the kernel needs: the volume and each direct axis's
+    /// table of roots.
+    pub(crate) fn workgroup_storage_bytes(&self) -> Option<u64> {
+        let elements = self
+            .dims
+            .iter()
+            .try_fold(1usize, |product, &n| product.checked_mul(n))?;
+        let roots = self
+            .dims
+            .iter()
+            .zip(&self.axes)
+            .filter(|(_, axis)| **axis == SmallVolumeAxis::Direct)
+            .map(|(&n, _)| n)
+            .sum::<usize>();
+        let complex = elements.checked_add(roots)?;
+        u64::try_from(complex).ok()?.checked_mul(8)
+    }
+
+    /// Whether `limits` allow this kernel.
+    pub(crate) fn supported_by_device_limits(&self, limits: &wgpu::Limits) -> bool {
+        self.workgroup_storage_bytes()
+            .is_some_and(|bytes| bytes <= u64::from(limits.max_compute_workgroup_storage_size))
+            && self.workgroup_size > 0
+            && self.workgroup_size <= limits.max_compute_invocations_per_workgroup
+            && self.workgroup_size <= limits.max_compute_workgroup_size_x
+    }
+
+    pub(crate) fn stable_key(&self) -> String {
+        let axes = self
+            .axes
+            .iter()
+            .map(|axis| match axis {
+                SmallVolumeAxis::Stages(radices) => format!("r{}", dims_key(radices)),
+                SmallVolumeAxis::Direct => String::from("direct"),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "shader:v1:small-volume:precision=f32:dims={}:axes={axes}:twiddles={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-f32-v1",
+            dims_key(&self.dims),
+            self.twiddle_length,
+            direction_key(self.direction),
+            self.workgroup_size,
+            self.apply_scale,
+            axis_scale_bits_key(AxisPrecision::F32, self.scale_bits),
+        )
+    }
 }
 
 impl FusedPrimeStageKey {
@@ -3462,6 +3601,7 @@ mod tests {
             ShaderCacheKey::C2cSmoothStage(_) => unreachable!(),
             ShaderCacheKey::C2cStridedStage(_) => unreachable!(),
             ShaderCacheKey::DirectDftC2cLut(_) => unreachable!(),
+            ShaderCacheKey::SmallVolume(_) => unreachable!(),
         });
         let snapshot = PipelineCacheSnapshot::from_entries(
             vec![SnapshotShaderEntry {

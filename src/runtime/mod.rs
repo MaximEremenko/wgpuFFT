@@ -20,6 +20,7 @@ pub mod real;
 pub(crate) mod recorder;
 pub(crate) mod register_fft;
 pub(crate) mod segmented_volume;
+pub(crate) mod small_volume;
 pub(crate) mod smooth_decompose;
 pub(crate) mod stage_executor;
 pub(crate) mod twiddle;

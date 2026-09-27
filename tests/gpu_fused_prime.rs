@@ -624,8 +624,9 @@ fn run_direct_cases(context: &wgpu_fft::device::GpuContext) {
             &format!("direct strided 6x43x5 axis 1 inverse={inverse}"),
         );
     }
-    // All-prime ND shapes run one direct kernel per axis.
-    for shape in [vec![17, 17], vec![19, 23, 29]] {
+    // All-prime ND shapes too large for one workgroup run one direct kernel
+    // per axis.
+    for shape in [vec![17, 17, 31], vec![19, 23, 29]] {
         let config = FftConfig::new_nd(shape.clone()).with_normalization(Normalization::None);
         let input = test_signal(config.total_complex_len().unwrap());
         let expected = reference_f64(&input, &config);

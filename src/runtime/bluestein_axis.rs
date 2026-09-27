@@ -425,6 +425,7 @@ impl BluesteinAxis {
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
                     long_axes: LongAxisRoute::new(config.fuse_long_axes),
+                    small_volumes: false,
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -443,6 +444,7 @@ impl BluesteinAxis {
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
                     long_axes: LongAxisRoute::new(config.fuse_long_axes),
+                    small_volumes: false,
                 },
                 &mut twiddle_lut_pool,
             )?;

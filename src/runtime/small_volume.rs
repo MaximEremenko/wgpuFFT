@@ -39,13 +39,15 @@ const MAX_DIRECT_READS: usize = 1 << 16;
 /// Longest twiddle table, `lcm` of the axis lengths.
 const MAX_TWIDDLE_LENGTH: usize = 1 << 16;
 
+/// The axis plans' parameters: the kernel transforms `total / ELEMENTS`
+/// volumes from volume `line_offset`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct SmallVolumeParams {
-    volumes: u32,
-    volume_offset: u32,
+    total: u32,
+    base_index: u32,
+    line_offset: u32,
     element_base: u32,
-    _pad: u32,
 }
 
 /// One kernel that transforms every axis of each volume of a small C2C
@@ -69,6 +71,7 @@ impl SmallVolumePlan {
             return Ok(None);
         };
         let volumes = u32::try_from(config.batch()).unwrap_or(u32::MAX);
+        let elements = key.dims.iter().product::<usize>() as u32;
         let pipeline_key = ComputePipelineCacheKey::small_volume(key.clone());
         let bind_group_layout = with_device_pipeline_cache(device, |cache| {
             cache.get_bind_group_layout(device, pipeline_key.layout)
@@ -92,10 +95,10 @@ impl SmallVolumePlan {
             &params_buffer,
             0,
             bytemuck::bytes_of(&SmallVolumeParams {
-                volumes,
-                volume_offset: 0,
+                total: volumes.saturating_mul(elements),
+                base_index: 0,
+                line_offset: 0,
                 element_base: 0,
-                _pad: 0,
             }),
         );
         let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
@@ -194,22 +197,9 @@ pub(crate) fn small_volume_key(
     if elements > MAX_SMALL_VOLUME_ELEMENTS {
         return Ok(None);
     }
-    let mut kinds = Vec::with_capacity(shape.len());
-    for &n in shape {
-        let kind = if let Ok(factors) = crate::runtime::factor_supported_length(n) {
-            if n <= 16 && n != 14 {
-                // One butterfly per line.
-                SmallVolumeAxis::Stages(vec![n])
-            } else {
-                SmallVolumeAxis::Stages(fused_smooth_factors(n, &factors))
-            }
-        } else if n % 2 == 1 && n <= tuning.direct_max_prime() {
-            SmallVolumeAxis::Direct
-        } else {
-            return Ok(None);
-        };
-        kinds.push(kind);
-    }
+    let Some(kinds) = volume_axes(shape, tuning.direct_max_prime()) else {
+        return Ok(None);
+    };
     let direct_lengths = shape
         .iter()
         .zip(&kinds)
@@ -234,6 +224,82 @@ pub(crate) fn small_volume_key(
         f64::from(scale),
     );
     Ok(key.supported_by_device_limits(limits).then_some(key))
+}
+
+/// How each axis of a small volume runs: stages of radices up to 16 (one
+/// butterfly for lengths up to 16), or a direct DFT for odd lengths up to
+/// `direct_max`; `None` when an axis has neither.
+fn volume_axes(dims: &[usize], direct_max: usize) -> Option<Vec<SmallVolumeAxis>> {
+    dims.iter()
+        .map(|&n| {
+            if let Ok(factors) = crate::runtime::factor_supported_length(n) {
+                Some(if n <= 16 && n != 14 {
+                    SmallVolumeAxis::Stages(vec![n])
+                } else {
+                    SmallVolumeAxis::Stages(fused_smooth_factors(n, &factors))
+                })
+            } else if n % 2 == 1 && n <= direct_max {
+                Some(SmallVolumeAxis::Direct)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The leading axes of a multi-axis plan that run as one small-volume stage
+/// over slabs of the volume, and its key: axes `0..k` for the largest
+/// `k >= 2` whose slab fits one workgroup, when the plan transforms them
+/// first. The later axes follow in place, so a 32x32x32 transform takes two
+/// kernels instead of three. `apply_scale` scales the stage's output when
+/// it covers every axis of the plan.
+pub(crate) fn leading_slab(
+    shape: &[usize],
+    axes: &[usize],
+    direction: FftDirection,
+    workgroup_size: u32,
+    apply_scale: bool,
+    scale_factor: f64,
+    limits: &wgpu::Limits,
+) -> Option<(usize, SmallVolumeKey)> {
+    let mut best = None;
+    let mut elements = 1usize;
+    for (k, &axis) in axes.iter().enumerate() {
+        if axis != k {
+            break;
+        }
+        elements = elements.checked_mul(shape[axis])?;
+        if elements > MAX_SMALL_VOLUME_ELEMENTS {
+            break;
+        }
+        let count = k + 1;
+        if count < 2 {
+            continue;
+        }
+        let dims = &shape[..count];
+        let Some(kinds) = volume_axes(dims, 0) else {
+            break;
+        };
+        let twiddle_length = dims.iter().fold(1usize, |lcm, &n| lcm / gcd(lcm, n) * n);
+        if twiddle_length > MAX_TWIDDLE_LENGTH {
+            break;
+        }
+        let covers_all = count == axes.len();
+        let key = SmallVolumeKey::new(
+            dims,
+            kinds,
+            twiddle_length,
+            direction,
+            workgroup_size,
+            apply_scale && covers_all,
+            if covers_all { scale_factor } else { 1.0 },
+        );
+        if !key.supported_by_device_limits(limits) {
+            break;
+        }
+        best = Some((count, key));
+    }
+    best
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -329,10 +395,10 @@ pub(crate) fn generate_small_volume_wgsl_for_key(key: &SmallVolumeKey) -> String
 
     format!(
         r#"struct Params {{
-  volumes: u32,
-  volumeOffset: u32,
+  total: u32,
+  baseIndex: u32,
+  lineOffset: u32,
   elementBase: u32,
-  pad0: u32,
 }};
 
 @group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
@@ -350,10 +416,10 @@ var<workgroup> vol: array<vec2<f32>, {elements}>;
 @compute @workgroup_size({workgroup_size}, 1, 1)
 fn main({entry_params}) {{
   {flat_workgroup_index}
-  if (wgFlat >= params.volumes) {{
+  if (wgFlat >= params.total / ELEMENTS) {{
     return;
   }}
-  let volumeBase: u32 = (params.volumeOffset + wgFlat) * ELEMENTS - params.elementBase;
+  let volumeBase: u32 = (params.lineOffset + wgFlat) * ELEMENTS - params.elementBase;
 {loads}{stores}{table_loads}  workgroupBarrier();
 {body}  for (var i: u32 = lid.x; i < ELEMENTS; i = i + WORKGROUP_SIZE) {{
     output[volumeBase + i] = {stored};

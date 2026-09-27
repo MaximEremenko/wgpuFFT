@@ -167,7 +167,9 @@ impl FftTuning {
     /// Whether an `f32` C2C transform of every axis of a small volume (up to
     /// 4096 points that fit workgroup memory) runs as one kernel per FFT, one
     /// workgroup per volume, instead of one kernel per axis: 16x16x16 takes
-    /// one dispatch instead of three.
+    /// one dispatch instead of three. Larger smooth volumes run their leading
+    /// axes this way over slabs that fit, then the other axes: 32x32x32 takes
+    /// two dispatches instead of three.
     pub const fn fuse_small_volumes(&self) -> bool {
         self.fuse_small_volumes
     }

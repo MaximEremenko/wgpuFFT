@@ -109,6 +109,63 @@ async fn run_small_volume_cases() {
         );
     }
 
+    // Larger volumes run their leading axes over slabs in one kernel, then
+    // the remaining axes in place.
+    for (label, config, slab_bytes) in [
+        (
+            "slabs 32x16 of 32x16x16",
+            FftConfig::new_nd([32, 16, 16]).with_normalization(Normalization::None),
+            4_096u64,
+        ),
+        (
+            "slabs 64x64 of inverse 64x64x32 batch 2",
+            FftConfig::inverse_nd([64, 64, 32]).with_batch(2),
+            32_768,
+        ),
+        (
+            "slabs 16x16 of 16x16x256",
+            FftConfig::new_nd([16, 16, 256]).with_normalization(Normalization::Orthogonal),
+            2_048,
+        ),
+        (
+            "slabs 24x20 of 24x20x10",
+            FftConfig::new_nd([24, 20, 10]).with_normalization(Normalization::None),
+            3_840,
+        ),
+        (
+            "slabs 8x8x8 of 8x8x8x16",
+            FftConfig::new_nd([8, 8, 8, 16]).with_normalization(Normalization::None),
+            4_096,
+        ),
+    ] {
+        let input = test_signal(config.total_complex_len().unwrap());
+        let values = input
+            .chunks_exact(2)
+            .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
+            .collect::<Vec<_>>();
+        let expected = reference_c2c_nd_f64(&values, &config).unwrap();
+        let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
+        assert_eq!(plan.route(), C2cRoute::MixedRadix, "{label}");
+        let kernels = kernel_labels(&plan);
+        if slab_bytes <= storage {
+            assert_eq!(
+                kernels.first().map(String::as_str),
+                Some(SMALL_VOLUME_LABEL),
+                "{label}"
+            );
+            assert_eq!(kernels.len(), 2, "{label}: {kernels:?}");
+            assert_eq!(plan.workspace_size_bytes(), 0, "{label}");
+        }
+        let (max_relative, rms_relative) = relative_error_metrics(&actual, &expected);
+        eprintln!(
+            "SMALL_VOLUME_ACCURACY label={label:?} max_relative={max_relative:.9e} rms_relative={rms_relative:.9e}"
+        );
+        assert!(
+            max_relative < 5.0e-7 && rms_relative < 5.0e-7,
+            "{label}: max/rms relative error={max_relative}/{rms_relative}"
+        );
+    }
+
     // Direct axes too costly for one workgroup, tuning that asks for Rader
     // or per-axis kernels, and a partial set of axes keep one kernel per axis.
     for (label, config) in [

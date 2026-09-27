@@ -1102,6 +1102,7 @@ fn row_axis_plan_index(
             workgroup_size: config.tuning().workgroup_size(),
             fused_workgroup_size: config.tuning().fused_workgroup_size(),
             long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
+            small_volumes: false,
         },
         twiddle_lut_pool,
     )?);

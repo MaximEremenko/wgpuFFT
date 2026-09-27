@@ -142,6 +142,15 @@ First tagged release.
   kernel, and other long axes run as two fused passes (`N = N1 * N2`),
   instead of one Stockham pass per radix;
   `FftTuning::with_fuse_long_axes(false)` restores the Stockham stages.
+- Longer power-of-two `f32` axes split into two register-resident passes
+  instead of two workgroup-memory ones, as balanced as the exchange buffer
+  allows. The first interleaves eight or four strided lines per workgroup
+  and applies the split twiddle on store; the second loads four contiguous
+  lines and hands each invocation a different line at its last exchange,
+  so its transposed stores also coalesce. FFT+iFFT pairs in place: 2^19
+  points 0.017 ms instead of 0.026 ms, 2^20 0.025 ms instead of 0.045 ms,
+  2^21 0.049 ms instead of 0.089 ms, 2^24 0.78 ms instead of 1.09 ms, and
+  65536-point lines batched 64 times 0.079 ms instead of 0.100 ms.
 
 ### Fixed
 

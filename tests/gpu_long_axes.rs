@@ -83,6 +83,26 @@ async fn run_split_cases() {
             2,
         ),
         ("8192x4-inverse", FftConfig::inverse_nd([8192, 4]), 2),
+        // Split passes in registers: the first twiddles on store, the second
+        // loads contiguous lines and stores them transposed.
+        (
+            "n2097152",
+            FftConfig::new(1 << 21).with_normalization(Normalization::None),
+            2,
+        ),
+        (
+            "3x65536-axis1-inverse",
+            FftConfig::inverse_nd([3, 65536]).with_axes([1]),
+            2,
+        ),
+        (
+            "65536x3-axis0-batch2",
+            FftConfig::new_nd([65536, 3])
+                .with_axes([0])
+                .with_batch(2)
+                .with_normalization(Normalization::None),
+            2,
+        ),
     ] {
         let total = config.total_complex_len().unwrap();
         let input = test_signal(total);

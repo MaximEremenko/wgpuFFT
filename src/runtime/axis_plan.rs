@@ -862,14 +862,15 @@ impl AxisPlan {
                     workgroups_x: total_lines as u32,
                     pipeline,
                 });
-            } else if let Some((n1, n2)) = config
+            } else if let Some((n1, n2, register_passes)) = config
                 .long_axes
                 .allows_split()
                 .then(|| {
-                    long_axis_split(
+                    long_axis_split_plan(
                         axis_len,
-                        config.precision,
-                        config.fused_workgroup_size,
+                        stride_complex,
+                        total_complex,
+                        &config,
                         &device.limits(),
                     )
                 })
@@ -883,6 +884,8 @@ impl AxisPlan {
                 let split_dims = [lower, &[n2, n1][..], upper].concat();
                 let out_dims = [lower, &[n1, n2][..], upper].concat();
                 let row_stride_lines = lower.iter().product::<usize>();
+                let [first_registers, second_registers] =
+                    register_passes.map_or([None, None], |passes| passes.map(Some));
                 let passes = [
                     (
                         axis + 1,
@@ -894,6 +897,7 @@ impl AxisPlan {
                             output: None,
                         },
                         false,
+                        first_registers,
                     ),
                     (
                         axis,
@@ -905,18 +909,22 @@ impl AxisPlan {
                             output: Some((out_dims, axis + 1)),
                         },
                         apply_any_scale && final_axis,
+                        second_registers,
                     ),
                 ];
-                for (pass_axis, pass_len, split_pass, apply_scale) in passes {
+                for (pass_axis, pass_len, split_pass, apply_scale, registers) in passes {
                     let pass_stride = stride_for_axis(&split_dims, pass_axis);
                     let total_lines = total_complex / pass_len;
-                    let lines_per_workgroup = fused_lines_per_workgroup(
-                        pass_len,
-                        pass_stride,
-                        config.precision,
-                        total_lines,
-                        u64::from(device.limits().max_compute_workgroup_storage_size),
-                    );
+                    let lines_per_workgroup = match &registers {
+                        Some((lines, ..)) => *lines,
+                        None => fused_lines_per_workgroup(
+                            pass_len,
+                            pass_stride,
+                            config.precision,
+                            total_lines,
+                            u64::from(device.limits().max_compute_workgroup_storage_size),
+                        ),
+                    };
                     let (kind, pipeline_key, shader_source): (_, _, Box<dyn FnOnce() -> String>) =
                         if pass_len.is_power_of_two() {
                             let key = FusedPow2StageKey::new(
@@ -926,13 +934,19 @@ impl AxisPlan {
                                 pass_len,
                                 pass_stride,
                                 config.direction,
-                                config.fused_workgroup_size,
+                                registers
+                                    .as_ref()
+                                    .map_or(config.fused_workgroup_size, |(_, size, _)| *size),
                                 apply_scale,
                                 scale,
                                 config.precision,
                             )
                             .with_lines_per_workgroup(lines_per_workgroup)
                             .with_split_pass(split_pass);
+                            let key = match registers {
+                                Some((_, _, schedule)) => key.with_registers(schedule),
+                                None => key,
+                            };
                             (
                                 AxisStageKind::FusedPow2 {
                                     axis_length: pass_len,
@@ -1979,7 +1993,12 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         precision: key.precision,
     };
     let source = if let Some(registers) = &key.registers {
-        generate_register_fft_wgsl(&config, registers, key.lines_per_workgroup as usize)
+        generate_register_fft_wgsl(
+            &config,
+            registers,
+            key.lines_per_workgroup as usize,
+            key.split_pass.as_ref(),
+        )
     } else if key.lines_per_workgroup > 1 || key.split_pass.is_some() {
         generate_fused_pow2_multiline_stage_wgsl(
             &config,
@@ -2199,6 +2218,145 @@ fn short_register_lines_plan(
         lines /= 2;
     }
     largest_register_schedule(axis_length, lines, 1, config.precision, limits)
+}
+
+/// Lines per workgroup, workgroup size, and schedule of a register kernel.
+type RegisterLines = (u32, u32, crate::runtime::pipeline_cache::RegisterSchedule);
+
+/// Lines per workgroup of a register split pass that loads contiguous lines
+/// and stores them transposed. More lines would store longer runs, but no
+/// longer keep whole lines in the exchange buffer, whose rounds cost more
+/// (1024-point lines of a 2^21-point axis 9.9 µs per pass with 4,
+/// 12.9 µs with 8).
+const CONTIGUOUS_SPLIT_LINES: usize = 4;
+/// Most lines per workgroup of a register split pass that loads strided
+/// lines, so each load spans 64 contiguous bytes.
+const STRIDED_SPLIT_LINES: usize = 8;
+/// Fewest workgroups a strided split pass keeps with [`STRIDED_SPLIT_LINES`]
+/// lines each; with fewer it takes four, spreading over more of the GPU.
+const MIN_STRIDED_SPLIT_WORKGROUPS: usize = 128;
+
+/// The split `n1 * n2` of an axis too long for one fused kernel (see
+/// `SplitPass`), with the register kernels of both passes when the device
+/// runs them: a power-of-two `f32` axis at the default fused workgroup size.
+/// Other axes split as [`long_axis_split`] does, into workgroup-memory
+/// kernels.
+///
+/// Register passes take a 2^21-point FFT+iFFT pair from
+/// 0.089 ms to 0.049 ms and a 2^19-point one from 0.026 ms
+/// to 0.017 ms.
+fn long_axis_split_plan(
+    axis_length: usize,
+    stride_complex: usize,
+    total_complex: usize,
+    config: &AxisPlanConfig,
+    limits: &wgpu::Limits,
+) -> Option<(usize, usize, Option<[RegisterLines; 2]>)> {
+    if let Some((n1, n2)) = register_axis_split(axis_length, config, limits) {
+        // In units of the axis stride, the first pass loads and stores lines
+        // at stride n2; the second loads lines at stride 1 and stores them at
+        // stride n1.
+        let first = register_split_plan(
+            n1,
+            n2 * stride_complex,
+            n2 * stride_complex,
+            total_complex / n1,
+            config,
+            limits,
+        );
+        let second = register_split_plan(
+            n2,
+            stride_complex,
+            n1 * stride_complex,
+            total_complex / n2,
+            config,
+            limits,
+        );
+        if let (Some(first), Some(second)) = (first, second) {
+            return Some((n1, n2, Some([first, second])));
+        }
+    }
+    long_axis_split(
+        axis_length,
+        config.precision,
+        config.fused_workgroup_size,
+        limits,
+    )
+    .map(|(n1, n2)| (n1, n2, None))
+}
+
+/// Splits a power-of-two axis into two register passes, `n1 * n2`, as
+/// balanced as possible. An odd power of two puts its longer factor on the
+/// second pass, whose lines load contiguous and store transposed, only when
+/// [`CONTIGUOUS_SPLIT_LINES`] of them fit the exchange buffer whole; otherwise
+/// on the first. The passes of 2^19 points took 16.7 µs per
+/// FFT+iFFT pair as 512 * 1024 against 17.4 µs as 1024 * 512, and those of
+/// 2^21 points 48.8 µs as 2048 * 1024 against 52.8 µs as 1024 * 2048.
+fn register_axis_split(
+    axis_length: usize,
+    config: &AxisPlanConfig,
+    limits: &wgpu::Limits,
+) -> Option<(usize, usize)> {
+    if !axis_length.is_power_of_two()
+        || config.precision != AxisPrecision::F32
+        || config.fused_workgroup_size != DEFAULT_FUSED_WORKGROUP_SIZE
+        || !config.long_axes.allows_registers()
+    {
+        return None;
+    }
+    let short = 1usize << (axis_length.ilog2() / 2);
+    let long = axis_length / short;
+    let storage_elements = limits.max_compute_workgroup_storage_size as usize
+        / config.precision.complex_size_bytes() as usize;
+    if CONTIGUOUS_SPLIT_LINES * long <= storage_elements {
+        Some((short, long))
+    } else {
+        Some((long, short))
+    }
+}
+
+/// Lines per workgroup, workgroup size, and schedule of a register kernel
+/// for one pass of a split long axis, which loads lines at `stride_in` and
+/// stores them at `stride_out`. Contiguous lines take
+/// [`CONTIGUOUS_SPLIT_LINES`]. Strided lines take [`STRIDED_SPLIT_LINES`]
+/// when that keeps [`MIN_STRIDED_SPLIT_WORKGROUPS`] and needs no more
+/// exchange rounds than four lines, else four: 512-point
+/// lines of a 2^19-point axis took 4.2 µs per pass with eight and 4.3 µs
+/// with four, but 1024-point lines of a 2^20-point axis 6.8 µs with four and
+/// 7.4 µs with eight.
+fn register_split_plan(
+    axis_length: usize,
+    stride_in: usize,
+    stride_out: usize,
+    total_lines: usize,
+    config: &AxisPlanConfig,
+    limits: &wgpu::Limits,
+) -> Option<RegisterLines> {
+    let storage_elements = limits.max_compute_workgroup_storage_size as usize
+        / config.precision.complex_size_bytes() as usize;
+    let whole = |lines: usize| lines * axis_length <= storage_elements;
+    let lines = if stride_in == 1 {
+        CONTIGUOUS_SPLIT_LINES
+    } else if total_lines / STRIDED_SPLIT_LINES >= MIN_STRIDED_SPLIT_WORKGROUPS
+        && (whole(STRIDED_SPLIT_LINES) || !whole(4))
+    {
+        STRIDED_SPLIT_LINES
+    } else {
+        4
+    };
+    let mut lines = lines.min(total_lines.next_power_of_two());
+    while lines >= 1 {
+        // A transposing kernel switches line mappings at an exchange.
+        let transposes =
+            crate::runtime::register_fft::transposes_lines(lines, stride_in, stride_out);
+        let schedule = register_schedule_for_lines(axis_length, lines, config.precision, limits)
+            .filter(|(_, schedule)| !transposes || schedule.radices.len() > 1);
+        if let Some((workgroup_size, schedule)) = schedule {
+            return Some((lines as u32, workgroup_size, schedule));
+        }
+        lines /= 2;
+    }
+    None
 }
 
 /// The register schedule for the most lines per workgroup from `lines` down
@@ -3714,11 +3872,16 @@ pub(crate) const fn multiline_line_stride(
 /// Whether a multi-line kernel loads or stores element-major: a strided
 /// axis, or a split pass storing into a strided output axis.
 pub(crate) fn multiline_element_major(stride_complex: usize, split: Option<&SplitPass>) -> bool {
-    let stride_out = match split.and_then(|split| split.output.as_ref()) {
+    stride_complex != 1 || split_output_stride(split, stride_complex) != 1
+}
+
+/// Stride between the stored elements of a line read at `stride_in`: a
+/// split axis's second pass stores through the split's output geometry.
+pub(crate) fn split_output_stride(split: Option<&SplitPass>, stride_in: usize) -> usize {
+    match split.and_then(|split| split.output.as_ref()) {
         Some((dims, axis)) => stride_for_axis(dims, *axis),
-        None => stride_complex,
-    };
-    stride_complex != 1 || stride_out != 1
+        None => stride_in,
+    }
 }
 
 /// Global loads of a multi-line kernel into workgroup memory, as straight-line

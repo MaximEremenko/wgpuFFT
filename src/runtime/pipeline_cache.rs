@@ -1888,6 +1888,14 @@ pub(crate) struct FusedPow2StageKey {
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
     scale_bits: u64,
+    /// Lines transformed by one workgroup; 1 keeps the original kernel.
+    #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
+    pub(crate) lines_per_workgroup: u32,
+}
+
+#[cfg(feature = "serde")]
+fn one_line_per_workgroup() -> u32 {
+    1
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1904,6 +1912,9 @@ pub(crate) struct FusedSmoothStageKey {
     pub(crate) workgroup_size: u32,
     pub(crate) apply_scale: bool,
     scale_bits: u64,
+    /// Lines transformed by one workgroup; 1 keeps the original kernel.
+    #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
+    pub(crate) lines_per_workgroup: u32,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2049,7 +2060,14 @@ impl FusedSmoothStageKey {
             workgroup_size,
             apply_scale,
             scale_bits,
+            lines_per_workgroup: 1,
         }
+    }
+
+    /// Transforms `lines` lines per workgroup instead of one.
+    pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
+        self.lines_per_workgroup = lines.max(1);
+        self
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {
@@ -2057,7 +2075,7 @@ impl FusedSmoothStageKey {
     }
 
     pub(crate) fn stable_key(&self) -> String {
-        format!(
+        let mut key = format!(
             "shader:v3:fused-smooth:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
             self.precision.as_str(),
             self.rank,
@@ -2071,7 +2089,11 @@ impl FusedSmoothStageKey {
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
             self.precision.as_str(),
-        )
+        );
+        if self.lines_per_workgroup > 1 {
+            key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        key
     }
 
     fn is_supported_by_limits(
@@ -2082,7 +2104,10 @@ impl FusedSmoothStageKey {
     ) -> bool {
         let Some(scratch_bytes) = self
             .axis_length
-            .checked_mul(self.precision.complex_size_bytes() as usize)
+            .checked_mul(self.lines_per_workgroup as usize)
+            .and_then(|elements| {
+                elements.checked_mul(self.precision.complex_size_bytes() as usize)
+            })
         else {
             return false;
         };
@@ -2125,7 +2150,14 @@ impl FusedPow2StageKey {
             workgroup_size,
             apply_scale,
             scale_bits,
+            lines_per_workgroup: 1,
         }
+    }
+
+    /// Transforms `lines` lines per workgroup instead of one.
+    pub(crate) fn with_lines_per_workgroup(mut self, lines: u32) -> Self {
+        self.lines_per_workgroup = lines.max(1);
+        self
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {
@@ -2133,7 +2165,7 @@ impl FusedPow2StageKey {
     }
 
     pub(crate) fn stable_key(&self) -> String {
-        format!(
+        let mut key = format!(
             "shader:v3:fused-pow2:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
             self.precision.as_str(),
             self.rank,
@@ -2146,7 +2178,11 @@ impl FusedPow2StageKey {
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
             self.precision.as_str(),
-        )
+        );
+        if self.lines_per_workgroup > 1 {
+            key.push_str(&format!(":lines={}", self.lines_per_workgroup));
+        }
+        key
     }
 
     fn is_supported_by_limits(
@@ -2157,7 +2193,10 @@ impl FusedPow2StageKey {
     ) -> bool {
         let Some(scratch_bytes) = self
             .axis_length
-            .checked_mul(self.precision.complex_size_bytes() as usize)
+            .checked_mul(self.lines_per_workgroup as usize)
+            .and_then(|elements| {
+                elements.checked_mul(self.precision.complex_size_bytes() as usize)
+            })
         else {
             return false;
         };

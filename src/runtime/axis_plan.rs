@@ -530,6 +530,14 @@ impl AxisPlan {
                 &device.limits(),
             ) {
                 let apply_scale = apply_any_scale && final_axis;
+                let total_lines = total_complex / axis_len;
+                let lines_per_workgroup = fused_lines_per_workgroup(
+                    axis_len,
+                    stride_complex,
+                    config.precision,
+                    total_lines,
+                    u64::from(device.limits().max_compute_workgroup_storage_size),
+                );
                 let shader_key = FusedPow2StageKey::new(
                     config.shape.len(),
                     axis,
@@ -541,7 +549,8 @@ impl AxisPlan {
                     apply_scale,
                     scale,
                     config.precision,
-                );
+                )
+                .with_lines_per_workgroup(lines_per_workgroup);
                 let pipeline_key = ComputePipelineCacheKey::fused_pow2_stage(shader_key.clone());
 
                 let shader_label =
@@ -567,7 +576,7 @@ impl AxisPlan {
                     apply_scale,
                     pipeline_key,
                     twiddle_lut_index,
-                    workgroups_x: total_complex_u32 / axis_len as u32,
+                    workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
                     pipeline,
                 });
             } else if fused_smooth_supported(
@@ -578,6 +587,14 @@ impl AxisPlan {
                 &device.limits(),
             ) {
                 let apply_scale = apply_any_scale && final_axis;
+                let total_lines = total_complex / axis_len;
+                let lines_per_workgroup = fused_lines_per_workgroup(
+                    axis_len,
+                    stride_complex,
+                    config.precision,
+                    total_lines,
+                    u64::from(device.limits().max_compute_workgroup_storage_size),
+                );
                 let shader_key = FusedSmoothStageKey::new(
                     config.shape.len(),
                     axis,
@@ -590,7 +607,8 @@ impl AxisPlan {
                     apply_scale,
                     scale,
                     config.precision,
-                );
+                )
+                .with_lines_per_workgroup(lines_per_workgroup);
                 let pipeline_key = ComputePipelineCacheKey::fused_smooth_stage(shader_key.clone());
 
                 let shader_label =
@@ -616,7 +634,7 @@ impl AxisPlan {
                     apply_scale,
                     pipeline_key,
                     twiddle_lut_index,
-                    workgroups_x: total_complex_u32 / axis_len as u32,
+                    workgroups_x: (total_lines as u32).div_ceil(lines_per_workgroup),
                     pipeline,
                 });
             } else {
@@ -1146,7 +1164,192 @@ fn main({entry_params}) {{
     )
 }
 
+/// Fused power-of-two kernel that transforms `lines` lines per workgroup.
+///
+/// Short lines leave most invocations of a one-line workgroup idle, and on
+/// strided axes one line per workgroup makes neighbouring invocations read
+/// addresses a whole stride apart. Here every radix stage spreads the units of
+/// all lines over the invocations, and strided axes load element-major so
+/// neighbouring invocations read neighbouring lines.
+pub(crate) fn generate_fused_pow2_multiline_stage_wgsl(
+    config: &FusedPow2StageWgslConfig<'_>,
+    lines: usize,
+) -> String {
+    debug_assert_eq!(config.rank, config.dims.len());
+    debug_assert_eq!(config.axis_length, config.dims[config.axis]);
+    debug_assert!(config.axis_length.is_power_of_two() && config.axis_length >= 2);
+    debug_assert!(lines > 1 && config.workgroup_size > 0);
+
+    let maybe_scale = if config.apply_scale {
+        let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
+        format!("      value = {value};\n")
+    } else {
+        String::new()
+    };
+    let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
+    let factors = crate::runtime::factor_supported_length(config.axis_length)
+        .expect("a power-of-two FFT length must have a supported radix schedule");
+    let mut previous = 1usize;
+    let mut radix_stages = String::new();
+    for radix in factors {
+        radix_stages.push_str(&generate_fused_radix_stage_multiline_wgsl(
+            config.axis_length,
+            radix,
+            previous,
+            config.direction,
+            config.precision,
+        ));
+        previous *= radix;
+    }
+    // Contiguous lines load line-major; strided lines load element-major so
+    // neighbouring invocations touch neighbouring lines.
+    let split = if config.stride_complex == 1 {
+        "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;"
+    } else {
+        "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;"
+    };
+
+    specialize_complex_wgsl(
+        format!(
+            r#"struct Params {{
+  total: u32,
+  baseIndex: u32,
+  lineOffset: u32,
+  elementBase: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
+
+{complex_wgsl}
+{twiddle_lookup_wgsl}
+
+const N: u32 = {n}u;
+const LOG_N: u32 = {log_n}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const LINES: u32 = {lines}u;
+
+var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let firstLine: u32 = params.baseIndex / N;
+  let totalLines: u32 = params.total / N;
+  if (firstLine >= totalLines) {{
+    return;
+  }}
+  let activeLines: u32 = totalLines - firstLine;
+  let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= activeLines) {{
+    return;
+  }}
+  let lineCount: u32 = min(LINES, activeLines - groupLine);
+  let lineStart: u32 = params.lineOffset + firstLine + groupLine;
+
+  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+      scratch[lineSlot * N + (reverseBits(p) >> (32u - LOG_N))] = src[srcIdx];
+    }}
+  }}
+  workgroupBarrier();
+
+{radix_stages}
+  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      var value: vec2<f32> = scratch[lineSlot * N + p];
+{maybe_scale}      let dstIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+      dst[dstIdx] = value;
+    }}
+  }}
+}}
+"#,
+            complex_wgsl = complex_wgsl(),
+            n = config.axis_length,
+            log_n = config.axis_length.ilog2(),
+            stride = config.stride_complex,
+            workgroup_size = config.workgroup_size,
+            lines = lines,
+            scratch_len = config.axis_length * lines,
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            line_base_fn = line_base_fn,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+            radix_stages = radix_stages,
+            maybe_scale = maybe_scale,
+            split = split,
+        ),
+        config.precision,
+    )
+}
+
 fn generate_fused_radix_stage_wgsl(
+    axis_length: usize,
+    radix: usize,
+    previous: usize,
+    direction: FftDirection,
+    precision: AxisPrecision,
+) -> String {
+    format!(
+        r#"  {{
+    const RADIX: u32 = {radix}u;
+    const PREVIOUS: u32 = {previous}u;
+    const UNIT_COUNT: u32 = {unit_count}u;
+    for (var unit: u32 = lid.x; unit < UNIT_COUNT; unit = unit + WORKGROUP_SIZE) {{
+      let block: u32 = unit / PREVIOUS;
+      let j: u32 = unit - block * PREVIOUS;
+      let base: u32 = block * (RADIX * PREVIOUS) + j;
+{body}    }}
+    workgroupBarrier();
+  }}
+"#,
+        unit_count = axis_length / radix,
+        body = fused_radix_stage_body_wgsl(axis_length, radix, previous, direction, precision),
+    )
+}
+
+/// One radix stage of the multi-line fused kernel: butterfly units of every
+/// line in the workgroup share the invocations, and absent lines of a partial
+/// last workgroup are skipped.
+fn generate_fused_radix_stage_multiline_wgsl(
+    axis_length: usize,
+    radix: usize,
+    previous: usize,
+    direction: FftDirection,
+    precision: AxisPrecision,
+) -> String {
+    format!(
+        r#"  {{
+    const RADIX: u32 = {radix}u;
+    const PREVIOUS: u32 = {previous}u;
+    const UNIT_COUNT: u32 = {unit_count}u;
+    for (var slot: u32 = lid.x; slot < LINES * UNIT_COUNT; slot = slot + WORKGROUP_SIZE) {{
+      let lineSlot: u32 = slot / UNIT_COUNT;
+      if (lineSlot < lineCount) {{
+      let unit: u32 = slot - lineSlot * UNIT_COUNT;
+      let block: u32 = unit / PREVIOUS;
+      let j: u32 = unit - block * PREVIOUS;
+      let base: u32 = lineSlot * N + block * (RADIX * PREVIOUS) + j;
+{body}      }}
+    }}
+    workgroupBarrier();
+  }}
+"#,
+        unit_count = axis_length / radix,
+        body = fused_radix_stage_body_wgsl(axis_length, radix, previous, direction, precision),
+    )
+}
+
+/// Loads, twiddles, butterflies, and stores of one fused radix-2/4/8 unit.
+fn fused_radix_stage_body_wgsl(
     axis_length: usize,
     radix: usize,
     previous: usize,
@@ -1231,27 +1434,7 @@ fn generate_fused_radix_stage_wgsl(
         _ => unreachable!(),
     }
 
-    format!(
-        r#"  {{
-    const RADIX: u32 = {radix}u;
-    const PREVIOUS: u32 = {previous}u;
-    const UNIT_COUNT: u32 = {unit_count}u;
-    for (var unit: u32 = lid.x; unit < UNIT_COUNT; unit = unit + WORKGROUP_SIZE) {{
-      let block: u32 = unit / PREVIOUS;
-      let j: u32 = unit - block * PREVIOUS;
-      let base: u32 = block * (RADIX * PREVIOUS) + j;
-{values}{twiddles}{butterflies}{writes}    }}
-    workgroupBarrier();
-  }}
-"#,
-        radix = radix,
-        previous = previous,
-        unit_count = axis_length / radix,
-        values = values,
-        twiddles = twiddles,
-        butterflies = butterflies,
-        writes = writes,
-    )
+    format!("{values}{twiddles}{butterflies}{writes}")
 }
 
 fn append_fused_butterfly(
@@ -1267,7 +1450,7 @@ fn append_fused_butterfly(
 }
 
 pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) -> String {
-    generate_fused_pow2_stage_wgsl(&FusedPow2StageWgslConfig {
+    let config = FusedPow2StageWgslConfig {
         rank: key.rank,
         axis: key.axis,
         dims: &key.dims,
@@ -1278,7 +1461,39 @@ pub(crate) fn generate_fused_pow2_stage_wgsl_for_key(key: &FusedPow2StageKey) ->
         apply_scale: key.apply_scale,
         scale_factor: key.scale_factor(),
         precision: key.precision,
-    })
+    };
+    if key.lines_per_workgroup > 1 {
+        generate_fused_pow2_multiline_stage_wgsl(&config, key.lines_per_workgroup as usize)
+    } else {
+        generate_fused_pow2_stage_wgsl(&config)
+    }
+}
+
+/// Lines per workgroup for a fused kernel on an axis of `axis_length`.
+///
+/// Targets about 2048 elements per workgroup so radix stages keep 256
+/// invocations busy; strided axes take at least 8 adjacent lines so their
+/// loads coalesce. Workgroup storage caps the result, and small transforms
+/// keep at least 256 workgroups so their lines spread across the GPU instead
+/// of queueing on a few compute units.
+fn fused_lines_per_workgroup(
+    axis_length: usize,
+    stride_complex: usize,
+    precision: AxisPrecision,
+    total_lines: usize,
+    max_workgroup_storage_bytes: u64,
+) -> u32 {
+    const TARGET_ELEMENTS: usize = 2048;
+    const MIN_STRIDED_LINES: usize = 8;
+    const MIN_WORKGROUPS: usize = 256;
+    let mut lines = (TARGET_ELEMENTS / axis_length).max(1);
+    if stride_complex > 1 {
+        lines = lines.max(MIN_STRIDED_LINES);
+    }
+    let line_bytes = axis_length * precision.complex_size_bytes() as usize;
+    let max_by_storage = (max_workgroup_storage_bytes as usize / line_bytes).max(1);
+    let max_by_fill = (total_lines / MIN_WORKGROUPS).max(1);
+    lines.min(max_by_storage).min(max_by_fill) as u32
 }
 
 pub(crate) fn generate_fused_smooth_stage_wgsl(config: &FusedSmoothStageWgslConfig<'_>) -> String {
@@ -1654,7 +1869,7 @@ fn generate_fused_smooth_butterfly_math_wgsl(
 }
 
 pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey) -> String {
-    generate_fused_smooth_stage_wgsl(&FusedSmoothStageWgslConfig {
+    let config = FusedSmoothStageWgslConfig {
         rank: key.rank,
         axis: key.axis,
         dims: &key.dims,
@@ -1666,7 +1881,203 @@ pub(crate) fn generate_fused_smooth_stage_wgsl_for_key(key: &FusedSmoothStageKey
         apply_scale: key.apply_scale,
         scale_factor: key.scale_factor(),
         precision: key.precision,
-    })
+    };
+    if key.lines_per_workgroup > 1 {
+        generate_fused_smooth_multiline_stage_wgsl(&config, key.lines_per_workgroup as usize)
+    } else {
+        generate_fused_smooth_stage_wgsl(&config)
+    }
+}
+
+/// Fused smooth-radix kernel that transforms `lines` lines per workgroup; see
+/// [`generate_fused_pow2_multiline_stage_wgsl`]. Every stage stays in
+/// workgroup memory and a final store pass writes the lines out, so strided
+/// axes store element-major as well as load that way.
+pub(crate) fn generate_fused_smooth_multiline_stage_wgsl(
+    config: &FusedSmoothStageWgslConfig<'_>,
+    lines: usize,
+) -> String {
+    debug_assert_eq!(config.rank, config.dims.len());
+    debug_assert_eq!(config.axis_length, config.dims[config.axis]);
+    debug_assert_eq!(config.factors.iter().product::<usize>(), config.axis_length);
+    debug_assert!(lines > 1 && config.workgroup_size > 0);
+
+    let maybe_scale = if config.apply_scale {
+        let value = scaled_complex_expr("value", Some(config.scale_factor), config.precision);
+        format!("      value = {value};\n")
+    } else {
+        String::new()
+    };
+    let line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims);
+    let mut ns = 1usize;
+    let mut radix_stages = String::new();
+    for &radix in config.factors {
+        ns *= radix;
+        radix_stages.push_str(&generate_in_place_smooth_fft_stage_multiline_wgsl(
+            config.axis_length,
+            radix,
+            ns,
+            config.direction,
+            config.workgroup_size,
+            lines,
+            config.precision,
+        ));
+    }
+    debug_assert_eq!(ns, config.axis_length);
+    let split = if config.stride_complex == 1 {
+        "let lineSlot: u32 = e / N;\n    let p: u32 = e - lineSlot * N;"
+    } else {
+        "let lineSlot: u32 = e % LINES;\n    let p: u32 = e / LINES;"
+    };
+
+    specialize_complex_wgsl(
+        format!(
+            r#"struct Params {{
+  total: u32,
+  baseIndex: u32,
+  lineOffset: u32,
+  elementBase: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> src: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
+
+{complex_wgsl}
+{twiddle_lookup_wgsl}
+
+const N: u32 = {n}u;
+const STRIDE: u32 = {stride}u;
+const WORKGROUP_SIZE: u32 = {workgroup_size}u;
+const LINES: u32 = {lines}u;
+
+var<workgroup> scratch: array<vec2<f32>, {scratch_len}>;
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup_size}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  let firstLine: u32 = params.baseIndex / N;
+  let totalLines: u32 = params.total / N;
+  if (firstLine >= totalLines) {{
+    return;
+  }}
+  let activeLines: u32 = totalLines - firstLine;
+  let groupLine: u32 = wgFlat * LINES;
+  if (groupLine >= activeLines) {{
+    return;
+  }}
+  let lineCount: u32 = min(LINES, activeLines - groupLine);
+  let lineStart: u32 = params.lineOffset + firstLine + groupLine;
+
+  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      let srcIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+      scratch[lineSlot * N + p] = src[srcIdx];
+    }}
+  }}
+  workgroupBarrier();
+
+{radix_stages}
+  for (var e: u32 = lid.x; e < LINES * N; e = e + WORKGROUP_SIZE) {{
+    {split}
+    if (lineSlot < lineCount) {{
+      var value: vec2<f32> = scratch[lineSlot * N + p];
+{maybe_scale}      let dstIdx: u32 = line_base(lineStart + lineSlot) + p * STRIDE - params.elementBase;
+      dst[dstIdx] = value;
+    }}
+  }}
+}}
+"#,
+            complex_wgsl = complex_wgsl(),
+            n = config.axis_length,
+            stride = config.stride_complex,
+            workgroup_size = config.workgroup_size,
+            lines = lines,
+            scratch_len = config.axis_length * lines,
+            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            line_base_fn = line_base_fn,
+            entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+            flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
+            radix_stages = radix_stages,
+            maybe_scale = maybe_scale,
+            split = split,
+        ),
+        config.precision,
+    )
+}
+
+/// One in-place smooth radix stage over `lines` lines of `axis_length`
+/// elements in `scratch`, with each line's units on consecutive invocations.
+#[allow(clippy::too_many_arguments)]
+fn generate_in_place_smooth_fft_stage_multiline_wgsl(
+    axis_length: usize,
+    radix: usize,
+    ns: usize,
+    direction: FftDirection,
+    workgroup_size: u32,
+    lines: usize,
+    precision: AxisPrecision,
+) -> String {
+    debug_assert_eq!(ns % radix, 0);
+    debug_assert_eq!(axis_length % radix, 0);
+    let ns_div_r = ns / radix;
+    let n_div_r = axis_length / radix;
+    let n_div_ns = axis_length / ns;
+    let unit_count = axis_length / radix;
+    let unit_slot_count = (unit_count * lines).div_ceil(workgroup_size as usize);
+    let zero = if precision == AxisPrecision::Df64 {
+        "vec4<f32>(0.0, 0.0, 0.0, 0.0)"
+    } else {
+        "vec2<f32>(0.0, 0.0)"
+    };
+    let mut computes = String::new();
+    let mut writes = String::new();
+
+    for slot in 0..unit_slot_count {
+        let mut stage_outputs = String::new();
+        let mut slot_writes = String::new();
+        for output in 0..radix {
+            stage_outputs.push_str(&format!(
+                "    var stageOut_{slot}_{output}: vec2<f32> = {zero};\n"
+            ));
+            slot_writes.push_str(&format!(
+                "      scratch[lineOffset_{slot} + block_{slot} * {ns}u + {output}u * {ns_div_r}u + j_{slot}] = stageOut_{slot}_{output};\n"
+            ));
+        }
+        let butterfly = generate_fused_smooth_butterfly_math_wgsl(
+            radix, ns_div_r, n_div_r, n_div_ns, direction, slot, "scratch", "twiddle", precision,
+        );
+        computes.push_str(&format!(
+            r#"    let slotUnit_{slot}: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+    let lineSlot_{slot}: u32 = slotUnit_{slot} / {unit_count}u;
+    let unit_{slot}: u32 = slotUnit_{slot} - lineSlot_{slot} * {unit_count}u;
+    let block_{slot}: u32 = unit_{slot} / {ns_div_r}u;
+    let j_{slot}: u32 = unit_{slot} - block_{slot} * {ns_div_r}u;
+    let lineOffset_{slot}: u32 = lineSlot_{slot} * N;
+{stage_outputs}    if (lineSlot_{slot} < lineCount) {{
+      let base_{slot}: u32 = lineOffset_{slot} + block_{slot} * {ns_div_r}u + j_{slot};
+{butterfly}    }}
+"#
+        ));
+        writes.push_str(&format!(
+            "    if (lineSlot_{slot} < lineCount) {{\n{slot_writes}    }}\n"
+        ));
+    }
+
+    specialize_complex_wgsl(
+        format!(
+            r#"  {{ // fused smooth radix-{radix} butterflies, {lines} lines
+{computes}    workgroupBarrier();
+{writes}    workgroupBarrier();
+  }}
+"#
+        ),
+        precision,
+    )
 }
 
 pub(crate) fn generate_stockham_radix_stage_wgsl(config: &StockhamStageWgslConfig<'_>) -> String {
@@ -2735,6 +3146,127 @@ mod tests {
             256,
             256
         ));
+    }
+
+    fn multiline_wgsl_for(dims: &[usize], axis: usize, lines: usize) -> String {
+        generate_fused_pow2_multiline_stage_wgsl(
+            &FusedPow2StageWgslConfig {
+                rank: dims.len(),
+                axis,
+                dims,
+                axis_length: dims[axis],
+                stride_complex: stride_for_axis(dims, axis),
+                direction: FftDirection::Forward,
+                workgroup_size: FUSED_POW2_WORKGROUP_SIZE,
+                apply_scale: true,
+                scale_factor: 0.25,
+                precision: AxisPrecision::F32,
+            },
+            lines,
+        )
+    }
+
+    #[test]
+    fn multiline_fused_pow2_packs_lines_and_orders_loads_by_axis() {
+        let contiguous = multiline_wgsl_for(&[64, 64], 0, 32);
+        assert!(contiguous.contains("const LINES: u32 = 32u;"));
+        assert!(contiguous.contains("var<workgroup> scratch: array<vec2<f32>, 2048>;"));
+        assert!(contiguous.contains("let lineSlot: u32 = e / N;"));
+        assert!(contiguous.contains("scratch[lineSlot * N + (reverseBits(p) >> (32u - LOG_N))]"));
+        assert!(contiguous.contains("let lineCount: u32 = min(LINES, activeLines - groupLine);"));
+        assert!(contiguous.contains("value = value * vec2<f32>(0.25, 0.25);"));
+        crate::runtime::assert_workgroup_var_written_before_read(&contiguous, "scratch");
+
+        // Strided axes load element-major so neighbouring invocations read
+        // neighbouring lines.
+        let strided = multiline_wgsl_for(&[64, 64], 1, 32);
+        assert!(strided.contains("const STRIDE: u32 = 64u;"));
+        assert!(strided.contains("let lineSlot: u32 = e % LINES;"));
+        crate::runtime::assert_workgroup_var_written_before_read(&strided, "scratch");
+    }
+
+    #[test]
+    fn multiline_fused_smooth_keeps_stages_in_workgroup_memory() {
+        let dims = [60usize, 48];
+        let factors = crate::runtime::factor_supported_length(48).unwrap();
+        let wgsl = generate_fused_smooth_multiline_stage_wgsl(
+            &FusedSmoothStageWgslConfig {
+                rank: 2,
+                axis: 1,
+                dims: &dims,
+                axis_length: 48,
+                stride_complex: 60,
+                factors: &factors,
+                direction: FftDirection::Inverse,
+                workgroup_size: FUSED_POW2_WORKGROUP_SIZE,
+                apply_scale: false,
+                scale_factor: 1.0,
+                precision: AxisPrecision::F32,
+            },
+            16,
+        );
+        assert!(wgsl.contains("const LINES: u32 = 16u;"));
+        assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 768>;"));
+        assert!(wgsl.contains("let lineSlot: u32 = e % LINES;"));
+        assert!(wgsl.contains("if (lineSlot_0 < lineCount) {"));
+        // The last stage writes workgroup memory; only the store pass writes dst.
+        assert_eq!(wgsl.matches("dst[").count(), 1);
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
+    }
+
+    #[test]
+    fn fused_lines_per_workgroup_fills_invocations_within_storage() {
+        let storage = 48 * 1024;
+        assert_eq!(
+            fused_lines_per_workgroup(64, 1, AxisPrecision::F32, 1 << 20, storage),
+            32
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(1024, 1, AxisPrecision::F32, 1 << 20, storage),
+            2
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(4096, 1, AxisPrecision::F32, 1 << 20, storage),
+            1
+        );
+        // Strided axes want at least 8 lines, capped by workgroup storage.
+        assert_eq!(
+            fused_lines_per_workgroup(512, 64, AxisPrecision::F32, 1 << 20, storage),
+            8
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(1024, 64, AxisPrecision::F32, 1 << 20, storage),
+            6
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(1024, 64, AxisPrecision::F64, 1 << 20, storage),
+            3
+        );
+        // Small transforms keep enough workgroups to spread across the GPU.
+        assert_eq!(
+            fused_lines_per_workgroup(64, 1, AxisPrecision::F32, 64, storage),
+            1
+        );
+        assert_eq!(
+            fused_lines_per_workgroup(64, 64, AxisPrecision::F32, 4096, storage),
+            16
+        );
+
+        let key = FusedPow2StageKey::new(
+            1,
+            0,
+            &[64],
+            64,
+            1,
+            FftDirection::Forward,
+            256,
+            false,
+            1.0,
+            AxisPrecision::F32,
+        );
+        assert!(!key.stable_key().contains(":lines="));
+        let key = key.with_lines_per_workgroup(32);
+        assert!(key.stable_key().ends_with(":lines=32"));
     }
 
     #[test]

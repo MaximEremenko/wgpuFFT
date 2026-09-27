@@ -8379,8 +8379,11 @@ mod tests {
                 panic!("bridge helper did not use a bridge shader key");
             };
             assert_eq!(shader_key.workgroup_size, 128);
-            assert!(generate_bridge_wgsl_for_key(shader_key)
-                .contains("@compute @workgroup_size(128, 1, 1)"));
+            let wgsl = generate_bridge_wgsl_for_key(shader_key);
+            assert!(wgsl.contains("@compute @workgroup_size(128, 1, 1)"));
+            if wgsl.contains("scratch[") {
+                crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
+            }
         }
 
         let default_keys =

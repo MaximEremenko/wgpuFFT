@@ -1795,6 +1795,12 @@ mod tests {
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 200>"));
         assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f32>"));
         assert!(wgsl.contains("perm[(L - 1u) - t]"));
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
+        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "x0Shared");
+        // The convolution padding must be zeroed in-kernel: pipelines skip
+        // wgpu's workgroup zero fill.
+        assert!(wgsl.contains("if (t >= L && t < M) {"));
+        assert!(wgsl.contains("scratch[t] = vec2<f32>(0.0, 0.0);"));
         assert!(wgsl.contains("output[base + perm[t] * STRIDE]"));
         assert!(wgsl.contains("let wrap: u32 = t + L"));
         assert!(wgsl.contains("fn twiddle_forward"));
@@ -1927,6 +1933,9 @@ mod tests {
             assert!(!wgsl.contains("vec2<f64>"));
             assert!(!wgsl.contains("sin("));
             assert!(!wgsl.contains("cos("));
+            if matches!(kind, RaderKernelKind::Sum) {
+                crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
+            }
         }
     }
 

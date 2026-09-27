@@ -88,6 +88,7 @@ struct AxisWindowPlan {
     twiddle_lut_storage_bytes: u64,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AxisWindowExecutor {
     Mixed(AxisPlan),
     Prime(Box<C2cPlan>),
@@ -542,7 +543,7 @@ impl FourStepC2cPlan {
             }
         }
 
-        let final_data = if self.axes.len() % 2 == 0 {
+        let final_data = if self.axes.len().is_multiple_of(2) {
             &output
         } else {
             &scratch
@@ -1623,7 +1624,7 @@ fn build_four_step_graph(
             )?;
         }
     }
-    let final_buffer = if axes.len() % 2 == 0 {
+    let final_buffer = if axes.len().is_multiple_of(2) {
         LogicalBufferId::Output
     } else {
         LogicalBufferId::Temp(0)

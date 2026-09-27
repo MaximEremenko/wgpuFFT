@@ -61,8 +61,8 @@ impl LogicalRange {
         size_bytes: u64,
         format: ElementFormat,
     ) -> Result<Self> {
-        if offset_bytes % format.bytes_per_element() != 0
-            || size_bytes % format.bytes_per_element() != 0
+        if !offset_bytes.is_multiple_of(format.bytes_per_element())
+            || !size_bytes.is_multiple_of(format.bytes_per_element())
         {
             return Err(FftError::WindowScheduleUnsupported {
                 reason: "logical range is not aligned to its element format",

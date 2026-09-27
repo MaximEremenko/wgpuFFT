@@ -42,7 +42,7 @@ pub(crate) fn resolve_axis_kinds_for_axes_with_tuning(
     axes: &[usize],
     tuning: &FftTuning,
 ) -> Result<Vec<AxisKind>> {
-    if shape.is_empty() || shape.iter().any(|&len| len == 0) {
+    if shape.is_empty() || shape.contains(&0) {
         return Err(FftError::ZeroLength);
     }
 
@@ -83,13 +83,13 @@ pub(crate) fn is_prime(n: usize) -> bool {
     if n < 2 {
         return false;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         return n == 2;
     }
 
     let mut d = 3usize;
     while d <= n / d {
-        if n % d == 0 {
+        if n.is_multiple_of(d) {
             return false;
         }
         d += 2;
@@ -117,9 +117,9 @@ pub(crate) fn prime_factors(mut n: usize) -> Vec<usize> {
     let mut factors = Vec::new();
     let mut d = 2usize;
     while d <= n / d {
-        if n % d == 0 {
+        if n.is_multiple_of(d) {
             factors.push(d);
-            while n % d == 0 {
+            while n.is_multiple_of(d) {
                 n /= d;
             }
         }
@@ -169,7 +169,7 @@ fn is_smooth_supported(mut n: usize) -> bool {
         return false;
     }
     for &radix in SUPPORTED_RADICES {
-        while n % radix == 0 {
+        while n.is_multiple_of(radix) {
             n /= radix;
         }
     }

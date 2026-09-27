@@ -2819,10 +2819,12 @@ mod tests {
 
     #[test]
     fn dynamic_1d_keys_check_lane_and_reduction_storage_limits_without_flattening_tiles() {
-        let mut limits = wgpu::Limits::default();
-        limits.max_compute_invocations_per_workgroup = 64;
-        limits.max_compute_workgroup_size_x = 64;
-        limits.max_compute_workgroup_storage_size = 1024;
+        let mut limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 64,
+            max_compute_workgroup_size_x: 64,
+            max_compute_workgroup_storage_size: 1024,
+            ..wgpu::Limits::default()
+        };
 
         let stockham = ShaderCacheKey::StockhamStage(StockhamStageKey::new(
             1,

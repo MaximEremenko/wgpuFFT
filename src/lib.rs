@@ -41,6 +41,11 @@
 //! With the default `cpu` feature, [`CpuFftPlan`] runs the same transforms on
 //! host memory, for machines without a usable GPU adapter.
 
+// `FftError` carries plan diagnostics and is returned only on cold paths
+// (planning and validation); boxing it would complicate the public API for no
+// runtime gain.
+#![allow(clippy::result_large_err)]
+
 pub mod config;
 #[cfg(feature = "cpu")]
 pub mod cpu;

@@ -42,3 +42,8 @@ wasm-bindgen-test = "=0.3.79"
 [[bench]]
 name = "fft_bench"
 harness = false
+
+# Checks the long-axis kernels against the CPU backend.
+[[test]]
+name = "gpu_long_axes"
+required-features = ["cpu"]

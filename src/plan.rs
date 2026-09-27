@@ -915,15 +915,12 @@ impl FftPlan {
     pub fn diagnostics_for_limits(&self, limits: FftDeviceLimits) -> FftDiagnostics {
         let mut diagnostics = self.diagnostics().with_device_limits(limits);
         let route = self.route().as_str().to_owned();
-        match self.execution_graph() {
-            Ok(graph) => {
-                let scheduler = WindowScheduler::new(scheduler_limits_from_diagnostics(limits));
-                let executor = StageExecutor::new(&scheduler);
-                for blocker in executor.graph_blockers(route, &graph) {
-                    diagnostics = diagnostics.with_blocker(blocker);
-                }
+        if let Ok(graph) = self.execution_graph() {
+            let scheduler = WindowScheduler::new(scheduler_limits_from_diagnostics(limits));
+            let executor = StageExecutor::new(&scheduler);
+            for blocker in executor.graph_blockers(route, &graph) {
+                diagnostics = diagnostics.with_blocker(blocker);
             }
-            Err(_) => {}
         }
         diagnostics
     }
@@ -1548,6 +1545,7 @@ fn output_endpoint_format_for(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_logical_io_bind_error_blockers(
     mut diagnostics: FftDiagnostics,
     role: &'static str,

@@ -234,6 +234,8 @@ impl<'a> BufferView<'a> {
         if self.logical_byte_offset != 0 {
             return false;
         }
+        // Buffers hash by identity; their interior state does not affect it.
+        #[allow(clippy::mutable_key_type)]
         let mut unique_buffers = HashSet::with_capacity(self.segments.len());
         let Some(total_bytes) = self.segments.iter().try_fold(0u64, |total, segment| {
             if segment.offset_bytes != 0
@@ -484,7 +486,7 @@ fn iter_ranges<'a>(
 }
 
 fn validate_copy_alignment(offset: u64, size: u64) -> Result<()> {
-    if offset % COPY_BUFFER_ALIGNMENT == 0 && size % COPY_BUFFER_ALIGNMENT == 0 {
+    if offset.is_multiple_of(COPY_BUFFER_ALIGNMENT) && size.is_multiple_of(COPY_BUFFER_ALIGNMENT) {
         Ok(())
     } else {
         Err(FftError::BufferViewCopyUnaligned {

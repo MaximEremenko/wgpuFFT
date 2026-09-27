@@ -366,7 +366,7 @@ fn choose_factor_split(len: u64, max_bind_bytes: u64) -> Result<Option<(u64, u64
 fn proper_smooth_divisors(len: u64) -> Result<Vec<u64>> {
     let mut divisors = Vec::new();
     for divisor in 2..len {
-        if len % divisor != 0 {
+        if !len.is_multiple_of(divisor) {
             continue;
         }
         let other = len / divisor;
@@ -390,7 +390,7 @@ fn largest_divisor_fitting(
     max_bind_bytes: u64,
 ) -> Option<u64> {
     (1..=axis_chunkable).rev().find(|candidate| {
-        axis_chunkable % candidate == 0
+        axis_chunkable.is_multiple_of(*candidate)
             && checked_chunk_bytes(*candidate, other_axis, max_bind_bytes).is_ok()
     })
 }

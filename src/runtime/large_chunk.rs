@@ -40,7 +40,7 @@ impl LargeChunkPlan {
                 max_bind_bytes: limits.max_storage_buffer_binding_size,
             });
         }
-        if bytes_per_batch == 0 || bytes_per_batch % 4 != 0 {
+        if bytes_per_batch == 0 || !bytes_per_batch.is_multiple_of(4) {
             return Err(FftError::LargeChunkUnsupported {
                 reason: "bytes per batch must be non-zero and 4-byte aligned",
                 bytes_per_batch,

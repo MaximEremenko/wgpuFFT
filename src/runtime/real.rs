@@ -293,6 +293,7 @@ fn real_range(
     LogicalRange::new(buffer, offset_bytes, size_bytes, format)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_real_normal_graph(
     label: &'static str,
     first_kernel_label: &'static str,
@@ -1409,6 +1410,7 @@ fn execute_c2r_logical_views(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_real_logical_views(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -1639,7 +1641,7 @@ fn validate_real_stage_key(key: &RealStageKey) -> Result<()> {
                     "real pack/unpack shader key requires a non-empty shape",
                 ));
             }
-            if key.dims.iter().any(|&dim| dim == 0) {
+            if key.dims.contains(&0) {
                 return Err(real_shader_key_error(
                     "real pack/unpack shader key dimensions must be non-zero",
                 ));
@@ -2307,6 +2309,7 @@ impl C2rLargeChunkPlan {
 }
 
 impl RealKernel {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -2464,6 +2467,7 @@ fn dispatch_complex_to_real_windowed(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_linear_real_windowed(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -2650,6 +2654,7 @@ fn dispatch_unpack_c2r_windowed(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_real_windowed_pair(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -2693,6 +2698,7 @@ fn dispatch_real_windowed_pair(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn choose_real_window_count(
     device: &wgpu::Device,
     input: &BufferView<'_>,
@@ -2730,6 +2736,7 @@ fn choose_real_window_count(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_real_windowed_kernel(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -2796,6 +2803,7 @@ fn dispatch_real_windowed_kernel(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_real_strided_copy(
     device: &wgpu::Device,
     encoder: &mut CommandRecorder<'_>,
@@ -3554,19 +3562,17 @@ fn generate_unpack_c2r_wgsl(shape: &[usize], workgroup_size: u32) -> String {
     let in_total = product(&in_shape);
     let nx = shape[0];
     let in_nx = in_shape[0];
-    let even = nx % 2 == 0;
+    let even = nx.is_multiple_of(2);
     let decoded = decode_coords_wgsl("rem", shape, "c");
 
     let mut mirror_coords_code = String::new();
     let mut coord_for_in_index = Vec::with_capacity(shape.len());
     coord_for_in_index.push(String::from("xPacked"));
-    for dim in 1..shape.len() {
-        let coord = &decoded.coords[dim];
+    for (dim, (&extent, coord)) in shape.iter().zip(&decoded.coords).enumerate().skip(1) {
         let mirror = format!("c{dim}m");
         let packed = format!("c{dim}p");
         mirror_coords_code.push_str(&format!(
-            "  let {mirror}: u32 = select(0u, {}u - {coord}, {coord} != 0u);\n",
-            shape[dim]
+            "  let {mirror}: u32 = select(0u, {extent}u - {coord}, {coord} != 0u);\n"
         ));
         mirror_coords_code.push_str(&format!(
             "  let {packed}: u32 = select({coord}, {mirror}, x >= IN_NX);\n"
@@ -3587,12 +3593,11 @@ fn generate_unpack_c2r_wgsl(shape: &[usize], workgroup_size: u32) -> String {
     }
 
     let mut self_conj_expr = String::from("(x == 0u || (EVEN_NX && x == (NX / 2u)))");
-    for dim in 1..shape.len() {
-        let coord = &decoded.coords[dim];
-        if shape[dim] % 2 == 0 {
+    for (&extent, coord) in shape.iter().zip(&decoded.coords).skip(1) {
+        if extent.is_multiple_of(2) {
             self_conj_expr.push_str(&format!(
                 " && ({coord} == 0u || {coord} == {}u)",
-                shape[dim] / 2
+                extent / 2
             ));
         } else {
             self_conj_expr.push_str(&format!(" && ({coord} == 0u)"));
@@ -3712,19 +3717,17 @@ fn generate_unpack_c2r_windowed_wgsl(shape: &[usize], workgroup_size: u32) -> St
     let in_total = product(&in_shape);
     let nx = shape[0];
     let in_nx = in_shape[0];
-    let even = nx % 2 == 0;
+    let even = nx.is_multiple_of(2);
     let decoded = decode_coords_wgsl("rem", shape, "c");
 
     let mut mirror_coords_code = String::new();
     let mut coord_for_in_index = Vec::with_capacity(shape.len());
     coord_for_in_index.push(String::from("xPacked"));
-    for dim in 1..shape.len() {
-        let coord = &decoded.coords[dim];
+    for (dim, (&extent, coord)) in shape.iter().zip(&decoded.coords).enumerate().skip(1) {
         let mirror = format!("c{dim}m");
         let packed = format!("c{dim}p");
         mirror_coords_code.push_str(&format!(
-            "  let {mirror}: u32 = select(0u, {}u - {coord}, {coord} != 0u);\n",
-            shape[dim]
+            "  let {mirror}: u32 = select(0u, {extent}u - {coord}, {coord} != 0u);\n"
         ));
         mirror_coords_code.push_str(&format!(
             "  let {packed}: u32 = select({coord}, {mirror}, x >= IN_NX);\n"
@@ -3745,12 +3748,11 @@ fn generate_unpack_c2r_windowed_wgsl(shape: &[usize], workgroup_size: u32) -> St
     }
 
     let mut self_conj_expr = String::from("(x == 0u || (EVEN_NX && x == (NX / 2u)))");
-    for dim in 1..shape.len() {
-        let coord = &decoded.coords[dim];
-        if shape[dim] % 2 == 0 {
+    for (&extent, coord) in shape.iter().zip(&decoded.coords).skip(1) {
+        if extent.is_multiple_of(2) {
             self_conj_expr.push_str(&format!(
                 " && ({coord} == 0u || {coord} == {}u)",
-                shape[dim] / 2
+                extent / 2
             ));
         } else {
             self_conj_expr.push_str(&format!(" && ({coord} == 0u)"));
@@ -4320,9 +4322,11 @@ mod tests {
 
     #[test]
     fn real_policy_limits_honor_tuning_and_explicit_caps() {
-        let mut device_limits = wgpu::Limits::default();
-        device_limits.max_storage_buffer_binding_size = 8_192;
-        device_limits.max_buffer_size = 16_384;
+        let device_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 8_192,
+            max_buffer_size: 16_384,
+            ..wgpu::Limits::default()
+        };
         let config = FftConfig::new(16).with_tuning(
             FftTuning::default()
                 .with_max_storage_buffer_binding_size(4_096u64)

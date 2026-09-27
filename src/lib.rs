@@ -68,7 +68,7 @@ pub use diagnostics::{
 pub use error::{FftError, FftExecutionError, FftPlanCreationError, Result};
 pub use plan::{
     create_c2r_plan, create_c2r_plan_with_diagnostics, create_plan, create_plan_with_diagnostics,
-    create_r2c_plan, create_r2c_plan_with_diagnostics, FftPlan, FftTransformKind,
+    create_r2c_plan, create_r2c_plan_with_diagnostics, FftPlan, FftRecorder, FftTransformKind,
 };
 pub use runtime::axis_policy::{AxisKind, DEFAULT_RADER_MAX_PRIME};
 pub use runtime::buffer_view::{BufferLayout, BufferRange, BufferSegment, BufferView, FftIoView};

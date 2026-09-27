@@ -16,6 +16,7 @@ use crate::runtime::logical_io::{
     BoundLogicalIo, FftEndpointFormat, FftLogicalLayout, FftLogicalView,
 };
 use crate::runtime::real::{C2rPlan, R2cPlan};
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::{SchedulerLimits, WindowScheduler};
 use crate::tuning::FftTuningSummary;
@@ -30,6 +31,44 @@ pub enum FftTransformKind {
 /// Public plan handle for supported FFT transforms.
 pub struct FftPlan {
     inner: FftPlanInner,
+}
+
+/// Records several FFT executions into one shared compute pass.
+///
+/// Every `FftPlan::execute*` call opens and closes its own compute pass,
+/// which costs a few microseconds of GPU time per call. When transforms run
+/// back to back, such as a forward and inverse pair, recording them through
+/// one recorder keeps a single pass open across executions; wgpu still orders
+/// dependent dispatches inside it. The pass ends where a plan needs a buffer
+/// copy and when the recorder is dropped, after which the encoder records
+/// other commands again.
+///
+/// ```no_run
+/// # fn demo(
+/// #     device: &wgpu::Device,
+/// #     encoder: &mut wgpu::CommandEncoder,
+/// #     forward: &wgpu_fft::FftPlan,
+/// #     inverse: &wgpu_fft::FftPlan,
+/// #     a: &wgpu::Buffer,
+/// #     b: &wgpu::Buffer,
+/// # ) -> wgpu_fft::Result<()> {
+/// let mut recorder = wgpu_fft::FftRecorder::new(encoder);
+/// forward.record(device, &mut recorder, a, b)?;
+/// inverse.record(device, &mut recorder, b, a)?;
+/// drop(recorder);
+/// # Ok(())
+/// # }
+/// ```
+pub struct FftRecorder<'a> {
+    inner: CommandRecorder<'a>,
+}
+
+impl<'a> FftRecorder<'a> {
+    pub fn new(encoder: &'a mut wgpu::CommandEncoder) -> Self {
+        Self {
+            inner: CommandRecorder::new(encoder),
+        }
+    }
 }
 
 enum FftPlanInner {
@@ -742,6 +781,63 @@ impl FftPlan {
                     error,
                 )
             })
+    }
+
+    /// [`Self::execute`] recorded into `recorder`'s shared compute pass.
+    pub fn record(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut FftRecorder<'_>,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.record_views(
+            device,
+            recorder,
+            BufferView::whole(input),
+            BufferView::whole(output),
+        )
+    }
+
+    /// [`Self::execute_views`] recorded into `recorder`'s shared compute pass.
+    pub fn record_views(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut FftRecorder<'_>,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
+        input.validate_min_size(self.required_input_buffer_size_bytes())?;
+        output.validate_min_size(self.required_output_buffer_size_bytes())?;
+        self.record_logical_views(
+            device,
+            recorder,
+            FftLogicalView::contiguous(input),
+            FftLogicalView::contiguous(output),
+        )
+    }
+
+    /// [`Self::execute_logical_views`] recorded into `recorder`'s shared
+    /// compute pass.
+    pub fn record_logical_views(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut FftRecorder<'_>,
+        input: FftLogicalView<'_>,
+        output: FftLogicalView<'_>,
+    ) -> Result<()> {
+        let recorder = &mut recorder.inner;
+        match &self.inner {
+            FftPlanInner::C2c(plan) => {
+                plan.execute_logical_views_recorded(device, recorder, input, output)
+            }
+            FftPlanInner::R2c(plan) => {
+                plan.execute_logical_views_recorded(device, recorder, input, output)
+            }
+            FftPlanInner::C2r(plan) => {
+                plan.execute_logical_views_recorded(device, recorder, input, output)
+            }
+        }
     }
 
     pub fn diagnostics(&self) -> FftDiagnostics {

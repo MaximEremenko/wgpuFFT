@@ -132,6 +132,7 @@ struct Options {
     compare_max_buffer_bytes: Option<CompareMaxBufferBytes>,
     segmented_burst_depth: usize,
     workgroup_size: Option<u32>,
+    shared_pass: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +362,9 @@ async fn run() -> BenchResult<()> {
             .map_or_else(|| "default".to_owned(), |value| value.to_string()),
     );
     println!(
-        "method: FFT+iFFT pairs, one command encoder, one submit, wall-clock submit-through-device-poll"
+        "method: FFT+iFFT pairs, one command encoder, one submit, wall-clock submit-through-device-poll{}"
+    ,
+        if options.shared_pass { ", all pairs in one compute pass (FftRecorder)" } else { "" }
     );
     println!(
         "comparability: wgpuFFT mode=out-of-place; VkFFT reference samples mode=in-place; both directions normalization=none"
@@ -892,23 +895,43 @@ async fn run_case(
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("wgpu_fft.bench.pairs"),
             });
-            for iteration in 0..num_iter {
-                forward
-                    .execute_checked(device, &mut encoder, &buffer_a, &buffer_b)
-                    .map_err(|error| {
-                        contextual_error(
-                            format!("recording forward FFT for iteration {iteration}"),
-                            error,
-                        )
-                    })?;
-                inverse
-                    .execute_checked(device, &mut encoder, &buffer_b, &buffer_a)
-                    .map_err(|error| {
-                        contextual_error(
-                            format!("recording inverse FFT for iteration {iteration}"),
-                            error,
-                        )
-                    })?;
+            if options.shared_pass {
+                let mut recorder = wgpu_fft::FftRecorder::new(&mut encoder);
+                for iteration in 0..num_iter {
+                    forward
+                        .record(device, &mut recorder, &buffer_a, &buffer_b)
+                        .map_err(|error| {
+                            input_error(format!(
+                                "recording forward FFT for iteration {iteration}: {error}"
+                            ))
+                        })?;
+                    inverse
+                        .record(device, &mut recorder, &buffer_b, &buffer_a)
+                        .map_err(|error| {
+                            input_error(format!(
+                                "recording inverse FFT for iteration {iteration}: {error}"
+                            ))
+                        })?;
+                }
+            } else {
+                for iteration in 0..num_iter {
+                    forward
+                        .execute_checked(device, &mut encoder, &buffer_a, &buffer_b)
+                        .map_err(|error| {
+                            contextual_error(
+                                format!("recording forward FFT for iteration {iteration}"),
+                                error,
+                            )
+                        })?;
+                    inverse
+                        .execute_checked(device, &mut encoder, &buffer_b, &buffer_a)
+                        .map_err(|error| {
+                            contextual_error(
+                                format!("recording inverse FFT for iteration {iteration}"),
+                                error,
+                            )
+                        })?;
+                }
             }
             Ok(encoder.finish())
         })();
@@ -2127,6 +2150,7 @@ fn parse_options() -> BenchResult<Options> {
         compare_max_buffer_bytes: None,
         segmented_burst_depth: DEFAULT_SEGMENTED_BURST_DEPTH,
         workgroup_size: None,
+        shared_pass: false,
     };
     let mut segmented_burst_depth_was_set = false;
     while let Some(argument) = args.next() {
@@ -2166,6 +2190,9 @@ fn parse_options() -> BenchResult<Options> {
                     "--wait-timeout-secs",
                 )?;
                 options.wait_timeout = Duration::from_secs(seconds);
+            }
+            "--shared-pass" => {
+                options.shared_pass = true;
             }
             "--workgroup-size" => {
                 options.workgroup_size = Some(parse_workgroup_size(next_value(

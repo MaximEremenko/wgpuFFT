@@ -226,13 +226,16 @@ impl RaderAxis {
             }),
         );
 
+        // The fused kernel also reads, after the permutation, each natural
+        // element's slot in the convolution input.
+        let perm_table = rader_permutation_table(&perm);
         let perm_buffer = storage_buffer(
             device,
             "wgpu_fft.rader.perm",
-            (perm.len() * std::mem::size_of::<u32>()) as u64,
+            (perm_table.len() * std::mem::size_of::<u32>()) as u64,
             wgpu::BufferUsages::COPY_DST,
         )?;
-        queue.write_buffer(&perm_buffer, 0, bytemuck::cast_slice(&perm));
+        queue.write_buffer(&perm_buffer, 0, bytemuck::cast_slice(&perm_table));
 
         let bfft_buffer = storage_buffer(
             device,
@@ -1010,33 +1013,6 @@ fn fused_rader_supported(
     )
 }
 
-/// Zero padding a fused Rader kernel needs to reduce the line sum in place;
-/// shorter padding (a cyclic convolution has none) uses a separate array.
-const MIN_PADDED_REDUCTION: usize = 32;
-/// Size of the separate line-sum reduction array.
-const SEPARATE_REDUCTION: usize = 64;
-
-/// Line-sum reduction of a fused Rader kernel: its size, and whether it has
-/// its own array rather than the convolution's zero padding.
-fn fused_rader_reduction(n: usize, m: usize, workgroup_size: u32) -> (usize, bool) {
-    let padding = m.saturating_sub(n.saturating_sub(1));
-    let capacity = workgroup_size.max(1) as usize;
-    if padding >= MIN_PADDED_REDUCTION {
-        (1usize << padding.min(capacity).ilog2(), false)
-    } else {
-        (1usize << SEPARATE_REDUCTION.min(capacity).ilog2(), true)
-    }
-}
-
-/// Workgroup elements a fused Rader kernel needs beyond the convolution:
-/// `x0`, plus the separate reduction array when there is one.
-pub(crate) fn fused_rader_extra_elements(n: usize, m: usize, workgroup_size: u32) -> usize {
-    match fused_rader_reduction(n, m, workgroup_size) {
-        (size, true) => 1 + size,
-        (_, false) => 1,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fused_rader_supported_by_limits(
     n: usize,
@@ -1054,11 +1030,7 @@ pub(crate) fn fused_rader_supported_by_limits(
     if linear_length.max(m) < min_convolution_length {
         return false;
     }
-    let complex_bytes = precision.complex_size_bytes() as usize;
-    let Some(workgroup_bytes) = m
-        .checked_add(fused_rader_extra_elements(n, m, workgroup_size))
-        .and_then(|elements| elements.checked_mul(complex_bytes))
-    else {
+    let Some(workgroup_bytes) = m.checked_mul(precision.complex_size_bytes() as usize) else {
         return false;
     };
     workgroup_bytes as u64 <= max_workgroup_storage_bytes
@@ -1086,6 +1058,19 @@ pub(crate) fn rader_convolution_length(n: usize) -> Result<usize> {
         m = next_power_of_two_at_least(min_conv);
     }
     Ok(m)
+}
+
+/// `perm` followed by the destination table: entry `L + q` is the slot of
+/// the reversed convolution input that `x[q + 1]` fills, where slot `t` holds
+/// `x[perm[L - 1 - t]]`.
+pub(crate) fn rader_permutation_table(perm: &[u32]) -> Vec<u32> {
+    let l = perm.len();
+    let mut table = perm.to_vec();
+    table.resize(2 * l, 0);
+    for (k, &natural) in perm.iter().enumerate() {
+        table[l + natural as usize - 1] = (l - 1 - k) as u32;
+    }
+    table
 }
 
 pub(crate) fn rader_permutation(n: usize) -> Result<Vec<u32>> {
@@ -1212,6 +1197,14 @@ fn bind_view_entry<'a>(
     })
 }
 
+/// WGSL of a fused Rader kernel: one workgroup transforms one line.
+///
+/// Every invocation loads the line in natural order, coalesced, and scatters
+/// each element to its place in the permuted convolution input using the
+/// destination table after the permutation in `perm`. The forward FFT's
+/// bin 0 is the sum of `x[1..N)`, so `X[0] = x[0] + A[0]` needs no reduction.
+/// Results return to natural order in workgroup memory before a coalesced
+/// store.
 pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> String {
     debug_assert_eq!(key.kind, FusedPrimeKind::Rader);
     let n = key.axis_length;
@@ -1219,21 +1212,6 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     let m = key.convolution_length;
     let m_slot_count = m.div_ceil(key.workgroup_size as usize);
     let l_slot_count = l.div_ceil(key.workgroup_size as usize);
-    let (reduction_size, separate_reduction) = fused_rader_reduction(n, m, key.workgroup_size);
-    let sum_slot_count = l.div_ceil(reduction_size);
-    // A cyclic convolution has no zero padding to reduce the line sum in.
-    let reduction_slot = |offset: &str| {
-        if separate_reduction {
-            format!("reduction[{offset}]")
-        } else {
-            format!("scratch[L + {offset}]")
-        }
-    };
-    let reduction_decl = if separate_reduction {
-        format!("var<workgroup> reduction: array<vec2<f32>, {reduction_size}>;\n")
-    } else {
-        String::new()
-    };
     let line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims);
     let scale = match key.precision {
         AxisPrecision::Df64 => format_df64(key.scale_factor()),
@@ -1280,18 +1258,42 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
         AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
         _ => "vec2<f32>(value.x, -value.y)",
     };
-    let line_sum_add = complex_add_expr(key.precision, "lineSum", "value");
-    let reduction_add = complex_add_expr(
+    // Parenthesized: the f32 and f64 scale multiplies its operand's last term.
+    let scaled_first = complex_scale_expr(
         key.precision,
-        &reduction_slot("lid.x"),
-        &reduction_slot("lid.x + reductionStride"),
+        &format!("({})", complex_add_expr(key.precision, "x0", "scratch[0]")),
+        scale_ref,
     );
-    let scaled_sum = complex_scale_expr(key.precision, &reduction_slot("0u"), scale_ref);
     let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
     let scaled_wrap = complex_scale_expr(key.precision, "scratch[wrap]", inverse_m_ref);
     let wrap_add = complex_add_expr(key.precision, "convolution", &scaled_wrap);
-    let x0_add = complex_add_expr(key.precision, "x0Shared", "convolution");
-    let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
+    let x0_add = complex_add_expr(key.precision, "x0", "convolution");
+    let scaled_result = complex_scale_expr(key.precision, "scratch[q]", scale_ref);
+
+    // Each invocation holds its outputs while others still read the
+    // convolution, then writes them back in natural order.
+    let mut collect = String::new();
+    let mut scatter = String::new();
+    for slot in 0..l_slot_count {
+        collect.push_str(&format!(
+            r#"  var value{slot}: vec2<f32> = {zero};
+  {{
+    let t: u32 = lid.x + {slot}u * WORKGROUP_SIZE;
+    if (t < L) {{
+      var convolution: vec2<f32> = {scaled_convolution};
+      let wrap: u32 = t + L;
+      if (wrap < M) {{
+        convolution = {wrap_add};
+      }}
+      value{slot} = {x0_add};
+    }}
+  }}
+"#
+        ));
+        scatter.push_str(&format!(
+            "  if (lid.x + {slot}u * WORKGROUP_SIZE < L) {{\n    scratch[perm[lid.x + {slot}u * WORKGROUP_SIZE] - 1u] = value{slot};\n  }}\n"
+        ));
+    }
 
     specialize_rader_wgsl(
         format!(
@@ -1304,6 +1306,8 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
 
 @group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+// perm[t] is the natural index of convolution output t; perm[L + q] is the
+// convolution input slot of x[q + 1].
 @group(0) @binding(2) var<storage, read> perm: array<u32>;
 @group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
 @group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
@@ -1340,14 +1344,10 @@ const STRIDE: u32 = {stride}u;
 const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const M_SLOT_COUNT: u32 = {m_slot_count}u;
 const L_SLOT_COUNT: u32 = {l_slot_count}u;
-const REDUCTION_SIZE: u32 = {reduction_size}u;
-const SUM_SLOT_COUNT: u32 = {sum_slot_count}u;
 const INVERSE_M: {scalar} = {inverse_m};
 const SCALE: {scalar} = {scale};
 
 var<workgroup> scratch: array<vec2<f32>, {m}>;
-var<workgroup> x0Shared: vec2<f32>;
-{reduction_decl}
 
 {line_base_fn}
 
@@ -1360,40 +1360,13 @@ fn main({entry_params}) {{
   }}
 
   let base: u32 = line_base(params.lineOffset + lineLocal);
-  var lineSum: vec2<f32> = {zero};
-  if (lid.x == 0u) {{
-    x0Shared = input[base];
-    lineSum = x0Shared;
-  }}
-  for (var slot: u32 = 0u; slot < SUM_SLOT_COUNT; slot = slot + 1u) {{
-    let t: u32 = lid.x + slot * REDUCTION_SIZE;
-    if (lid.x < REDUCTION_SIZE && t < L) {{
-      let value: vec2<f32> = input[base + perm[(L - 1u) - t] * STRIDE];
-      scratch[t] = value;
-      lineSum = {line_sum_add};
+  let x0: vec2<f32> = input[base];
+  for (var slot: u32 = 0u; slot < L_SLOT_COUNT; slot = slot + 1u) {{
+    let q: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (q < L) {{
+      scratch[perm[L + q]] = input[base + (q + 1u) * STRIDE];
     }}
   }}
-  if (lid.x < REDUCTION_SIZE) {{
-    {reduction_store} = lineSum;
-  }}
-  workgroupBarrier();
-
-  var reductionStride: u32 = REDUCTION_SIZE / 2u;
-  loop {{
-    if (reductionStride == 0u) {{
-      break;
-    }}
-    if (lid.x < reductionStride) {{
-      {reduction_store} = {reduction_add};
-    }}
-    workgroupBarrier();
-    reductionStride = reductionStride / 2u;
-  }}
-  if (lid.x == 0u) {{
-    output[base] = {scaled_sum};
-  }}
-  workgroupBarrier();
-
   for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
     let t: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (t >= L && t < M) {{
@@ -1403,6 +1376,10 @@ fn main({entry_params}) {{
   workgroupBarrier();
 
 {forward_stages}
+  // Bin 0 of the forward FFT is the sum of x[1..N).
+  if (lid.x == 0u) {{
+    output[base] = {scaled_first};
+  }}
   for (var slot: u32 = 0u; slot < M_SLOT_COUNT; slot = slot + 1u) {{
     let t: u32 = lid.x + slot * WORKGROUP_SIZE;
     if (t < M) {{
@@ -1412,16 +1389,12 @@ fn main({entry_params}) {{
   workgroupBarrier();
 
 {inverse_stages}
+{collect}  workgroupBarrier();
+{scatter}  workgroupBarrier();
   for (var slot: u32 = 0u; slot < L_SLOT_COUNT; slot = slot + 1u) {{
-    let t: u32 = lid.x + slot * WORKGROUP_SIZE;
-    if (t < L) {{
-      var convolution: vec2<f32> = {scaled_convolution};
-      let wrap: u32 = t + L;
-      if (wrap < M) {{
-        convolution = {wrap_add};
-      }}
-      let value: vec2<f32> = {x0_add};
-      output[base + perm[t] * STRIDE] = {scaled_value};
+    let q: u32 = lid.x + slot * WORKGROUP_SIZE;
+    if (q < L) {{
+      output[base + (q + 1u) * STRIDE] = {scaled_result};
     }}
   }}
 }}
@@ -1431,7 +1404,6 @@ fn main({entry_params}) {{
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
             scalar = staged_scalar_type(key.precision),
-            reduction_store = reduction_slot("lid.x"),
         ),
         key.precision,
     )
@@ -1839,7 +1811,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fused_rader_gate_accounts_for_x0_and_tiny_line_floor() {
+    fn fused_rader_gate_accounts_for_scratch_and_tiny_line_floor() {
         assert!(fused_rader_supported_by_limits(
             2999,
             6000,
@@ -1886,7 +1858,7 @@ mod tests {
             AxisPrecision::F32,
             DEFAULT_FUSED_WORKGROUP_SIZE,
             DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
-            48_007,
+            47_999,
             256,
             256
         ));
@@ -1912,7 +1884,7 @@ mod tests {
         ));
         assert!(!fused_rader_supported_by_limits(
             1500,
-            3072,
+            3073,
             AxisPrecision::F64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
             DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
@@ -1932,7 +1904,7 @@ mod tests {
         ));
         assert!(!fused_rader_supported_by_limits(
             1500,
-            3072,
+            3073,
             AxisPrecision::Df64,
             DEFAULT_FUSED_WORKGROUP_SIZE,
             DEFAULT_FUSED_MIN_CONVOLUTION_LENGTH,
@@ -1972,15 +1944,19 @@ mod tests {
         );
         let wgsl = generate_fused_rader_wgsl_for_key(&key);
         assert!(wgsl.contains("var<workgroup> scratch: array<vec2<f32>, 200>"));
-        assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f32>"));
-        assert!(wgsl.contains("perm[(L - 1u) - t]"));
+        // Lines load and store in natural order; the permutation happens in
+        // workgroup memory, and X[0] comes from the forward FFT's bin 0.
+        assert!(wgsl.contains("let x0: vec2<f32> = input[base];"));
+        assert!(wgsl.contains("scratch[perm[L + q]] = input[base + (q + 1u) * STRIDE];"));
+        assert!(wgsl.contains("output[base] = (x0 + scratch[0]) * vec2<f32>(SCALE, SCALE);"));
+        assert!(wgsl.contains("scratch[perm[lid.x + 0u * WORKGROUP_SIZE] - 1u] = value0;"));
+        assert!(wgsl.contains("output[base + (q + 1u) * STRIDE]"));
+        assert!(!wgsl.contains("reduction"));
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "scratch");
-        crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "x0Shared");
         // The convolution padding must be zeroed in-kernel: pipelines skip
         // wgpu's workgroup zero fill.
         assert!(wgsl.contains("if (t >= L && t < M) {"));
         assert!(wgsl.contains("scratch[t] = vec2<f32>(0.0, 0.0);"));
-        assert!(wgsl.contains("output[base + perm[t] * STRIDE]"));
         assert!(wgsl.contains("let wrap: u32 = t + L"));
         assert!(wgsl.contains("fn twiddle_forward"));
         assert!(wgsl.contains("fn twiddle_inverse"));
@@ -2053,7 +2029,7 @@ mod tests {
         );
         let wgsl = generate_fused_rader_wgsl_for_key(&key);
         assert!(wgsl.contains("array<vec2<f64>, 200>"));
-        assert!(wgsl.contains("var<workgroup> x0Shared: vec2<f64>"));
+        assert!(wgsl.contains("let x0: vec2<f64> = input[base];"));
         assert!(wgsl.contains("const INVERSE_M: f64 = 0.005lf;"));
         assert!(!wgsl.contains("vec2<f32>"));
     }
@@ -2081,8 +2057,8 @@ mod tests {
         assert!(fused.contains("array<vec4<f32>, 200>"));
         assert!(fused.contains("const INVERSE_M: Df64 = Df64("));
         assert!(fused.contains("return vec4<f32>(value.x, value.y, -value.z, -value.w)"));
-        assert!(fused.contains("df64_complex_add(lineSum, value)"));
-        assert!(fused.contains("df64_complex_scale(value, Df64("));
+        assert!(fused.contains("df64_complex_add(x0, scratch[0])"));
+        assert!(fused.contains("df64_complex_scale(scratch[q], Df64("));
         assert!(!fused.contains("lineSum = lineSum + value"));
         assert!(!fused.contains("vec2<f64>"));
 

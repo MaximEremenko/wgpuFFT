@@ -17,9 +17,10 @@ use crate::runtime::nd_wgsl::{
 };
 use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, BluesteinKernelKind, BluesteinStageKey, ComputePipelineCacheKey,
-    FusedPrimeKind, FusedPrimeStageKey, ShaderCacheKey,
+    FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule, ShaderCacheKey,
 };
 use crate::runtime::recorder::CommandRecorder;
+use crate::runtime::register_fft::{generate_register_bluestein_wgsl, register_schedule};
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
@@ -81,6 +82,9 @@ pub(crate) struct BluesteinAxis {
 
 enum BluesteinExecution {
     Fused(FusedBluesteinExecution),
+    /// The convolution's FFTs run in registers (see
+    /// `register_fft::generate_register_bluestein_wgsl`).
+    Register(FusedBluesteinExecution),
     MultiPass(Box<MultiPassBluesteinExecution>),
 }
 
@@ -176,8 +180,21 @@ impl BluesteinAxis {
     ) -> Result<Self> {
         config.validate()?;
         let n = config.shape[config.axis];
-        let m = bluestein_convolution_length(n)?;
-        let factors = crate::runtime::factor_supported_length(m)?;
+        let register = register_bluestein_plan(
+            n,
+            config.precision,
+            config.fused_workgroup_size,
+            config.fused_min_convolution_length,
+            config.fuse_long_axes,
+            &device.limits(),
+        );
+        let (m, factors) = match &register {
+            Some((m, _, schedule)) => (*m, schedule.radices.clone()),
+            None => {
+                let m = bluestein_convolution_length(n)?;
+                (m, crate::runtime::factor_supported_length(m)?)
+            }
+        };
 
         let lines = checked_mul(config.batch, lines_per_batch(&config.shape, config.axis))?;
         let lines_u32 = lines as u32;
@@ -257,7 +274,42 @@ impl BluesteinAxis {
             }
         }
 
-        let execution = if fused_bluestein_supported(
+        let execution = if let Some((_, workgroup_size, schedule)) = register {
+            let twiddle_buffer = create_twiddle_lut_buffer_for_len_with_precision(
+                device,
+                queue,
+                "wgpu_fft.bluestein.register.twiddle_lut",
+                m,
+                config.precision.as_fft_precision(),
+            )?;
+            let shader_key = FusedPrimeStageKey::new(
+                FusedPrimeKind::Bluestein,
+                config.shape.len(),
+                config.axis,
+                &config.shape,
+                n,
+                stride_complex,
+                m,
+                &factors,
+                config.direction,
+                workgroup_size,
+                apply_scale,
+                scale,
+                config.precision,
+            )
+            .with_registers(schedule);
+            let pipeline_key = ComputePipelineCacheKey::fused_prime_stage(shader_key.clone());
+            let bind_group_layout = with_device_pipeline_cache(device, |cache| {
+                cache.get_bind_group_layout(device, pipeline_key.layout)
+            });
+            let pipeline = cached_fused_bluestein_pipeline(device, &pipeline_key, &shader_key);
+            BluesteinExecution::Register(FusedBluesteinExecution {
+                workgroups: lines_u32,
+                pipeline,
+                bind_group_layout,
+                twiddle_buffer,
+            })
+        } else if fused_bluestein_supported(
             m,
             config.precision,
             config.fused_workgroup_size,
@@ -436,7 +488,9 @@ impl BluesteinAxis {
 
     pub(crate) fn twiddle_lut_storage_bytes(&self) -> u64 {
         match &self.execution {
-            BluesteinExecution::Fused(execution) => execution.twiddle_buffer.size(),
+            BluesteinExecution::Fused(execution) | BluesteinExecution::Register(execution) => {
+                execution.twiddle_buffer.size()
+            }
             BluesteinExecution::MultiPass(execution) => {
                 let bytes = execution.work_fft_forward.twiddle_lut_storage_bytes();
                 debug_assert_eq!(
@@ -449,12 +503,23 @@ impl BluesteinAxis {
     }
 
     pub(crate) fn graph_is_fused(&self) -> bool {
-        matches!(self.execution, BluesteinExecution::Fused(_))
+        matches!(
+            self.execution,
+            BluesteinExecution::Fused(_) | BluesteinExecution::Register(_)
+        )
+    }
+
+    /// Graph label of the single kernel of a fused execution.
+    pub(crate) fn graph_fused_label(&self) -> &'static str {
+        match self.execution {
+            BluesteinExecution::Register(_) => "bluestein-register-stage",
+            _ => "bluestein-fused-workgroup-stage",
+        }
     }
 
     pub(crate) fn graph_forward_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            BluesteinExecution::Fused(_) => Vec::new(),
+            BluesteinExecution::Fused(_) | BluesteinExecution::Register(_) => Vec::new(),
             BluesteinExecution::MultiPass(execution) => {
                 execution.work_fft_forward.graph_stage_kinds()
             }
@@ -463,7 +528,7 @@ impl BluesteinAxis {
 
     pub(crate) fn graph_forward_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            BluesteinExecution::Fused(_) => 0,
+            BluesteinExecution::Fused(_) | BluesteinExecution::Register(_) => 0,
             BluesteinExecution::MultiPass(execution) => {
                 execution.work_fft_forward.workspace_size_bytes()
             }
@@ -472,7 +537,7 @@ impl BluesteinAxis {
 
     pub(crate) fn graph_inverse_fft_stage_kinds(&self) -> Vec<AxisStageKind> {
         match &self.execution {
-            BluesteinExecution::Fused(_) => Vec::new(),
+            BluesteinExecution::Fused(_) | BluesteinExecution::Register(_) => Vec::new(),
             BluesteinExecution::MultiPass(execution) => {
                 execution.work_fft_inverse.graph_stage_kinds()
             }
@@ -481,7 +546,7 @@ impl BluesteinAxis {
 
     pub(crate) fn graph_inverse_fft_workspace_bytes(&self) -> u64 {
         match &self.execution {
-            BluesteinExecution::Fused(_) => 0,
+            BluesteinExecution::Fused(_) | BluesteinExecution::Register(_) => 0,
             BluesteinExecution::MultiPass(execution) => {
                 execution.work_fft_inverse.workspace_size_bytes()
             }
@@ -535,7 +600,7 @@ impl BluesteinAxis {
         debug_assert!(self.lines > 0);
 
         match &self.execution {
-            BluesteinExecution::Fused(execution) => {
+            BluesteinExecution::Fused(execution) | BluesteinExecution::Register(execution) => {
                 self.dispatch_fused(device, encoder, input, output, execution)?;
             }
             BluesteinExecution::MultiPass(execution) => {
@@ -796,6 +861,41 @@ pub(crate) fn fused_bluestein_supported_by_limits(
         && workgroup_size <= max_workgroup_size_x
 }
 
+/// Convolution length, workgroup size, and schedule of a register-resident
+/// Bluestein kernel for an axis of `n`: used when the smooth convolution does
+/// not fit workgroup memory but a power-of-two one fits registers.
+pub(crate) fn register_bluestein_plan(
+    n: usize,
+    precision: AxisPrecision,
+    fused_workgroup_size: u32,
+    fused_min_convolution_length: usize,
+    fuse_long_axes: bool,
+    limits: &wgpu::Limits,
+) -> Option<(usize, u32, RegisterSchedule)> {
+    if !fuse_long_axes {
+        return None;
+    }
+    let smooth = bluestein_convolution_length(n).ok()?;
+    if fused_bluestein_supported(
+        smooth,
+        precision,
+        fused_workgroup_size,
+        fused_min_convolution_length,
+        limits,
+    ) {
+        return None;
+    }
+    let m = n
+        .checked_mul(2)?
+        .checked_sub(1)?
+        .checked_next_power_of_two()?;
+    if m < fused_min_convolution_length {
+        return None;
+    }
+    let (workgroup_size, schedule) = register_schedule(m, precision, limits)?;
+    Some((m, workgroup_size, schedule))
+}
+
 pub(crate) fn bluestein_convolution_length(n: usize) -> Result<usize> {
     let min_conv = n
         .checked_mul(2)
@@ -860,9 +960,16 @@ fn cached_fused_bluestein_pipeline(
     let pipeline_label = format!("wgpu_fft.bluestein.fused.pipeline.{stable_key}");
     let shader_label = format!("wgpu_fft.bluestein.fused.shader.{stable_key}");
     with_device_pipeline_cache(device, |cache| {
-        cache.get_compute_pipeline(device, key, &pipeline_label, &shader_label, || {
-            generate_fused_bluestein_wgsl_for_key(shader_key)
-        })
+        cache.get_compute_pipeline(
+            device,
+            key,
+            &pipeline_label,
+            &shader_label,
+            || match &shader_key.registers {
+                Some(registers) => generate_register_bluestein_wgsl(shader_key, registers),
+                None => generate_fused_bluestein_wgsl_for_key(shader_key),
+            },
+        )
     })
 }
 

@@ -11,11 +11,13 @@ use crate::runtime::axis_plan::{
 #[cfg(test)]
 use crate::runtime::axis_policy::resolve_axis_kinds_for_axes;
 use crate::runtime::axis_policy::{resolve_axis_kinds_for_config, AxisKind};
+use crate::runtime::bluestein_axis::register_bluestein_plan;
 use crate::runtime::bluestein_axis::{
     bluestein_bfft, bluestein_chirp, bluestein_convolution_length,
     fused_bluestein_supported_by_limits, BluesteinAxis, BluesteinAxisConfig,
 };
 use crate::runtime::buffer_view::{BufferLayout, BufferView, FftIoView};
+use crate::runtime::direct_prime::direct_prime_supported;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
 use crate::runtime::four_step::FourStepC2cPlan;
 use crate::runtime::large_bridge::{plan_large_bridge, LargeBridgePlan, LargeBridgeRoute};
@@ -199,13 +201,55 @@ fn prime_binding_inventory(
         .zip(axis_kinds.iter().copied())
     {
         let n = config.shape()[axis];
+        let forced_rader = config.tuning().force_rader_axes().contains(&axis);
+        let register_bluestein = (kind == AxisKind::Bluestein
+            || (kind == AxisKind::Rader && !forced_rader))
+            .then(|| {
+                register_bluestein_plan(
+                    n,
+                    axis_precision,
+                    config.tuning().fused_workgroup_size(),
+                    config.tuning().fused_min_convolution_length(),
+                    config.tuning().fuse_long_axes(),
+                    compute_limits,
+                )
+            })
+            .flatten();
+        let direct_prime = kind == AxisKind::Rader
+            && !forced_rader
+            && n <= config.tuning().direct_max_prime()
+            && direct_prime_supported(
+                n,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                compute_limits,
+            );
+        let rader_fused = kind == AxisKind::Rader
+            && fused_rader_supported_by_limits(
+                rader_convolution_length(n)?,
+                axis_precision,
+                config.tuning().fused_workgroup_size(),
+                config.tuning().fused_min_convolution_length(),
+                u64::from(compute_limits.max_compute_workgroup_storage_size),
+                compute_limits.max_compute_invocations_per_workgroup,
+                compute_limits.max_compute_workgroup_size_x,
+            );
+        let register_bluestein = register_bluestein.filter(|_| !direct_prime && !rader_fused);
         let m = match kind {
             AxisKind::Mixed => continue,
-            AxisKind::Rader => rader_convolution_length(n)?,
-            AxisKind::Bluestein => bluestein_convolution_length(n)?,
+            AxisKind::Rader => match &register_bluestein {
+                Some((m, _, _)) => *m,
+                None => rader_convolution_length(n)?,
+            },
+            AxisKind::Bluestein => match &register_bluestein {
+                Some((m, _, _)) => *m,
+                None => bluestein_convolution_length(n)?,
+            },
         };
         let fused = match kind {
             AxisKind::Mixed => false,
+            // Direct and register kernels need only small helper tables.
+            _ if direct_prime || register_bluestein.is_some() => true,
             AxisKind::Rader => fused_rader_supported_by_limits(
                 m,
                 axis_precision,
@@ -4214,7 +4258,7 @@ impl ConvolutionGraphFfts {
     fn bluestein(plan: &BluesteinAxis) -> Self {
         Self {
             fused: plan.graph_is_fused(),
-            fused_label: "bluestein-fused-workgroup-stage",
+            fused_label: plan.graph_fused_label(),
             forward_stage_kinds: plan.graph_forward_fft_stage_kinds(),
             forward_workspace_bytes: plan.graph_forward_fft_workspace_bytes(),
             inverse_stage_kinds: plan.graph_inverse_fft_stage_kinds(),
@@ -4698,7 +4742,7 @@ fn build_normal_bluestein_c2c_graph(
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
-                label: "bluestein-fused-workgroup-stage",
+                label: convolution.fused_label,
                 input,
                 output,
                 work_items: work_items_for_bytes(required_bytes, element_format),
@@ -5075,7 +5119,7 @@ fn add_bluestein_c2c_stages(
     if convolution.fused {
         graph.push_stage(
             LargeStage::Kernel {
-                label: "bluestein-fused-workgroup-stage",
+                label: convolution.fused_label,
                 input,
                 output,
                 work_items: work_items_for_bytes(required_bytes, element_format),
@@ -7472,6 +7516,8 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
 }
 
 fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> RaderAxisConfig {
+    // A forced Rader axis runs Rader's convolution, not a substitute.
+    let forced = config.tuning().force_rader_axes().contains(&axis);
     RaderAxisConfig {
         shape: config.shape().to_vec(),
         axis,
@@ -7487,7 +7533,12 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
         fuse_long_axes: config.tuning().fuse_long_axes(),
-        direct_max_prime: config.tuning().direct_max_prime(),
+        direct_max_prime: if forced {
+            0
+        } else {
+            config.tuning().direct_max_prime()
+        },
+        bluestein_fallback: !forced,
     }
 }
 
@@ -7930,10 +7981,14 @@ mod tests {
     #[test]
     fn prime_binding_inventory_tracks_the_configured_fusion_floor() {
         let compute_limits = wgpu::Limits::default();
-        let fused = FftConfig::new(101).with_batch(10);
-        let staged = fused.clone().with_tuning(
-            crate::tuning::FftTuning::default().with_fused_min_convolution_length(usize::MAX),
-        );
+        // Short primes default to direct kernels; keep them on Rader here.
+        let rader = crate::tuning::FftTuning::default().with_direct_max_prime(0);
+        let fused = FftConfig::new(101)
+            .with_batch(10)
+            .with_tuning(rader.clone());
+        let staged = fused
+            .clone()
+            .with_tuning(rader.with_fused_min_convolution_length(usize::MAX));
         let kinds = [AxisKind::Rader];
         let m = rader_convolution_length(101).unwrap();
         assert_eq!(
@@ -9395,7 +9450,10 @@ mod tests {
                 helper("bluestein-chirp-helper", 0, 128, ElementFormat::ComplexF32),
                 helper("bluestein-bfft-helper", 1, 128, ElementFormat::ComplexF32),
             ],
-            test_fused_convolution(),
+            ConvolutionGraphFfts {
+                fused_label: "bluestein-fused-workgroup-stage",
+                ..test_fused_convolution()
+            },
             128,
             ElementFormat::ComplexF32,
             limits,

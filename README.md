@@ -93,7 +93,10 @@ lines use generated Stockham stages. Prime `f32` axes up to 127 run a direct
 DFT kernel that pairs `X[k]` with `X[p - k]`. Other prime axes route through
 Rader, unsupported composite axes route through Bluestein convolution over a
 smooth internal length, and mixed-algorithm ND plans execute typed axis-sequence
-stage graphs. The direct DFT compute kernel remains as a length-one fallback.
+stage graphs. When a convolution does not fit workgroup memory, Bluestein runs
+its forward and inverse FFTs over a power-of-two length of up to 16384 points
+in registers within one kernel (`f32`), and Rader primes whose convolution does
+not fit use that kernel too. The direct DFT compute kernel remains as a length-one fallback.
 
 Public `FftLogicalView` and `BufferView` execution APIs normalize whole-buffer,
 offset, segmented, strided, and segmented+strided logical input/output views for

@@ -22,7 +22,7 @@ use crate::runtime::axis_plan::{
     complex_wgsl, radix_root_wgsl, scaled_complex_expr, specialize_complex_wgsl,
     twiddle_lookup_wgsl, wgsl_line_base_fn, AxisPrecision, FusedPow2StageWgslConfig,
 };
-use crate::runtime::pipeline_cache::RegisterSchedule;
+use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule};
 
 /// Elements each invocation keeps in registers: one radix-16 unit per
 /// stage. Longer lines would need more registers per invocation for little
@@ -102,97 +102,28 @@ pub(crate) fn generate_register_fft_wgsl(
     debug_assert!(radices.iter().all(|&radix| values.is_multiple_of(radix)));
     debug_assert!(exchange.is_power_of_two() && n.is_multiple_of(exchange));
 
+    let layout = RegisterLayout {
+        n,
+        workgroup,
+        values,
+        radices,
+        exchange,
+    };
     let direction = config.direction;
     let precision = config.precision;
     let mut body = String::new();
-
-    let first = radices[0];
-    for m in 0..values / first {
-        for q in 0..first {
-            let offset = m * workgroup + q * (n / first);
-            body.push_str(&format!(
-                "  let x0_{}: vec2<f32> = src[base + {} * STRIDE];\n",
-                m * first + q,
-                thread_offset(offset)
-            ));
-        }
-    }
-
-    let mut previous = 1usize;
-    for (stage, &radix) in radices.iter().enumerate() {
-        let span = previous * radix;
-        if previous > 1 && previous <= workgroup {
-            body.push_str(&format!("  let j{stage}: u32 = t & {}u;\n", previous - 1));
-        }
-        for m in 0..values / radix {
-            let inputs = (0..radix)
-                .map(|q| {
-                    let input = format!("x{stage}_{}", m * radix + q);
-                    if previous == 1 || q == 0 {
-                        return input;
-                    }
-                    let j = if previous <= workgroup {
-                        format!("j{stage}")
-                    } else {
-                        format!("({} & {}u)", thread_offset(m * workgroup), previous - 1)
-                    };
-                    let twiddled = format!("w{stage}_{m}_{q}");
-                    body.push_str(&format!(
-                        "  let {twiddled}: vec2<f32> = c_mul(twiddle({j} * {}u), {input});\n",
-                        q * (n / span)
-                    ));
-                    twiddled
-                })
-                .collect::<Vec<_>>();
-            let outputs = emit_dft(
-                &mut body,
-                &format!("f{stage}_{m}"),
-                &inputs,
-                direction,
-                precision,
-            );
-            for (k, output) in outputs.iter().enumerate() {
-                body.push_str(&format!(
-                    "  let y{stage}_{}: vec2<f32> = {output};\n",
-                    m * radix + k
-                ));
-            }
-        }
-        if stage + 1 == radices.len() {
-            break;
-        }
-        emit_exchange(
-            &mut body,
-            stage,
-            ExchangeGeometry {
-                n,
-                workgroup,
-                values,
-                radix,
-                previous,
-                next_radix: radices[stage + 1],
-                exchange,
-            },
-        );
-        previous = span;
-    }
-
-    let last = radices.len() - 1;
-    let radix = radices[last];
+    emit_register_loads(&mut body, layout, 0, |register, position| {
+        format!("  let {register}: vec2<f32> = src[base + {position} * STRIDE];\n")
+    });
+    let (last, previous) =
+        emit_register_stages(&mut body, layout, 0, direction, precision, "twiddle");
     let scale_factor = config.apply_scale.then_some(config.scale_factor);
-    for m in 0..values / radix {
-        for k in 0..radix {
-            let value = scaled_complex_expr(
-                &format!("y{last}_{}", m * radix + k),
-                scale_factor,
-                precision,
-            );
-            body.push_str(&format!(
-                "  dst[base + {} * STRIDE] = {value};\n",
-                thread_offset(m * workgroup + k * previous)
-            ));
-        }
-    }
+    emit_register_stores(&mut body, layout, last, previous, |value, position| {
+        format!(
+            "  dst[base + {position} * STRIDE] = {};\n",
+            scaled_complex_expr(value, scale_factor, precision)
+        )
+    });
 
     specialize_complex_wgsl(
         format!(
@@ -247,6 +178,268 @@ fn main({entry_params}) {{
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
         ),
         precision,
+    )
+}
+
+/// Line geometry of a register-resident FFT.
+#[derive(Clone, Copy)]
+struct RegisterLayout<'a> {
+    n: usize,
+    workgroup: usize,
+    values: usize,
+    radices: &'a [usize],
+    exchange: usize,
+}
+
+/// Emits the first stage's inputs `x{stage}_*`. `load(register, position)`
+/// renders the statements binding `register` to the element at the WGSL line
+/// position `position`.
+fn emit_register_loads(
+    body: &mut String,
+    layout: RegisterLayout<'_>,
+    stage: usize,
+    load: impl Fn(&str, &str) -> String,
+) {
+    let first = layout.radices[0];
+    for m in 0..layout.values / first {
+        for q in 0..first {
+            let register = format!("x{stage}_{}", m * first + q);
+            let position = thread_offset(m * layout.workgroup + q * (layout.n / first));
+            body.push_str(&load(&register, &position));
+        }
+    }
+}
+
+/// Emits the radix stages of one FFT over the registers, numbered from
+/// `first`: they read `x{first}_*` and leave their outputs in `y{last}_*`.
+/// Returns `last` and the product of the radices before the last stage.
+fn emit_register_stages(
+    body: &mut String,
+    layout: RegisterLayout<'_>,
+    first: usize,
+    direction: FftDirection,
+    precision: AxisPrecision,
+    twiddle: &str,
+) -> (usize, usize) {
+    let RegisterLayout {
+        n,
+        workgroup,
+        values,
+        radices,
+        exchange,
+    } = layout;
+    let mut previous = 1usize;
+    for (index, &radix) in radices.iter().enumerate() {
+        let stage = first + index;
+        let span = previous * radix;
+        if previous > 1 && previous <= workgroup {
+            body.push_str(&format!("  let j{stage}: u32 = t & {}u;\n", previous - 1));
+        }
+        for m in 0..values / radix {
+            let inputs = (0..radix)
+                .map(|q| {
+                    let input = format!("x{stage}_{}", m * radix + q);
+                    if previous == 1 || q == 0 {
+                        return input;
+                    }
+                    let j = if previous <= workgroup {
+                        format!("j{stage}")
+                    } else {
+                        format!("({} & {}u)", thread_offset(m * workgroup), previous - 1)
+                    };
+                    let twiddled = format!("w{stage}_{m}_{q}");
+                    body.push_str(&format!(
+                        "  let {twiddled}: vec2<f32> = c_mul({twiddle}({j} * {}u), {input});\n",
+                        q * (n / span)
+                    ));
+                    twiddled
+                })
+                .collect::<Vec<_>>();
+            let outputs = emit_dft(
+                body,
+                &format!("f{stage}_{m}"),
+                &inputs,
+                direction,
+                precision,
+            );
+            for (k, output) in outputs.iter().enumerate() {
+                body.push_str(&format!(
+                    "  let y{stage}_{}: vec2<f32> = {output};\n",
+                    m * radix + k
+                ));
+            }
+        }
+        if index + 1 == radices.len() {
+            return (stage, previous);
+        }
+        emit_exchange(
+            body,
+            stage,
+            ExchangeGeometry {
+                n,
+                workgroup,
+                values,
+                radix,
+                previous,
+                next_radix: radices[index + 1],
+                exchange,
+            },
+            &|value, _| value.to_owned(),
+        );
+        previous = span;
+    }
+    unreachable!("a register schedule has at least one radix")
+}
+
+/// Emits the last stage's outputs `y{last}_*`: `store(value, position)`
+/// renders the statements storing `value`, the element at the WGSL line
+/// position `position`.
+fn emit_register_stores(
+    body: &mut String,
+    layout: RegisterLayout<'_>,
+    last: usize,
+    previous: usize,
+    store: impl Fn(&str, &str) -> String,
+) {
+    let radix = layout.radices[layout.radices.len() - 1];
+    for m in 0..layout.values / radix {
+        for k in 0..radix {
+            let value = format!("y{last}_{}", m * radix + k);
+            let position = thread_offset(m * layout.workgroup + k * previous);
+            body.push_str(&store(&value, &position));
+        }
+    }
+}
+
+/// WGSL of a register-resident Bluestein kernel: one workgroup convolves one
+/// line of `key.axis_length` with forward and inverse FFTs of
+/// `key.convolution_length` points held in registers, so the line is read
+/// and written once. The chirp is applied on load and store, and the filter
+/// spectrum on the exchange between the two FFTs.
+pub(crate) fn generate_register_bluestein_wgsl(
+    key: &FusedPrimeStageKey,
+    schedule: &RegisterSchedule,
+) -> String {
+    debug_assert_eq!(key.kind, FusedPrimeKind::Bluestein);
+    debug_assert_eq!(key.precision, AxisPrecision::F32);
+    let n = key.axis_length;
+    let m = key.convolution_length;
+    let workgroup = key.workgroup_size as usize;
+    let layout = RegisterLayout {
+        n: m,
+        workgroup,
+        values: m / workgroup,
+        radices: &schedule.radices,
+        exchange: schedule.exchange_len.min(m),
+    };
+    let precision = key.precision;
+    let mut body = String::new();
+    // Positions at or past N are the convolution's zero padding.
+    emit_register_loads(&mut body, layout, 0, |register, position| {
+        format!(
+            "  var {register}: vec2<f32> = vec2<f32>(0.0, 0.0);\n  if ({position} < N) {{\n    {register} = c_mul(input[base + {position} * STRIDE], chirp[{position}]);\n  }}\n"
+        )
+    });
+    let (forward_last, previous) = emit_register_stages(
+        &mut body,
+        layout,
+        0,
+        FftDirection::Forward,
+        precision,
+        "twiddle_forward",
+    );
+    let radices = &schedule.radices;
+    emit_exchange(
+        &mut body,
+        forward_last,
+        ExchangeGeometry {
+            n: m,
+            workgroup,
+            values: layout.values,
+            radix: radices[radices.len() - 1],
+            previous,
+            next_radix: radices[0],
+            exchange: layout.exchange,
+        },
+        &|value, position| format!("c_mul({value}, bfft[{position}])"),
+    );
+    let (inverse_last, previous) = emit_register_stages(
+        &mut body,
+        layout,
+        forward_last + 1,
+        FftDirection::Inverse,
+        precision,
+        "twiddle_inverse",
+    );
+    // The inverse FFT is unnormalized: fold 1/M into the output scale.
+    let scale = precision.format_wgsl_scalar(key.scale_factor() / m as f64);
+    emit_register_stores(
+        &mut body,
+        layout,
+        inverse_last,
+        previous,
+        |value, position| {
+            format!(
+            "  if ({position} < N) {{\n    output[base + {position} * STRIDE] = c_mul({value}, chirp[{position}]) * {scale};\n  }}\n"
+        )
+        },
+    );
+
+    format!(
+        r#"struct Params {{
+  lines: u32,
+  lineOffset: u32,
+  pad0: u32,
+  pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> input: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> output: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> chirp: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> bfft: array<vec2<f32>>;
+@group(0) @binding(4) var<storage, read> axisTwiddles: array<vec2<f32>>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+{complex_wgsl}
+
+fn twiddle_forward(index: u32) -> vec2<f32> {{
+  return axisTwiddles[index];
+}}
+
+fn twiddle_inverse(index: u32) -> vec2<f32> {{
+  let value: vec2<f32> = axisTwiddles[index];
+  return vec2<f32>(value.x, -value.y);
+}}
+
+const N: u32 = {n}u;
+const STRIDE: u32 = {stride}u;
+
+var<workgroup> exchange: array<vec2<f32>, {exchange}>;
+
+// Spreads the 16 consecutive elements of each 256-element block over all
+// banks so strided exchange accesses do not conflict.
+fn swizzle(index: u32) -> u32 {{
+  return index ^ ((index >> 4u) & 15u);
+}}
+
+{line_base_fn}
+
+@compute @workgroup_size({workgroup}, 1, 1)
+fn main({entry_params}) {{
+  {flat_workgroup_index}
+  if (wgFlat >= params.lines) {{
+    return;
+  }}
+  let base: u32 = line_base(params.lineOffset + wgFlat);
+  let t: u32 = lid.x;
+{body}}}
+"#,
+        complex_wgsl = complex_wgsl(),
+        stride = key.stride_complex,
+        exchange = layout.exchange,
+        line_base_fn = wgsl_line_base_fn(key.rank, key.axis, &key.dims),
+        entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
+        flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
     )
 }
 
@@ -337,8 +530,15 @@ impl ExchangeAccess {
 }
 
 /// Moves stage `stage`'s outputs `y{stage}_*` to the next stage's inputs
-/// `x{stage + 1}_*` through the exchange buffer.
-fn emit_exchange(body: &mut String, stage: usize, geometry: ExchangeGeometry) {
+/// `x{stage + 1}_*` through the exchange buffer. `write_value(value,
+/// position)` renders the stored value of the element at the WGSL line
+/// position `position`.
+fn emit_exchange(
+    body: &mut String,
+    stage: usize,
+    geometry: ExchangeGeometry,
+    write_value: &dyn Fn(&str, &str) -> String,
+) {
     let ExchangeGeometry {
         workgroup,
         values,
@@ -408,16 +608,20 @@ fn emit_exchange(body: &mut String, stage: usize, geometry: ExchangeGeometry) {
             |access, declare| {
                 debug_assert!(!declare);
                 format!(
-                    "exchange[swizzle({})] = y{stage}_{};",
+                    "exchange[swizzle({})] = {};",
                     access.local_position(offset),
-                    access.register
+                    write_value(&format!("y{stage}_{}", access.register), &access.position)
                 )
             },
             |access| {
                 format!(
-                    "if ((d{stage}_{register} >> {shift}u) == {round}u) {{\n    exchange[swizzle(d{stage}_{register} & {mask}u)] = y{stage}_{register};\n  }}",
+                    "if ((d{stage}_{register} >> {shift}u) == {round}u) {{\n    exchange[swizzle(d{stage}_{register} & {mask}u)] = {value};\n  }}",
                     register = access.register,
                     shift = exchange.trailing_zeros(),
+                    value = write_value(
+                        &format!("y{stage}_{}", access.register),
+                        &format!("d{stage}_{}", access.register)
+                    ),
                 )
             },
             false,

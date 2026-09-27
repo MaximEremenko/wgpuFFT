@@ -645,9 +645,16 @@ impl ShaderCacheKey {
                 FusedPrimeKind::Rader => {
                     crate::runtime::rader_axis::generate_fused_rader_wgsl_for_key(key)
                 }
-                FusedPrimeKind::Bluestein => {
-                    crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
-                }
+                FusedPrimeKind::Bluestein => match &key.registers {
+                    Some(registers) => {
+                        crate::runtime::register_fft::generate_register_bluestein_wgsl(
+                            key, registers,
+                        )
+                    }
+                    None => {
+                        crate::runtime::bluestein_axis::generate_fused_bluestein_wgsl_for_key(key)
+                    }
+                },
                 FusedPrimeKind::Direct => {
                     crate::runtime::direct_prime::generate_direct_prime_wgsl_for_key(key)
                 }
@@ -829,10 +836,14 @@ impl ShaderCacheKey {
                     key.workgroup_size,
                 )?;
                 validate_snapshot_convolution(key.kind, key.axis_length, key.convolution_length)?;
-                let factors_valid = if key.kind == FusedPrimeKind::Direct {
-                    key.factors == [key.axis_length]
-                } else {
-                    validate_snapshot_factors(&key.factors, key.convolution_length)
+                let factors_valid = match (key.kind, &key.registers) {
+                    (FusedPrimeKind::Bluestein, Some(registers)) => {
+                        key.factors == registers.radices
+                            && registers.is_consistent(key.convolution_length, key.workgroup_size)
+                    }
+                    (FusedPrimeKind::Direct, None) => key.factors == [key.axis_length],
+                    (_, None) => validate_snapshot_factors(&key.factors, key.convolution_length),
+                    (_, Some(_)) => false,
                 };
                 if !factors_valid {
                     return snapshot_integrity("invalid fused-prime convolution factors");
@@ -2039,6 +2050,9 @@ pub(crate) struct FusedPrimeStageKey {
     /// Lines per workgroup of a direct kernel; 1 for Rader and Bluestein.
     #[cfg_attr(feature = "serde", serde(default = "one_line_per_workgroup"))]
     pub(crate) lines_per_workgroup: u32,
+    /// Set when a Bluestein convolution runs in registers.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) registers: Option<RegisterSchedule>,
 }
 
 impl FusedPrimeStageKey {
@@ -2081,7 +2095,14 @@ impl FusedPrimeStageKey {
             apply_scale,
             scale_bits,
             lines_per_workgroup: 1,
+            registers: None,
         }
+    }
+
+    /// Runs the convolution's FFTs in registers with `schedule`.
+    pub(crate) fn with_registers(mut self, schedule: RegisterSchedule) -> Self {
+        self.registers = Some(schedule);
+        self
     }
 
     /// Transforms `lines` lines per workgroup (direct kernels only).
@@ -2115,6 +2136,9 @@ impl FusedPrimeStageKey {
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
         }
+        if let Some(registers) = &self.registers {
+            key.push_str(&registers.stable_key_suffix());
+        }
         key
     }
 
@@ -2125,8 +2149,9 @@ impl FusedPrimeStageKey {
         max_workgroup_size_x: u32,
     ) -> bool {
         let complex_bytes = self.precision.complex_size_bytes() as usize;
-        let scratch_elements = match self.kind {
-            FusedPrimeKind::Direct => self
+        let scratch_elements = match (self.kind, &self.registers) {
+            (_, Some(registers)) => Some(registers.exchange_len),
+            (FusedPrimeKind::Direct, None) => self
                 .axis_length
                 .checked_mul(self.lines_per_workgroup as usize),
             _ => Some(self.convolution_length),

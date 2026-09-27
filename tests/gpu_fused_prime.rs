@@ -9,6 +9,7 @@ use wgpu_fft::{C2cRoute, FftConfig, FftPlan, FftTuning, Normalization};
 
 const RADER_FUSED_LABEL: &str = "rader-fused-workgroup-stage";
 const DIRECT_LABEL: &str = "rader-direct-dft-stage";
+const BLUESTEIN_REGISTER_LABEL: &str = "bluestein-register-stage";
 const BLUESTEIN_FUSED_LABEL: &str = "bluestein-fused-workgroup-stage";
 
 #[test]
@@ -185,14 +186,28 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
             RADER_FUSED_LABEL,
             &["rader-permutation-helper", "rader-bfft-helper"],
         );
-        assert_rader_fallback_plan(&fallback_plan, "forced 16 KiB N=2999");
-        let fallback_kernels = kernel_labels(&fallback_plan);
+        // The convolution no longer fits 16 KiB, so the prime runs Bluestein's
+        // register-resident kernel.
         assert_eq!(
-            fallback_kernels.len(),
-            9,
-            "forced 16 KiB N=2999 should use five bridge kernels and two split fused passes per inner FFT: {fallback_kernels:?}"
+            kernel_labels(&fallback_plan),
+            [BLUESTEIN_REGISTER_LABEL],
+            "forced 16 KiB N=2999"
         );
-        let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
+        // Forcing Rader keeps the multi-pass Rader pipeline covered.
+        let forced_rader = config
+            .clone()
+            .with_tuning(FftTuning::default().with_force_rader_axes([0]));
+        let (staged, staged_plan) =
+            execute_c2c(&low_device, &low_queue, forced_rader.clone(), &input);
+        assert_rader_fallback_plan(&staged_plan, "forced 16 KiB N=2999");
+        let staged_kernels = kernel_labels(&staged_plan);
+        assert_eq!(
+            staged_kernels.len(),
+            9,
+            "forced 16 KiB N=2999 should use five bridge kernels and two split fused passes per inner FFT: {staged_kernels:?}"
+        );
+        assert_matches_reference(&staged, &expected, "Rader N=2999 staged fallback");
+        let unsplit = unsplit_fallback(&low_device, &low_queue, &forced_rader, &input);
         assert_eq!(
             unsplit.1.len(),
             17,
@@ -237,11 +252,12 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
             BLUESTEIN_FUSED_LABEL,
             &["bluestein-chirp-helper", "bluestein-bfft-helper"],
         );
-        assert_bluestein_fallback_plan(&fallback_plan, "forced 16 KiB N=2026");
-        let fallback_kernels = kernel_labels(&fallback_plan);
-        assert!(
-            matches!(fallback_kernels.len(), 5 | 7),
-            "forced 16 KiB N=2026 should use three bridge kernels and one register-resident kernel or two split passes per inner FFT: {fallback_kernels:?}"
+        // The 4096-point convolution no longer fits 16 KiB of workgroup
+        // memory, so it runs in registers.
+        assert_eq!(
+            kernel_labels(&fallback_plan),
+            [BLUESTEIN_REGISTER_LABEL],
+            "forced 16 KiB N=2026"
         );
         let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
         assert_eq!(
@@ -397,7 +413,11 @@ fn run_rader_fallback_case(context: &wgpu_fft::device::GpuContext, length: usize
     let input = test_signal(length);
     let expected = reference_f64(&input, &config);
     let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
-    assert_rader_fallback_plan(&plan, label);
+    // Primes whose convolution fits no workgroup run Bluestein's
+    // register-resident kernel where the device supports one.
+    if kernel_labels(&plan) != [BLUESTEIN_REGISTER_LABEL] {
+        assert_rader_fallback_plan(&plan, label);
+    }
     assert_matches_reference(&actual, &expected, label);
     let (max_relative, rms_relative) = relative_error_metrics(&actual, &expected);
     assert!(
@@ -414,7 +434,9 @@ fn run_bluestein_fallback_case(
     let input = test_signal(config.total_complex_len().unwrap());
     let expected = reference_f64(&input, &config);
     let (actual, plan) = execute_c2c(&context.device, &context.queue, config, &input);
-    assert_bluestein_fallback_plan(&plan, label);
+    if kernel_labels(&plan) != [BLUESTEIN_REGISTER_LABEL] {
+        assert_bluestein_fallback_plan(&plan, label);
+    }
     assert_matches_reference(&actual, &expected, label);
     let (max_relative, rms_relative) = relative_error_metrics(&actual, &expected);
     assert!(

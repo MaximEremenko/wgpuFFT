@@ -77,7 +77,7 @@ async fn run_accuracy_cases() {
             assert_single_fused_stage(&plan, stage_label, label);
         }
         if label.starts_with("bluestein-3256") && !fused_selected {
-            assert_multipass_prime_stage(&plan, "bluestein-fused-workgroup-stage", label);
+            assert_unfused_bluestein_stage(&plan, "bluestein-fused-workgroup-stage", label);
         }
         if label.starts_with("rader-2999") && !fused_selected {
             assert_no_fused_stage(&plan, "rader-fused-workgroup-stage", label);
@@ -194,19 +194,23 @@ fn assert_single_fused_stage(plan: &FftPlan, expected_label: &str, case_label: &
     );
 }
 
-fn assert_multipass_prime_stage(plan: &FftPlan, fused_label: &str, case_label: &str) {
+/// A Bluestein axis whose convolution does not fit workgroup memory runs in
+/// registers as one kernel, or, where the device cannot, as staged kernels
+/// whose padded inner FFTs are fused.
+fn assert_unfused_bluestein_stage(plan: &FftPlan, fused_label: &str, case_label: &str) {
     let diagnostics = plan.diagnostics();
     let kernels = diagnostics
         .stages()
         .iter()
         .filter(|stage| stage.kind == "kernel")
         .collect::<Vec<_>>();
-    assert!(
-        kernels.len() > 1,
-        "{case_label}: expected multipass fallback"
-    );
-    // The fallback's padded inner FFTs each run as one register-resident
-    // kernel, or as two split passes where the device cannot run one.
+    if kernels.len() == 1 {
+        assert_eq!(
+            kernels[0].label, "bluestein-register-stage",
+            "{case_label}: expected the register-resident Bluestein kernel"
+        );
+        return;
+    }
     assert!(
         matches!(kernels.len(), 5 | 7),
         "{case_label}: expected a 5- or 7-pass fused Bluestein fallback: {kernels:?}"

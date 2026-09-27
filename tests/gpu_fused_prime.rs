@@ -231,10 +231,9 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         );
         assert_bluestein_fallback_plan(&fallback_plan, "forced 16 KiB N=2026");
         let fallback_kernels = kernel_labels(&fallback_plan);
-        assert_eq!(
-            fallback_kernels.len(),
-            7,
-            "forced 16 KiB N=2026 should use three bridge kernels and two split fused passes per inner FFT: {fallback_kernels:?}"
+        assert!(
+            matches!(fallback_kernels.len(), 5 | 7),
+            "forced 16 KiB N=2026 should use three bridge kernels and one register-resident kernel or two split passes per inner FFT: {fallback_kernels:?}"
         );
         let unsplit = unsplit_fallback(&low_device, &low_queue, &config, &input);
         assert_eq!(
@@ -276,7 +275,7 @@ fn unsplit_fallback(
     config: &FftConfig,
     input: &[f32],
 ) -> (Vec<f32>, Vec<String>) {
-    let tuning = config.tuning().clone().with_split_long_axes(false);
+    let tuning = config.tuning().clone().with_fuse_long_axes(false);
     let (output, plan) = execute_c2c(device, queue, config.clone().with_tuning(tuning), input);
     let kernels = kernel_labels(&plan);
     assert!(

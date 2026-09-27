@@ -179,7 +179,7 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 | `max_storage_buffer_binding_size` | `None` | Optional planning cap, clamped to the device and effective buffer-size limit. |
 | `max_buffer_size` | `None` | Optional planning cap, clamped to the device limit. |
 | `fused_min_convolution_length` | `128` | Minimum Rader/Bluestein convolution length eligible for fused-prime execution. |
-| `split_long_axes` | `true` | Runs an axis too long for one fused workgroup as two fused passes (`N = N1 * N2`); `false` keeps one Stockham pass per radix. |
+| `fuse_long_axes` | `true` | Runs an axis too long for workgroup memory as one register-resident fused kernel (contiguous power-of-two `f32` axes up to 16384 on 1024-invocation devices) or as two fused passes (`N = N1 * N2`); `false` keeps one Stockham pass per radix. |
 
 The four-step swap thresholds change sequential window sizing; they do not
 create concurrent window rings or add FFT stages. There is no public
@@ -301,8 +301,10 @@ through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual Studio 2022
 17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to the
 executable or on `PATH`. Otherwise it falls back to the legacy FXC compiler.
 Every route works with both, but FXC is much slower to create plans: on an RTX
-5090 the GPU test suite takes 271 s with FXC and 118 s with DXC, and `df64`
-plans are the slowest. Ship DXC with DX12 applications, or prefer Vulkan.
+5090 the GPU test suite takes about 260 s with FXC and 40 s with DXC. `df64`
+plans and the register-resident kernels of 8192- and 16384-point `f32` axes
+are the slowest; an N=8192 plan takes 2.6 s with FXC and 0.1 s on Vulkan.
+Ship DXC with DX12 applications, or prefer Vulkan.
 
 Tested on an NVIDIA RTX 5090 under Windows 11 with Vulkan, DX12 (FXC and DXC),
 and Chrome 153's WebGPU. Metal, AMD, Intel, and Linux have not been tested.

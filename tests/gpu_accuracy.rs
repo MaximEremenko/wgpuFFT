@@ -205,11 +205,11 @@ fn assert_multipass_prime_stage(plan: &FftPlan, fused_label: &str, case_label: &
         kernels.len() > 1,
         "{case_label}: expected multipass fallback"
     );
-    // The fallback's padded inner FFTs are split into two fused passes each.
-    assert_eq!(
-        kernels.len(),
-        7,
-        "{case_label}: expected the 7-pass split Bluestein fallback"
+    // The fallback's padded inner FFTs each run as one register-resident
+    // kernel, or as two split passes where the device cannot run one.
+    assert!(
+        matches!(kernels.len(), 5 | 7),
+        "{case_label}: expected a 5- or 7-pass fused Bluestein fallback: {kernels:?}"
     );
     assert!(
         kernels.iter().all(|stage| stage.label != fused_label),

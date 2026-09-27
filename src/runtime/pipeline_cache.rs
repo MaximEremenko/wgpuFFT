@@ -792,6 +792,11 @@ impl ShaderCacheKey {
                 if key.axis_length < 2 || !key.axis_length.is_power_of_two() {
                     return snapshot_integrity("invalid fused power-of-two axis length");
                 }
+                if key.registers.as_ref().is_some_and(|registers| {
+                    !registers.is_consistent(key.axis_length, key.workgroup_size)
+                }) {
+                    return snapshot_integrity("invalid register-resident radix schedule");
+                }
                 validate_snapshot_axis_scale(key.precision, key.apply_scale, key.scale_bits)
             }
             Self::FusedSmoothStage(key) => {
@@ -1894,6 +1899,48 @@ pub(crate) struct FusedPow2StageKey {
     /// Set when this kernel is one pass of a split long axis.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) split_pass: Option<SplitPass>,
+    /// Set when the line is kept in registers instead of workgroup memory.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) registers: Option<RegisterSchedule>,
+}
+
+/// Radix schedule of a register-resident fused kernel (see
+/// `runtime::register_fft`); the workgroup size fixes the elements each
+/// invocation holds.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RegisterSchedule {
+    /// Stockham radices, first stage first.
+    pub(crate) radices: Vec<usize>,
+    /// Elements of the workgroup exchange buffer, a power of two.
+    pub(crate) exchange_len: usize,
+}
+
+impl RegisterSchedule {
+    fn stable_key_suffix(&self) -> String {
+        format!(
+            ":registers=r{}.exchange{}",
+            dims_key(&self.radices),
+            self.exchange_len
+        )
+    }
+
+    /// Whether the schedule is a valid factorization for `workgroup_size`
+    /// invocations over a line of `axis_length`.
+    #[cfg(feature = "serde")]
+    fn is_consistent(&self, axis_length: usize, workgroup_size: u32) -> bool {
+        let workgroup_size = workgroup_size as usize;
+        workgroup_size > 0
+            && axis_length.is_multiple_of(workgroup_size)
+            && self.exchange_len.is_power_of_two()
+            && self.exchange_len <= axis_length
+            && axis_length.is_multiple_of(self.exchange_len)
+            && self.radices.iter().product::<usize>() == axis_length
+            && self.radices.iter().all(|&radix| {
+                matches!(radix, 2 | 4 | 8 | 16)
+                    && (axis_length / workgroup_size).is_multiple_of(radix)
+            })
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -2200,6 +2247,7 @@ impl FusedPow2StageKey {
             scale_bits,
             lines_per_workgroup: 1,
             split_pass: None,
+            registers: None,
         }
     }
 
@@ -2212,6 +2260,12 @@ impl FusedPow2StageKey {
     /// Makes this kernel one pass of a split long axis.
     pub(crate) fn with_split_pass(mut self, split_pass: SplitPass) -> Self {
         self.split_pass = Some(split_pass);
+        self
+    }
+
+    /// Keeps the line in registers with `schedule`.
+    pub(crate) fn with_registers(mut self, schedule: RegisterSchedule) -> Self {
+        self.registers = Some(schedule);
         self
     }
 
@@ -2240,6 +2294,9 @@ impl FusedPow2StageKey {
         if let Some(split_pass) = &self.split_pass {
             key.push_str(&split_pass.stable_key_suffix());
         }
+        if let Some(registers) = &self.registers {
+            key.push_str(&registers.stable_key_suffix());
+        }
         key
     }
 
@@ -2249,13 +2306,15 @@ impl FusedPow2StageKey {
         max_invocations_per_workgroup: u32,
         max_workgroup_size_x: u32,
     ) -> bool {
-        let Some(scratch_bytes) = self
-            .axis_length
-            .checked_mul(self.lines_per_workgroup as usize)
-            .and_then(|elements| {
-                elements.checked_mul(self.precision.complex_size_bytes() as usize)
-            })
-        else {
+        let scratch_elements = match &self.registers {
+            Some(registers) => Some(registers.exchange_len),
+            None => self
+                .axis_length
+                .checked_mul(self.lines_per_workgroup as usize),
+        };
+        let Some(scratch_bytes) = scratch_elements.and_then(|elements| {
+            elements.checked_mul(self.precision.complex_size_bytes() as usize)
+        }) else {
             return false;
         };
         scratch_bytes as u64 <= max_workgroup_storage_bytes

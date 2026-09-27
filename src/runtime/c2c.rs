@@ -6,6 +6,7 @@ use crate::error::{FftError, Result};
 use crate::math::{to_interleaved_f32, DoubleFloat};
 use crate::runtime::axis_plan::{
     AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind, AxisTwiddleLutPool,
+    LongAxisRoute,
 };
 #[cfg(test)]
 use crate::runtime::axis_policy::resolve_axis_kinds_for_axes;
@@ -3470,9 +3471,7 @@ impl SmoothDecompositionC2cPlan {
                             precision: AxisPrecision::F32,
                             workgroup_size: config.tuning().workgroup_size(),
                             fused_workgroup_size: config.tuning().fused_workgroup_size(),
-                            // Windowed large routes keep one pass per radix: split passes store
-                            // transposed across a whole line, which a window may not cover.
-                            split_long_axes: false,
+                            long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
                         },
                         &mut twiddle_lut_pool,
                     )?;
@@ -3507,9 +3506,7 @@ impl SmoothDecompositionC2cPlan {
                         precision: AxisPrecision::F32,
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
-                        // Windowed large routes keep one pass per radix: split passes store
-                        // transposed across a whole line, which a window may not cover.
-                        split_long_axes: false,
+                        long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
                     };
                     let phase1 = build_smooth_phase_execution(
                         device,
@@ -3530,9 +3527,7 @@ impl SmoothDecompositionC2cPlan {
                         precision: AxisPrecision::F32,
                         workgroup_size: config.tuning().workgroup_size(),
                         fused_workgroup_size: config.tuning().fused_workgroup_size(),
-                        // Windowed large routes keep one pass per radix: split passes store
-                        // transposed across a whole line, which a window may not cover.
-                        split_long_axes: false,
+                        long_axes: LongAxisRoute::windowed(config.tuning().fuse_long_axes()),
                     };
                     let phase2 = build_smooth_phase_execution(
                         device,
@@ -7448,7 +7443,7 @@ fn axis_plan_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) 
         precision: config.precision().into(),
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
-        split_long_axes: config.tuning().split_long_axes(),
+        long_axes: LongAxisRoute::new(config.tuning().fuse_long_axes()),
     }
 }
 
@@ -7467,7 +7462,7 @@ fn rader_config_for_axis(config: &FftConfig, axis: usize, final_axis: bool) -> R
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
-        split_long_axes: config.tuning().split_long_axes(),
+        fuse_long_axes: config.tuning().fuse_long_axes(),
     }
 }
 
@@ -7490,7 +7485,7 @@ fn bluestein_config_for_axis(
         workgroup_size: config.tuning().workgroup_size(),
         fused_workgroup_size: config.tuning().fused_workgroup_size(),
         fused_min_convolution_length: config.tuning().fused_min_convolution_length(),
-        split_long_axes: config.tuning().split_long_axes(),
+        fuse_long_axes: config.tuning().fuse_long_axes(),
     }
 }
 

@@ -5,7 +5,7 @@ use crate::error::{FftError, Result};
 use crate::math::{reference_c2c_nd_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
-    AxisStageKind, AxisTwiddleLutPool,
+    AxisStageKind, AxisTwiddleLutPool, LongAxisRoute,
 };
 use crate::runtime::axis_policy::{
     is_prime, mod_pow, next_power_of_two_at_least, next_smooth_at_least, primitive_root_prime,
@@ -67,7 +67,7 @@ pub(crate) struct RaderAxisConfig {
     pub(crate) workgroup_size: u32,
     pub(crate) fused_workgroup_size: u32,
     pub(crate) fused_min_convolution_length: usize,
-    pub(crate) split_long_axes: bool,
+    pub(crate) fuse_long_axes: bool,
 }
 
 pub(crate) struct RaderAxis {
@@ -346,7 +346,7 @@ impl RaderAxis {
                     precision: config.precision,
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
-                    split_long_axes: config.split_long_axes,
+                    long_axes: LongAxisRoute::new(config.fuse_long_axes),
                 },
                 &mut twiddle_lut_pool,
             )?;
@@ -364,7 +364,7 @@ impl RaderAxis {
                     precision: config.precision,
                     workgroup_size: config.workgroup_size,
                     fused_workgroup_size: config.fused_workgroup_size,
-                    split_long_axes: config.split_long_axes,
+                    long_axes: LongAxisRoute::new(config.fuse_long_axes),
                 },
                 &mut twiddle_lut_pool,
             )?;

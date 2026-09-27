@@ -2,6 +2,7 @@ use crate::diagnostics::{stage_route_for_label, FftBlocker, FftBlockerKind};
 use crate::error::{FftError, Result};
 use crate::runtime::buffer_view::{BufferRange, BufferView};
 use crate::runtime::large_graph::{LargeExecutionGraph, LargeStage, LogicalRange};
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::window_scheduler::{SchedulerLimits, WindowScheduler};
 
 pub(crate) struct StageExecutor<'a> {
@@ -89,7 +90,7 @@ impl<'a> StageExecutor<'a> {
 
     pub(crate) fn copy_view_range_to_buffer(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         view: &BufferView<'_>,
         view_offset: u64,
         dst: &wgpu::Buffer,
@@ -102,7 +103,7 @@ impl<'a> StageExecutor<'a> {
         validate_copy_usage(&ranges, wgpu::BufferUsages::COPY_SRC, "COPY_SRC")?;
         let mut cursor = dst_offset;
         for range in ranges {
-            encoder.copy_buffer_to_buffer(
+            encoder.encoder().copy_buffer_to_buffer(
                 range.buffer,
                 range.offset_bytes,
                 dst,
@@ -116,7 +117,7 @@ impl<'a> StageExecutor<'a> {
 
     pub(crate) fn copy_buffer_to_view_range(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         src: &wgpu::Buffer,
         src_offset: u64,
         view: &BufferView<'_>,
@@ -129,7 +130,7 @@ impl<'a> StageExecutor<'a> {
         validate_copy_usage(&ranges, wgpu::BufferUsages::COPY_DST, "COPY_DST")?;
         let mut cursor = src_offset;
         for range in ranges {
-            encoder.copy_buffer_to_buffer(
+            encoder.encoder().copy_buffer_to_buffer(
                 src,
                 cursor,
                 range.buffer,

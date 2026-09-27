@@ -19,6 +19,7 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FourStepKernelKind, FourStepStageKey,
     ShaderCacheKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::stage_executor::StageExecutor;
 use crate::runtime::window_scheduler::{SchedulerLimits, WindowScheduler};
 
@@ -390,7 +391,7 @@ impl SegmentedVolumeC2cPlan {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -467,7 +468,7 @@ impl SegmentedVolumeC2cPlan {
 
     fn upload(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         executor: &StageExecutor<'_>,
         input: &BufferView<'_>,
     ) -> Result<()> {
@@ -486,7 +487,7 @@ impl SegmentedVolumeC2cPlan {
 
     fn download(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         executor: &StageExecutor<'_>,
         output: &BufferView<'_>,
     ) -> Result<()> {
@@ -564,7 +565,7 @@ impl FrontRowBurstPlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
         burst_ring: &[BurstStagePair],
@@ -611,7 +612,7 @@ impl SlabAxisPlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         scheduler: &WindowScheduler,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
@@ -705,7 +706,7 @@ impl SlabAxisPlan {
 
     fn gather_dispatch(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
         dispatch: &SlabDispatch,
@@ -743,7 +744,7 @@ impl SlabAxisPlan {
 
     fn scatter_dispatch(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         executor: &StageExecutor<'_>,
         arena: &BufferView<'_>,
         dispatch: &SlabDispatch,
@@ -858,7 +859,7 @@ impl SegmentedScalePlan {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         scheduler: &WindowScheduler,
         arena: &SegmentedArena,
         bind_group_layout: &wgpu::BindGroupLayout,
@@ -886,10 +887,7 @@ impl SegmentedScalePlan {
                     },
                 ],
             });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_fft.segmented_volume.scale.pass"),
-                timestamp_writes: None,
-            });
+            let pass = encoder.pass();
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             let workgroups = u32::try_from(dispatch.size_bytes / COMPLEX_F32_BYTES)
@@ -1113,7 +1111,7 @@ fn row_axis_plan_index(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_transpose(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     scheduler: &WindowScheduler,
     input: &wgpu::Buffer,
     output: &wgpu::Buffer,
@@ -1162,10 +1160,7 @@ fn dispatch_transpose(
                 max_per_dimension: max_workgroups_per_dimension(device),
             })?;
     let (x, y, z) = split_workgroups(workgroups, max_workgroups_per_dimension(device))?;
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("wgpu_fft.segmented_volume.transpose.pass"),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.dispatch_workgroups(x, y, z);

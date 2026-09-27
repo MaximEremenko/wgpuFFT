@@ -40,6 +40,7 @@ use crate::runtime::rader_axis::{
     fused_rader_supported_by_limits, rader_bfft, rader_convolution_length, rader_permutation,
     RaderAxis, RaderAxisConfig,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::segmented_volume::{validate_segmented_burst_depth, SegmentedVolumeC2cPlan};
 use crate::runtime::smooth_decompose::{
     MixedAxisStep, SmoothAxisStep, SmoothDecompositionPlan, SmoothDecompositionStep,
@@ -669,7 +670,6 @@ struct SmoothChunkCopyRequest {
 
 struct DirectDftPlan {
     precision: AxisPrecision,
-    pipeline_key: ComputePipelineCacheKey,
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
@@ -1308,6 +1308,18 @@ impl C2cPlan {
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
+        self.execute_views_recorded(device, &mut CommandRecorder::new(encoder), input, output)
+    }
+
+    /// [`Self::execute_views`] for plans nested in another execution, which
+    /// share the caller's compute pass.
+    pub(crate) fn execute_views_recorded(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut CommandRecorder<'_>,
+        input: BufferView<'_>,
+        output: BufferView<'_>,
+    ) -> Result<()> {
         let input = self.validate_io_view(device, input)?;
         let output = self.validate_io_view(device, output)?;
         self.execute_views_impl(device, encoder, input, output, None)
@@ -1329,7 +1341,13 @@ impl C2cPlan {
         let input = self.validate_io_view(device, input)?;
         let output = self.validate_io_view(device, output)?;
         let workspace = self.validate_workspace_view(device, workspace)?;
-        self.execute_views_impl(device, encoder, input, output, Some(workspace))
+        self.execute_views_impl(
+            device,
+            &mut CommandRecorder::new(encoder),
+            input,
+            output,
+            Some(workspace),
+        )
     }
 
     pub fn execute_io_views(
@@ -1344,7 +1362,13 @@ impl C2cPlan {
         if input.contiguous && output.contiguous {
             return self.execute_views(device, encoder, input.view, output.view);
         }
-        self.execute_io_views_impl(device, encoder, input, output, None)
+        self.execute_io_views_impl(
+            device,
+            &mut CommandRecorder::new(encoder),
+            input,
+            output,
+            None,
+        )
     }
 
     pub fn execute_io_views_with_workspace(
@@ -1363,7 +1387,13 @@ impl C2cPlan {
         let input = self.validate_io_layout(device, input)?;
         let output = self.validate_io_layout(device, output)?;
         let workspace = self.validate_workspace_view(device, workspace)?;
-        self.execute_io_views_impl(device, encoder, input, output, Some(workspace))
+        self.execute_io_views_impl(
+            device,
+            &mut CommandRecorder::new(encoder),
+            input,
+            output,
+            Some(workspace),
+        )
     }
 
     pub fn execute_logical_views(
@@ -1415,7 +1445,7 @@ impl C2cPlan {
     fn execute_views_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: Option<BufferView<'_>>,
@@ -1501,7 +1531,7 @@ impl C2cPlan {
     fn execute_io_views_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: C2cIoLayout<'_>,
         output: C2cIoLayout<'_>,
         workspace: Option<BufferView<'_>>,
@@ -1666,7 +1696,7 @@ impl C2cPlan {
     fn execute_route_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: Option<BufferView<'_>>,
@@ -1819,7 +1849,7 @@ impl LargeChunkC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -1842,7 +1872,7 @@ impl LargeChunkC2cPlan {
                 0,
                 range.byte_size,
             )?;
-            self.child.execute_views(
+            self.child.execute_views_recorded(
                 device,
                 encoder,
                 BufferView::whole(&self.input_stage).prefix(self.plan.staging_size_bytes())?,
@@ -1955,7 +1985,7 @@ impl LargeAxisSequenceC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -2013,7 +2043,7 @@ impl LargeAxisSequenceC2cPlan {
         for (step_index, child) in self.children.iter().enumerate() {
             let src = self.resolve_buffer(src_slot, exec_input.clone(), exec_output.clone())?;
             let dst = self.resolve_buffer(dst_slot, exec_input.clone(), exec_output.clone())?;
-            child.execute_views(device, encoder, src, dst)?;
+            child.execute_views_recorded(device, encoder, src, dst)?;
 
             if step_index + 1 < self.children.len() {
                 src_slot = dst_slot;
@@ -2121,7 +2151,7 @@ impl LargeBridgeC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         required_bytes: u64,
@@ -2200,7 +2230,7 @@ impl WindowedPrimeBridge {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -2665,7 +2695,7 @@ impl RaderBridgeC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -2675,14 +2705,14 @@ impl RaderBridgeC2cPlan {
             self.dispatch_sum_init(device, encoder)?;
             self.dispatch_sum_accumulate(device, encoder, &input, line)?;
             self.dispatch_pack(device, encoder, &input, line)?;
-            self.child_forward.execute_views(
+            self.child_forward.execute_views_recorded(
                 device,
                 encoder,
                 BufferView::whole(&self.work_buffer).prefix(self.work_bytes())?,
                 BufferView::whole(&self.fft_buffer).prefix(self.work_bytes())?,
             )?;
             self.dispatch_mul(device, encoder)?;
-            self.child_inverse.execute_views(
+            self.child_inverse.execute_views_recorded(
                 device,
                 encoder,
                 BufferView::whole(&self.fft_buffer).prefix(self.work_bytes())?,
@@ -2709,7 +2739,7 @@ impl RaderBridgeC2cPlan {
     fn dispatch_sum_init(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
         let sum = BufferView::whole(&self.sum_buffer).prefix(COMPLEX_F32_BYTES)?;
@@ -2749,7 +2779,7 @@ impl RaderBridgeC2cPlan {
     fn dispatch_sum_accumulate(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -2807,7 +2837,7 @@ impl RaderBridgeC2cPlan {
     fn dispatch_pack(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -2870,11 +2900,7 @@ impl RaderBridgeC2cPlan {
         Ok(())
     }
 
-    fn dispatch_mul(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<()> {
+    fn dispatch_mul(&self, device: &wgpu::Device, encoder: &mut CommandRecorder<'_>) -> Result<()> {
         dispatch_bridge_mul_windows(
             device,
             encoder,
@@ -2894,7 +2920,7 @@ impl RaderBridgeC2cPlan {
     fn dispatch_write_y0(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -2937,7 +2963,7 @@ impl RaderBridgeC2cPlan {
     fn dispatch_post(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -3103,7 +3129,7 @@ impl BluesteinBridgeC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -3111,14 +3137,14 @@ impl BluesteinBridgeC2cPlan {
         ensure_single_storage_bridge_view(&output, "large Bluestein bridge output")?;
         for line in 0..self.lines {
             self.dispatch_pack(device, encoder, &input, line)?;
-            self.child_forward.execute_views(
+            self.child_forward.execute_views_recorded(
                 device,
                 encoder,
                 BufferView::whole(&self.work_buffer).prefix(self.work_bytes())?,
                 BufferView::whole(&self.fft_buffer).prefix(self.work_bytes())?,
             )?;
             self.dispatch_mul(device, encoder)?;
-            self.child_inverse.execute_views(
+            self.child_inverse.execute_views_recorded(
                 device,
                 encoder,
                 BufferView::whole(&self.fft_buffer).prefix(self.work_bytes())?,
@@ -3140,7 +3166,7 @@ impl BluesteinBridgeC2cPlan {
     fn dispatch_pack(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -3200,11 +3226,7 @@ impl BluesteinBridgeC2cPlan {
         Ok(())
     }
 
-    fn dispatch_mul(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<()> {
+    fn dispatch_mul(&self, device: &wgpu::Device, encoder: &mut CommandRecorder<'_>) -> Result<()> {
         dispatch_bridge_mul_windows(
             device,
             encoder,
@@ -3224,7 +3246,7 @@ impl BluesteinBridgeC2cPlan {
     fn dispatch_post(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: &BufferView<'_>,
         line: u64,
     ) -> Result<()> {
@@ -3364,13 +3386,13 @@ impl SmoothPhaseExecution {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
         match self {
             Self::Axis(plan) => plan.execute_views(device, encoder, input, output),
-            Self::C2c(plan) => plan.execute_views(device, encoder, input, output),
+            Self::C2c(plan) => plan.execute_views_recorded(device, encoder, input, output),
         }
     }
 
@@ -3596,7 +3618,7 @@ impl SmoothDecompositionC2cPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -3727,7 +3749,7 @@ impl MixedAxisExecution {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         shape: &[usize],
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -3772,7 +3794,7 @@ impl SmoothAxisExecution {
     fn execute(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         shape: &[usize],
         input: BufferView<'_>,
         output: BufferView<'_>,
@@ -5975,7 +5997,7 @@ fn create_view_staging_buffer(
 
 fn copy_view_to_buffer(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     view: &BufferView<'_>,
     dst: &wgpu::Buffer,
     dst_offset: u64,
@@ -5986,7 +6008,7 @@ fn copy_view_to_buffer(
 
 fn copy_view_range_to_buffer(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     view: &BufferView<'_>,
     view_offset: u64,
     dst: &wgpu::Buffer,
@@ -6006,7 +6028,7 @@ fn copy_view_range_to_buffer(
 
 fn copy_buffer_to_view(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     src: &wgpu::Buffer,
     src_offset: u64,
     view: &BufferView<'_>,
@@ -6017,7 +6039,7 @@ fn copy_buffer_to_view(
 
 fn copy_buffer_to_view_range(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     src: &wgpu::Buffer,
     src_offset: u64,
     view: &BufferView<'_>,
@@ -6108,7 +6130,7 @@ fn smooth_chunk_copy_direction(kind: C2cSmoothKernelKind) -> Result<SmoothChunkC
 
 fn dispatch_c2c_axis_line_copy_blocks(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cSmoothKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6177,7 +6199,7 @@ fn choose_axis_line_copy_count(
 
 fn dispatch_c2c_smooth_chunk_copy_blocks(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cSmoothKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6469,7 +6491,7 @@ fn bridge_pipeline_key<'a>(
 
 fn dispatch_bridge_mul_windows(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     route: &'static str,
     pipeline_key: &ComputePipelineCacheKey,
     work_buffer: &wgpu::Buffer,
@@ -6518,7 +6540,7 @@ fn dispatch_bridge_mul_windows(
 
 fn dispatch_bridge_kernel(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     route: &'static str,
     pipeline_key: &ComputePipelineCacheKey,
     storage_entries: &[wgpu::BindGroupEntry<'_>],
@@ -6565,10 +6587,7 @@ fn dispatch_bridge_kernel(
         layout: &bind_group_layout,
         entries: &entries,
     });
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("wgpu_fft.c2c.bridge.pass"),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -6631,7 +6650,7 @@ fn checked_mul_u64(a: u64, b: u64) -> Result<u64> {
 
 fn dispatch_c2c_smooth_axis_line_copy(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cSmoothKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6652,7 +6671,7 @@ fn dispatch_c2c_smooth_axis_line_copy(
 
 fn dispatch_c2c_smooth_axis_chunk_copy(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cSmoothKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6673,7 +6692,7 @@ fn dispatch_c2c_smooth_axis_chunk_copy(
 
 fn dispatch_c2c_smooth_copy_pipeline(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cSmoothKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6723,11 +6742,7 @@ fn dispatch_c2c_smooth_copy_pipeline(
         ],
     });
 
-    let pass_label = format!("wgpu_fft.c2c.smooth.pass.{}", pipeline_key.stable_key());
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(&pass_label),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -6740,7 +6755,7 @@ fn dispatch_c2c_smooth_copy_pipeline(
 
 fn dispatch_c2c_smooth_twiddle_transpose(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
     twiddle_coarse: &wgpu::Buffer,
@@ -6804,11 +6819,7 @@ fn dispatch_c2c_smooth_twiddle_transpose(
         ],
     });
 
-    let pass_label = format!("wgpu_fft.c2c.smooth.pass.{}", pipeline_key.stable_key());
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(&pass_label),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -6854,7 +6865,7 @@ fn create_smooth_params_buffer(
 
 fn dispatch_c2c_strided_copy(
     device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
+    encoder: &mut CommandRecorder<'_>,
     kind: C2cStridedKernelKind,
     input: &BufferView<'_>,
     output: &BufferView<'_>,
@@ -6923,11 +6934,7 @@ fn dispatch_c2c_strided_copy(
         ],
     });
 
-    let pass_label = format!("wgpu_fft.c2c.strided.pass.{}", pipeline_key.stable_key());
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(&pass_label),
-        timestamp_writes: None,
-    });
+    let pass = encoder.pass();
     pass.set_pipeline(&pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     let (x, y, z) = split_workgroups(
@@ -7592,7 +7599,7 @@ impl AxisSequencePlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -7605,7 +7612,7 @@ impl AxisSequencePlan {
     fn execute_views_with_workspace(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: BufferView<'_>,
@@ -7620,7 +7627,7 @@ impl AxisSequencePlan {
     fn execute_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         workspace: Option<BufferView<'_>>,
@@ -7692,7 +7699,7 @@ impl AxisStep {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -7817,7 +7824,6 @@ impl DirectDftPlan {
 
         Ok(Self {
             precision,
-            pipeline_key,
             pipeline,
             bind_group_layout,
             params_buffer,
@@ -7833,7 +7839,7 @@ impl DirectDftPlan {
     fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -7866,14 +7872,7 @@ impl DirectDftPlan {
             ],
         });
 
-        let pass_label = format!(
-            "wgpu_fft.c2c_dft.pass.cache{}",
-            self.pipeline_key.stable_key()
-        );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(&pass_label),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(self.workgroups_x, max_workgroups_per_dimension(device))?;

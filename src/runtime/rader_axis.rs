@@ -21,6 +21,7 @@ use crate::runtime::pipeline_cache::{
     with_device_pipeline_cache, ComputePipelineCacheKey, FusedPrimeKind, FusedPrimeStageKey,
     PipelineLayoutCacheKey, RaderKernelKind, RaderStageKey, ShaderCacheKey,
 };
+use crate::runtime::recorder::CommandRecorder;
 use crate::runtime::twiddle::create_twiddle_lut_buffer_for_len_with_precision;
 use crate::runtime::window_scheduler::WindowScheduler;
 
@@ -529,7 +530,7 @@ impl RaderAxis {
     pub(crate) fn execute_views(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
     ) -> Result<()> {
@@ -567,7 +568,7 @@ impl RaderAxis {
     fn dispatch_fused(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         output: BufferView<'_>,
         execution: &FusedRaderExecution,
@@ -586,10 +587,7 @@ impl RaderAxis {
                 bind_uniform_entry(5, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.fused.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) =
@@ -601,7 +599,7 @@ impl RaderAxis {
     fn dispatch_sum(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
@@ -617,10 +615,7 @@ impl RaderAxis {
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.sum.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.sum_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -634,7 +629,7 @@ impl RaderAxis {
     fn dispatch_pack(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         input: BufferView<'_>,
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
@@ -650,10 +645,7 @@ impl RaderAxis {
                 bind_uniform_entry(3, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.pack.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.pack_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -667,7 +659,7 @@ impl RaderAxis {
     fn dispatch_mul(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
         let scheduler = WindowScheduler::for_device(device);
@@ -681,10 +673,7 @@ impl RaderAxis {
                 bind_uniform_entry(2, &execution.total_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.mul.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.mul_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -698,7 +687,7 @@ impl RaderAxis {
     fn dispatch_write_y0(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: BufferView<'_>,
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
@@ -713,10 +702,7 @@ impl RaderAxis {
                 bind_uniform_entry(2, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.write_y0.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.write_y0_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(
@@ -730,7 +716,7 @@ impl RaderAxis {
     fn dispatch_post(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut CommandRecorder<'_>,
         output: BufferView<'_>,
         execution: &MultiPassRaderExecution,
     ) -> Result<()> {
@@ -747,10 +733,7 @@ impl RaderAxis {
                 bind_uniform_entry(4, &self.lines_params_buffer),
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_fft.rader.post.pass"),
-            timestamp_writes: None,
-        });
+        let pass = encoder.pass();
         pass.set_pipeline(&execution.post_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let (x, y, z) = split_workgroups(

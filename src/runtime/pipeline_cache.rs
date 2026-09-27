@@ -2329,13 +2329,16 @@ impl FusedSmoothStageKey {
         max_invocations_per_workgroup: u32,
         max_workgroup_size_x: u32,
     ) -> bool {
-        let Some(scratch_bytes) = self
-            .axis_length
-            .checked_mul(self.lines_per_workgroup as usize)
-            .and_then(|elements| {
-                elements.checked_mul(self.precision.complex_size_bytes() as usize)
-            })
-        else {
+        let Some(scratch_bytes) = crate::runtime::axis_plan::multiline_line_stride(
+            self.axis_length,
+            self.lines_per_workgroup as usize,
+            crate::runtime::axis_plan::multiline_element_major(
+                self.stride_complex,
+                self.split_pass.as_ref(),
+            ),
+        )
+        .checked_mul(self.lines_per_workgroup as usize)
+        .and_then(|elements| elements.checked_mul(self.precision.complex_size_bytes() as usize)) else {
             return false;
         };
         scratch_bytes as u64 <= max_workgroup_storage_bytes
@@ -2455,9 +2458,15 @@ impl FusedPow2StageKey {
             Some(registers) => registers
                 .exchange_len
                 .checked_mul(self.lines_per_workgroup as usize),
-            None => self
-                .axis_length
-                .checked_mul(self.lines_per_workgroup as usize),
+            None => crate::runtime::axis_plan::multiline_line_stride(
+                self.axis_length,
+                self.lines_per_workgroup as usize,
+                crate::runtime::axis_plan::multiline_element_major(
+                    self.stride_complex,
+                    self.split_pass.as_ref(),
+                ),
+            )
+            .checked_mul(self.lines_per_workgroup as usize),
         };
         let Some(scratch_bytes) = scratch_elements.and_then(|elements| {
             elements.checked_mul(self.precision.complex_size_bytes() as usize)

@@ -318,17 +318,22 @@ pass.
 
 `request_default_device()` asks wgpu for a high-performance adapter from
 Vulkan, Metal, or DX12 (the browser WebGPU backend on wasm). When several
-backends expose the same GPU, Vulkan is listed first.
+backends expose the same GPU, Vulkan is listed first. On native targets,
+`WGPU_ADAPTER_NAME=<text>` picks the adapter whose name contains the text
+instead, and `WGPU_FFT_FORCE_FALLBACK=1` the platform's software adapter
+(WARP on Windows, lavapipe on Linux).
 
 On DX12, wgpu compiles shaders with DXC when it is available: statically linked
 through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual Studio 2022
 17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to the
 executable or on `PATH`. Otherwise it falls back to the legacy FXC compiler.
 Every route works with both, but FXC is much slower to create plans: on an RTX
-5090 the GPU test suite takes about 260 s with FXC and 40 s with DXC. `df64`
+5090 the GPU test suite takes about 300 s with FXC and 45 s with DXC. `df64`
 plans and the register-resident kernels of 8192- and 16384-point `f32` axes
 are the slowest; an N=8192 plan takes 2.6 s with FXC and 0.1 s on Vulkan.
-Ship DXC with DX12 applications, or prefer Vulkan.
+Ship DXC with DX12 applications, or prefer Vulkan. The WARP software adapter
+needs DXC: it crashes while running some FXC-compiled kernels (also with
+earlier versions of this crate), and runs every kernel correctly with DXC.
 
 Tested on an NVIDIA RTX 5090 under Windows 11 with Vulkan, DX12 (FXC and DXC),
 and Chrome 153's WebGPU. Metal, AMD, Intel, and Linux have not been tested.

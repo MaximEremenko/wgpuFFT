@@ -1643,7 +1643,7 @@ fn initialize_buffers(
 }
 
 fn fill_initialization_seed(seed: &wgpu::Buffer, precision: FftPrecision) -> BenchResult<()> {
-    let mut mapped = seed.slice(..).get_mapped_range_mut();
+    let mut mapped = seed.slice(..).get_mapped_range_mut()?;
     match precision {
         FftPrecision::F32 => {
             let value_count = mapped.len() / std::mem::size_of::<f32>();

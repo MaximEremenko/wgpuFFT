@@ -67,7 +67,10 @@ async fn browser_webgpu_executes_small_c2c() {
         .expect("browser map callback must run")
         .expect("browser readback mapping must succeed");
 
-    let mapped = readback.slice(..).get_mapped_range();
+    let mapped = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("browser readback range must be mapped");
     let actual = bytemuck::cast_slice::<u8, f32>(&mapped);
     for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
         assert!(

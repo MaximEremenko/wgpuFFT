@@ -66,6 +66,7 @@ async fn request_browser_default_device() -> BrowserContext {
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
             compatible_surface: None,
         })
         .await
@@ -316,7 +317,10 @@ async fn execute_and_read_samples(
         .await
         .expect("browser map callback must run")
         .expect("browser sample readback must map");
-    let mapped = readback.slice(..).get_mapped_range();
+    let mapped = readback
+        .slice(..)
+        .get_mapped_range()
+        .expect("browser readback range must be mapped");
     bytemuck::cast_slice::<u8, f32>(&mapped).to_vec()
 }
 

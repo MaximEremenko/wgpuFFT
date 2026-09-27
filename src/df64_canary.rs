@@ -208,7 +208,9 @@ pub async fn validate_df64_invariants(
         .ok_or(Df64CanaryError::MapCallbackDropped)?
         .map_err(|_| Df64CanaryError::MapFailed)?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|_| Df64CanaryError::MapFailed)?;
     let actual = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();

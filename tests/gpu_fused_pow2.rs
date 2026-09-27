@@ -563,7 +563,9 @@ fn read_f32(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<f32> {
         .recv()
         .expect("map callback should send a result")
         .expect("readback buffer should map");
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .expect("readback buffer should be mapped");
     let values = bytemuck::cast_slice(&mapped).to_vec();
     drop(mapped);
     buffer.unmap();

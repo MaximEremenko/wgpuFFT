@@ -295,7 +295,9 @@ fn read_f32(context: &wgpu_fft::device::GpuContext, readback_buffer: &wgpu::Buff
         .expect("map callback should send a result")
         .expect("readback buffer should map");
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .expect("readback buffer should be mapped");
     let actual = bytemuck::cast_slice(&mapped).to_vec();
     drop(mapped);
     readback_buffer.unmap();

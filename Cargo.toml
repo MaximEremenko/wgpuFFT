@@ -26,14 +26,14 @@ serde = ["dep:serde", "dep:serde_json"]
 bytemuck = { version = "1.22", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
-wgpu = "29.0.1"
+wgpu = "30.0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 pollster = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 futures-channel = "0.3"
-wasm-bindgen-test = "=0.3.70"
+wasm-bindgen-test = "=0.3.79"
 
 [[bench]]
 name = "fft_bench"

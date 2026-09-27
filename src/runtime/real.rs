@@ -2834,7 +2834,10 @@ fn create_real_strided_params_buffer(
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        let mut mapped = buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("uniform buffer is mapped at creation");
         mapped.copy_from_slice(bytemuck::bytes_of(&params));
     }
     buffer.unmap();
@@ -2852,7 +2855,10 @@ fn create_real_window_params_buffer(
         mapped_at_creation: true,
     });
     {
-        let mut mapped = buffer.slice(..).get_mapped_range_mut();
+        let mut mapped = buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("uniform buffer is mapped at creation");
         mapped.copy_from_slice(bytemuck::bytes_of(&params));
     }
     buffer.unmap();

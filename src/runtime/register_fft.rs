@@ -1,5 +1,6 @@
-//! Register-resident fused kernels for power-of-two lines longer than
-//! workgroup storage holds.
+//! Register-resident fused kernels for power-of-two lines: long lines that
+//! workgroup storage cannot hold, and shorter lines where loading straight
+//! into registers beats a workgroup-memory kernel.
 //!
 //! Invocation `t` keeps `N / workgroup_size` elements of its line in
 //! registers through a self-sorting (Stockham) radix schedule. Stage `s` with
@@ -31,8 +32,11 @@ use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, Registe
 const VALUES_PER_INVOCATION: usize = 16;
 /// Largest radix of a register stage.
 const MAX_RADIX: usize = 16;
-/// Smallest exchange buffer; the bank swizzle permutes 256-element blocks.
-const MIN_EXCHANGE_LEN: usize = 256;
+/// Smallest exchange buffer: one 16-value unit. The bank swizzle permutes
+/// aligned 16-element blocks, so it maps any power-of-two length onto itself.
+const MIN_EXCHANGE_LEN: usize = 16;
+/// Elements one invocation of a register kernel holds.
+pub(crate) const REGISTER_VALUES_PER_INVOCATION: usize = VALUES_PER_INVOCATION;
 
 /// Workgroup size and schedule of a register-resident kernel for an `f32`
 /// power-of-two line of `axis_length`, or `None` when the device cannot run

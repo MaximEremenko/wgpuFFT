@@ -183,15 +183,28 @@ fn assert_workgroup_sweep(context: &wgpu_fft::device::GpuContext) {
             }),
             "missing staged pipeline cache key for workgroup size {workgroup_size}"
         );
-        assert!(
-            snapshot.pipeline_keys().iter().any(|key| {
-                key.contains("shader:v3:fused-pow2")
-                    && key.contains("n=256")
-                    && key.contains(&workgroup_fragment)
-            }),
-            "missing fused pipeline cache key for workgroup size {workgroup_size}"
-        );
+        // The default fused workgroup size lets the line run in a register
+        // kernel, which sizes its own workgroup.
+        if workgroup_size != FftTuning::default().fused_workgroup_size() {
+            assert!(
+                snapshot.pipeline_keys().iter().any(|key| {
+                    key.contains("shader:v3:fused-pow2")
+                        && key.contains("n=256")
+                        && key.contains(&workgroup_fragment)
+                        && !key.contains(":registers=")
+                }),
+                "missing fused pipeline cache key for workgroup size {workgroup_size}"
+            );
+        }
     }
+    assert!(
+        snapshot.pipeline_keys().iter().any(|key| {
+            key.contains("shader:v3:fused-pow2")
+                && key.contains("n=256")
+                && key.contains(":registers=")
+        }),
+        "missing register pipeline cache key for the default fused workgroup size"
+    );
 }
 
 fn assert_public_large_limit_routes(context: &wgpu_fft::device::GpuContext) {

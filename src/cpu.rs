@@ -38,9 +38,12 @@ use crate::plan::FftTransformKind;
 
 /// Work below this many elements per extra thread stays on the calling thread.
 const MIN_ELEMENTS_PER_WORKER: usize = 1 << 15;
-/// Contiguous lines at least this long, too few to keep every thread busy,
-/// run as a parallel four-step decomposition.
+/// Contiguous lines at least this long, in batches of fewer than
+/// `FOUR_STEP_MAX_LINES` lines, run as a parallel four-step decomposition.
+/// The choice depends on the problem alone, so results do not depend on the
+/// machine's thread count.
 const FOUR_STEP_MIN_LEN: usize = 1 << 15;
+const FOUR_STEP_MAX_LINES: usize = 16;
 /// Smallest factor of a four-step decomposition worth its extra passes.
 const FOUR_STEP_MIN_FACTOR: usize = 16;
 
@@ -427,8 +430,8 @@ impl<T: FftNum + bytemuck::Pod> TypedKernels<T> {
         for kernel in &self.axes {
             let len = shape[kernel.axis];
             match &kernel.four_step {
-                // Too few lines to keep every thread busy: split each line.
-                Some(four_step) if data.len() / len < worker_count(data.len()) => {
+                // Too few lines to keep threads busy: split each line.
+                Some(four_step) if data.len() / len < FOUR_STEP_MAX_LINES => {
                     for line in data.chunks_exact_mut(len) {
                         four_step.run(line);
                     }

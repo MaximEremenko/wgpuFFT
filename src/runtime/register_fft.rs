@@ -20,11 +20,13 @@ use std::collections::BTreeSet;
 
 use crate::config::FftDirection;
 use crate::runtime::axis_plan::{
-    complex_wgsl, convolution_twiddle_fns_wgsl, emit_split_twiddles, radix_root_wgsl,
-    scaled_complex_expr, specialize_complex_wgsl, twiddle_lookup_wgsl, wgsl_line_base_fn,
-    AxisPrecision, FusedPow2StageWgslConfig,
+    complex_wgsl, computes_twiddles, convolution_twiddle_fns_wgsl, emit_split_twiddles,
+    radix_root_wgsl, scaled_complex_expr, specialize_complex_wgsl, split_output_stride,
+    twiddle_lookup_wgsl, wgsl_line_base_fn, AxisPrecision, FusedPow2StageWgslConfig,
 };
-use crate::runtime::pipeline_cache::{FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule};
+use crate::runtime::pipeline_cache::{
+    FusedPrimeKind, FusedPrimeStageKey, RegisterSchedule, SplitPass,
+};
 
 /// Elements each invocation keeps in registers: one radix-16 unit per
 /// stage. Longer lines would need more registers per invocation for little
@@ -115,12 +117,27 @@ pub(crate) fn register_schedule_for_lines(
     ))
 }
 
+/// Whether a kernel of `lines` lines per workgroup loads them in one order
+/// and stores them in the other: element-major (neighbouring invocations on
+/// neighbouring lines) on a strided side, line-major on a contiguous one.
+pub(crate) fn transposes_lines(lines: usize, stride_in: usize, stride_out: usize) -> bool {
+    lines > 1 && (stride_in > 1) != (stride_out > 1)
+}
+
 /// WGSL of a register-resident kernel; one workgroup transforms `lines`
 /// lines, invocation `lid` working on line `lid % lines`.
+///
+/// As one pass of a split long axis (`split`), the kernel stores through the
+/// split's output geometry and applies its twiddle on store. When that makes
+/// it load contiguous lines and store strided ones, or the reverse (see
+/// [`transposes_lines`]), each invocation moves from the load side's line
+/// mapping to the store side's between the write and the read of the last
+/// exchange, so both sides access memory coalesced.
 pub(crate) fn generate_register_fft_wgsl(
     config: &FusedPow2StageWgslConfig<'_>,
     schedule: &RegisterSchedule,
     lines: usize,
+    split: Option<&SplitPass>,
 ) -> String {
     let n = config.axis_length;
     let workgroup = config.workgroup_size as usize / lines;
@@ -134,6 +151,9 @@ pub(crate) fn generate_register_fft_wgsl(
     debug_assert!(radices.iter().all(|&radix| values.is_multiple_of(radix)));
     debug_assert!(exchange.is_power_of_two() && n.is_multiple_of(exchange));
 
+    let stride_out = split_output_stride(split, config.stride_complex);
+    let transposes = transposes_lines(lines, config.stride_complex, stride_out);
+    debug_assert!(!transposes || radices.len() > 1);
     let layout = RegisterLayout {
         n,
         workgroup,
@@ -147,39 +167,128 @@ pub(crate) fn generate_register_fft_wgsl(
     emit_register_loads(&mut body, layout, 0, |register, position| {
         format!("  let {register}: vec2<f32> = src[base + {position} * STRIDE];\n")
     });
-    let (last, previous) =
-        emit_register_stages(&mut body, layout, 0, direction, precision, "twiddle");
+    let switch = transposes.then_some(MappingSwitch {
+        to_load: "  t = loadT;\n  exchangeLine = loadLine;\n",
+        to_store: "  t = storeT;\n  exchangeLine = storeLine;\n",
+    });
+    let (last, previous) = emit_register_stages(
+        &mut body, layout, 0, direction, precision, "twiddle", switch,
+    );
     let scale_factor = config.apply_scale.then_some(config.scale_factor);
     // The last workgroup's absent lines compute a present line's data and
     // store nothing.
     body.push_str("  if (exchangeLine < lineCount) {\n");
-    emit_register_stores(&mut body, layout, last, previous, |value, position| {
-        format!(
-            "  dst[base + {position} * STRIDE] = {};\n",
-            scaled_complex_expr(value, scale_factor, precision)
-        )
-    });
+    match split {
+        None => emit_register_stores(&mut body, layout, last, previous, |value, position| {
+            format!(
+                "  dst[base + {position} * STRIDE] = {};\n",
+                scaled_complex_expr(value, scale_factor, precision)
+            )
+        }),
+        Some(split) => {
+            body.push_str(
+                "  let outLine: u32 = params.lineOffset + firstLine + groupLine + exchangeLine;\n  let baseOut: u32 = line_base_out(outLine) - params.elementBase;\n",
+            );
+            if let Some((rows, row_stride_lines)) = split.row_twiddle {
+                body.push_str(&format!(
+                    "  let row: u32 = (outLine / {row_stride_lines}u) % {rows}u;\n"
+                ));
+            }
+            emit_register_stores(&mut body, layout, last, previous, |value, position| {
+                let value = if split.row_twiddle.is_some() {
+                    format!("c_mul({value}, twiddle_full(row * {position}))")
+                } else {
+                    value.to_owned()
+                };
+                format!(
+                    "  dst[baseOut + {position} * STRIDE_OUT] = {};\n",
+                    scaled_complex_expr(&value, scale_factor, precision)
+                )
+            });
+        }
+    }
     body.push_str("  }\n");
     // Strided lines interleave element by element so neighbouring
     // invocations load neighbouring lines; contiguous lines stay whole so
     // neighbouring invocations load neighbouring elements.
     let element_major = config.stride_complex > 1;
-    let (swizzle_line, line_mapping) = match (lines > 1, element_major) {
+    let mapping = |element_major: bool| {
+        if element_major {
+            ("lid.x % LINES", "lid.x / LINES")
+        } else {
+            ("lid.x / LINE_INVOCATIONS", "lid.x % LINE_INVOCATIONS")
+        }
+    };
+    let (swizzle, line_mapping) = match (lines > 1, element_major) {
         (false, _) => (
-            "",
+            "index ^ ((index >> 4u) & 15u)",
             "exchangeLine = 0u;
-  let t: u32 = lid.x;",
+  let t: u32 = lid.x;"
+                .to_owned(),
         ),
+        // Lines take whole blocks, as line-major lines do. The element-major
+        // side reads one position of every line at once: each line's XOR
+        // puts those reads, and the next positions after them, in
+        // different banks.
+        (true, _) if transposes => {
+            let (load_line, load_t) = mapping(element_major);
+            let (store_line, store_t) = mapping(!element_major);
+            (
+                "(index ^ ((index >> 4u) & 15u) ^ ((exchangeLine * LINE_XOR) & 15u)) + exchangeLine * EXCHANGE",
+                format!(
+                    "let loadLine: u32 = {load_line};
+  let loadT: u32 = {load_t};
+  let storeLine: u32 = {store_line};
+  let storeT: u32 = {store_t};
+  exchangeLine = loadLine;
+  var t: u32 = loadT;"
+                ),
+            )
+        }
         (true, true) => (
-            " * LINES + exchangeLine",
+            "(index ^ ((index >> 4u) & 15u)) * LINES + exchangeLine",
             "exchangeLine = lid.x % LINES;
-  let t: u32 = lid.x / LINES;",
+  let t: u32 = lid.x / LINES;"
+                .to_owned(),
         ),
         (true, false) => (
-            " + exchangeLine * EXCHANGE",
+            "(index ^ ((index >> 4u) & 15u)) + exchangeLine * EXCHANGE",
             "exchangeLine = lid.x / LINE_INVOCATIONS;
-  let t: u32 = lid.x % LINE_INVOCATIONS;",
+  let t: u32 = lid.x % LINE_INVOCATIONS;"
+                .to_owned(),
         ),
+    };
+    let twiddle_fns = match split {
+        Some(SplitPass {
+            full_length,
+            row_twiddle: Some(_),
+            ..
+        }) => {
+            // The pass computes its own twiddles; only an axis longer than
+            // any computed table reads the bound table for the split twiddle.
+            debug_assert!(computes_twiddles(n, precision));
+            format!(
+                "{}\n\n{}",
+                twiddle_lookup_wgsl(n, direction, precision),
+                twiddle_lookup_wgsl(*full_length, direction, precision)
+                    .replace("fn twiddle(", "fn twiddle_full(")
+            )
+        }
+        _ => twiddle_lookup_wgsl(n, direction, precision),
+    };
+    let split_declarations = match split {
+        Some(split) => format!(
+            "const STRIDE_OUT: u32 = {stride_out}u;\n\n{}\n",
+            split
+                .output
+                .as_ref()
+                .map_or_else(
+                    || wgsl_line_base_fn(config.rank, config.axis, config.dims),
+                    |(dims, axis)| wgsl_line_base_fn(dims.len(), *axis, dims)
+                )
+                .replace("fn line_base(", "fn line_base_out(")
+        ),
+        None => String::new(),
     };
 
     specialize_complex_wgsl(
@@ -197,14 +306,14 @@ pub(crate) fn generate_register_fft_wgsl(
 @group(0) @binding(3) var<storage, read> axisTwiddles: array<vec2<f32>>;
 
 {complex_wgsl}
-{twiddle_lookup_wgsl}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const STRIDE: u32 = {stride}u;
 const LINES: u32 = {lines}u;
 const LINE_INVOCATIONS: u32 = {workgroup}u;
 const EXCHANGE: u32 = {exchange}u;
-
+{line_xor_declaration}{split_declarations}
 var<workgroup> exchange: array<vec2<f32>, {exchange_total}>;
 // The line this invocation works on; lines interleave in the exchange buffer.
 var<private> exchangeLine: u32;
@@ -212,7 +321,7 @@ var<private> exchangeLine: u32;
 // Spreads the 16 consecutive elements of each 256-element block over all
 // banks so strided exchange accesses do not conflict.
 fn swizzle(index: u32) -> u32 {{
-  return (index ^ ((index >> 4u) & 15u)){swizzle_line};
+  return {swizzle};
 }}
 
 {line_base_fn}
@@ -235,8 +344,12 @@ fn main({entry_params}) {{
 {body}}}
 "#,
             complex_wgsl = complex_wgsl(),
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(n, direction, precision),
             stride = config.stride_complex,
+            line_xor_declaration = if transposes {
+                format!("const LINE_XOR: u32 = {}u;\n", (16 / lines).max(1))
+            } else {
+                String::new()
+            },
             exchange_total = exchange * lines,
             workgroup_total = workgroup * lines,
             line_base_fn = wgsl_line_base_fn(config.rank, config.axis, config.dims),
@@ -286,6 +399,7 @@ fn emit_register_stages(
     direction: FftDirection,
     precision: AxisPrecision,
     twiddle: &str,
+    switch: Option<MappingSwitch>,
 ) -> (usize, usize) {
     let RegisterLayout {
         n,
@@ -358,6 +472,7 @@ fn emit_register_stages(
                 exchange,
             },
             &|value, _| value.to_owned(),
+            switch.filter(|_| index + 2 == radices.len()),
         );
         previous = span;
     }
@@ -424,6 +539,7 @@ pub(crate) fn generate_register_bluestein_wgsl(
         FftDirection::Forward,
         precision,
         "twiddle_forward",
+        None,
     );
     let radices = &schedule.radices;
     emit_exchange(
@@ -439,6 +555,7 @@ pub(crate) fn generate_register_bluestein_wgsl(
             exchange: layout.exchange,
         },
         &|value, position| format!("c_mul({value}, bfft[{position}])"),
+        None,
     );
     let (inverse_last, previous) = emit_register_stages(
         &mut body,
@@ -447,6 +564,7 @@ pub(crate) fn generate_register_bluestein_wgsl(
         FftDirection::Inverse,
         precision,
         "twiddle_inverse",
+        None,
     );
     // The inverse FFT is unnormalized: fold 1/M into the output scale.
     let scale = precision.format_wgsl_scalar(key.scale_factor() / m as f64);
@@ -554,6 +672,16 @@ fn thread_offset(offset: usize) -> String {
     }
 }
 
+/// WGSL moving an invocation of a transposing kernel between the line
+/// mappings of its load and store sides (see [`generate_register_fft_wgsl`]).
+/// The exchange it applies to writes each round from the load side's
+/// mapping and reads it into the store side's.
+#[derive(Clone, Copy)]
+struct MappingSwitch {
+    to_load: &'static str,
+    to_store: &'static str,
+}
+
 #[derive(Clone, Copy)]
 struct ExchangeGeometry {
     n: usize,
@@ -640,6 +768,7 @@ fn emit_exchange(
     stage: usize,
     geometry: ExchangeGeometry,
     write_value: &dyn Fn(&str, &str) -> String,
+    switch: Option<MappingSwitch>,
 ) {
     let ExchangeGeometry {
         workgroup,
@@ -702,6 +831,9 @@ fn emit_exchange(
     let mask = exchange - 1;
     for round in 0..geometry.n / exchange {
         let offset = round * exchange;
+        if let Some(switch) = switch.filter(|_| round > 0) {
+            body.push_str(switch.to_load);
+        }
         emit_round(
             body,
             &writes,
@@ -729,6 +861,9 @@ fn emit_exchange(
             false,
         );
         body.push_str("  workgroupBarrier();\n");
+        if let Some(switch) = switch {
+            body.push_str(switch.to_store);
+        }
         emit_round(
             body,
             &reads,
@@ -1115,6 +1250,7 @@ mod tests {
             },
             &schedule,
             8,
+            None,
         );
         assert!(wgsl.contains("@compute @workgroup_size(512, 1, 1)"));
         assert!(wgsl.contains("var<workgroup> exchange: array<vec2<f32>, 4096>;"));
@@ -1122,6 +1258,87 @@ mod tests {
         assert!(wgsl.contains("let t: u32 = lid.x / LINES;"));
         assert!(wgsl.contains("if (exchangeLine < lineCount) {"));
         crate::runtime::assert_workgroup_var_written_before_read(&wgsl, "exchange");
+    }
+
+    #[test]
+    fn split_passes_twiddle_and_transpose_on_store() {
+        let vulkan = limits(1024, 48 * 1024);
+        let n = 1 << 21;
+        // Viewed as n2 + 1024 * n1: the first pass transforms 2048-point lines
+        // at stride 1024 and applies the split twiddle on store.
+        let (workgroup, schedule) =
+            register_schedule_for_lines(2048, 8, AxisPrecision::F32, &vulkan).unwrap();
+        let first = generate_register_fft_wgsl(
+            &FusedPow2StageWgslConfig {
+                rank: 2,
+                axis: 1,
+                dims: &[1024, 2048],
+                axis_length: 2048,
+                stride_complex: 1024,
+                direction: FftDirection::Forward,
+                workgroup_size: workgroup,
+                apply_scale: false,
+                scale_factor: 1.0,
+                precision: AxisPrecision::F32,
+            },
+            &schedule,
+            8,
+            Some(&SplitPass {
+                full_length: n,
+                twiddle_scale: 1024,
+                row_twiddle: Some((1024, 1)),
+                output: None,
+            }),
+        );
+        assert!(first.contains("let row: u32 = (outLine / 1u) % 1024u;"));
+        assert!(
+            first.contains("dst[baseOut + t * STRIDE_OUT] = c_mul(y2_0, twiddle_full(row * t));")
+        );
+        assert!(first.contains("fn twiddle_full(index: u32)"));
+        assert!(!first.contains("loadT"));
+        crate::runtime::assert_workgroup_var_written_before_read(&first, "exchange");
+
+        // The second transforms contiguous 1024-point lines and stores element
+        // k2 of line k1 at k1 + 2048 * k2: it loads line-major and stores
+        // element-major, switching at its last exchange.
+        let (workgroup, schedule) =
+            register_schedule_for_lines(1024, 4, AxisPrecision::F32, &vulkan).unwrap();
+        assert_eq!(workgroup, 256);
+        assert_eq!(schedule.exchange_len, 1024);
+        let second = generate_register_fft_wgsl(
+            &FusedPow2StageWgslConfig {
+                rank: 2,
+                axis: 0,
+                dims: &[1024, 2048],
+                axis_length: 1024,
+                stride_complex: 1,
+                direction: FftDirection::Forward,
+                workgroup_size: workgroup,
+                apply_scale: true,
+                scale_factor: 0.5,
+                precision: AxisPrecision::F32,
+            },
+            &schedule,
+            4,
+            Some(&SplitPass {
+                full_length: n,
+                twiddle_scale: 2048,
+                row_twiddle: None,
+                output: Some((vec![2048, 1024], 1)),
+            }),
+        );
+        assert!(second.contains("let loadLine: u32 = lid.x / LINE_INVOCATIONS;"));
+        assert!(second.contains("let storeLine: u32 = lid.x % LINES;"));
+        assert!(second.contains("var t: u32 = loadT;"));
+        // One exchange round each for the two exchanges; only the last
+        // switches, before its read.
+        assert_eq!(second.matches("t = storeT;").count(), 1);
+        assert!(!second.contains("t = loadT;"));
+        assert!(second.contains("const LINE_XOR: u32 = 4u;"));
+        assert!(second.contains("const STRIDE_OUT: u32 = 2048u;"));
+        assert!(second.contains("dst[baseOut + t * STRIDE_OUT] = y2_0 * vec2<f32>(0.5, 0.5);"));
+        assert!(!second.contains("twiddle_full"));
+        crate::runtime::assert_workgroup_var_written_before_read(&second, "exchange");
     }
 
     fn wgsl_for(n: usize, invocations: u32, storage: u32, direction: FftDirection) -> String {
@@ -1142,6 +1359,7 @@ mod tests {
             },
             &schedule,
             1,
+            None,
         )
     }
 

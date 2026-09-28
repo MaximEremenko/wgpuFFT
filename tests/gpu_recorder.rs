@@ -1,7 +1,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 //! Opt-in GPU checks that executions recorded through one `FftRecorder`,
-//! sharing a compute pass, produce exactly what separate executions do.
+//! sharing a compute pass with each other and with the caller's own work,
+//! produce exactly what separate executions do.
 
 use std::mem::ManuallyDrop;
 use std::sync::mpsc;
@@ -76,6 +77,9 @@ async fn run_cases() {
         &[&windowed, &windowed],
         15 * 14 * 3 * 2,
     );
+
+    // A caller kernel in the shared pass and a caller copy between executions.
+    compare_caller_work(device, queue, &forward, &inverse, 64 * 32 * 2);
 }
 
 /// Runs `plans` in sequence, ping-ponging two buffers, once with separate
@@ -153,6 +157,95 @@ fn compare_real(
         assert!((value - original).abs() < 1e-4, "r2c/c2r round trip");
     }
     assert_eq!(separate, shared, "real: recorded output differs");
+}
+
+const SCALE_WGSL: &str = "
+@group(0) @binding(0) var<storage, read_write> data: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < arrayLength(&data)) {
+        data[id.x] = data[id.x] * 0.25 + 1.0;
+    }
+}
+";
+
+/// Runs a forward transform, a caller kernel over its output, a caller copy,
+/// and the inverse, once with the caller's work in its own pass and once
+/// through the recorder's `compute_pass` and `encoder`, and requires
+/// identical output.
+fn compare_caller_work(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    forward: &FftPlan,
+    inverse: &FftPlan,
+    floats: usize,
+) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpu_fft.test.recorder.scale"),
+        source: wgpu::ShaderSource::Wgsl(SCALE_WGSL.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("wgpu_fft.test.recorder.scale"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let input = test_signal(floats);
+    let bytes = (floats * 4) as u64;
+    let run = |shared: bool| {
+        let a = storage(device, floats);
+        let b = storage(device, floats);
+        let c = storage(device, floats);
+        queue.write_buffer(&a, 0, bytemuck::cast_slice(&input));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_fft.test.recorder.scale"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: b.as_entire_binding(),
+            }],
+        });
+        let scale = |pass: &mut wgpu::ComputePass<'_>| {
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups((floats as u32).div_ceil(64), 1, 1);
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        if shared {
+            let mut recorder = FftRecorder::new(&mut encoder);
+            forward.record(device, &mut recorder, &a, &b).unwrap();
+            scale(recorder.compute_pass());
+            recorder
+                .encoder()
+                .copy_buffer_to_buffer(&b, 0, &c, 0, bytes);
+            inverse.record(device, &mut recorder, &c, &a).unwrap();
+        } else {
+            forward
+                .execute_checked(device, &mut encoder, &a, &b)
+                .unwrap();
+            scale(&mut encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default()));
+            encoder.copy_buffer_to_buffer(&b, 0, &c, 0, bytes);
+            inverse
+                .execute_checked(device, &mut encoder, &c, &a)
+                .unwrap();
+        }
+        read_back(device, queue, encoder, &a, floats)
+    };
+    let separate = run(false);
+    let shared = run(true);
+    // The kernel adds 1 + i to every bin, which the normalized inverse turns
+    // into 1 + i at the first element.
+    for (index, (value, original)) in separate.iter().zip(&input).enumerate() {
+        let expected = original * 0.25 + if index < 2 { 1.0 } else { 0.0 };
+        assert!(
+            (value - expected).abs() < 1e-4,
+            "caller work: element {index} is {value}, expected {expected}"
+        );
+    }
+    assert_eq!(separate, shared, "caller work: recorded output differs");
 }
 
 fn storage(device: &wgpu::Device, floats: usize) -> wgpu::Buffer {

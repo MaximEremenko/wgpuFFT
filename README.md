@@ -59,7 +59,10 @@ drop(recorder); // ends the pass; the encoder records other commands again
 ```
 
 On an RTX 5090 this halves the time of a small forward and inverse pair (a
-64x64 pair takes 8 µs instead of 17 µs).
+64x64 pair takes 8 µs instead of 17 µs). Your own kernels can share the pass
+too: `recorder.compute_pass()` returns it for your dispatches (set your
+pipeline and bind groups each time, since executions change them), and
+`recorder.encoder()` ends it for copies and clears.
 
 `execute_in_place` and `record_in_place` transform one buffer, reading the
 input from its start and writing the output over it:

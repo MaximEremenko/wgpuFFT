@@ -20,7 +20,9 @@ First tagged release.
 - `CpuFftPlan`, a native CPU backend behind the default `cpu` feature, with the
   same configuration and buffer layouts, built on `rustfft` and `realfft`.
 - `FftRecorder`, which records several executions into one shared compute pass
-  (`FftPlan::record`, `record_views`, `record_logical_views`).
+  (`FftPlan::record`, `record_views`, `record_logical_views`). Its
+  `compute_pass` and `encoder` methods record the caller's own dispatches into
+  that pass, and copies or clears between executions.
 - In-place execution: `FftPlan::execute_in_place` and `record_in_place`
   transform one buffer. Most C2C plans run their kernels on it: each kernel
   stores the lines it loaded, or passes them through the plan's workspace.

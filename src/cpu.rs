@@ -25,7 +25,7 @@
 //! # Ok::<(), wgpu_fft::FftError>(())
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::num_complex::Complex;
@@ -38,6 +38,11 @@ use crate::plan::FftTransformKind;
 
 /// Work below this many elements per extra thread stays on the calling thread.
 const MIN_ELEMENTS_PER_WORKER: usize = 1 << 15;
+/// Contiguous lines at least this long, too few to keep every thread busy,
+/// run as a parallel four-step decomposition.
+const FOUR_STEP_MIN_LEN: usize = 1 << 15;
+/// Smallest factor of a four-step decomposition worth its extra passes.
+const FOUR_STEP_MIN_FACTOR: usize = 16;
 
 /// Host-memory FFT plan with the same configuration semantics and buffer
 /// layouts as [`FftPlan`](crate::FftPlan).
@@ -57,10 +62,18 @@ enum Kernels {
 }
 
 struct TypedKernels<T: FftNum> {
-    /// Complex transforms in execution order, each with the axis it runs on.
-    axes: Vec<(usize, Arc<dyn Fft<T>>)>,
+    /// Complex transforms in execution order.
+    axes: Vec<AxisKernel<T>>,
     real: RealKernel<T>,
     scale: T,
+}
+
+/// The transform of one axis.
+struct AxisKernel<T: FftNum> {
+    axis: usize,
+    fft: Arc<dyn Fft<T>>,
+    /// A parallel decomposition of long contiguous lines.
+    four_step: Option<FourStep<T>>,
 }
 
 enum RealKernel<T: FftNum> {
@@ -272,6 +285,57 @@ impl CpuFftPlan {
         }
     }
 
+    /// Executes an `F32` or `Df64` complex-to-complex plan in place on `f32`
+    /// words, which hold the input and receive the output.
+    ///
+    /// `F64` plans must use [`Self::execute_in_place_f64`]; real transforms
+    /// change the element count and cannot run in place.
+    pub fn execute_in_place(&self, data: &mut [f32]) -> Result<()> {
+        self.check_in_place(data.len())?;
+        match (&self.kernels, self.config.precision()) {
+            (Kernels::F32(kernels), _) => {
+                kernels.run_in_place(self.config.shape(), data);
+                Ok(())
+            }
+            (Kernels::F64(kernels), FftPrecision::Df64) => {
+                let input = data.to_vec();
+                kernels.run_df64_c2c(self.config.shape(), &input, data);
+                Ok(())
+            }
+            (Kernels::F64(_), requested) => Err(FftError::PrecisionUnsupported {
+                requested,
+                route: "cpu",
+                reason: "f64-plans-execute-with-execute_in_place_f64",
+            }),
+        }
+    }
+
+    /// Executes an `F64` complex-to-complex plan in place on `f64` words.
+    pub fn execute_in_place_f64(&self, data: &mut [f64]) -> Result<()> {
+        self.check_in_place(data.len())?;
+        match (&self.kernels, self.config.precision()) {
+            (Kernels::F64(kernels), FftPrecision::F64) => {
+                kernels.run_in_place(self.config.shape(), data);
+                Ok(())
+            }
+            (_, requested) => Err(FftError::PrecisionUnsupported {
+                requested,
+                route: "cpu",
+                reason: "execute_in_place_f64-requires-an-f64-plan",
+            }),
+        }
+    }
+
+    fn check_in_place(&self, len: usize) -> Result<()> {
+        if self.kind != FftTransformKind::C2c {
+            return Err(FftError::InPlaceUnsupported {
+                route: "cpu",
+                reason: "real-transforms-change-the-element-count",
+            });
+        }
+        self.check_lengths(len, len)
+    }
+
     fn packed(&self) -> &[usize] {
         self.packed_shape.as_deref().unwrap_or(&[])
     }
@@ -308,7 +372,17 @@ impl<T: FftNum + bytemuck::Pod> TypedKernels<T> {
         let mut planner = FftPlanner::<T>::new();
         let axes = axes
             .iter()
-            .map(|&axis| (axis, planner.plan_fft(shape[axis], direction)))
+            .map(|&axis| {
+                let len = shape[axis];
+                let contiguous = shape[..axis].iter().product::<usize>() == 1;
+                AxisKernel {
+                    axis,
+                    fft: planner.plan_fft(len, direction),
+                    four_step: contiguous
+                        .then(|| FourStep::new(len, direction, &mut planner))
+                        .flatten(),
+                }
+            })
             .collect();
         Self { axes, real, scale }
     }
@@ -324,10 +398,8 @@ impl<T: FftNum + bytemuck::Pod> TypedKernels<T> {
     ) {
         match kind {
             FftTransformKind::C2c => {
-                output.copy_from_slice(input);
-                let data: &mut [Complex<T>] = bytemuck::cast_slice_mut(output);
-                self.transform_axes(data, shape);
-                scale_all(data, self.scale);
+                copy_parallel(input, output);
+                self.run_in_place(shape, output);
             }
             FftTransformKind::R2c => {
                 let data: &mut [Complex<T>] = bytemuck::cast_slice_mut(output);
@@ -344,10 +416,25 @@ impl<T: FftNum + bytemuck::Pod> TypedKernels<T> {
         }
     }
 
+    /// Runs a complex-to-complex plan on `data` in place.
+    fn run_in_place(&self, shape: &[usize], data: &mut [T]) {
+        let data: &mut [Complex<T>] = bytemuck::cast_slice_mut(data);
+        self.transform_axes(data, shape);
+        scale_all(data, self.scale);
+    }
+
     fn transform_axes(&self, data: &mut [Complex<T>], shape: &[usize]) {
-        let mut work = Vec::new();
-        for (axis, fft) in &self.axes {
-            transform_axis(data, shape, *axis, fft.as_ref(), &mut work);
+        for kernel in &self.axes {
+            let len = shape[kernel.axis];
+            match &kernel.four_step {
+                // Too few lines to keep every thread busy: split each line.
+                Some(four_step) if data.len() / len < worker_count(data.len()) => {
+                    for line in data.chunks_exact_mut(len) {
+                        four_step.run(line);
+                    }
+                }
+                _ => transform_axis(data, shape, kernel.axis, kernel.fft.as_ref()),
+            }
         }
     }
 
@@ -433,14 +520,12 @@ fn direction_name(direction: FftDirection) -> &'static str {
     }
 }
 
-/// Transforms every line of `axis`, using `work` to make strided lines
-/// contiguous.
+/// Transforms every line of `axis` in place.
 fn transform_axis<T: FftNum>(
     data: &mut [Complex<T>],
     shape: &[usize],
     axis: usize,
     fft: &dyn Fft<T>,
-    work: &mut Vec<Complex<T>>,
 ) {
     let len = shape[axis];
     if len == 1 {
@@ -450,33 +535,256 @@ fn transform_axis<T: FftNum>(
     let inner = shape[..axis].iter().product::<usize>();
     if inner == 1 {
         process_lines(data, len, fft);
+    } else {
+        transform_strided(data, len, inner, fft, None);
+    }
+}
+
+/// Called with the column index and the transformed line of every column
+/// of a strided transform.
+type ColumnHook<'a, T> = &'a (dyn Fn(usize, &mut [Complex<T>]) + Sync);
+
+/// Transforms, in place, the lines of `data` viewed as `[outer][len][inner]`
+/// along its middle dimension.
+///
+/// Tiles of neighbouring columns are gathered into a contiguous buffer,
+/// transformed together, and written back, so no transposed copy of the
+/// data is needed. With enough blocks, each thread takes whole blocks;
+/// otherwise each thread takes a range of columns of every row.
+fn transform_strided<T: FftNum>(
+    data: &mut [Complex<T>],
+    len: usize,
+    inner: usize,
+    fft: &dyn Fft<T>,
+    hook: Option<ColumnHook<'_, T>>,
+) {
+    let block = len * inner;
+    let outer = data.len() / block;
+    let workers = worker_count(data.len());
+    if workers <= 1 || outer >= workers {
+        for_each_chunk_group(data, block, |_, blocks| {
+            let mut tile = Tile::new(len, fft);
+            for block in blocks.chunks_exact_mut(block) {
+                let mut rows = block.chunks_exact_mut(inner).collect::<Vec<_>>();
+                tile.transform_columns(&mut rows, 0, hook);
+            }
+        });
         return;
     }
+    let tile_width = tile_width::<T>();
+    let width = inner.div_ceil(workers).div_ceil(tile_width) * tile_width;
+    let parts = inner.div_ceil(width);
+    let mut columns = (0..parts)
+        .map(|_| Vec::with_capacity(outer * len))
+        .collect::<Vec<_>>();
+    for row in data.chunks_exact_mut(inner) {
+        let mut rest = row;
+        for part in &mut columns {
+            let count = width.min(rest.len());
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(count);
+            part.push(head);
+            rest = tail;
+        }
+    }
+    std::thread::scope(|scope| {
+        for (part, mut rows) in columns.into_iter().enumerate() {
+            scope.spawn(move || {
+                let mut tile = Tile::new(len, fft);
+                for block_rows in rows.chunks_exact_mut(len) {
+                    tile.transform_columns(block_rows, part * width, hook);
+                }
+            });
+        }
+    });
+}
 
-    // View the data as [outer][len][inner] and transpose each block to
-    // [outer][inner][len] so every line is contiguous.
-    let block = len * inner;
-    work.resize(data.len(), Complex::zero());
-    let source: &[Complex<T>] = data;
-    for_each_chunk_group(work, len, |first_line, lines| {
-        for (index, line) in lines.chunks_exact_mut(len).enumerate() {
-            let line_index = first_line + index;
-            let base = (line_index / inner) * block + line_index % inner;
-            for (n, value) in line.iter_mut().enumerate() {
-                *value = source[base + n * inner];
+/// Complex values per row that one tile gathers: 256 bytes, so every row
+/// contributes whole cache lines.
+fn tile_width<T>() -> usize {
+    (256 / std::mem::size_of::<Complex<T>>()).max(1)
+}
+
+/// A thread's buffers for transforming strided lines through tiles.
+struct Tile<'a, T: FftNum> {
+    fft: &'a dyn Fft<T>,
+    len: usize,
+    lines: Vec<Complex<T>>,
+    scratch: Vec<Complex<T>>,
+}
+
+impl<'a, T: FftNum> Tile<'a, T> {
+    fn new(len: usize, fft: &'a dyn Fft<T>) -> Self {
+        Self {
+            fft,
+            len,
+            lines: vec![Complex::zero(); tile_width::<T>() * len],
+            scratch: vec![Complex::zero(); fft.get_inplace_scratch_len()],
+        }
+    }
+
+    /// Transforms every column of `rows` in place, one line per column over
+    /// the `len` rows; `first` is the index of the first column, for `hook`.
+    fn transform_columns(
+        &mut self,
+        rows: &mut [&mut [Complex<T>]],
+        first: usize,
+        hook: Option<ColumnHook<'_, T>>,
+    ) {
+        let len = self.len;
+        let width = rows.first().map_or(0, |row| row.len());
+        let mut column = 0;
+        while column < width {
+            let count = tile_width::<T>().min(width - column);
+            let lines = &mut self.lines[..count * len];
+            for (n, row) in rows.iter().enumerate() {
+                for (t, &value) in row[column..column + count].iter().enumerate() {
+                    lines[t * len + n] = value;
+                }
+            }
+            self.fft.process_with_scratch(lines, &mut self.scratch);
+            if let Some(hook) = hook {
+                for (t, line) in lines.chunks_exact_mut(len).enumerate() {
+                    hook(first + column + t, line);
+                }
+            }
+            for (n, row) in rows.iter_mut().enumerate() {
+                for (t, value) in row[column..column + count].iter_mut().enumerate() {
+                    *value = lines[t * len + n];
+                }
+            }
+            column += count;
+        }
+    }
+}
+
+/// A long line of `rows * columns` points transformed as a matrix, row
+/// `n1` holding points `n1 * columns..(n1 + 1) * columns`: a transform of
+/// every column, twiddles, a transform of every row, and a transpose. Each
+/// step runs on every thread.
+struct FourStep<T: FftNum> {
+    len: usize,
+    rows: usize,
+    columns: usize,
+    /// Transforms a column: `rows` points.
+    column_fft: Arc<dyn Fft<T>>,
+    /// Transforms a row: `columns` points.
+    row_fft: Arc<dyn Fft<T>>,
+    /// The twiddle `w^e` is `coarse[e >> shift] * fine[e & mask]`.
+    coarse: Vec<Complex<f64>>,
+    fine: Vec<Complex<f64>>,
+    shift: u32,
+    /// The transpose buffer, kept between executions.
+    work: Mutex<Vec<Complex<T>>>,
+}
+
+impl<T: FftNum> FourStep<T> {
+    /// Splits `len` into its two factors closest to its square root, if
+    /// neither is small.
+    fn new(
+        len: usize,
+        direction: rustfft::FftDirection,
+        planner: &mut FftPlanner<T>,
+    ) -> Option<Self> {
+        if len < FOUR_STEP_MIN_LEN {
+            return None;
+        }
+        let mut rows = (len as f64).sqrt() as usize;
+        while rows > 1 && !len.is_multiple_of(rows) {
+            rows -= 1;
+        }
+        if rows < FOUR_STEP_MIN_FACTOR {
+            return None;
+        }
+        let columns = len / rows;
+        let sign = match direction {
+            rustfft::FftDirection::Forward => -1.0,
+            rustfft::FftDirection::Inverse => 1.0,
+        };
+        let root = |exponent: usize| {
+            let angle = sign * std::f64::consts::TAU * exponent as f64 / len as f64;
+            Complex::new(angle.cos(), angle.sin())
+        };
+        let shift = (usize::BITS - len.leading_zeros()).div_ceil(2);
+        let fine = (0..1usize << shift).map(root).collect();
+        let coarse = (0..=(len - 1) >> shift)
+            .map(|high| root(high << shift))
+            .collect();
+        Some(Self {
+            len,
+            rows,
+            columns,
+            column_fft: planner.plan_fft(rows, direction),
+            row_fft: planner.plan_fft(columns, direction),
+            coarse,
+            fine,
+            shift,
+            work: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Transforms one line in place.
+    fn run(&self, line: &mut [Complex<T>]) {
+        let (rows, columns) = (self.rows, self.columns);
+        // Column n2 holds Y[k1] after its transform; scale it by w^(n2 * k1).
+        let twiddle = |column: usize, values: &mut [Complex<T>]| {
+            let mut exponent = 0;
+            for value in values {
+                let w = self.coarse[exponent >> self.shift]
+                    * self.fine[exponent & ((1 << self.shift) - 1)];
+                let w = Complex::new(
+                    T::from_f64(w.re).expect("twiddles are finite"),
+                    T::from_f64(w.im).expect("twiddles are finite"),
+                );
+                *value = *value * w;
+                exponent += column;
+                if exponent >= self.len {
+                    exponent -= self.len;
+                }
+            }
+        };
+        transform_strided(
+            line,
+            rows,
+            columns,
+            self.column_fft.as_ref(),
+            Some(&twiddle),
+        );
+        process_lines(line, columns, self.row_fft.as_ref());
+        // Row k1 holds X[k1 + rows * k2] at column k2: transpose.
+        let mut work = self
+            .work
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if work.len() != self.len {
+            *work = vec![Complex::zero(); self.len];
+        }
+        transpose(line, rows, columns, &mut work);
+        copy_parallel(&work, line);
+    }
+}
+
+/// Writes `source`, viewed as `[rows][columns]`, into `target` as
+/// `[columns][rows]`, in tiles that keep both sides in cache.
+fn transpose<T: Copy + Send + Sync>(source: &[T], rows: usize, columns: usize, target: &mut [T]) {
+    const TILE: usize = 32;
+    for_each_chunk_group(target, rows, |first, chunk| {
+        let count = chunk.len() / rows;
+        for start in (0..count).step_by(TILE) {
+            let tile = TILE.min(count - start);
+            for row in 0..rows {
+                let values = &source[row * columns + first + start..][..tile];
+                for (offset, &value) in values.iter().enumerate() {
+                    chunk[(start + offset) * rows + row] = value;
+                }
             }
         }
     });
-    process_lines(work, len, fft);
-    let lines: &[Complex<T>] = work;
-    for_each_chunk_group(data, inner, |first_row, rows| {
-        for (index, row) in rows.chunks_exact_mut(inner).enumerate() {
-            let row_index = first_row + index;
-            let (outer, n) = (row_index / len, row_index % len);
-            for (j, value) in row.iter_mut().enumerate() {
-                *value = lines[(outer * inner + j) * len + n];
-            }
-        }
+}
+
+/// Copies `input` into `output` on several threads for large inputs.
+fn copy_parallel<T: Copy + Send + Sync>(input: &[T], output: &mut [T]) {
+    for_each_chunk_group(output, 1, |first, chunk| {
+        chunk.copy_from_slice(&input[first..first + chunk.len()]);
     });
 }
 
@@ -811,5 +1119,119 @@ mod tests {
             CpuFftPlan::c2c(FftConfig::new(0)).err(),
             Some(FftError::ZeroLength)
         );
+    }
+
+    /// Transforms every selected axis line by line with rustfft, as a
+    /// reference for the tiled, split, and four-step paths.
+    fn line_by_line(values: &[Complex<f64>], config: &FftConfig) -> Vec<Complex<f64>> {
+        let shape = config.shape();
+        let direction = match config.direction() {
+            FftDirection::Forward => rustfft::FftDirection::Forward,
+            FftDirection::Inverse => rustfft::FftDirection::Inverse,
+        };
+        let mut data = values.to_vec();
+        let total = shape.iter().product::<usize>();
+        let mut planner = FftPlanner::<f64>::new();
+        for &axis in config.axes() {
+            let len = shape[axis];
+            let inner = shape[..axis].iter().product::<usize>();
+            let fft = planner.plan_fft(len, direction);
+            let mut line = vec![Complex::zero(); len];
+            for transform in data.chunks_exact_mut(total) {
+                for outer in 0..total / (len * inner) {
+                    for column in 0..inner {
+                        let base = outer * len * inner + column;
+                        for (n, value) in line.iter_mut().enumerate() {
+                            *value = transform[base + n * inner];
+                        }
+                        fft.process(&mut line);
+                        for (n, value) in line.iter().enumerate() {
+                            transform[base + n * inner] = *value;
+                        }
+                    }
+                }
+            }
+        }
+        let scale = config.scale_f64().unwrap();
+        data.iter().map(|value| value * scale).collect()
+    }
+
+    fn large_configs() -> Vec<FftConfig> {
+        vec![
+            // Few blocks: threads split the columns of every row.
+            FftConfig::new_nd([512, 400]),
+            FftConfig::inverse_nd([300, 700]),
+            // Blocks per thread on the middle axis, columns on the last.
+            FftConfig::new_nd([64, 48, 40]).with_batch(3),
+            FftConfig::new_nd([40, 64, 48]).with_axes([2, 0]),
+            // Long lines: the four-step decomposition.
+            FftConfig::new(100_000),
+            FftConfig::inverse(98_304).with_batch(2),
+            FftConfig::new_nd([70_000, 3]).with_axes([0]),
+            // A prime length keeps one transform per line.
+            FftConfig::new(65_537),
+        ]
+    }
+
+    #[test]
+    fn tiled_split_and_four_step_paths_match_a_line_by_line_transform() {
+        for config in large_configs() {
+            let total = config.total_complex_len().unwrap();
+            let values = (0..total)
+                .map(|index| {
+                    let x = index as f64;
+                    Complex::new((x * 0.37).sin() + 0.25, (x * 0.11).cos() - 0.5)
+                })
+                .collect::<Vec<_>>();
+            let expected = line_by_line(&values, &config);
+            let peak = expected.iter().fold(0.0f64, |m, v| m.max(v.norm()));
+
+            let plan = CpuFftPlan::c2c(config.clone().with_precision(FftPrecision::F64)).unwrap();
+            let input = values.iter().flat_map(|v| [v.re, v.im]).collect::<Vec<_>>();
+            let mut output = vec![0.0f64; input.len()];
+            plan.execute_f64(&input, &mut output).unwrap();
+            let mut in_place = input.clone();
+            plan.execute_in_place_f64(&mut in_place).unwrap();
+            assert_eq!(output, in_place, "{config:?}: in place differs");
+            let worst = output
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(&expected)
+                .map(|(&[re, im], e)| (Complex::new(re, im) - e).norm())
+                .fold(0.0f64, f64::max);
+            assert!(worst <= 1e-12 * peak, "f64 {config:?}: {worst} of {peak}");
+
+            let plan = CpuFftPlan::c2c(config.clone()).unwrap();
+            let input = input.iter().map(|&v| v as f32).collect::<Vec<_>>();
+            let mut output = vec![0.0f32; input.len()];
+            plan.execute(&input, &mut output).unwrap();
+            let worst = output
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(&expected)
+                .map(|(&[re, im], e)| (Complex::new(f64::from(re), f64::from(im)) - e).norm())
+                .fold(0.0f64, f64::max);
+            assert!(worst <= 2e-5 * peak, "f32 {config:?}: {worst} of {peak}");
+        }
+    }
+
+    #[test]
+    fn real_plans_cannot_run_in_place() {
+        let plan = CpuFftPlan::r2c(FftConfig::new(8)).unwrap();
+        assert!(matches!(
+            plan.execute_in_place(&mut [0.0; 8]),
+            Err(FftError::InPlaceUnsupported { .. })
+        ));
+        let plan = CpuFftPlan::c2c(FftConfig::new(8)).unwrap();
+        assert!(matches!(
+            plan.execute_in_place(&mut [0.0; 12]),
+            Err(FftError::HostBufferLength { .. })
+        ));
+        assert!(matches!(
+            plan.execute_in_place_f64(&mut [0.0; 16]),
+            Err(FftError::PrecisionUnsupported { .. })
+        ));
     }
 }

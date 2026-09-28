@@ -19,6 +19,8 @@ First tagged release.
 - WebAssembly support on the browser WebGPU backend.
 - `CpuFftPlan`, a native CPU backend behind the default `cpu` feature, with the
   same configuration and buffer layouts, built on `rustfft` and `realfft`.
+  `execute_in_place` and `execute_in_place_f64` transform C2C data in one
+  buffer.
 - `FftRecorder`, which records several executions into one shared compute pass
   (`FftPlan::record`, `record_views`, `record_logical_views`). Its
   `compute_pass` and `encoder` methods record the caller's own dispatches into
@@ -150,6 +152,13 @@ First tagged release.
   points 0.017 ms instead of 0.026 ms, 2^20 0.025 ms instead of 0.045 ms,
   2^21 0.049 ms instead of 0.089 ms, 2^24 0.78 ms instead of 1.09 ms, and
   65536-point lines batched 64 times 0.079 ms instead of 0.100 ms.
+- The CPU backend transforms strided axes in place: threads gather tiles of
+  neighbouring columns, transform them, and write them back, taking whole
+  blocks or a range of columns of every row, instead of transposing the whole
+  array twice. Long lines too few to keep every thread busy run as a parallel
+  four-step decomposition, and inputs are copied on every thread. A 256^3
+  transform runs about four times faster, 2048x2048 about three times, and a
+  single 2,000,000-point line about twice as fast.
 
 ### Fixed
 

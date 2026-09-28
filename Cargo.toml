@@ -47,3 +47,8 @@ harness = false
 [[test]]
 name = "gpu_long_axes"
 required-features = ["cpu"]
+
+[[bench]]
+name = "cpu_fft_bench"
+harness = false
+required-features = ["cpu"]

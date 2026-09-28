@@ -93,6 +93,11 @@ pub enum FftError {
         expected: usize,
         actual: usize,
     },
+    /// The plan cannot transform one buffer in place.
+    InPlaceUnsupported {
+        route: &'static str,
+        reason: &'static str,
+    },
     BufferViewEmptySegments,
     BufferSegmentZeroSize {
         index: usize,
@@ -356,6 +361,9 @@ impl fmt::Display for FftError {
                 f,
                 "FFT host {buffer} buffer has {actual} scalar words, expected {expected}"
             ),
+            Self::InPlaceUnsupported { route, reason } => {
+                write!(f, "FFT {route} plan cannot run in place: {reason}")
+            }
             Self::BufferViewEmptySegments => {
                 write!(f, "FFT buffer view must contain at least one segment")
             }
@@ -640,6 +648,11 @@ impl FftError {
                     .with_route("cpu")
                     .with_stage("host-buffer")
                     .with_layout(*buffer)
+            }
+            Self::InPlaceUnsupported { route, .. } => {
+                FftBlocker::new(FftBlockerKind::Validation, self.to_string())
+                    .with_route(*route)
+                    .with_stage("in-place")
             }
             Self::BufferViewEmptySegments => {
                 FftBlocker::new(FftBlockerKind::Layout, self.to_string())

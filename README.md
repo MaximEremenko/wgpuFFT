@@ -201,9 +201,11 @@ host memory for machines without a usable GPU adapter. It takes the same
 `FftConfig` and uses the same layouts as the GPU plans: interleaved complex
 values, `[re_hi, re_lo, im_hi, im_lo]` for `df64`, and the packed real
 spectrum. It is built on `rustfft` and `realfft` (AVX, SSE, or NEON where the
-CPU supports them) and splits large transforms across CPU threads. C2C plans
-support every precision, with `df64` computed in native `f64`; real transforms
-support `f32` and `f64`.
+CPU supports them) and splits large transforms across CPU threads: strided
+axes are transformed in place through tiles of neighbouring columns, and long
+single lines through a four-step decomposition. C2C plans support every
+precision, with `df64` computed in native `f64`; real transforms support
+`f32` and `f64`.
 
 ```rust
 use wgpu_fft::{CpuFftPlan, FftConfig};
@@ -214,8 +216,10 @@ let mut output = vec![0.0f32; plan.required_output_len()];
 plan.execute(&input, &mut output)?;
 ```
 
-`F64` plans execute with `execute_f64` on `f64` slices. Build with
-`default-features = false` to leave the CPU backend out of GPU-only builds.
+`F64` plans execute with `execute_f64` on `f64` slices, and
+`execute_in_place` / `execute_in_place_f64` transform C2C data in one buffer.
+Build with `default-features = false` to leave the CPU backend out of
+GPU-only builds.
 
 ## Precision
 

@@ -55,9 +55,9 @@ First tagged release.
 - Bluestein axes whose convolution does not fit workgroup memory, and Rader
   primes in the same position, run as one register-resident kernel for
   convolutions up to 16384 points (`f32`): over 1 GiB, N=3256 takes 7.4 ms
-  instead of 79.5 ms and N=4093 6.5 ms instead of 84 ms;
-  6841x6841 takes 7.5 ms instead of 30 ms. Lines of 16384
-  points keep 32 values per invocation in 512 invocations.
+  instead of 79.5 ms and N=4093 6.5 ms instead of 84 ms; 6841x6841 takes
+  7.5 ms instead of 30 ms. Lines of 16384 points keep 32 values per
+  invocation in 512 invocations.
 - Rader's convolution is cyclic over `N - 1` points when that length is
   smooth, halving its FFTs: over 1 GiB, N=1009 takes 3.8 ms instead of 6.4 ms
   and N=2003 6.4 ms instead of 11.8 ms.
@@ -80,9 +80,9 @@ First tagged release.
 - Power-of-two `f32` lines of 16 to 512 points (64 when contiguous), and
   contiguous ones from 1024 points, run in register-resident kernels, which
   load straight into registers and pass through workgroup memory once per
-  radix-16 stage: 128x128x64 takes 32 µs instead of 58 µs and
-  1024x1024 29 µs instead of 39 µs. A non-default
-  `FftTuning::with_fused_workgroup_size` keeps the workgroup-memory kernels.
+  radix-16 stage: 128x128x64 takes 32 µs instead of 58 µs and 1024x1024
+  29 µs instead of 39 µs. A non-default `FftTuning::with_fused_workgroup_size`
+  keeps the workgroup-memory kernels.
 - Multi-line fused kernels issue all their global loads before storing any,
   and pad each line in workgroup memory by one element when neighbouring
   invocations touch neighbouring lines, avoiding bank conflicts.
@@ -114,18 +114,17 @@ First tagged release.
   reduces exactly in integers, and Taylor polynomials give its sine and
   cosine to about one ulp in plain `f32` arithmetic, so accuracy stays
   that of the table (the RMS error of 110 test transforms moved by 1% on
-  geometric mean). 1920x1080 takes 46 µs instead of 54 µs,
-  2560x1440 74 µs instead of 83 µs, 65536-point lines batched 64 times
-  0.10 ms instead of 0.18 ms, and 1048576-point lines 0.13 ms instead of
-  0.30 ms. Fused Rader and Bluestein convolutions of more than 2048 points,
-  whose invocations hold several butterflies per stage, keep the table.
+  geometric mean). 1920x1080 takes 46 µs instead of 54 µs, 2560x1440 74 µs
+  instead of 83 µs, 65536-point lines batched 64 times 0.10 ms instead of
+  0.18 ms, and 1048576-point lines 0.13 ms instead of 0.30 ms. Fused Rader
+  and Bluestein convolutions of more than 2048 points, whose invocations hold
+  several butterflies per stage, keep the table.
 - Primes whose `N - 1` has prime factors from 17 to 61 besides radices up
   to 13 convolve cyclically over `N - 1` points in the fused Rader kernel
   (`f32`), each such factor as one straight-line radix-p stage, when a line
   holds at least 36 of its butterflies and workgroup memory holds the line:
-  4241x4241 takes 2.3 ms instead of 5.2 ms, 1381x1381 130 µs
-  instead of 187 µs, and N=6121 batched 512 times 0.10 ms instead of
-  0.41 ms.
+  4241x4241 takes 2.3 ms instead of 5.2 ms, 1381x1381 130 µs instead of
+  187 µs, and N=6121 batched 512 times 0.10 ms instead of 0.41 ms.
 - Plan creation builds the filter spectra of Rader and Bluestein axes with
   an `f64` FFT instead of a plain DFT: an N=6841 plan takes 1.3 s instead
   of 4.6 s, including adapter start-up.
@@ -134,9 +133,9 @@ First tagged release.
   volume, instead of one kernel per axis (`FftTuning::fuse_small_volumes`):
   8x8x8 takes 3.6 µs instead of 10.2 µs, 31x31 6.2 µs instead of 8.5 µs,
   and 16x16x16 batched 256 times 15 µs instead of 32 µs. Larger smooth
-  volumes run their leading axes the same way over slabs that fit, then
-  the other axes in place: 32x32x32 takes 8.5 µs instead of 12.0 µs
-  and 32x16x16 7.1 µs instead of 10.2 µs.
+  volumes run their leading axes the same way over slabs that fit, then the
+  other axes in place: 32x32x32 takes 8.5 µs instead of 12.0 µs and 32x16x16
+  7.1 µs instead of 10.2 µs.
 - Axes too long for workgroup memory still run fused: contiguous
   power-of-two `f32` axes up to 16384 keep the line in registers in one
   kernel, and other long axes run as two fused passes (`N = N1 * N2`),

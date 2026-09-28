@@ -1,27 +1,52 @@
 # wgpuFFT
 
-Rust `wgpu` FFT library. The package name is `wgpu-fft`; the library target is
-imported as `wgpu_fft`. This is the Rust counterpart of the JavaScript
-[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project. The
-[wgpuNUFFT](https://github.com/MaximEremenko/wgpuNUFFT) project builds
-nonuniform transforms on this crate and pins it as a Git submodule.
+[![CI](https://github.com/MaximEremenko/wgpuFFT/actions/workflows/ci.yml/badge.svg)](https://github.com/MaximEremenko/wgpuFFT/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](Cargo.toml)
+
+GPU FFTs for Rust on `wgpu`: Vulkan, DX12, and Metal natively, and WebGPU in
+the browser. The package is `wgpu-fft`, imported as `wgpu_fft`. It is the Rust
+counterpart of the JavaScript
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) project, and
+[wgpuNUFFT](https://github.com/MaximEremenko/wgpuNUFFT) builds nonuniform FFTs
+on it.
+
+## Features
+
+- **Precisions**: complex-to-complex (C2C) transforms in `f32`, native `f64`
+  (Vulkan `SHADER_F64`), and portable double-float (`df64`), plus
+  real-to-complex and complex-to-real `f32` transforms.
+- **Any length and shape**: mixed radix (2, 3, 4, 5, 7, 8, 11, 13), Rader for
+  primes, and Bluestein for other lengths, over 1D and ND shapes, axis
+  subsets, and batches.
+- **Fast kernels**: fused single-workgroup and register-resident kernels
+  wherever a line fits.
+- **Large transforms**: batch chunking, axis and smooth decomposition, a
+  GPU-resident four-step, and segmented volumes across several buffers for
+  data beyond one storage binding.
+- **Your encoder, your buffers**: out-of-place and in-place execution, and
+  several transforms in one shared compute pass.
+- **Diagnostics**: structured errors, route diagnostics, validated per-plan
+  tuning, and pipeline-cache snapshots.
+- **CPU backend**: `CpuFftPlan` runs the same configurations and layouts on
+  the CPU.
 
 ## Installation
 
-This crate is intentionally kept GitHub-only and is not published on
-crates.io. Depend on a tagged release, together with the matching `wgpu`
-major version, because the public API takes `wgpu` types such as
-`&wgpu::Device` and `&wgpu::Buffer`:
+The crate is distributed through GitHub rather than crates.io. Depend on it
+together with the matching `wgpu` major version, because the API takes `wgpu`
+types such as `&wgpu::Device` and `&wgpu::Buffer`:
 
 ```toml
 [dependencies]
 wgpu = "30"
-wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT", tag = "v0.1.0" }
+wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT", branch = "main" }
 ```
 
-The default `cpu` feature adds the host-memory [CPU backend](#cpu-backend).
-The optional `serde` feature adds schema-versioned JSON persistence for
-pipeline-cache snapshots. The minimum supported Rust version is 1.92.
+`Cargo.lock` then pins the exact commit. The default `cpu` feature adds the
+[CPU backend](#cpu-backend), and the optional `serde` feature adds
+schema-versioned JSON persistence for pipeline-cache snapshots. The minimum
+supported Rust version is 1.92.
 
 ## Quick start
 
@@ -32,8 +57,8 @@ default GPU and falls back to the CPU backend when no adapter is available:
 cargo run --example quickstart
 ```
 
-A plan records its transform into your own command encoder, reading and
-writing caller-owned buffers of `plan.required_buffer_size_bytes()` bytes (input
+A plan records its transform into your command encoder, reading and writing
+your buffers of `plan.required_buffer_size_bytes()` bytes (input
 `STORAGE | COPY_DST`, output `STORAGE | COPY_SRC` to read results back):
 
 ```rust
@@ -44,8 +69,10 @@ plan.execute_checked(&gpu.device, &mut encoder, &input, &output)?;
 gpu.queue.submit([encoder.finish()]);
 ```
 
-`execute_checked` returns a structured error for undersized buffers or missing
-buffer usages; `execute` panics in those cases.
+`execute_checked` returns a structured error for undersized buffers or
+missing buffer usages; `execute` panics in those cases.
+
+### Sharing a compute pass
 
 Each `execute*` call opens and closes its own compute pass, which costs a few
 microseconds of GPU time. To run several transforms back to back, record them
@@ -58,11 +85,13 @@ inverse.record(&gpu.device, &mut recorder, &b, &a)?;
 drop(recorder); // ends the pass; the encoder records other commands again
 ```
 
-This halves the time of a small forward and inverse pair (a
-64x64 pair takes 8 µs instead of 17 µs). Your own kernels can share the pass
-too: `recorder.compute_pass()` returns it for your dispatches (set your
-pipeline and bind groups each time, since executions change them), and
+This halves the time of a small forward and inverse pair (a 64x64 pair takes
+8 µs instead of 17 µs). Your own kernels can share the pass too:
+`recorder.compute_pass()` returns it for your dispatches (set your pipeline
+and bind groups each time, since executions change them), and
 `recorder.encoder()` ends it for copies and clears.
+
+### In-place execution
 
 `execute_in_place` and `record_in_place` transform one buffer, reading the
 input from its start and writing the output over it:
@@ -71,17 +100,16 @@ input from its start and writing the output over it:
 plan.execute_in_place(&gpu.device, &mut encoder, &buffer)?;
 ```
 
-Most C2C plans run their kernels on the buffer itself, which keeps one
-buffer in the GPU's caches instead of two: a 4096x2048
-FFT+iFFT pair takes 0.165 ms in place instead of 0.248 ms out of place. R2C
-and C2R plans, and a few C2C routes, copy the input into a buffer they keep,
-so `buffer` then needs `COPY_SRC`; `supports_in_place()` reports which plans
-run in place without that copy.
+Most C2C plans run their kernels on the buffer itself, which keeps one buffer
+in the GPU's caches instead of two: a 4096x2048 FFT+iFFT pair takes 0.165 ms
+in place instead of 0.248 ms out of place. R2C and C2R plans, and a few C2C
+routes, copy the input into a buffer they keep, so `buffer` then needs
+`COPY_SRC`; `supports_in_place()` reports which plans run in place without
+that copy.
 
-This crate exposes a native Rust API for out-of-place and in-place
-complex-to-complex `f32`, native `f64`, and portable double-float (`df64`)
-transforms, plus real/packed-complex `f32` transforms, over 1D/ND shapes and
-batches. F32 and native-f64 C2C buffers are interleaved complex scalars:
+## Data layout
+
+F32 and native-f64 C2C buffers hold interleaved complex scalars:
 
 ```text
 [re0, im0, re1, im1, ...]
@@ -93,66 +121,78 @@ Df64 uses four `f32` words per complex element:
 [re_hi0, re_lo0, im_hi0, im_lo0, ...]
 ```
 
-R2C/C2R use the [WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT)
-packed-spectrum convention. For a logical real
-shape `[N0, ...]`, the packed complex shape is `[floor(N0 / 2) + 1, ...]`, also
-stored as interleaved complex values.
+R2C and C2R use the [WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT)
+packed-spectrum convention: a logical real shape `[N0, ...]` has the packed
+complex shape `[floor(N0 / 2) + 1, ...]`, also stored as interleaved complex
+values.
 
-Power-of-two axes and multi-stage smooth axes use a single-workgroup fused
-kernel when the complete line fits device workgroup storage (8 bytes per `f32`
-complex element or 16 bytes per native-`f64`/`df64` complex element) and 256
-invocations are supported by default. The fused workgroup size is tunable per
-plan. This covers mixed-radix
-lengths with radices `2, 3, 4, 5, 7, 8, 11, 13`. Longer contiguous
-power-of-two `f32` lines keep their elements in registers within one kernel,
-strided power-of-two axes interleave up to eight lines per workgroup in
-registers when workgroup memory holds fewer,
-other long axes run as two fused passes (`N = N1 * N2`, register-resident for
-power-of-two `f32` axes, the second storing transposed), and the remaining
-lines use generated Stockham stages. Prime `f32` axes up to 127 run a direct
-DFT kernel that pairs `X[k]` with `X[p - k]`. Other prime axes route through
-Rader, unsupported composite axes route through Bluestein convolution over a
-smooth internal length, and mixed-algorithm ND plans execute typed axis-sequence
-stage graphs. When a convolution does not fit workgroup memory, Bluestein runs
-its forward and inverse FFTs over a power-of-two length of up to 16384 points
-in registers within one kernel (`f32`), and Rader primes whose convolution does
-not fit use that kernel too. Rader convolves cyclically over `N - 1` points
-when that length is smooth, and over a zero-padded smooth length otherwise. The direct DFT compute kernel remains as a length-one fallback.
+## Algorithms
 
-Public `FftLogicalView` and `BufferView` execution APIs normalize whole-buffer,
-offset, segmented, strided, and segmented+strided logical input/output views for
-C2C, R2C, and C2R. Compatibility `FftIoView`/`BufferLayout` calls route through
-the same logical I/O path. The runtime uses a central `WindowScheduler` for
-storage bindings and copy windows, and stage graphs expose route kernels,
-helper windows, pack/unpack staging, large chunking, smooth decomposition,
-axis decomposition, and Rader/Bluestein bridge execution.
+Plans choose a route for every axis:
 
-Structured diagnostics are part of the public surface. `FftPlan::diagnostics()`
-summarizes the selected route graph, `diagnostics_for_device(...)` adds active
-device-limit blockers, `diagnostics_for_limits(...)` preflights an explicit
-`FftDeviceLimits` set, `diagnostics_for_views(...)`/`diagnostics_for_io_views(...)`
-cover compatibility `BufferView` and `FftIoView` callers,
-`diagnostics_for_views_with_workspace(...)`,
-`diagnostics_for_io_views_with_workspace(...)`, and
-`diagnostics_for_logical_views_with_workspace(...)` cover caller-owned
-workspace, and `diagnostics_for_logical_views(...)` or
-`diagnostics_for_logical_views_with_limits(...)` add endpoint layout, usage,
-alignment, staging, and copy-window blockers.
-Successful graph diagnostics include route-owned helper-buffer requirements
-derived from helper-window stages.
-Diagnostic plan constructors return `FftPlanCreationError` when planning fails,
-and checked execution APIs return `FftExecutionError`; both preserve the
-original `FftError` plus route, stage, layout, helper-buffer, and device-limit
-diagnostics.
+- **Smooth lengths** (radices 2, 3, 4, 5, 7, 8, 11, and 13) run in one fused
+  single-workgroup kernel when the whole line fits workgroup storage (8 bytes
+  per `f32` complex element, 16 bytes per native-`f64` or `df64` one) and the
+  device supports the fused workgroup size, 256 invocations by default and
+  tunable per plan.
+- **Long lines**: contiguous power-of-two `f32` lines keep their elements in
+  registers within one kernel. Strided power-of-two axes interleave up to
+  eight lines per workgroup in registers when workgroup memory holds fewer.
+  Other long axes run as two fused passes (`N = N1 * N2`, register-resident
+  for power-of-two `f32` axes, the second storing transposed), and the
+  remaining lines use generated Stockham stages.
+- **Primes**: `f32` axes up to 127 run a direct DFT kernel that pairs `X[k]`
+  with `X[p - k]`. Other prime axes use Rader's algorithm, which convolves
+  cyclically over `N - 1` points when that length is smooth, and over a
+  zero-padded smooth length otherwise.
+- **Other lengths** use Bluestein's convolution over a smooth internal length.
+  When a convolution does not fit workgroup memory, Bluestein runs its forward
+  and inverse FFTs over a power-of-two length of up to 16384 points in
+  registers within one kernel (`f32`), and Rader primes whose convolution does
+  not fit use that kernel too.
+- **Mixed ND plans** execute typed axis-sequence stage graphs. The direct DFT
+  compute kernel remains as a length-one fallback.
 
-A thread-local per-device internal cache reuses bind group layouts, pipeline
-layouts, shader modules, and compute pipelines for generated fused
-power-of-two, fused smooth-radix, and Stockham kernels, Rader/Bluestein helpers,
-real helpers, C2C/real layout helpers, smooth/strided helpers, and direct DFT
-pipelines. Typed in-memory cache snapshots can be exported and imported through
-`export_pipeline_cache_snapshot` and `import_pipeline_cache_snapshot`;
-entries that exceed the target device's fused-kernel compute limits or require
-an unavailable shader feature are skipped.
+## Views, diagnostics, and caching
+
+Public `FftLogicalView` and `BufferView` execution APIs normalize
+whole-buffer, offset, segmented, strided, and segmented+strided logical input
+and output views for C2C, R2C, and C2R. Compatibility `FftIoView` and
+`BufferLayout` calls route through the same logical I/O path. The runtime uses
+a central `WindowScheduler` for storage bindings and copy windows, and stage
+graphs expose route kernels, helper windows, pack and unpack staging, large
+chunking, smooth decomposition, axis decomposition, and Rader and Bluestein
+bridge execution.
+
+Structured diagnostics are part of the public API:
+
+- `FftPlan::diagnostics()` summarizes the selected route graph, including
+  route-owned helper-buffer requirements derived from helper-window stages.
+- `diagnostics_for_device(...)` adds active device-limit blockers, and
+  `diagnostics_for_limits(...)` preflights an explicit `FftDeviceLimits` set.
+- `diagnostics_for_views(...)` and `diagnostics_for_io_views(...)` cover
+  compatibility `BufferView` and `FftIoView` callers.
+- `diagnostics_for_views_with_workspace(...)`,
+  `diagnostics_for_io_views_with_workspace(...)`, and
+  `diagnostics_for_logical_views_with_workspace(...)` cover caller-owned
+  workspace.
+- `diagnostics_for_logical_views(...)` and
+  `diagnostics_for_logical_views_with_limits(...)` add endpoint layout, usage,
+  alignment, staging, and copy-window blockers.
+
+Diagnostic plan constructors return `FftPlanCreationError` when planning
+fails, and checked execution APIs return `FftExecutionError`; both preserve
+the original `FftError` plus route, stage, layout, helper-buffer, and
+device-limit diagnostics.
+
+A thread-local per-device cache reuses bind group layouts, pipeline layouts,
+shader modules, and compute pipelines for the generated fused power-of-two,
+fused smooth-radix, and Stockham kernels, the Rader and Bluestein helpers, the
+real, C2C layout, smooth, and strided helpers, and the direct DFT pipelines.
+`export_pipeline_cache_snapshot` and `import_pipeline_cache_snapshot` export
+and import typed in-memory snapshots of it; entries that exceed the target
+device's fused-kernel compute limits or need an unavailable shader feature
+are skipped.
 
 ## CPU backend
 
@@ -179,33 +219,28 @@ plan.execute(&input, &mut output)?;
 
 ## Precision
 
-- `FftPrecision::F32` uses native `f32` storage and arithmetic. It is the
-  default and is supported by every backend. Its kernels compute twiddles
-  rather than read a table: the angle reduces exactly in integers and
-  Taylor polynomials give its sine and cosine to about one ulp, in plain
-  `f32` arithmetic rather than the platform's `sin` and `cos`.
-- `FftPrecision::F64` uses native `f64` storage and arithmetic. The current
-  implementation targets Vulkan devices exposing `wgpu::Features::SHADER_F64`;
-  plan creation returns structured `PrecisionUnsupported` diagnostics when the
-  feature is unavailable.
-- `FftPrecision::Df64` represents each scalar as an unevaluated `hi + lo` pair
-  of `f32` words and uses pure-f32 WGSL. It needs no optional device features
-  and provides roughly 44-48 effective mantissa bits. Its exponent range is
-  still the `f32` range (approximately `1e-38` through `1e38`), and preservation
-  of subnormal low words is backend-dependent. Normal C2C mixed-radix, Rader,
-  Bluestein, batched/ND, and strided routes support df64; real transforms and
-  large execution routes remain structured-unsupported. Vulkan and DX12 exact
-  arithmetic canaries are tested. Metal's fast-math compiler
-  makes it the riskiest backend and it remains untested.
+| Precision | Arithmetic | Backends | Notes |
+|---|---|---|---|
+| `FftPrecision::F32` (default) | native `f32` | all | Twiddles are computed in plain `f32` arithmetic, not read from a table or taken from the platform's `sin` and `cos`: the angle reduces exactly in integers, and Taylor polynomials give its sine and cosine to about one ulp. |
+| `FftPrecision::F64` | native `f64` | Vulkan with `wgpu::Features::SHADER_F64` | Plan creation returns structured `PrecisionUnsupported` diagnostics when the feature is unavailable. |
+| `FftPrecision::Df64` | `hi + lo` pairs of `f32` words, pure-`f32` WGSL | all | About 44-48 effective mantissa bits with the `f32` exponent range (about `1e-38` to `1e38`). |
+
+Df64 needs no optional device feature. Preservation of its subnormal low
+words is backend-dependent. Normal C2C mixed-radix, Rader, Bluestein,
+batched and ND, and strided routes support df64; real transforms and the
+large execution routes return structured unsupported errors. Its exact
+arithmetic canaries pass on Vulkan and DX12. Metal, whose compiler enables
+fast math, is the riskiest backend and remains untested.
 
 ## Tuning
 
 Attach validated per-plan controls with
-`FftConfig::with_tuning(FftTuning::new()...)`. Defaults preserve the untuned
-planner. Invalid values, incompatible forced algorithms, device-limit
-violations, and infeasible forced routes return structured
-`FftError::InvalidTuning`; `FftPlan::diagnostics()` reports both requested and
-effective tuning. Limit overrides can only lower the adapter's real limits.
+`FftConfig::with_tuning(FftTuning::new()...)`. The defaults keep the untuned
+planner's choices. Invalid values, incompatible forced algorithms,
+device-limit violations, and infeasible forced routes return structured
+`FftError::InvalidTuning`, and `FftPlan::diagnostics()` reports both the
+requested and the effective tuning. Limit overrides can only lower the
+adapter's real limits.
 
 | Control | Default | Effect |
 |---|---:|---|
@@ -230,14 +265,14 @@ effective tuning. Limit overrides can only lower the adapter's real limits.
 The four-step swap thresholds change sequential window sizing; they do not
 create concurrent window rings or add FFT stages. There is no public
 normal-route coalescing-transpose threshold because that transpose route does
-not exist in the Rust implementation. The direct-DFT 64-lane workgroup and
+not exist in the Rust implementation. The direct-DFT 64-lane workgroup and the
 four-step 16x16 transpose tile are internal and are not changed by
-`workgroup_size`. FFT convolution is used internally by Rader/Bluestein but is
-not exposed as a public `fftconv`/`conv2d` API. Single-stage smooth-axis fusion
-also remains an internal route choice because it would not remove a global
-pass.
+`workgroup_size`. FFT convolution is used internally by Rader and Bluestein
+but is not exposed as a public `fftconv` or `conv2d` API. Single-stage
+smooth-axis fusion also remains an internal route choice, because it would
+not remove a global pass.
 
-## Current Scope
+## Current scope
 
 - C2C `f32` over 1D/ND shapes on native `wgpu` backends.
 - Native C2C `f64` over normal 1D/ND mixed-radix, Rader, Bluestein, and
@@ -260,8 +295,8 @@ pass.
 - `FftPlan::required_input_buffer_size_bytes()`,
   `required_output_buffer_size_bytes()`, `required_buffer_size_bytes()`, and
   `packed_shape()` for real-plan sizing.
-- Plan-owned temporary buffers for multi-stage, mixed-algorithm, real, and large
-  GPU routes.
+- Plan-owned temporary buffers for multi-stage, mixed-algorithm, real, and
+  large GPU routes.
 - Optional caller-owned C2C workspace buffer for routes that report nonzero
   `workspace_size_bytes()`.
 - Public `BufferView` for whole buffers, single slices, and segmented logical
@@ -277,7 +312,8 @@ pass.
   from distinct whole physical buffers. Inputs require `COPY_SRC`; outputs
   require `COPY_DST`. Partial, aliased, offset, or strided endpoints remain
   structured errors.
-- Public `FftIoView`/`BufferLayout` compatibility views for strided logical I/O.
+- Public `FftIoView`/`BufferLayout` compatibility views for strided logical
+  I/O.
 - Fallible `FftPlan::*_with_diagnostics` constructors, `execute_checked`,
   `execute_views`, `execute_io_views`, `execute_logical_views`,
   workspace-aware variants for all three view layers, and
@@ -289,32 +325,32 @@ pass.
 - Large-route policy classifies normal, large-chunk, and large-out-of-core
   plans, with execution metadata for normal, batch chunk, smooth 1D
   decomposition, axis decomposition, Rader/Bluestein bridge routes, and
-  GPU-resident rank>=2 four-step C2C routes. C2C and real transforms can execute
-  batch `LargeChunk` when each chunk fits active binding limits. C2C and real
-  routes can also execute binding-safe large decomposition through staged C2C
-  child graphs when the required full-temp/helper buffers fit active limits.
-- In this API, out-of-core means outside one storage-binding window: data stays
-  GPU-resident. Rank>=2 C2C volumes with at least two selected axes can execute
-  when one batch exceeds `maxStorageBufferBindingSize` but the full dataset and
-  route-owned helpers fit `maxBufferSize`. Every selected smooth-axis line must
-  fit the active binding cap; Rader and Bluestein axes can instead reuse their
-  normal child plan or a bounded prime bridge. Automatically selected oversized
-  Rader lines may use Bluestein; explicitly forced Rader returns
-  `InvalidTuning` instead of changing algorithms. Rank 2 uses stripe
-  transposes; higher ranks move each non-front axis through a tiled
-  prefix-by-axis block permutation and restore canonical layout afterward. No
-  host or disk staging is required for this route.
+  GPU-resident rank>=2 four-step C2C routes. C2C and real transforms can
+  execute batch `LargeChunk` when each chunk fits active binding limits. C2C
+  and real routes can also execute binding-safe large decomposition through
+  staged C2C child graphs when the required full-temp/helper buffers fit
+  active limits.
+- In this API, out-of-core means outside one storage-binding window: data
+  stays GPU-resident. Rank>=2 C2C volumes with at least two selected axes can
+  execute when one batch exceeds `maxStorageBufferBindingSize` but the full
+  dataset and route-owned helpers fit `maxBufferSize`. Every selected
+  smooth-axis line must fit the active binding cap; Rader and Bluestein axes
+  can instead reuse their normal child plan or a bounded prime bridge.
+  Automatically selected oversized Rader lines may use Bluestein; explicitly
+  forced Rader returns `InvalidTuning` instead of changing algorithms. Rank 2
+  uses stripe transposes; higher ranks move each non-front axis through a
+  tiled prefix-by-axis block permutation and restore canonical layout
+  afterward. No host or disk staging is required for this route.
 - Rank>=2 smooth C2C volumes with at least two selected axes and above the
   active policy `maxBufferSize` can use a plan-owned segmented GPU arena when
   every front row and non-front slab line fits a binding-safe staging window.
   Axis rows and slabs are staged through a configurable one-to-three-slot ring
   of A/B window pairs, with one segmented normalization pass and no host or
-  disk staging. The measured burst depth defaults to 2.
-  On hardware where the logical volume itself exceeds the real device
-  `maxBufferSize`, callers provide the volume as distinct whole physical
-  buffers through `BufferView`. Prime axes inside a segmented volume,
-  partial/strided caller views, and caller-workspace reuse remain
-  structured-unsupported.
+  disk staging. The measured burst depth defaults to 2. On hardware where the
+  logical volume itself exceeds the real device `maxBufferSize`, callers
+  provide the volume as distinct whole physical buffers through `BufferView`.
+  Prime axes inside a segmented volume, partial/strided caller views, and
+  caller-workspace reuse remain structured-unsupported.
 - Large-chunk, GPU-resident four-step, and segmented full-volume execution are
   currently `f32` routes. Native-`f64` or `df64` plans that require one of
   those routes, and all real extended-precision transforms, return structured
@@ -323,8 +359,8 @@ pass.
   fused smooth-radix, and Stockham stages, Rader helper, real helper, C2C
   strided/smooth helper, and direct DFT pipeline parameters.
 - Typed in-memory pipeline cache snapshots expose WGSL shader code and stable
-  pipeline key strings. The optional `serde` feature adds schema-versioned JSON
-  persistence with source/key integrity validation.
+  pipeline key strings. The optional `serde` feature adds schema-versioned
+  JSON persistence with source/key integrity validation.
 - Route policy executes mixed-radix, Rader, Bluestein, and mixed algorithm
   sequences.
 - R2C requires forward direction; C2R requires inverse direction. Real
@@ -346,22 +382,22 @@ backends expose the same GPU, Vulkan is listed first. On native targets,
 instead, and `WGPU_FFT_FORCE_FALLBACK=1` the platform's software adapter
 (WARP on Windows, lavapipe on Linux).
 
-On DX12, wgpu compiles shaders with DXC when it is available: statically linked
-through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual Studio 2022
-17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to the
-executable or on `PATH`. Otherwise it falls back to the legacy FXC compiler.
-Every route works with both, but FXC is much slower to create plans: the GPU
-test suite takes about 380 s with FXC and 40 s with DXC. `df64`
-plans and the register-resident kernels of 8192- and 16384-point `f32` axes
-are the slowest; an N=8192 plan takes 2.6 s with FXC and 0.1 s on Vulkan.
-Ship DXC with DX12 applications, or prefer Vulkan. The WARP software adapter
-needs DXC: it crashes while running some FXC-compiled kernels (also with
-earlier versions of this crate), and runs every kernel correctly with DXC.
+On DX12, wgpu compiles shaders with DXC when it is available: statically
+linked through wgpu's `static-dxc` feature (which needs MSVC 14.41, Visual
+Studio 2022 17.11, or newer), or as `dxcompiler.dll` 1.8.2502 or newer next to
+the executable or on `PATH`. Otherwise it falls back to the legacy FXC
+compiler. Every route works with both, but FXC is much slower to create plans:
+the GPU test suite takes about 380 s with FXC and 40 s with DXC. `df64` plans
+and the register-resident kernels of 8192- and 16384-point `f32` axes are the
+slowest; an N=8192 plan takes 2.6 s with FXC and 0.1 s on Vulkan. Ship DXC
+with DX12 applications, or prefer Vulkan. The WARP software adapter needs
+DXC: it crashes while running some FXC-compiled kernels, and runs every kernel
+correctly with DXC.
 
 Tested under Windows 11 with Vulkan, DX12 (FXC and DXC), and Chrome 153's
 WebGPU. Metal and Linux have not been tested.
 
-## Commands
+## Testing
 
 ```bash
 cargo fmt --check
@@ -372,13 +408,26 @@ WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_f64 --release
 WGPU_BACKEND=vulkan WGPU_FFT_RUN_GPU_TESTS=1 cargo test --test gpu_df64 --release -- --nocapture
 ```
 
-The environment-variable prefixes above are bash syntax. On Windows PowerShell
-set the variables first, for example:
+The environment-variable prefixes above are bash syntax. In PowerShell, set
+the variables first:
 
 ```powershell
 $env:WGPU_BACKEND = 'dx12'; $env:WGPU_FFT_RUN_GPU_TESTS = '1'
 cargo test --test gpu_df64_canary --release -- --nocapture
 ```
+
+The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
+is set. The native test helper excludes the GL backend by default, because
+EGL can crash on WSL and Linux systems where `/dev/dri` nodes exist but are
+not readable by the current user. Set `WGPU_BACKEND=gl` only when GL/EGL
+access is known to work; `WGPU_BACKEND=vulkan` forces Vulkan.
+
+The portable-df64 arithmetic has a separate exact-word GPU canary. Run
+`cargo test --test gpu_df64_canary --release -- --nocapture` once with
+`WGPU_BACKEND=vulkan` and once with `WGPU_BACKEND=dx12` (and
+`WGPU_FFT_RUN_GPU_TESTS=1` in both cases). Optimization is the hazard: WGSL
+has no no-contract or `precise` qualifier, so these release-build canaries
+are part of the arithmetic support contract.
 
 Browser (Wasm) tests run in Chrome's WebGPU implementation through
 `wasm-bindgen-test-runner` and a ChromeDriver matching the installed Chrome
@@ -393,21 +442,7 @@ The runner covers the smoke, correctness-matrix, and large-route tests; see
 `wasm-bindgen-cli` version must exactly match the `wasm-bindgen` version in
 `Cargo.lock` (currently 0.2.129).
 
-The GPU integration tests are opt-in and skip unless `WGPU_FFT_RUN_GPU_TESTS=1`
-is set. The native test helper excludes the GL backend by default because EGL
-can crash on WSL/Linux systems where `/dev/dri` nodes exist but are not readable
-by the current user. Set `WGPU_BACKEND=gl` explicitly only when GL/EGL access is
-known to work; use `WGPU_BACKEND=vulkan` to force Vulkan.
-
-The portable-df64 arithmetic groundwork has a separate exact-word GPU canary.
-Run `cargo test --test gpu_df64_canary --release -- --nocapture` once with
-`WGPU_BACKEND=vulkan` and once with `WGPU_BACKEND=dx12` (and
-`WGPU_FFT_RUN_GPU_TESTS=1` in both cases). Optimization is the hazard: WGSL
-provides no no-contract/`precise` qualifier, so these release-backend canaries
-are part of the arithmetic support contract. Metal's fast-math compilation
-makes it the riskiest backend for the error-free transforms; it is currently
-untested. Double-float also retains the `f32` exponent range, and preservation
-of subnormals is backend-dependent.
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

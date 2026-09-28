@@ -474,7 +474,9 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         assert_close_f32(&fused, &fallback, &format!("{label} fused versus fallback"));
         assert!(fused_max < 5.0e-7 && fused_rms < 3.0e-7, "{label}");
         let fallback_reference = fallback
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let (difference_max, difference_rms) = relative_error_metrics(&fused, &fallback_reference);
@@ -521,7 +523,9 @@ async fn compare_rader_2999_with_16k_fallback(context: &wgpu_fft::device::GpuCon
         assert_matches_reference(&fallback, &expected, &format!("{label} fallback"));
         assert_close_f32(&fused, &fallback, &format!("{label} fused versus fallback"));
         let fallback_reference = fallback
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let (difference_max, difference_rms) = relative_error_metrics(&fused, &fallback_reference);
@@ -852,7 +856,9 @@ fn helper_labels(plan: &FftPlan) -> Vec<String> {
 
 fn reference_f64(input: &[f32], config: &FftConfig) -> Vec<Complex64> {
     let values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect::<Vec<_>>();
     reference_c2c_nd_f64(&values, config).unwrap()
@@ -914,7 +920,7 @@ fn test_signal(complex_len: usize) -> Vec<f32> {
 
 fn assert_matches_reference(actual: &[f32], expected: &[Complex64], label: &str) {
     assert_eq!(actual.len(), expected.len() * 2, "{label}");
-    for (index, (pair, expected)) in actual.chunks_exact(2).zip(expected).enumerate() {
+    for (index, (pair, expected)) in actual.as_chunks::<2>().0.iter().zip(expected).enumerate() {
         let dr = f64::from(pair[0]) - expected.re;
         let di = f64::from(pair[1]) - expected.im;
         let error = dr.hypot(di);
@@ -946,7 +952,7 @@ fn relative_error_metrics(actual: &[f32], expected: &[Complex64]) -> (f64, f64) 
     let mut max_reference = 0.0f64;
     let mut error_energy = 0.0f64;
     let mut reference_energy = 0.0f64;
-    for (pair, expected) in actual.chunks_exact(2).zip(expected) {
+    for (pair, expected) in actual.as_chunks::<2>().0.iter().zip(expected) {
         let dr = f64::from(pair[0]) - expected.re;
         let di = f64::from(pair[1]) - expected.im;
         let error2 = dr * dr + di * di;

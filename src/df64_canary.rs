@@ -486,7 +486,9 @@ mod tests {
         assert_eq!(first[9], 0.0f32.to_bits());
         assert!(
             expected
-                .chunks_exact(WORDS_PER_CASE)
+                .as_chunks::<WORDS_PER_CASE>()
+                .0
+                .iter()
                 .all(|words| words[7] != 0.0f32.to_bits()),
             "each two_prod canary must require a nonzero error word"
         );
@@ -495,7 +497,7 @@ mod tests {
         assert_ne!(compile_time_scale.lo, 0.0);
         let compile_time_product =
             DoubleFloat::new(1.0, f32::from_bits(0x3080_0000)).mul_df(compile_time_scale);
-        for words in expected.chunks_exact(WORDS_PER_CASE) {
+        for words in expected.as_chunks::<WORDS_PER_CASE>().0 {
             assert_eq!(words[20], edge.0.to_bits());
             assert_eq!(words[21], edge.1.to_bits());
             assert!(f32::from_bits(words[20]).is_finite());

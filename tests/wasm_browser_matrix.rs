@@ -459,8 +459,10 @@ fn real_signal(len: usize) -> Vec<f32> {
 
 fn reference_c2c_f64_as_f32(input: &[f32], config: &FftConfig) -> Vec<f32> {
     let values = input
-        .chunks_exact(2)
-        .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[re, im]| Complex64::new(f64::from(re), f64::from(im)))
         .collect::<Vec<_>>();
     reference_c2c_nd_f64(&values, config)
         .unwrap()

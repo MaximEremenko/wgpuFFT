@@ -437,7 +437,9 @@ fn test_signal(complex_len: usize) -> Vec<f32> {
 
 fn reference_f64(input: &[f32], config: &FftConfig) -> Vec<Complex64> {
     let values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect::<Vec<_>>();
     reference_c2c_nd_f64(&values, config).unwrap()
@@ -449,7 +451,7 @@ fn assert_matches_reference(actual: &[f32], expected: &[Complex64], label: &str)
     let mut reference_energy = 0.0f64;
     let mut max_error = 0.0f64;
     let mut max_reference = 0.0f64;
-    for (pair, expected) in actual.chunks_exact(2).zip(expected) {
+    for (pair, expected) in actual.as_chunks::<2>().0.iter().zip(expected) {
         let error = (f64::from(pair[0]) - expected.re).hypot(f64::from(pair[1]) - expected.im);
         let magnitude = expected.re.hypot(expected.im);
         error_energy += error * error;

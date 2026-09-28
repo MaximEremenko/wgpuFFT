@@ -28,7 +28,7 @@ fn main() {
     };
 
     // The DFT of an impulse at index 1 is exp(-2*pi*i*k/n).
-    for (k, value) in output.chunks_exact(2).enumerate() {
+    for (k, value) in output.as_chunks::<2>().0.iter().enumerate() {
         println!("X[{k}] = {:+.6} {:+.6}i", value[0], value[1]);
     }
 }

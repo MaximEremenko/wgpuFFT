@@ -855,7 +855,7 @@ fn assert_f64_accuracy(label: &str, actual: &[f64], expected: &[Complex64]) {
     let mut reference_energy = 0.0f64;
     let mut reference_max = 0.0f64;
 
-    for (pair, expected) in actual.chunks_exact(2).zip(expected) {
+    for (pair, expected) in actual.as_chunks::<2>().0.iter().zip(expected) {
         let error = (pair[0] - expected.re).hypot(pair[1] - expected.im);
         let magnitude = expected.re.hypot(expected.im);
         max_abs = max_abs.max(error);

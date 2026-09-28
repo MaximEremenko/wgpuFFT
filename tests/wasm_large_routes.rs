@@ -327,7 +327,7 @@ async fn execute_and_read_samples(
 fn assert_unit_impulse_samples(actual: &[f32], sample_indices: &[u64], route: &str) {
     for (sample, (&index, pair)) in sample_indices
         .iter()
-        .zip(actual.chunks_exact(2))
+        .zip(actual.as_chunks::<2>().0)
         .enumerate()
     {
         let error = (pair[0] - 1.0).hypot(pair[1]);

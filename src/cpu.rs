@@ -401,20 +401,22 @@ impl TypedKernels<f64> {
     /// transformed in `f64` and split back into `hi + lo` pairs.
     fn run_df64_c2c(&self, shape: &[usize], input: &[f32], output: &mut [f32]) {
         let mut data = input
-            .chunks_exact(4)
-            .map(|words| {
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&[re_hi, re_lo, im_hi, im_lo]| {
                 Complex::new(
-                    f64::from(words[0]) + f64::from(words[1]),
-                    f64::from(words[2]) + f64::from(words[3]),
+                    f64::from(re_hi) + f64::from(re_lo),
+                    f64::from(im_hi) + f64::from(im_lo),
                 )
             })
             .collect::<Vec<_>>();
         self.transform_axes(&mut data, shape);
         scale_all(&mut data, self.scale);
-        for (words, value) in output.chunks_exact_mut(4).zip(&data) {
+        for (words, value) in output.as_chunks_mut::<4>().0.iter_mut().zip(&data) {
             let (re_hi, re_lo) = split_df64(value.re);
             let (im_hi, im_lo) = split_df64(value.im);
-            words.copy_from_slice(&[re_hi, re_lo, im_hi, im_lo]);
+            *words = [re_hi, re_lo, im_hi, im_lo];
         }
     }
 }
@@ -634,8 +636,10 @@ mod tests {
                 .collect::<Vec<_>>();
             let reference = reference_c2c_nd_f64(
                 &values
-                    .chunks_exact(2)
-                    .map(|pair| Complex64::new(pair[0], pair[1]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&[re, im]| Complex64::new(re, im))
                     .collect::<Vec<_>>(),
                 &config,
             )
@@ -660,8 +664,10 @@ mod tests {
             let mut output = vec![0.0f32; plan.required_output_len()];
             plan.execute(&df64_input, &mut output).unwrap();
             let joined = output
-                .chunks_exact(2)
-                .map(|pair| f64::from(pair[0]) + f64::from(pair[1]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[hi, lo]| f64::from(hi) + f64::from(lo))
                 .collect::<Vec<_>>();
             assert_close_f64(&joined, &reference, 1e-12, &format!("df64 {config:?}"));
         }
@@ -751,7 +757,7 @@ mod tests {
         let mut output = vec![0.0f64; total * 2];
         plan.execute_f64(&input, &mut output).unwrap();
         let peak = (k2 * shape[1] + k1) * shape[0] + k0;
-        for (index, pair) in output.chunks_exact(2).enumerate() {
+        for (index, pair) in output.as_chunks::<2>().0.iter().enumerate() {
             let expected = if index == peak { 1.0 } else { 0.0 };
             assert!(
                 (pair[0] - expected).abs() < 1e-9 && pair[1].abs() < 1e-9,

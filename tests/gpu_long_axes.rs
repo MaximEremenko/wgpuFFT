@@ -199,7 +199,12 @@ fn cpu_reference(input: &[f32], config: &FftConfig) -> Vec<f64> {
 fn relative_errors(actual: &[f32], reference: &[f64]) -> (f64, f64) {
     assert_eq!(actual.len(), reference.len());
     let (mut max_error, mut peak, mut error_energy, mut energy) = (0.0f64, 0.0f64, 0.0, 0.0);
-    for (pair, expected) in actual.chunks_exact(2).zip(reference.chunks_exact(2)) {
+    for (pair, expected) in actual
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(reference.as_chunks::<2>().0.iter())
+    {
         let error = (f64::from(pair[0]) - expected[0]).hypot(f64::from(pair[1]) - expected[1]);
         let magnitude = expected[0].hypot(expected[1]);
         max_error = max_error.max(error);

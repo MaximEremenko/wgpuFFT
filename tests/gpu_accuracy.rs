@@ -134,7 +134,9 @@ fn reference_c2c_f64(input: &[f32], config: &FftConfig) -> Vec<Complex64> {
     let total = config.total_complex_len().unwrap();
     assert_eq!(input.len(), total * 2);
     let values = input
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect::<Vec<_>>();
     reference_c2c_nd_f64(&values, config).unwrap()
@@ -155,7 +157,7 @@ fn accuracy_metrics(actual: &[f32], reference: &[Complex64]) -> AccuracyMetrics 
     let mut reference_energy = 0.0f64;
     let mut reference_max = 0.0f64;
 
-    for (pair, expected) in actual.chunks_exact(2).zip(reference) {
+    for (pair, expected) in actual.as_chunks::<2>().0.iter().zip(reference) {
         let dr = f64::from(pair[0]) - expected.re;
         let di = f64::from(pair[1]) - expected.im;
         let error = dr.hypot(di);

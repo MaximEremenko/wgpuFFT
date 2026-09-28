@@ -108,6 +108,16 @@ First tagged release.
   per radix-R butterfly instead of `R - 1`, forming the rest as products:
   1523x1523 takes 187 µs instead of 220 µs and 2048x1024 47 µs instead of
   51 µs.
+- `f32` kernels compute their twiddles instead of reading them from a
+  table, whose reads sat on each stage's critical path: the angle's octant
+  reduces exactly in integers, and Taylor polynomials give its sine and
+  cosine to about one ulp in plain `f32` arithmetic, so accuracy stays
+  that of the table (the RMS error of 110 test transforms moved by 1% on
+  geometric mean). 1920x1080 takes 46 µs instead of 54 µs (VkFFT 44 µs),
+  2560x1440 74 µs instead of 83 µs, 65536-point lines batched 64 times
+  0.10 ms instead of 0.18 ms, and 1048576-point lines 0.13 ms instead of
+  0.30 ms. Fused Rader and Bluestein convolutions of more than 2048 points,
+  whose invocations hold several butterflies per stage, keep the table.
 - Primes whose `N - 1` has prime factors from 17 to 61 besides radices up
   to 13 convolve cyclically over `N - 1` points in the fused Rader kernel
   (`f32`), each such factor as one straight-line radix-p stage, when a line

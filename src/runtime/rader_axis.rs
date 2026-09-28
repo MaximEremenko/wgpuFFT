@@ -4,7 +4,8 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{fft_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
-    fused_smooth_factors, fused_smooth_pads_indices, generate_fused_scratch_fft_stages_wgsl,
+    convolution_computes_twiddles, convolution_twiddle_fns_wgsl, fused_smooth_factors,
+    fused_smooth_pads_indices, generate_fused_scratch_fft_stages_wgsl,
     generate_in_place_smooth_fft_stage_multiline_wgsl, lines_per_workgroup_keeping,
     multiline_line_stride, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision, AxisStageKind,
     AxisTwiddleLutPool, LongAxisRoute, FUSED_PRIME_RADICES, MIN_FUSED_WORKGROUPS,
@@ -1493,10 +1494,11 @@ pub(crate) fn generate_fused_rader_wgsl_for_key(key: &FusedPrimeStageKey) -> Str
     );
 
     let zero = complex_zero(key.precision);
-    let twiddle_inverse_value = match key.precision {
-        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
-        _ => "vec2<f32>(value.x, -value.y)",
-    };
+    let twiddle_fns = convolution_twiddle_fns_wgsl(
+        m,
+        key.precision,
+        convolution_computes_twiddles(m, key.precision, false),
+    );
     // Parenthesized: the f32 and f64 scale multiplies its operand's last term.
     let scaled_first = complex_scale_expr(
         key.precision,
@@ -1567,14 +1569,7 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
   );
 }}
 
-fn twiddle_forward(index: u32) -> vec2<f32> {{
-  return axisTwiddles[index];
-}}
-
-fn twiddle_inverse(index: u32) -> vec2<f32> {{
-  let value: vec2<f32> = axisTwiddles[index];
-  return {twiddle_inverse_value};
-}}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const L: u32 = {l}u;
@@ -1757,6 +1752,11 @@ fn generate_fused_rader_serial_wgsl(key: &FusedPrimeStageKey) -> String {
         ));
     }
 
+    let twiddle_fns = convolution_twiddle_fns_wgsl(
+        m,
+        key.precision,
+        convolution_computes_twiddles(m, key.precision, false),
+    );
     format!(
         r#"struct Params {{
   lines: u32,
@@ -1789,14 +1789,7 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
   );
 }}
 
-fn twiddle_forward(index: u32) -> vec2<f32> {{
-  return axisTwiddles[index];
-}}
-
-fn twiddle_inverse(index: u32) -> vec2<f32> {{
-  let value: vec2<f32> = axisTwiddles[index];
-  return vec2<f32>(value.x, -value.y);
-}}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const L: u32 = {l}u;
@@ -1939,10 +1932,11 @@ fn generate_fused_rader_multiline_wgsl(key: &FusedPrimeStageKey) -> String {
     let inverse_stages = stages(FftDirection::Inverse, "twiddle_inverse");
 
     let zero = complex_zero(key.precision);
-    let twiddle_inverse_value = match key.precision {
-        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
-        _ => "vec2<f32>(value.x, -value.y)",
-    };
+    let twiddle_fns = convolution_twiddle_fns_wgsl(
+        m,
+        key.precision,
+        convolution_computes_twiddles(m, key.precision, false),
+    );
     // Invocation `e` takes line `lineSlot`, input `q` of the permuted load
     // and natural-order store.
     let split = if element_major {
@@ -2052,14 +2046,7 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
   );
 }}
 
-fn twiddle_forward(index: u32) -> vec2<f32> {{
-  return axisTwiddles[index];
-}}
-
-fn twiddle_inverse(index: u32) -> vec2<f32> {{
-  let value: vec2<f32> = axisTwiddles[index];
-  return {twiddle_inverse_value};
-}}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const L: u32 = {l}u;

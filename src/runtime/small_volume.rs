@@ -15,8 +15,8 @@ use bytemuck::{Pod, Zeroable};
 use crate::config::{FftConfig, FftDirection, FftPrecision};
 use crate::error::Result;
 use crate::runtime::axis_plan::{
-    complex_wgsl, fused_smooth_factors, generate_fused_smooth_butterfly_math_wgsl, rebind_in_place,
-    scaled_complex_expr, AxisPrecision,
+    complex_wgsl, computed_twiddle_wgsl, fused_smooth_factors,
+    generate_fused_smooth_butterfly_math_wgsl, rebind_in_place, scaled_complex_expr, AxisPrecision,
 };
 use crate::runtime::buffer_view::BufferView;
 use crate::runtime::dispatch::{max_workgroups_per_dimension, split_workgroups};
@@ -373,13 +373,12 @@ pub(crate) fn generate_small_volume_wgsl_for_key(key: &SmallVolumeKey) -> String
         match kind {
             SmallVolumeAxis::Stages(radices) => {
                 debug_assert_eq!(radices.iter().product::<usize>(), n);
-                let value = match key.direction {
-                    FftDirection::Forward => "value",
-                    FftDirection::Inverse => "vec2<f32>(value.x, -value.y)",
-                };
-                functions.push_str(&format!(
-                    "fn twiddle{axis}(index: u32) -> vec2<f32> {{\n  let value: vec2<f32> = axisTwiddles[index * {step}u];\n  return {value};\n}}\n\n"
+                functions.push_str(&computed_twiddle_wgsl(
+                    &format!("twiddle{axis}"),
+                    n,
+                    key.direction,
                 ));
+                functions.push_str("\n\n");
                 body.push_str(&stages_wgsl(
                     axis,
                     n,

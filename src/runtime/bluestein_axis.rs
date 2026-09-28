@@ -4,6 +4,7 @@ use crate::config::{FftDirection, Normalization};
 use crate::error::{FftError, Result};
 use crate::math::{fft_f64, Complex32, Complex64, ComplexDoubleFloat, DoubleFloat};
 use crate::runtime::axis_plan::{
+    convolution_computes_twiddles, convolution_twiddle_fns_wgsl,
     generate_fused_scratch_fft_stages_wgsl, AxisLayout, AxisPlan, AxisPlanConfig, AxisPrecision,
     AxisStageKind, AxisTwiddleLutPool, LongAxisRoute,
 };
@@ -1225,10 +1226,11 @@ pub(crate) fn generate_fused_bluestein_wgsl_for_key(key: &FusedPrimeStageKey) ->
     );
 
     let zero = complex_zero(key.precision);
-    let twiddle_inverse_value = match key.precision {
-        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
-        _ => "vec2<f32>(value.x, -value.y)",
-    };
+    let twiddle_fns = convolution_twiddle_fns_wgsl(
+        m,
+        key.precision,
+        convolution_computes_twiddles(m, key.precision, false),
+    );
     let scaled_convolution = complex_scale_expr(key.precision, "scratch[t]", inverse_m_ref);
     let scaled_value = complex_scale_expr(key.precision, "value", scale_ref);
 
@@ -1263,14 +1265,7 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {{
   );
 }}
 
-fn twiddle_forward(index: u32) -> vec2<f32> {{
-  return axisTwiddles[index];
-}}
-
-fn twiddle_inverse(index: u32) -> vec2<f32> {{
-  let value: vec2<f32> = axisTwiddles[index];
-  return {twiddle_inverse_value};
-}}
+{twiddle_fns}
 
 const N: u32 = {n}u;
 const M: u32 = {m}u;

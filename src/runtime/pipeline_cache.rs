@@ -2336,7 +2336,7 @@ impl SmallVolumeKey {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "shader:v1:small-volume:precision=f32:dims={}:axes={axes}:twiddles={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-f32-v1{}",
+            "shader:v1:small-volume:precision=f32:dims={}:axes={axes}:twiddles={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=computed-f32-v1{}",
             dims_key(&self.dims),
             self.twiddle_length,
             direction_key(self.direction),
@@ -2449,7 +2449,7 @@ impl FusedPrimeStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         let mut key = format!(
-            "shader:v2:fused-prime:{}:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            "shader:v2:fused-prime:{}:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:m={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle={}",
             self.kind.as_str(),
             self.precision.as_str(),
             self.rank,
@@ -2463,7 +2463,18 @@ impl FusedPrimeStageKey {
             self.workgroup_size,
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
-            self.precision.as_str(),
+            // Direct kernels read their roots from the table.
+            if self.kind != FusedPrimeKind::Direct
+                && crate::runtime::axis_plan::convolution_computes_twiddles(
+                    self.convolution_length,
+                    self.precision,
+                    self.registers.is_some(),
+                )
+            {
+                twiddle_key(self.precision, self.convolution_length)
+            } else {
+                format!("host-f64-{}-v1", self.precision.as_str())
+            },
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
@@ -2630,7 +2641,7 @@ impl FusedSmoothStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         let mut key = format!(
-            "shader:v3:fused-smooth:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            "shader:v3:fused-smooth:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:factors={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle={}",
             self.precision.as_str(),
             self.rank,
             self.axis,
@@ -2642,7 +2653,12 @@ impl FusedSmoothStageKey {
             self.workgroup_size,
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
-            self.precision.as_str(),
+            twiddle_key(
+                self.precision,
+                self.split_pass
+                    .as_ref()
+                    .map_or(self.axis_length, |split| split.full_length)
+            ),
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
@@ -2763,7 +2779,7 @@ impl FusedPow2StageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         let mut key = format!(
-            "shader:v3:fused-pow2:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1",
+            "shader:v3:fused-pow2:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle={}",
             self.precision.as_str(),
             self.rank,
             self.axis,
@@ -2774,7 +2790,12 @@ impl FusedPow2StageKey {
             self.workgroup_size,
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
-            self.precision.as_str(),
+            twiddle_key(
+                self.precision,
+                self.split_pass
+                    .as_ref()
+                    .map_or(self.axis_length, |split| split.full_length)
+            ),
         );
         if self.lines_per_workgroup > 1 {
             key.push_str(&format!(":lines={}", self.lines_per_workgroup));
@@ -2876,7 +2897,7 @@ impl StockhamStageKey {
 
     pub(crate) fn stable_key(&self) -> String {
         format!(
-            "shader:v3:stockham:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle=host-f64-{}-v1{}",
+            "shader:v3:stockham:precision={}:rank={}:axis={}:dims={}:n={}:stride={}:radix={}:ns={}:direction={}:workgroup={}:scale={}:scale_bits={}:twiddle={}{}",
             self.precision.as_str(),
             self.rank,
             self.axis,
@@ -2889,9 +2910,20 @@ impl StockhamStageKey {
             self.workgroup_size,
             self.apply_scale,
             axis_scale_bits_key(self.precision, self.scale_bits),
-            self.precision.as_str(),
+            twiddle_key(self.precision, self.axis_length),
             if self.in_place { ":in_place" } else { "" },
         )
+    }
+}
+
+/// Stable-key label of how a kernel of `precision` gets the twiddles of a
+/// `length`-point table: computed (see
+/// `axis_plan::computed_twiddle_wgsl`) or read from the host table.
+fn twiddle_key(precision: AxisPrecision, length: usize) -> String {
+    if crate::runtime::axis_plan::computes_twiddles(length, precision) {
+        String::from("computed-f32-v1")
+    } else {
+        format!("host-f64-{}-v1", precision.as_str())
     }
 }
 
@@ -3162,7 +3194,7 @@ mod tests {
         assert_eq!(key.scale_factor(), f64::from(1.0f32 / 12.0));
         assert_eq!(
             key.stable_key(),
-            "shader:v3:stockham:precision=f32:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=host-f64-f32-v1"
+            "shader:v3:stockham:precision=f32:rank=2:axis=1:dims=4x3:n=3:stride=4:radix=3:ns=3:direction=forward:workgroup=64:scale=true:scale_bits=0x3daaaaab:twiddle=computed-f32-v1"
         );
     }
 
@@ -3284,7 +3316,7 @@ mod tests {
         assert_eq!(key.scale_factor(), 1.0 / 1024.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v3:fused-pow2:precision=f32:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000:twiddle=host-f64-f32-v1"
+            "shader:v3:fused-pow2:precision=f32:rank=2:axis=1:dims=4x256:n=256:stride=4:direction=inverse:workgroup=256:scale=true:scale_bits=0x3a800000:twiddle=computed-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_pow2_stage(key);
         assert!(pipeline.stable_key().starts_with(
@@ -3446,7 +3478,7 @@ mod tests {
         assert_eq!(key.scale_factor(), 1.0 / 4096.0);
         assert_eq!(
             key.stable_key(),
-            "shader:v3:fused-smooth:precision=f32:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000:twiddle=host-f64-f32-v1"
+            "shader:v3:fused-smooth:precision=f32:rank=2:axis=1:dims=4x1001:n=1001:stride=4:factors=13x11x7:direction=inverse:workgroup=256:scale=true:scale_bits=0x39800000:twiddle=computed-f32-v1"
         );
         let pipeline = ComputePipelineCacheKey::fused_smooth_stage(key);
         assert!(pipeline.stable_key().contains("shader:v3:fused-smooth:"));

@@ -1656,7 +1656,8 @@ fn main({entry_params}) {{
             log_n = config.axis_length.ilog2(),
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            twiddle_lookup_wgsl =
+                twiddle_lookup_wgsl(config.axis_length, config.direction, config.precision),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -1779,8 +1780,12 @@ fn main({entry_params}) {{
             lines = lines,
             scratch_len = multiline_line_stride(config.axis_length, lines, element_major) * lines,
             line_stride = multiline_line_stride(config.axis_length, lines, element_major),
-            twiddle_lookup_wgsl =
-                multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
+            twiddle_lookup_wgsl = multiline_twiddle_lookup_wgsl(
+                config.axis_length,
+                config.direction,
+                config.precision,
+                split
+            ),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -2507,7 +2512,8 @@ fn main({entry_params}) {{
             stride = config.stride_complex,
             workgroup_size = config.workgroup_size,
             line_slot_count = line_slot_count,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            twiddle_lookup_wgsl =
+                twiddle_lookup_wgsl(config.axis_length, config.direction, config.precision),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -3274,8 +3280,12 @@ fn main({entry_params}) {{
             lines = lines,
             scratch_len = multiline_line_stride(config.axis_length, lines, element_major) * lines,
             line_stride = multiline_line_stride(config.axis_length, lines, element_major),
-            twiddle_lookup_wgsl =
-                multiline_twiddle_lookup_wgsl(config.direction, config.precision, split),
+            twiddle_lookup_wgsl = multiline_twiddle_lookup_wgsl(
+                config.axis_length,
+                config.direction,
+                config.precision,
+                split
+            ),
             line_base_fn = line_base_fn,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
             flat_workgroup_index = crate::runtime::dispatch::WGSL_FLAT_WORKGROUP_INDEX,
@@ -3482,7 +3492,8 @@ fn main({entry_params}) {{
             n_div_r = n_div_r,
             n_div_ns = n_div_ns,
             stride = config.stride_complex,
-            twiddle_lookup_wgsl = twiddle_lookup_wgsl(config.direction, config.precision),
+            twiddle_lookup_wgsl =
+                twiddle_lookup_wgsl(config.axis_length, config.direction, config.precision),
             line_base_fn = line_base_fn,
             workgroup_size = config.workgroup_size,
             entry_params = crate::runtime::dispatch::WGSL_FLAT_ENTRY_PARAMS,
@@ -3533,7 +3544,113 @@ fn c_mul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 }"#
 }
 
-pub(crate) fn twiddle_lookup_wgsl(direction: FftDirection, precision: AxisPrecision) -> String {
+/// Longest twiddle table whose values `f32` kernels compute (see
+/// [`computed_twiddle_wgsl`]) rather than read: eight times an index then
+/// fits `u32` and the reduced numerator `f32` exactly.
+const MAX_COMPUTED_TWIDDLE_LENGTH: usize = 1 << 24;
+
+/// Whether kernels of `precision` compute the twiddles of a `length`-point
+/// table instead of reading them.
+pub(crate) fn computes_twiddles(length: usize, precision: AxisPrecision) -> bool {
+    precision == AxisPrecision::F32 && length <= MAX_COMPUTED_TWIDDLE_LENGTH
+}
+
+/// WGSL of `fn {name}(index: u32) -> vec2<f32>`, the twiddle
+/// `W_length^index` (its conjugate for the inverse direction), computed
+/// instead of read from the table: a table read is a memory access on each
+/// stage's critical path, which cost mid-size transforms up to a fifth of
+/// their time (1920 points: 21.3 µs per FFT+iFFT pair of 1080 lines with
+/// table reads, 17.1 µs computed, on an RTX 5090). `index / length` reduces
+/// to an octant in integers, so the angle is exact up to one rounding of
+/// its fraction of `pi/4`, and Taylor polynomials give its sine and cosine
+/// to about one ulp: plain `f32` arithmetic, portable, where the platform's
+/// `sin` and `cos` may be far less accurate.
+pub(crate) fn computed_twiddle_wgsl(name: &str, length: usize, direction: FftDirection) -> String {
+    debug_assert!(length > 0 && length <= MAX_COMPUTED_TWIDDLE_LENGTH);
+    let eighth =
+        crate::runtime::nd_wgsl::format_wgsl_f32_roundtrip((1.0 / (8.0 * length as f64)) as f32);
+    let sign = match direction {
+        FftDirection::Forward => "-",
+        FftDirection::Inverse => "",
+    };
+    format!(
+        r#"fn {name}(index: u32) -> vec2<f32> {{
+  // The angle 2 pi index / {length} is octant * pi / 4 + 2 pi x, or
+  // (octant + 1) * pi / 4 - 2 pi x in odd octants, with x in [0, 1/8].
+  let eighths: u32 = index * 8u;
+  let octant: u32 = eighths / {length}u;
+  let rem: u32 = eighths - octant * {length}u;
+  let odd: bool = (octant & 1u) == 1u;
+  let x: f32 = f32(select(rem, {length}u - rem, odd)) * {eighth};
+  let t: f32 = x * x;
+  let s: f32 = x * (6.2831855 + t * (-41.341702 + t * (81.60525 + t * (-76.70586 + t * 42.058693))));
+  let c: f32 = 1.0 + t * (-19.739208 + t * (64.93939 + t * (-85.45682 + t * (60.24464 - t * 26.426257))));
+  let sn: f32 = select(s, -s, odd);
+  // Rotate by the angle's whole quarter turns.
+  let quarter: u32 = ((octant + 1u) >> 1u) & 3u;
+  let swap: bool = (quarter & 1u) == 1u;
+  let cosine: f32 = select(c, sn, swap);
+  let sine: f32 = select(sn, c, swap);
+  return vec2<f32>(
+    select(cosine, -cosine, ((quarter + 1u) & 2u) != 0u),
+    {sign}select(sine, -sine, (quarter & 2u) != 0u)
+  );
+}}"#
+    )
+}
+
+/// Longest convolution whose twiddles fused Rader and Bluestein kernels in
+/// workgroup memory compute: longer ones hold several butterflies per
+/// invocation per stage, where the arithmetic costs more than the reads
+/// (N = 1229, convolving 2457 points, ran 11% slower computed, while
+/// N = 1381, convolving 1380, ran 2% faster). Register-resident ones always
+/// compute them.
+const MAX_COMPUTED_CONVOLUTION_LENGTH: usize = 2048;
+
+/// Whether a prime kernel's `length`-point convolution computes its
+/// twiddles (see [`MAX_COMPUTED_CONVOLUTION_LENGTH`]).
+pub(crate) fn convolution_computes_twiddles(
+    length: usize,
+    precision: AxisPrecision,
+    registers: bool,
+) -> bool {
+    computes_twiddles(length, precision) && (registers || length <= MAX_COMPUTED_CONVOLUTION_LENGTH)
+}
+
+/// WGSL of the `twiddle_forward` and `twiddle_inverse` functions of a
+/// prime kernel's `length`-point convolution, computed or read.
+pub(crate) fn convolution_twiddle_fns_wgsl(
+    length: usize,
+    precision: AxisPrecision,
+    computed: bool,
+) -> String {
+    if computed {
+        debug_assert!(computes_twiddles(length, precision));
+        return format!(
+            "{}\n\n{}",
+            computed_twiddle_wgsl("twiddle_forward", length, FftDirection::Forward),
+            computed_twiddle_wgsl("twiddle_inverse", length, FftDirection::Inverse)
+        );
+    }
+    let inverse = match precision {
+        AxisPrecision::Df64 => "vec4<f32>(value.x, value.y, -value.z, -value.w)",
+        _ => "vec2<f32>(value.x, -value.y)",
+    };
+    format!(
+        "fn twiddle_forward(index: u32) -> vec2<f32> {{\n  return axisTwiddles[index];\n}}\n\nfn twiddle_inverse(index: u32) -> vec2<f32> {{\n  let value: vec2<f32> = axisTwiddles[index];\n  return {inverse};\n}}"
+    )
+}
+
+/// WGSL of `fn twiddle(index: u32)`, the twiddle `W_length^index` of a
+/// `length`-point table.
+pub(crate) fn twiddle_lookup_wgsl(
+    length: usize,
+    direction: FftDirection,
+    precision: AxisPrecision,
+) -> String {
+    if computes_twiddles(length, precision) {
+        return computed_twiddle_wgsl("twiddle", length, direction);
+    }
     if precision == AxisPrecision::Df64 {
         return match direction {
             FftDirection::Forward => r#"fn twiddle(index: u32) -> vec4<f32> {
@@ -3687,20 +3804,21 @@ fn multiline_split_wgsl(stride: usize) -> &'static str {
     }
 }
 
-/// Twiddle lookup for a multi-line kernel. A split-axis pass binds the full
-/// axis's table, so `twiddle` scales its own indices and `twiddle_full` reads
-/// the table directly for the split twiddle.
+/// Twiddle lookup for a multi-line kernel of `axis_length`. A split-axis
+/// pass binds the full axis's table, so `twiddle` scales its own indices and
+/// `twiddle_full` reads the table directly for the split twiddle.
 fn multiline_twiddle_lookup_wgsl(
+    axis_length: usize,
     direction: FftDirection,
     precision: AxisPrecision,
     split: Option<&SplitPass>,
 ) -> String {
-    let lookup = twiddle_lookup_wgsl(direction, precision);
     match split {
-        None => lookup,
+        None => twiddle_lookup_wgsl(axis_length, direction, precision),
         Some(split) => format!(
             "{}\n\nfn twiddle(index: u32) -> vec2<f32> {{\n  return twiddle_full(index * {}u);\n}}",
-            lookup.replace("fn twiddle(", "fn twiddle_full("),
+            twiddle_lookup_wgsl(split.full_length, direction, precision)
+                .replace("fn twiddle(", "fn twiddle_full("),
             split.twiddle_scale
         ),
     }
@@ -4918,7 +5036,10 @@ mod tests {
         let n1024 = fused_wgsl_for(1024, FftDirection::Inverse);
         assert_eq!(n1024.matches("const RADIX: u32 = 8u;").count(), 3);
         assert_eq!(n1024.matches("const RADIX: u32 = 2u;").count(), 1);
-        assert!(n1024.contains("return vec2<f32>(value.x, -value.y);"));
+        // f32 kernels compute their twiddles, conjugated for the inverse.
+        assert!(!n1024.contains("axisTwiddles["));
+        assert!(n1024.contains("    select(sine, -sine, (quarter & 2u) != 0u)"));
+        assert!(!n1024.contains("-select(sine"));
 
         let n2048 = fused_wgsl_for(2048, FftDirection::Forward);
         assert_eq!(n2048.matches("const RADIX: u32 = 8u;").count(), 3);
@@ -5057,7 +5178,8 @@ scratch[k] = a;
         assert!(wgsl.contains("fused smooth radix-13 butterflies"));
         assert!(wgsl.contains("fused smooth radix-11 butterflies"));
         assert!(wgsl.contains("fused smooth radix-7 butterflies"));
-        assert!(wgsl.contains("return vec2<f32>(value.x, -value.y);"));
+        assert!(!wgsl.contains("axisTwiddles["));
+        assert!(wgsl.contains("    select(sine, -sine, (quarter & 2u) != 0u)"));
         assert!(!wgsl.contains("cos("));
         assert!(!wgsl.contains("sin("));
         assert!(!wgsl.contains("cis("));

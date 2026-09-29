@@ -40,10 +40,11 @@ types such as `&wgpu::Device` and `&wgpu::Buffer`:
 ```toml
 [dependencies]
 wgpu = "30"
-wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT", branch = "main" }
+wgpu-fft = { git = "https://github.com/MaximEremenko/wgpuFFT", tag = "v0.1.0" }
 ```
 
-`Cargo.lock` then pins the exact commit. The default `cpu` feature adds the
+Use `branch = "main"` instead to follow the latest changes; `Cargo.lock`
+pins the exact commit either way. The default `cpu` feature adds the
 [CPU backend](#cpu-backend), and the optional `serde` feature adds
 schema-versioned JSON persistence for pipeline-cache snapshots. The minimum
 supported Rust version is 1.92.

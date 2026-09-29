@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
+import os
 import re
 import subprocess
 import sys
@@ -26,6 +27,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 OUTPUT = HERE / "dist" / "wgpu_fft_web.js"
+# A target directory of its own: the path remapping below changes the
+# compiler flags, which would otherwise rebuild the usual wasm32 target.
+TARGET_DIR = REPO / "target" / "standalone"
+CARGO_HOME = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo").resolve()
 # The global that wasm-bindgen's glue defines; `wgpuFftWeb.load()` wraps it.
 BINDINGS = "wgpuFftWebBindings"
 
@@ -67,6 +72,27 @@ def locked_version(name: str) -> str:
     return match.group(1)
 
 
+def build_env() -> dict[str, str]:
+    """The environment for cargo, with flags that replace the local paths
+    rustc writes into panic messages (dependency sources under CARGO_HOME,
+    this checkout) by fixed names, so the module names no user or folder."""
+    env = dict(os.environ)
+    flags = env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    flags = flags.split("\x1f") if flags else env.get("RUSTFLAGS", "").split()
+    flags += [f"--remap-path-prefix={CARGO_HOME}=/cargo", f"--remap-path-prefix={REPO}=/wgpuFFT"]
+    # Separated by 0x1f, so paths may contain spaces.
+    env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(flag for flag in flags if flag)
+    env.pop("RUSTFLAGS", None)
+    return env
+
+
+def check_no_local_paths(wasm: bytes) -> None:
+    for prefix in {str(CARGO_HOME), str(REPO), str(Path.home())}:
+        for form in {prefix, prefix.replace("\\", "/")}:
+            if form.encode() in wasm:
+                sys.exit(f"the module still contains the local path {form}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--wasm-bindgen", default="wasm-bindgen", help="the wasm-bindgen CLI to run")
@@ -84,18 +110,20 @@ def main() -> None:
 
     subprocess.run(
         ["cargo", "build", "--locked", "-p", "wgpu-fft-web", "--target", "wasm32-unknown-unknown",
-         "--release"],
+         "--release", "--target-dir", str(TARGET_DIR)],
         cwd=REPO,
+        env=build_env(),
         check=True,
     )
     with tempfile.TemporaryDirectory() as out:
         subprocess.run(
             [args.wasm_bindgen, "--target", "no-modules", "--no-modules-global", BINDINGS,
-             "--out-dir", out, str(REPO / "target/wasm32-unknown-unknown/release/wgpu_fft_web.wasm")],
+             "--out-dir", out, str(TARGET_DIR / "wasm32-unknown-unknown/release/wgpu_fft_web.wasm")],
             check=True,
         )
         glue = (Path(out) / "wgpu_fft_web.js").read_text(encoding="utf-8")
         wasm = (Path(out) / "wgpu_fft_web_bg.wasm").read_bytes()
+    check_no_local_paths(wasm)
 
     payload = base64.b64encode(gzip.compress(wasm, compresslevel=9, mtime=0)).decode("ascii")
     header = textwrap.dedent(f"""\

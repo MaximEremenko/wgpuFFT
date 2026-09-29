@@ -1228,6 +1228,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-fft-web"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "futures-channel",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wgpu",
+ "wgpu-fft",
+]
+
+[[package]]
 name = "wgpu-hal"
 version = "30.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

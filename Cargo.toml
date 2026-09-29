@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+members = ["wgpu-fft-web"]
 
 [package]
 publish = false

@@ -1,0 +1,23 @@
+[package]
+publish = false
+name = "wgpu-fft-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "wasm-bindgen browser surface for wgpu-fft: N-dimensional FFT plans on WebGPU and an f64 CPU fallback"
+readme = "README.md"
+keywords = ["fft", "wgpu", "webgpu", "wasm"]
+categories = ["mathematics", "algorithms", "wasm"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = "1.22"
+futures-channel = "0.3"
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+wgpu = "30.0.1"
+wgpu-fft = { path = "..", version = "0.1.0" }

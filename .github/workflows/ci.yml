@@ -55,6 +55,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target wasm32-unknown-unknown --all-targets --all-features
 
+  # The standalone browser build is not checked in: every run uploads it as
+  # the wgpu_fft_web artifact, and a v* tag attaches it to the tag's release.
+  browser:
+    name: Browser build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p wgpu-fft-web
+      - name: Install wasm-bindgen-cli
+        # The CLI must match the wasm-bindgen crate in Cargo.lock.
+        run: |
+          version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - run: python3 wgpu-fft-web/build_standalone.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgpu_fft_web
+          path: wgpu-fft-web/dist/wgpu_fft_web.js
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" wgpu-fft-web/dist/wgpu_fft_web.js --clobber
+
   msrv:
     name: MSRV (1.92)
     runs-on: ubuntu-latest
